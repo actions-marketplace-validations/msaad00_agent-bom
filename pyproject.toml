@@ -48,7 +48,7 @@ dependencies = [
 [project.optional-dependencies]
 api = [
     "fastapi>=0.115",
-    "uvicorn[standard]>=0.32",
+    "uvicorn[standard]>=0.44.0",
     "sse-starlette>=2.1",
 ]
 otel = [
