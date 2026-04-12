@@ -49,7 +49,7 @@ dependencies = [
 api = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
-    "sse-starlette>=2.1",
+    "sse-starlette>=3.3.4",
 ]
 otel = [
     "opentelemetry-api>=1.20",
