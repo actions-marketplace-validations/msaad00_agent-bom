@@ -82,7 +82,7 @@ databricks = ["databricks-sdk>=0.20"]
 snowflake = ["snowflake-connector-python>=3.6"]
 nebius = ["requests>=2.32.4"]  # GHSA-9hjg-9r4m-mvj7 (session cookie leak)
 huggingface = ["huggingface-hub>=0.20"]
-wandb = ["wandb>=0.16"]
+wandb = ["wandb>=0.25.1"]
 mlflow = ["mlflow>=2.10"]
 openai = ["openai>=1.12"]
 ai-enrich = ["litellm>=1.30"]
