@@ -1099,6 +1099,8 @@ export interface FindingListEnvelope<T> {
   warnings: string[];
   /** Applied default read-window (#4009); present on `/v1/findings`. */
   window?: ReadWindow | undefined;
+  /** Canonical server-applied facets echoed for pagination/debugging. */
+  filters?: { finding_class?: "vulnerability" | "misconfiguration" | "secret" | "identity" } | undefined;
 }
 
 /** Applied time-window echoed by windowed read surfaces (#4009). */
@@ -1903,6 +1905,7 @@ export interface JobsResponse {
   total?: number | undefined;
   limit?: number | undefined;
   offset?: number | undefined;
+  status_counts?: Partial<Record<JobStatus, number>> | undefined;
 }
 
 export interface JobListItem {

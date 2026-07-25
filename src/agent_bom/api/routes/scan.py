@@ -79,6 +79,7 @@ from agent_bom.api.tenant_quota import enforce_active_scan_quota, enforce_retain
 from agent_bom.backpressure import BackpressureRejectedError, adaptive_backpressure
 from agent_bom.canonical_ids import canonical_finding_id
 from agent_bom.evidence import EvidenceTier, redact_for_persistence
+from agent_bom.finding_scope import FindingClass
 from agent_bom.security import sanitize_error
 
 router = APIRouter()
@@ -1592,21 +1593,45 @@ async def list_jobs(
     limit: Annotated[int, Query(ge=1, le=1000)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
     include_details: bool = False,
+    q: Annotated[str | None, Query(max_length=200)] = None,
+    status: JobStatus | None = None,
 ) -> dict:
     """List all scan jobs (for the UI job history panel).
 
-    Supports pagination via ``limit`` (default 50, max 1000) and ``offset``.
+    Search and status predicates are applied by the persistence backend before
+    pagination, so totals and exports describe the full filtered collection.
     """
     tenant_id = _tenant_id(request)
     store = _get_store()
+    query = q.strip() if q else None
+    filter_kwargs: dict[str, Any] = {}
+    if query:
+        filter_kwargs["query"] = query
+    if status is not None:
+        filter_kwargs["status"] = status
     count_summary = getattr(store, "count_summary", None)
     if callable(count_summary):
-        total = count_summary(tenant_id=tenant_id)
-        summary = store.list_summary(tenant_id=tenant_id, limit=limit, offset=offset)
+        total = count_summary(tenant_id=tenant_id, **filter_kwargs)
+        summary = store.list_summary(tenant_id=tenant_id, limit=limit, offset=offset, **filter_kwargs)
     else:
         summary = store.list_summary(tenant_id=tenant_id)
+        if query:
+            summary = [
+                item
+                for item in summary
+                if query.casefold()
+                in " ".join(str(item.get(key) or "") for key in ("job_id", "source_id", "triggered_by", "schedule_id", "target")).casefold()
+            ]
+        if status is not None:
+            summary = [item for item in summary if item.get("status") == status]
         total = len(summary)
         summary = summary[offset : offset + limit]
+    count_summary_by_status = getattr(store, "count_summary_by_status", None)
+    status_counts = (
+        count_summary_by_status(tenant_id=tenant_id, query=query)
+        if callable(count_summary_by_status)
+        else {}
+    )
     enriched: list[dict[str, Any]] = []
     for item in summary:
         in_mem = _jobs_get(item["job_id"])
@@ -1636,6 +1661,7 @@ async def list_jobs(
         "total": total,
         "limit": limit,
         "offset": offset,
+        "status_counts": status_counts,
     }
 
 
@@ -1662,6 +1688,7 @@ def _canonical_scope_filters(
     account: str | None,
     environment: str | None,
     domain: str | None,
+    finding_class: str | None = None,
 ) -> dict[str, str]:
     """Normalize the optional scope/domain filters into an active-filter map.
 
@@ -1684,6 +1711,8 @@ def _canonical_scope_filters(
 
         key = domain.strip().lower()
         filters["domain"] = _LEGACY_DOMAIN_ALIASES.get(key, key)
+    if finding_class:
+        filters["finding_class"] = finding_class
     return filters
 
 
@@ -1931,8 +1960,9 @@ async def list_findings(
     domain: Annotated[str | None, Query(max_length=32)] = None,
     window_days: Annotated[int | None, Query(ge=0, le=3650)] = None,
     status: Annotated[str, Query(max_length=16)] = _DEFAULT_FINDING_STATUS,
+    finding_class: FindingClass | None = None,
 ) -> dict:
-    """List vulnerability findings aggregated from completed scan results.
+    """List unified findings aggregated from completed scan results.
 
     The heavy work — dedup/sort of in-memory scan findings plus synchronous
     store reads — runs in a worker thread so a single deep read cannot block
@@ -1972,6 +2002,7 @@ async def list_findings(
                 domain,
                 window_days,
                 status,
+                finding_class,
             )
     except BackpressureRejectedError as exc:
         raise HTTPException(
@@ -1996,6 +2027,7 @@ def _list_findings_impl(
     domain: str | None = None,
     window_days: int | None = None,
     status: str = _DEFAULT_FINDING_STATUS,
+    finding_class: str | None = None,
 ) -> dict:
     """Synchronous body of :func:`list_findings` (runs in a worker thread).
 
@@ -2119,7 +2151,7 @@ def _list_findings_impl(
     # returns that scan's rows verbatim.
     from agent_bom.api.findings_current import current_scan_findings
 
-    scope_filters = _canonical_scope_filters(provider, account, environment, domain)
+    scope_filters = _canonical_scope_filters(provider, account, environment, domain, finding_class)
 
     store = get_compliance_hub_store()
     bulk_list = getattr(store, "list_current_page", None) or getattr(store, "list_page", None)
@@ -2338,6 +2370,7 @@ def _list_findings_impl(
         scan_id=scan_id,
         cursor=cursor or "",
         next_cursor=next_cursor or "",
+        filters={"finding_class": finding_class} if finding_class else {},
         warnings=warnings,
         total_approximate=total_approximate,
     )
