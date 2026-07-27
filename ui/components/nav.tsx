@@ -67,6 +67,8 @@ interface NavLink {
   capability?: string;
   /** One-line "what is this" descriptor, surfaced as a hover tooltip. */
   desc?: string;
+  /** Deployment-wide operator surfaces are hidden unless the effective session has the capability. */
+  operatorOnly?: boolean;
 }
 
 interface NavGroup {
@@ -112,6 +114,7 @@ const NAV_GROUPS: NavGroup[] = [
     icon: Gauge,
     desc: "Risk, findings, and fixes",
     links: [
+      { href: "/", label: "Overview", icon: LayoutDashboard, desc: "Cross-domain posture snapshot" },
       {
         href: "/security-graph",
         label: "Investigation",
@@ -120,7 +123,6 @@ const NAV_GROUPS: NavGroup[] = [
       },
       { href: "/findings", label: "Findings", icon: Bug, desc: "Queue of evidence; open a row to investigate the estate node" },
       { href: "/remediation", label: "Remediation", icon: Wrench },
-      { href: "/", label: "Overview", icon: LayoutDashboard, desc: "Cross-domain posture snapshot" },
     ],
     secondary: [
       { href: "/graph", label: "Lineage", icon: GitBranch },
@@ -153,7 +155,6 @@ const NAV_GROUPS: NavGroup[] = [
       { href: "/governance", label: "Governance", icon: Eye, capability: "policy.manage" },
       { href: "/drift", label: "Drift", icon: Radar, desc: "Config drift from approved baselines" },
       { href: "/audit", label: "Audit Log", icon: FileText },
-      { href: "/self-posture", label: "Self-Audit", icon: ShieldCheck, desc: "This control plane's own security & governance hardening posture" },
     ],
     secondary: [
       { href: "/blueprints", label: "Blueprints", icon: Boxes },
@@ -188,6 +189,14 @@ const NAV_GROUPS: NavGroup[] = [
       { href: "/jobs", label: "Scan Jobs", icon: Clock },
       { href: "/activity", label: "Activity", icon: Activity },
       { href: "/integrations", label: "Integrations", icon: Plug, desc: "Webhooks, SIEM, threat intel, and report exports" },
+      {
+        href: "/self-posture",
+        label: "Control Plane Security",
+        icon: ShieldCheck,
+        capability: "policy.manage",
+        operatorOnly: true,
+        desc: "Operator checks for this deployment's authentication, isolation, audit, and secret controls",
+      },
     ],
     secondary: [{ href: "/registry", label: "MCP Catalog", icon: Boxes }],
   },
@@ -383,6 +392,9 @@ export function Nav() {
 
   const roleAllowsLink = useCallback(
     (link: NavLink) => {
+      if (link.operatorOnly) {
+        return Boolean(session?.role_summary) && hasCapability(link.capability ?? "");
+      }
       if (!link.capability || !session?.auth_required) {
         return true;
       }
@@ -521,6 +533,38 @@ export function Nav() {
           const hasActiveChild = [...group.visibleLinks, ...group.hiddenLinks, ...group.secondaryLinks].some(
             (link) => isNavLinkActive(link.href, path),
           );
+          const sectionLanding = group.visibleLinks[0] ?? group.hiddenLinks[0] ?? group.secondaryLinks[0];
+          const groupHeaderClassName = `w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs font-medium transition-colors border-l-2 ${
+            isCollapsed ? "justify-center px-0 py-2" : ""
+          } ${
+            hasActiveChild
+              ? "border-[color:var(--border-strong)] text-[color:var(--foreground)] bg-[color:var(--surface-elevated)]"
+              : "border-transparent text-[color:var(--text-secondary)] hover:border-[color:var(--border-subtle)] hover:text-[color:var(--foreground)] hover:bg-[color:var(--surface-muted)]"
+          }`;
+          const groupHeaderContent = (
+            <>
+              <GroupIcon
+                className={`${isCollapsed ? "h-[18px] w-[18px]" : "h-4 w-4"} shrink-0 ${navGroupIconClass(group.label, hasActiveChild)}`}
+              />
+              {!isCollapsed && (
+                <>
+                  <div className="min-w-0 flex-1 text-left">
+                    <span className="block uppercase tracking-wider text-[10px] font-semibold">
+                      {group.label}
+                    </span>
+                  </div>
+                  <span className="rounded-full border border-[color:var(--border-subtle)] bg-[color:var(--surface-elevated)] px-1.5 py-0.5 text-[9px] font-mono text-[color:var(--text-tertiary)]">
+                    {group.visibleLinks.length}
+                  </span>
+                  {isExpanded ? (
+                    <ChevronDown className="w-3 h-3 text-[color:var(--text-tertiary)]" />
+                  ) : (
+                    <ChevronRight className="w-3 h-3 text-[color:var(--text-tertiary)]" />
+                  )}
+                </>
+              )}
+            </>
+          );
 
           return (
             <div
@@ -530,53 +574,32 @@ export function Nav() {
               }`}
             >
               {/* Group Header */}
-              <button
-                onClick={() => {
-                  if (captureMode) {
-                    return;
-                  }
-                  if (isCollapsed) {
-                    return;
-                  } else {
-                    toggleGroup(group.label);
-                  }
-                }}
-                onMouseEnter={isCollapsed ? (event) => openCollapsedFlyout(group.label, event.currentTarget) : undefined}
-                onMouseLeave={isCollapsed ? scheduleCollapsedFlyoutClose : undefined}
-                onFocus={isCollapsed ? (event) => openCollapsedFlyout(group.label, event.currentTarget) : undefined}
-                onBlur={isCollapsed ? scheduleCollapsedFlyoutClose : undefined}
-                className={`w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs font-medium transition-colors border-l-2 ${
-                  isCollapsed ? "justify-center px-0 py-2" : ""
-                } ${
-                  hasActiveChild
-                    ? "border-[color:var(--border-strong)] text-[color:var(--foreground)] bg-[color:var(--surface-elevated)]"
-                    : "border-transparent text-[color:var(--text-secondary)] hover:border-[color:var(--border-subtle)] hover:text-[color:var(--foreground)] hover:bg-[color:var(--surface-muted)]"
-                }`}
-                aria-expanded={isCollapsed ? collapsedFlyoutGroup === group.label : isExpanded}
-                aria-label={isCollapsed ? group.label : undefined}
-                title={group.desc}
-              >
-                <GroupIcon
-                  className={`${isCollapsed ? "h-[18px] w-[18px]" : "h-4 w-4"} shrink-0 ${navGroupIconClass(group.label, hasActiveChild)}`}
-                />
-                {!isCollapsed && (
-                  <>
-                    <div className="min-w-0 flex-1 text-left">
-                      <span className="block uppercase tracking-wider text-[10px] font-semibold">
-                        {group.label}
-                      </span>
-                    </div>
-                    <span className="rounded-full border border-[color:var(--border-subtle)] bg-[color:var(--surface-elevated)] px-1.5 py-0.5 text-[9px] font-mono text-[color:var(--text-tertiary)]">
-                      {group.visibleLinks.length}
-                    </span>
-                    {isExpanded ? (
-                      <ChevronDown className="w-3 h-3 text-[color:var(--text-tertiary)]" />
-                    ) : (
-                      <ChevronRight className="w-3 h-3 text-[color:var(--text-tertiary)]" />
-                    )}
-                  </>
-                )}
-              </button>
+              {isCollapsed && sectionLanding ? (
+                <Link
+                  href={sectionLanding.href}
+                  onMouseEnter={(event) => openCollapsedFlyout(group.label, event.currentTarget)}
+                  onMouseLeave={scheduleCollapsedFlyoutClose}
+                  onFocus={(event) => openCollapsedFlyout(group.label, event.currentTarget)}
+                  onBlur={scheduleCollapsedFlyoutClose}
+                  onClick={() => setCollapsedFlyoutGroup(null)}
+                  className={groupHeaderClassName}
+                  aria-label={`${group.label}: open ${sectionLanding.label}`}
+                  title={`${group.label}: open ${sectionLanding.label}${group.desc ? ` — ${group.desc}` : ""}`}
+                >
+                  {groupHeaderContent}
+                </Link>
+              ) : (
+                <button
+                  onClick={() => {
+                    if (!captureMode) toggleGroup(group.label);
+                  }}
+                  className={groupHeaderClassName}
+                  aria-expanded={isExpanded}
+                  title={group.desc}
+                >
+                  {groupHeaderContent}
+                </button>
+              )}
 
               {/* Group Links */}
               {isExpanded && !isCollapsed && (
@@ -726,8 +749,9 @@ export function Nav() {
       <header className="fixed inset-x-0 top-0 z-[60] flex h-16 items-center gap-3 border-b border-[color:var(--border-subtle)] bg-[color:var(--surface)]/95 px-4 backdrop-blur-sm">
         <Link href="/" className="group flex min-w-0 items-center transition-opacity hover:opacity-90">
           <BrandLogo
+            showWordmark={!collapsed}
             markClassName="h-9 w-9"
-            wordmarkClassName="hidden h-[26px] w-auto max-w-[11rem] sm:block"
+            wordmarkClassName="hidden h-[26px] w-auto max-w-[11rem] lg:block"
             className="transition-transform duration-200 group-hover:scale-[1.01]"
           />
         </Link>

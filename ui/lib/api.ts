@@ -440,6 +440,7 @@ export type {
 export type { MitreAtlasCatalogMetadata } from "./api-types";
 export type { ReadWindow } from "./api-types";
 export type { GatewayFeedHealth } from "./api-types";
+export type { ManagedTrialEnvelope } from "./api-types";
 
 // ── Scan Pipeline Step Types ────────────────────────────────────────────────
 
@@ -559,6 +560,11 @@ async function post<T>(path: string, body: unknown, headers: Record<string, stri
   }, "POST");
   _runInvalidations(path);
   return res.json() as Promise<T>;
+}
+
+function mutationIdempotencyKey(prefix: string): string {
+  const random = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `${prefix}-${random}`;
 }
 
 async function postVoid(path: string, body: unknown, headers: Record<string, string> = {}): Promise<void> {
@@ -739,7 +745,8 @@ export const api = {
   deleteKey: (keyId: string) => del(`/v1/auth/keys/${encodeURIComponent(keyId)}`),
 
   /** Start a scan — returns immediately with job_id */
-  startScan: (req: ScanRequest) => post<ScanJob>("/v1/scan", req),
+  startScan: (req: ScanRequest) =>
+    post<ScanJob>("/v1/scan", req, { "Idempotency-Key": mutationIdempotencyKey("ui-scan") }),
 
   /** Poll scan status + results */
   getScan: (jobId: string) => get<ScanJob>(`/v1/scan/${jobId}`),
@@ -1676,7 +1683,11 @@ export const api = {
     post<CloudConnectionTestResponse>(`/v1/cloud/connections/${encodeURIComponent(id)}/test`, {}),
   /** Queue a durable read-only scan via the credential broker. */
   scanCloudConnection: (id: string) =>
-    post<CloudConnectionScanResponse>(`/v1/cloud/connections/${encodeURIComponent(id)}/scan`, {}),
+    post<CloudConnectionScanResponse>(
+      `/v1/cloud/connections/${encodeURIComponent(id)}/scan`,
+      {},
+      { "Idempotency-Key": mutationIdempotencyKey("ui-cloud-scan") },
+    ),
 
   // ── Drift / behavior-incident cockpit ──
   listDriftIncidents: (includeResolved = false, limit = 200) =>

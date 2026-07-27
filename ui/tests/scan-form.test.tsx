@@ -3,7 +3,53 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
 import { ScanForm } from "@/components/scan-form";
-import { api } from "@/lib/api";
+import { api, type AuthMeResponse } from "@/lib/api";
+
+const authState = vi.hoisted(() => ({
+  capabilities: ["inventory.read", "scan.run"],
+  authMethod: "no_auth",
+  managedTrialMode: false,
+  role: "analyst",
+}));
+
+vi.mock("@/components/auth-provider", () => ({
+  useAuthState: () => {
+    const session: AuthMeResponse = {
+      authenticated: true,
+      auth_required: authState.authMethod !== "no_auth",
+      configured_modes: [],
+      recommended_ui_mode: authState.authMethod,
+      auth_method: authState.authMethod,
+      managed_trial_mode: authState.managedTrialMode,
+      subject: null,
+      tenant_id: "default",
+      role: authState.role,
+      role_summary: {
+        role: authState.role,
+        ui_role: authState.role === "analyst" ? "contributor" : authState.role,
+        display_name: authState.role === "analyst" ? "Contributor" : "Viewer",
+        description: "Test role",
+        capabilities: authState.capabilities,
+        capability_matrix: [],
+        can_see: [],
+        can_do: [],
+        cannot_do: [],
+      },
+      memberships: [],
+      request_id: null,
+      trace_id: null,
+      span_id: null,
+    };
+    return {
+      session,
+      loading: false,
+      error: null,
+      reconnecting: false,
+      refresh: vi.fn(),
+      hasCapability: (capability: string) => authState.capabilities.includes(capability),
+    };
+  },
+}));
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn() }),
@@ -42,6 +88,11 @@ const mockConnection = {
 
 describe("ScanForm", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
+    authState.capabilities = ["inventory.read", "scan.run"];
+    authState.authMethod = "no_auth";
+    authState.managedTrialMode = false;
+    authState.role = "analyst";
     vi.spyOn(api, "listCloudConnections").mockResolvedValue({
       schema_version: "cloud.connections.v1",
       tenant_id: "default",
@@ -51,21 +102,6 @@ describe("ScanForm", () => {
     vi.spyOn(api, "listSources").mockResolvedValue({
       sources: [],
       count: 0,
-    });
-    vi.spyOn(api, "listJobs").mockResolvedValue({
-      jobs: [
-        {
-          job_id: "job-recent-1",
-          status: "done",
-          created_at: "2026-01-01T00:00:00Z",
-          request: {},
-          scan_outcome: "complete",
-        },
-      ],
-      count: 1,
-      total: 1,
-      limit: 3,
-      offset: 0,
     });
   });
 
@@ -78,13 +114,12 @@ describe("ScanForm", () => {
     expect(screen.getByRole("tab", { name: "Ad-hoc" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Data source" })).toBeInTheDocument();
     expect(screen.getByText("Scope now")).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "What this scan produces" })).toBeInTheDocument();
+    expect(screen.getByText("What this scan collects and produces")).toBeInTheDocument();
     expect(screen.getByText("Read-only boundary")).toBeInTheDocument();
-    expect(screen.getByText("No cloud accounts")).toBeInTheDocument();
     await waitFor(() => {
-      expect(screen.getByText("Agent and MCP discovery")).toBeInTheDocument();
-      expect(screen.getByText("Complete")).toBeInTheDocument();
+      expect(screen.getByText(/Agent and MCP discovery/)).toBeInTheDocument();
     });
+    expect(screen.getByRole("link", { name: "Scan jobs" })).toHaveAttribute("href", "/jobs");
 
     await user.click(screen.getByRole("tab", { name: "Cloud account" }));
     await waitFor(() => {
@@ -170,6 +205,60 @@ describe("ScanForm", () => {
     expect(scanCloudConnection).toHaveBeenCalledWith("conn-aws-1");
   });
 
+  it("keeps direct cloud-scan routes read-only without scan.run", async () => {
+    authState.capabilities = ["inventory.read"];
+    authState.role = "viewer";
+    const scanCloudConnection = vi.spyOn(api, "scanCloudConnection");
+
+    render(<ScanForm initialConnectionId="conn-aws-1" />);
+
+    const runButton = await screen.findByRole("button", { name: /Run cloud scan/i });
+    expect(runButton).toBeDisabled();
+    expect(screen.getByText(/Scans require the Contributor role or higher/i)).toBeInTheDocument();
+    await userEvent.click(runButton);
+    expect(scanCloudConnection).not.toHaveBeenCalled();
+  });
+
+  it("intersects role capabilities with the managed-trial route envelope", async () => {
+    authState.authMethod = "managed_trial_oidc";
+    authState.managedTrialMode = true;
+    const user = userEvent.setup();
+    const startScan = vi.spyOn(api, "startScan");
+
+    render(<ScanForm initialConnectionId="conn-aws-1" />);
+
+    expect(await screen.findByRole("button", { name: /Run cloud scan/i })).toBeEnabled();
+    await user.click(screen.getByRole("tab", { name: "Ad-hoc" }));
+    expect(screen.getByRole("button", { name: /Start scan/i })).toBeDisabled();
+    expect(screen.getByText(/Managed trial scans run from a verified AWS connection/i)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Start scan/i }));
+    expect(startScan).not.toHaveBeenCalled();
+  });
+
+  it("applies the managed-trial route envelope to a non-OIDC principal", async () => {
+    authState.authMethod = "api_key";
+    authState.managedTrialMode = true;
+    const user = userEvent.setup();
+    const startScan = vi.spyOn(api, "startScan");
+
+    render(<ScanForm initialConnectionId="conn-aws-1" />);
+
+    expect(await screen.findByRole("button", { name: /Run cloud scan/i })).toBeEnabled();
+    await user.click(screen.getByRole("tab", { name: "Ad-hoc" }));
+    expect(screen.getByRole("button", { name: /Start scan/i })).toBeDisabled();
+    expect(startScan).not.toHaveBeenCalled();
+  });
+
+  it("keeps denied operational reads unavailable instead of reporting factual zero", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api, "listSources").mockRejectedValue(new Error("Forbidden"));
+
+    render(<ScanForm initialConnectionId="conn-aws-1" />);
+
+    await user.click(screen.getByRole("tab", { name: "Data source" }));
+    expect(await screen.findByText("Data sources are unavailable for this session.")).toBeInTheDocument();
+  });
+
   it("starts a public repository scan from a git URL", async () => {
     const user = userEvent.setup();
     const startScan = vi.spyOn(api, "startScan").mockResolvedValue({
@@ -190,7 +279,7 @@ describe("ScanForm", () => {
     expect(screen.getByText(/surfaces auto-detected/i)).toBeInTheDocument();
     expect(screen.getByText(/Secrets & credentials/i)).toBeInTheDocument();
     expect(screen.getByText(/not git URLs/i)).toBeInTheDocument();
-    expect(screen.getByText("SBOM evidence")).toBeInTheDocument();
+    expect(screen.getByText(/dependencies, SBOM, secrets/i)).toBeInTheDocument();
     expect(screen.getByText(/Repository code is not executed/i)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /Scan repository/i }));
     expect(startScan).toHaveBeenCalledWith({

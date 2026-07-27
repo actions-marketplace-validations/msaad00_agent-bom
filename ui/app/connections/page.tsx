@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
@@ -55,6 +55,7 @@ import {
   type SourceCreateRequest,
   type SourceKind,
   type SourceRecord,
+  type ManagedTrialEnvelope,
 } from "@/lib/api";
 import {
   buildUnifiedRows,
@@ -73,7 +74,6 @@ import { Card, Section } from "@/components/card";
 import { Collapsible } from "@/components/collapsible";
 import { PageLaneHeader } from "@/components/page-lane";
 import { Drawer } from "@/components/drawer";
-import { CoverageCockpit } from "@/components/coverage-cockpit";
 import { StatCard } from "@/components/stat-card";
 import { StatStrip } from "@/components/stat-strip";
 import { DemoConnectCard } from "@/components/demo-mode-cta";
@@ -97,11 +97,7 @@ import {
 import { serviceEntry } from "@/lib/service-registry";
 import { vendorLogo } from "@/lib/vendor-logos";
 import { FirstRunJourney } from "@/components/first-run-journey";
-import {
-  PermissionDeniedNotice,
-  RoleBadge,
-  RolePermissionsPanel,
-} from "@/components/role-access";
+import { PermissionDeniedNotice } from "@/components/role-access";
 
 // ── Hub tabs ────────────────────────────────────────────────────────────────
 // One Connections hub with two URL-synced segments: Connect (add any source —
@@ -812,10 +808,18 @@ function ConnectionsHub() {
   const { hasCapability, session } = useAuthState();
   const { counts } = useDeploymentContext();
   const { isDemoMode } = useDemoMode();
-  const canManage = !session?.auth_required || hasCapability("scan.run");
-  const canManageSources = !session?.auth_required || hasCapability("sources.manage");
-  const canRunScans = !session?.auth_required || hasCapability("scan.run");
-  const canManageFleet = hasCapability("fleet.manage");
+  const managedTrialSession = Boolean(
+    session?.managed_trial_mode || session?.auth_method === "managed_trial_oidc",
+  );
+  const managedTrialEnvelope = session?.managed_trial_envelope ?? null;
+  const canManage = hasCapability("scan.run");
+  const canManageSources = !managedTrialSession && hasCapability("sources.manage");
+  const canRunScans = hasCapability("scan.run");
+  const canUpdateConnections = canManage && !managedTrialSession;
+  const canDeleteConnections = canManage && !managedTrialSession;
+  const canRunSources = !managedTrialSession && canRunScans;
+  const canDeleteSources = !managedTrialSession && session?.role === "admin";
+  const canManageFleet = !managedTrialSession && hasCapability("fleet.manage");
   const registryCloudService = serviceEntry(counts?.services, "cloud_accounts");
   const dataSourcesService = serviceEntry(counts?.services, "data_sources");
 
@@ -837,8 +841,11 @@ function ConnectionsHub() {
   // Registered sources + control-plane source state.
   const [sources, setSources] = useState<SourceRecord[]>([]);
   const [sourcesLoading, setSourcesLoading] = useState(true);
+  const [sourcesUnavailable, setSourcesUnavailable] = useState(false);
   const [schedules, setSchedules] = useState<ScanSchedule[]>([]);
+  const [schedulesUnavailable, setSchedulesUnavailable] = useState(false);
   const [connectorHealth, setConnectorHealth] = useState<ConnectorHealthResponse[]>([]);
+  const [connectorHealthUnavailable, setConnectorHealthUnavailable] = useState(false);
   const [providerContracts, setProviderContracts] = useState<DiscoveryProvidersResponse | null>(null);
   const [formMessage, setFormMessage] = useState<string | null>(null);
   const [busySourceId, setBusySourceId] = useState<string | null>(null);
@@ -899,8 +906,10 @@ function ConnectionsHub() {
 
       if (sourcesResult.status === "fulfilled") {
         setSources(sourcesResult.value.sources ?? []);
+        setSourcesUnavailable(false);
       } else {
         setSources([]);
+        setSourcesUnavailable(true);
       }
 
       if (providerContractsResult.status === "fulfilled") {
@@ -916,8 +925,10 @@ function ConnectionsHub() {
           return leftTime - rightTime;
         });
         setSchedules(sorted);
+        setSchedulesUnavailable(false);
       } else {
         setSchedules([]);
+        setSchedulesUnavailable(true);
       }
 
       if (connectorsResult.status === "fulfilled") {
@@ -927,8 +938,10 @@ function ConnectionsHub() {
         setConnectorHealth(
           healthResults.flatMap((result) => (result.status === "fulfilled" ? [result.value] : [])),
         );
+        setConnectorHealthUnavailable(healthResults.some((result) => result.status === "rejected"));
       } else {
         setConnectorHealth([]);
+        setConnectorHealthUnavailable(true);
       }
     } finally {
       setSourcesLoading(false);
@@ -946,9 +959,15 @@ function ConnectionsHub() {
   }, [refresh, refreshSources]);
 
   const openWizard = useCallback((provider?: string) => {
+    if (
+      !canManage ||
+      (managedTrialSession &&
+        provider != null &&
+        !managedTrialEnvelope?.providers.includes(provider))
+    ) return;
     setWizardProvider(provider);
     setWizardOpen(true);
-  }, []);
+  }, [canManage, managedTrialEnvelope, managedTrialSession]);
 
   const handleCreated = useCallback(
     (created: CloudConnectionRecord) => {
@@ -969,14 +988,16 @@ function ConnectionsHub() {
 
   const handleRegisterSource = useCallback(
     (kind: SourceKind) => {
+      if (!canManageSources) return;
       setFormState((current) => ({ ...current, kind }));
       setCreateNonce((n) => n + 1);
       setTab("sources");
     },
-    [setTab],
+    [canManageSources, setTab],
   );
 
   async function handleScan(connection: CloudConnectionRecord) {
+    if (!canRunScans || connection.status !== "active") return;
     setBusyId(connection.id);
     setMessage(null);
     setScanErrors((prev) => {
@@ -999,6 +1020,7 @@ function ConnectionsHub() {
   }
 
   async function handleTest(connection: CloudConnectionRecord) {
+    if (!canManage) return;
     setBusyId(connection.id);
     setMessage(null);
     setScanErrors((prev) => {
@@ -1021,10 +1043,13 @@ function ConnectionsHub() {
   }
 
   async function handleDelete(connection: CloudConnectionRecord) {
+    if (!canDeleteConnections) return;
+    if (!window.confirm(`Delete ${connection.display_name}? The encrypted connection credential will be removed.`)) return;
     setBusyId(connection.id);
     setMessage(null);
     try {
       await api.deleteCloudConnection(connection.id);
+      setDetailId(null);
       setScanResults((prev) => {
         const next = { ...prev };
         delete next[connection.id];
@@ -1040,6 +1065,7 @@ function ConnectionsHub() {
   }
 
   async function handleScheduleChange(connection: CloudConnectionRecord, value: string) {
+    if (!canUpdateConnections) return;
     const scanIntervalMinutes = value === "" ? null : Number(value);
     setScheduleErrors((prev) => {
       const next = { ...prev };
@@ -1059,6 +1085,7 @@ function ConnectionsHub() {
   }
 
   async function handleScanModeChange(connection: CloudConnectionRecord, continuous: boolean) {
+    if (!canUpdateConnections) return;
     setScheduleErrors((prev) => {
       const next = { ...prev };
       delete next[connection.id];
@@ -1077,6 +1104,7 @@ function ConnectionsHub() {
   }
 
   async function handleFleetSync() {
+    if (!canManageFleet) return;
     setSyncingFleet(true);
     setFleetSyncSummary(null);
     try {
@@ -1096,6 +1124,7 @@ function ConnectionsHub() {
 
   async function handleCreateSource(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!canManageSources) return;
     setFormMessage(null);
     const selected = kindOption(formState.kind) ?? SOURCE_KIND_OPTIONS[0]!;
 
@@ -1134,6 +1163,18 @@ function ConnectionsHub() {
   }
 
   async function runSourceAction(sourceId: string, action: "test" | "run" | "delete") {
+    const allowed =
+      action === "run"
+        ? canRunSources
+        : action === "delete"
+          ? canDeleteSources
+          : canManageSources;
+    if (!allowed) return;
+    if (action === "delete") {
+      const source = sourceById.get(sourceId);
+      const label = source?.display_name || "this source";
+      if (!window.confirm(`Delete ${label}? Its registration and schedule links will be removed.`)) return;
+    }
     setBusySourceId(sourceId);
     setFormMessage(null);
     try {
@@ -1158,6 +1199,7 @@ function ConnectionsHub() {
 
   async function handleCreateSchedule(event: React.FormEvent<HTMLFormElement>, source: SourceRecord) {
     event.preventDefault();
+    if (!canManageSources) return;
     setFormMessage(null);
     if (!scheduleCron.trim()) {
       setFormMessage("Cron expression is required.");
@@ -1183,6 +1225,7 @@ function ConnectionsHub() {
   }
 
   async function runScheduleAction(scheduleId: string, action: "toggle" | "delete") {
+    if (!canManageSources) return;
     setBusyScheduleId(scheduleId);
     setFormMessage(null);
     try {
@@ -1335,6 +1378,9 @@ function ConnectionsHub() {
       onSearchChange={setGallerySearch}
       connectedCountFor={connectorConnectedCount}
       canManage={canManage}
+      canManageSources={canManageSources}
+      managedTrial={managedTrialSession}
+      managedTrialProviders={managedTrialEnvelope?.providers ?? null}
       onConnectCloud={openWizard}
       onRegisterSource={handleRegisterSource}
       onConnectCodingAgent={() => setCodingAgentOpen(true)}
@@ -1373,9 +1419,9 @@ function ConnectionsHub() {
         }
         banner={
           <div className="grid gap-3 sm:grid-cols-3">
-            <StatCard label="Cloud accounts" value={loading ? "…" : connections.length} />
-            <StatCard label="Registered sources" value={sourcesLoading ? "…" : sources.length} accent="info" />
-            <StatCard label="Last scan" value={loading ? "…" : formatWhenShort(lastAccountScan)} />
+            <StatCard label="Cloud accounts" value={loading ? "…" : error ? "Unavailable" : connections.length} />
+            <StatCard label="Registered sources" value={sourcesLoading ? "…" : sourcesUnavailable ? "Unavailable" : sources.length} accent="info" />
+            <StatCard label="Last scan" value={loading ? "…" : error ? "Unavailable" : formatWhenShort(lastAccountScan)} />
           </div>
         }
       />
@@ -1417,11 +1463,7 @@ function ConnectionsHub() {
           cloudService={cloudService}
           connections={connections}
           connectionsCount={connections.length}
-          lastAccountScan={lastAccountScan}
-          scanCount={counts?.scan_count ?? 0}
-          findingsCount={counts?.total ?? 0}
           canManage={canManage}
-          hasConnections={hasConnections}
           gallery={gallery}
           onConnect={() => openWizard("aws")}
         />
@@ -1438,12 +1480,14 @@ function ConnectionsHub() {
           filterQuery={filterQuery}
           onFilterQuery={setFilterQuery}
           loading={loading || sourcesLoading}
-          error={error}
+          error={error ?? (sourcesUnavailable ? "Registered sources are unavailable." : null)}
           onRetry={refreshAll}
           onRowOpen={openRow}
           connectionById={connectionById}
           busyId={busyId}
           canManage={canManage}
+          canUpdateConnections={canUpdateConnections}
+          canDeleteConnections={canDeleteConnections}
           onCloudTest={(c) => void handleTest(c)}
           onCloudScan={(c) => void handleScan(c)}
           onCloudDelete={(c) => void handleDelete(c)}
@@ -1458,11 +1502,13 @@ function ConnectionsHub() {
           canManageFleet={canManageFleet}
           onFleetSync={() => void handleFleetSync()}
           connectorHealth={connectorHealth}
+          connectorHealthUnavailable={connectorHealthUnavailable}
           connectorNames={connectorNames}
           healthyConnectors={healthyConnectors}
           providerContracts={providerContracts}
           providerSummary={providerSummary}
           schedulesCount={schedules.length}
+          schedulesUnavailable={schedulesUnavailable}
           nextSchedule={schedules[0]?.next_run ?? null}
           canManageSources={canManageSources}
           formState={formState}
@@ -1483,14 +1529,12 @@ function ConnectionsHub() {
         scheduleError={detailId ? scheduleErrors[detailId] : undefined}
         isBusy={busyId === detailId}
         canManage={canManage}
+        canDelete={canDeleteConnections}
         scannable={detailId ? SCANNABLE_PROVIDERS.has(connectionById.get(detailId)?.provider ?? "") : false}
         onClose={() => setDetailId(null)}
         onTest={(connection) => void handleTest(connection)}
         onScan={(connection) => void handleScan(connection)}
-        onDelete={(connection) => {
-          setDetailId(null);
-          void handleDelete(connection);
-        }}
+        onDelete={(connection) => void handleDelete(connection)}
       />
 
       <SourceDrawer
@@ -1501,7 +1545,8 @@ function ConnectionsHub() {
         busySourceId={busySourceId}
         busyScheduleId={busyScheduleId}
         canManageSources={canManageSources}
-        canRunScans={canRunScans}
+        canRunScans={canRunSources}
+        canDeleteSources={canDeleteSources}
         onSourceAction={runSourceAction}
         onScheduleAction={runScheduleAction}
         onCreateSchedule={handleCreateSchedule}
@@ -1515,6 +1560,11 @@ function ConnectionsHub() {
       {wizardOpen ? (
         <AddConnectionWizard
           initialProvider={wizardProvider}
+          managedTrial={managedTrialSession}
+          managedTrialEnvelope={managedTrialEnvelope}
+          providerConnectionCount={
+            connectedByProvider[wizardProvider ?? "aws"] ?? 0
+          }
           onClose={handleWizardClose}
           onCreated={handleCreated}
         />
@@ -1584,11 +1634,7 @@ function ConnectSegment({
   cloudService,
   connections,
   connectionsCount,
-  lastAccountScan,
-  scanCount,
-  findingsCount,
   canManage,
-  hasConnections,
   gallery,
   onConnect,
 }: {
@@ -1597,27 +1643,30 @@ function ConnectSegment({
   cloudService: ReturnType<typeof serviceEntry>;
   connections: CloudConnectionRecord[];
   connectionsCount: number;
-  lastAccountScan: string | null;
-  scanCount: number;
-  findingsCount: number;
   canManage: boolean;
-  hasConnections: boolean;
   gallery: React.ReactNode;
   onConnect: () => void;
 }) {
+  const verifiedConnectionsCount = connections.filter(
+    (connection) => connection.status === "active",
+  ).length;
+  const scannedConnectionsCount = connections.filter(
+    (connection) =>
+      connection.status === "active" && Boolean(connection.last_scan_at || connection.last_scan_id),
+  ).length;
+
   return (
     <div className="space-y-6">
       <FirstRunJourney
         connectionsCount={connectionsCount}
-        scanCount={scanCount}
-        findingsCount={findingsCount}
+        verifiedConnectionsCount={verifiedConnectionsCount}
+        scannedConnectionsCount={scannedConnectionsCount}
         canManage={canManage}
         session={session}
         onConnect={onConnect}
       />
 
       <div className="flex flex-wrap items-center gap-2">
-        <RoleBadge session={session} />
         <ServiceStateChip
           serviceId="cloud_accounts"
           entry={cloudService}
@@ -1626,15 +1675,6 @@ function ConnectSegment({
         />
       </div>
 
-      <ServiceStateBanner serviceId="cloud_accounts" entry={cloudService} registry={counts?.services} />
-
-      <CoverageCockpit
-        counts={counts}
-        scanCount={counts?.scan_count ?? null}
-        latestScanLabel={lastAccountScan ? formatWhen(lastAccountScan) : null}
-        connections={connections}
-      />
-
       <Section
         label="Connect a source"
         description="Cloud accounts open a read-only wizard; code, AI, and data sources register in the control plane and appear under Sources."
@@ -1642,21 +1682,6 @@ function ConnectSegment({
         {gallery}
       </Section>
 
-      {!hasConnections ? (
-        <p className="text-sm text-[color:var(--text-secondary)]">
-          Once a source is connected, switch to <span className="font-medium text-[color:var(--foreground)]">Sources</span> to
-          see it in the unified table with scan handoff, schedules, and evidence links.
-        </p>
-      ) : null}
-
-      <Collapsible
-        title="Roles & permissions"
-        subtitle="Viewer reads · Contributor connects and scans · Admin manages keys, policy, and fleet."
-        defaultOpen={false}
-        data-testid="roles-permissions"
-      >
-        <RolePermissionsPanel session={session} bare />
-      </Collapsible>
     </div>
   );
 }
@@ -1681,6 +1706,8 @@ interface SourcesSegmentProps {
   connectionById: Map<string, CloudConnectionRecord>;
   busyId: string | null;
   canManage: boolean;
+  canUpdateConnections: boolean;
+  canDeleteConnections: boolean;
   onCloudTest: (connection: CloudConnectionRecord) => void;
   onCloudScan: (connection: CloudConnectionRecord) => void;
   onCloudDelete: (connection: CloudConnectionRecord) => void;
@@ -1695,11 +1722,13 @@ interface SourcesSegmentProps {
   canManageFleet: boolean;
   onFleetSync: () => void;
   connectorHealth: ConnectorHealthResponse[];
+  connectorHealthUnavailable: boolean;
   connectorNames: string[];
   healthyConnectors: number;
   providerContracts: DiscoveryProvidersResponse | null;
   providerSummary: ReturnType<typeof summarizeProviders>;
   schedulesCount: number;
+  schedulesUnavailable: boolean;
   nextSchedule: string | null;
   canManageSources: boolean;
   formState: FormState;
@@ -1730,6 +1759,8 @@ function SourcesSegment(props: SourcesSegmentProps) {
     connectionById,
     busyId,
     canManage,
+    canUpdateConnections,
+    canDeleteConnections,
     onCloudTest,
     onCloudScan,
     onCloudDelete,
@@ -1744,11 +1775,13 @@ function SourcesSegment(props: SourcesSegmentProps) {
     canManageFleet,
     onFleetSync,
     connectorHealth,
+    connectorHealthUnavailable,
     connectorNames,
     healthyConnectors,
     providerContracts,
     providerSummary,
     schedulesCount,
+    schedulesUnavailable,
     nextSchedule,
     canManageSources,
     formState,
@@ -1792,7 +1825,7 @@ function SourcesSegment(props: SourcesSegmentProps) {
           { label: "Registered", value: loading ? "…" : totalRows },
           {
             label: "Connector health",
-            value: loading ? "…" : `${healthyConnectors}/${connectorHealth.length || 0}`,
+            value: loading ? "…" : connectorHealthUnavailable ? "Unavailable" : `${healthyConnectors}/${connectorHealth.length || 0}`,
             accent:
               connectorHealth.length > 0 && healthyConnectors === connectorHealth.length
                 ? "success"
@@ -1800,13 +1833,13 @@ function SourcesSegment(props: SourcesSegmentProps) {
           },
           {
             label: "Schedules",
-            value: loading ? "…" : schedulesCount,
-            hint: nextSchedule ? `Next ${formatWhen(nextSchedule)}` : "None yet",
+            value: loading ? "…" : schedulesUnavailable ? "Unavailable" : schedulesCount,
+            hint: schedulesUnavailable ? "Read not available" : nextSchedule ? `Next ${formatWhen(nextSchedule)}` : "None yet",
           },
           {
             label: "Providers",
-            value: loading ? "…" : providerSummary.total,
-            hint: `${providerSummary.readOnly} read-only`,
+            value: loading ? "…" : providerContracts ? providerSummary.total : "Unavailable",
+            hint: providerContracts ? `${providerSummary.readOnly} read-only` : "Read not available",
           },
         ]}
       />
@@ -1876,6 +1909,8 @@ function SourcesSegment(props: SourcesSegmentProps) {
                   connection={row.connectionId ? connectionById.get(row.connectionId) ?? null : null}
                   busyId={busyId}
                   canManage={canManage}
+                  canUpdate={canUpdateConnections}
+                  canDelete={canDeleteConnections}
                   onOpen={() => onRowOpen(row)}
                   onCloudTest={onCloudTest}
                   onCloudScan={onCloudScan}
@@ -2023,10 +2058,10 @@ function SourcesSegment(props: SourcesSegmentProps) {
           </p>
           <StatStrip
             items={[
-              { label: "Providers", value: loading ? "…" : providerSummary.total },
-              { label: "Read-only", value: loading ? "…" : `${providerSummary.readOnly}/${providerSummary.total}` },
-              { label: "Scope-zero modes", value: loading ? "…" : providerSummary.scopeZero },
-              { label: "Declared permissions", value: loading ? "…" : providerSummary.permissionCount },
+              { label: "Providers", value: loading ? "…" : providerContracts ? providerSummary.total : "Unavailable" },
+              { label: "Read-only", value: loading ? "…" : providerContracts ? `${providerSummary.readOnly}/${providerSummary.total}` : "Unavailable" },
+              { label: "Scope-zero modes", value: loading ? "…" : providerContracts ? providerSummary.scopeZero : "Unavailable" },
+              { label: "Declared permissions", value: loading ? "…" : providerContracts ? providerSummary.permissionCount : "Unavailable" },
             ]}
           />
           {providerContracts?.warnings?.length ? (
@@ -2174,6 +2209,8 @@ function UnifiedRow({
   connection,
   busyId,
   canManage,
+  canUpdate,
+  canDelete,
   onOpen,
   onCloudTest,
   onCloudScan,
@@ -2185,6 +2222,8 @@ function UnifiedRow({
   connection: CloudConnectionRecord | null;
   busyId: string | null;
   canManage: boolean;
+  canUpdate: boolean;
+  canDelete: boolean;
   onOpen: () => void;
   onCloudTest: (connection: CloudConnectionRecord) => void;
   onCloudScan: (connection: CloudConnectionRecord) => void;
@@ -2276,7 +2315,7 @@ function UnifiedRow({
               <select
                 id={`schedule-${connection!.id}`}
                 value={connection!.scan_interval_minutes?.toString() ?? ""}
-                disabled={!canManage}
+                disabled={!canUpdate}
                 onChange={(event) => onCloudScheduleChange(connection!, event.target.value)}
                 className="w-36 rounded-lg border border-[color:var(--border-subtle)] bg-[color:var(--surface-elevated)] px-2.5 py-1.5 text-xs text-[var(--foreground)] outline-none transition focus:border-emerald-500 disabled:cursor-not-allowed disabled:opacity-60"
               >
@@ -2290,7 +2329,7 @@ function UnifiedRow({
                 <input
                   type="checkbox"
                   checked={continuous}
-                  disabled={!canManage}
+                  disabled={!canUpdate}
                   onChange={(event) => onCloudScanModeChange(connection!, event.target.checked)}
                   className="h-3.5 w-3.5 shrink-0 accent-sky-500 disabled:cursor-not-allowed"
                   data-testid="schedule-scan-mode-continuous"
@@ -2332,8 +2371,14 @@ function UnifiedRow({
             </button>
             <button
               onClick={() => onCloudScan(connection!)}
-              disabled={isBusy || !canManage || !scannable}
-              title={scannable ? "Run a read-only inventory and CIS scan" : "Scanning for this provider is unavailable"}
+              disabled={isBusy || !canManage || !scannable || connection!.status !== "active"}
+              title={
+                !scannable
+                  ? "Scanning for this provider is unavailable"
+                  : connection!.status !== "active"
+                    ? "Verify this connection before running a scan"
+                    : "Run a read-only inventory and CIS scan"
+              }
               className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-medium text-black transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
             >
               <ShieldCheck className="h-3.5 w-3.5" />
@@ -2341,7 +2386,7 @@ function UnifiedRow({
             </button>
             <button
               onClick={() => onCloudDelete(connection!)}
-              disabled={isBusy || !canManage}
+              disabled={isBusy || !canDelete}
               aria-label={`Delete ${connection!.display_name}`}
               className="inline-flex items-center gap-1 rounded-lg border border-red-500/30 dark:border-red-900/60 bg-red-500/10 dark:bg-red-950/20 px-3 py-1.5 text-xs font-medium text-red-700 dark:text-red-300 transition hover:bg-red-500/10 dark:hover:bg-red-950/40 disabled:cursor-not-allowed disabled:opacity-60"
             >
@@ -2533,6 +2578,9 @@ function ConnectorGallery({
   onSearchChange,
   connectedCountFor,
   canManage,
+  canManageSources,
+  managedTrial,
+  managedTrialProviders,
   onConnectCloud,
   onRegisterSource,
   onConnectCodingAgent,
@@ -2543,6 +2591,9 @@ function ConnectorGallery({
   onSearchChange: (value: string) => void;
   connectedCountFor: (connector: CatalogConnector) => number;
   canManage: boolean;
+  canManageSources: boolean;
+  managedTrial: boolean;
+  managedTrialProviders: string[] | null;
   onConnectCloud: (provider: string) => void;
   onRegisterSource: (kind: SourceKind) => void;
   onConnectCodingAgent: () => void;
@@ -2611,6 +2662,9 @@ function ConnectorGallery({
               connector={connector}
               connectedCount={connectedCountFor(connector)}
               canManage={canManage}
+              canManageSources={canManageSources}
+              managedTrial={managedTrial}
+              managedTrialProviders={managedTrialProviders}
               onConnectCloud={onConnectCloud}
               onRegisterSource={onRegisterSource}
               onConnectCodingAgent={onConnectCodingAgent}
@@ -2626,6 +2680,9 @@ function ConnectorTile({
   connector,
   connectedCount,
   canManage,
+  canManageSources,
+  managedTrial,
+  managedTrialProviders,
   onConnectCloud,
   onRegisterSource,
   onConnectCodingAgent,
@@ -2633,6 +2690,9 @@ function ConnectorTile({
   connector: CatalogConnector;
   connectedCount: number;
   canManage: boolean;
+  canManageSources: boolean;
+  managedTrial: boolean;
+  managedTrialProviders: string[] | null;
   onConnectCloud: (provider: string) => void;
   onRegisterSource: (kind: SourceKind) => void;
   onConnectCodingAgent: () => void;
@@ -2641,6 +2701,11 @@ function ConnectorTile({
   const categoryLabel =
     CONNECTOR_CATEGORIES.find((c) => c.id === connector.category)?.label ?? connector.category;
   const connected = connectedCount > 0;
+  const cloudAllowed =
+    canManage &&
+    (!managedTrial ||
+      (connector.action.type === "cloud" &&
+        Boolean(managedTrialProviders?.includes(connector.action.provider))));
 
   return (
     <Card className="flex h-full flex-col gap-3">
@@ -2683,7 +2748,8 @@ function ConnectorTile({
           <button
             type="button"
             onClick={() => onConnectCloud(connector.action.type === "cloud" ? connector.action.provider : "")}
-            disabled={!canManage}
+            disabled={!cloudAllowed}
+            title={managedTrial && !cloudAllowed ? "Managed trial supports AWS account connections only." : undefined}
             aria-label={`Connect ${connector.label}`}
             className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-700/60 bg-emerald-500/10 px-2.5 py-1.5 text-xs font-medium text-emerald-700 dark:text-emerald-200 transition hover:border-emerald-500 hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-60"
           >
@@ -2704,7 +2770,7 @@ function ConnectorTile({
           <button
             type="button"
             onClick={() => onRegisterSource(connector.action.type === "source" ? connector.action.sourceKind : "scan.repo")}
-            disabled={!canManage}
+            disabled={!canManageSources}
             aria-label={`Register ${connector.label}`}
             className="inline-flex items-center gap-1.5 rounded-lg border border-[color:var(--border-subtle)] bg-[color:var(--surface-muted)] px-2.5 py-1.5 text-xs font-medium text-[color:var(--foreground)] transition hover:border-emerald-600 hover:text-emerald-700 dark:hover:text-emerald-300 disabled:cursor-not-allowed disabled:opacity-60"
           >
@@ -2825,6 +2891,7 @@ function ConnectionDetailDrawer({
   scheduleError,
   isBusy,
   canManage,
+  canDelete,
   scannable,
   onClose,
   onTest,
@@ -2838,6 +2905,7 @@ function ConnectionDetailDrawer({
   scheduleError: string | undefined;
   isBusy: boolean;
   canManage: boolean;
+  canDelete: boolean;
   scannable: boolean;
   onClose: () => void;
   onTest: (connection: CloudConnectionRecord) => void;
@@ -2888,14 +2956,14 @@ function ConnectionDetailDrawer({
           </button>
           <button
             onClick={() => onScan(connection)}
-            disabled={isBusy || !canManage || !scannable}
+            disabled={isBusy || !canManage || !scannable || connection.status !== "active"}
             className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-medium text-black transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
           >
             <ShieldCheck className="h-3.5 w-3.5" /> {isBusy ? "Working…" : "Run scan"}
           </button>
           <button
             onClick={() => onDelete(connection)}
-            disabled={isBusy || !canManage}
+            disabled={isBusy || !canDelete}
             className="ml-auto inline-flex items-center gap-1 rounded-lg border border-red-500/30 dark:border-red-900/60 bg-red-500/10 dark:bg-red-950/20 px-3 py-1.5 text-xs font-medium text-red-700 dark:text-red-300 transition hover:bg-red-500/10 dark:hover:bg-red-950/40 disabled:cursor-not-allowed disabled:opacity-60"
           >
             <Trash2 className="h-3.5 w-3.5" /> Delete
@@ -3010,6 +3078,7 @@ function SourceDrawer({
   busyScheduleId,
   canManageSources,
   canRunScans,
+  canDeleteSources,
   onSourceAction,
   onScheduleAction,
   onCreateSchedule,
@@ -3027,6 +3096,7 @@ function SourceDrawer({
   busyScheduleId: string | null;
   canManageSources: boolean;
   canRunScans: boolean;
+  canDeleteSources: boolean;
   onSourceAction: (sourceId: string, action: "test" | "run" | "delete") => void;
   onScheduleAction: (scheduleId: string, action: "toggle" | "delete") => void;
   onCreateSchedule: (event: React.FormEvent<HTMLFormElement>, source: SourceRecord) => void;
@@ -3079,7 +3149,8 @@ function SourceDrawer({
           </button>
           <button
             onClick={() => onSourceAction(source.source_id, "delete")}
-            disabled={isBusy || !canManageSources}
+            disabled={isBusy || !canDeleteSources}
+            title={!canDeleteSources ? "Deleting a source requires an Admin role." : undefined}
             className="rounded-lg border border-[color:var(--status-danger-border)] bg-[color:var(--status-danger-bg)] px-3 py-2 text-xs font-medium text-[color:var(--status-danger)] transition hover:border-[color:var(--status-danger)] disabled:cursor-not-allowed disabled:opacity-60"
           >
             Delete
@@ -3362,7 +3433,7 @@ function buildWizardForm(provider: string): WizardForm {
     external_id: "",
     regions: "",
     auth: {},
-    auto_scan_on_create: true,
+    auto_scan_on_create: false,
     scan_mode: "full",
   };
 }
@@ -3372,13 +3443,20 @@ type VerifyState = "idle" | "running" | "ok" | "error";
 
 function AddConnectionWizard({
   initialProvider,
+  managedTrial,
+  managedTrialEnvelope,
+  providerConnectionCount,
   onClose,
   onCreated,
 }: {
   initialProvider?: string | undefined;
+  managedTrial: boolean;
+  managedTrialEnvelope: ManagedTrialEnvelope | null;
+  providerConnectionCount: number;
   onClose: () => void;
   onCreated: (created: CloudConnectionRecord) => void;
 }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
   const [step, setStep] = useState<WizardStep>(0);
   const [form, setForm] = useState<WizardForm>(() =>
     buildWizardForm(initialProvider && providerOption(initialProvider) ? initialProvider : "aws"),
@@ -3409,12 +3487,48 @@ function AddConnectionWizard({
   const [scanError, setScanError] = useState<string | null>(null);
   const [scanId, setScanId] = useState<string | null>(null);
 
+  useEffect(() => {
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const dialog = dialogRef.current;
+    const focusableSelector =
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href]';
+    const focusable = () => Array.from(dialog?.querySelectorAll<HTMLElement>(focusableSelector) ?? []);
+    focusable()[0]?.focus();
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusable();
+      if (items.length === 0) return;
+      const first = items[0]!;
+      const last = items[items.length - 1]!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      previousFocus?.focus();
+    };
+  }, [onClose]);
+
   const provider = useMemo(
     () => providerOption(form.provider) ?? PROVIDER_OPTIONS[0]!,
     [form.provider],
   );
 
   const isAws = provider.value === "aws";
+  const managedTrialProviders = managedTrialEnvelope?.providers ?? [];
 
   useEffect(() => {
     if (!isAws) return;
@@ -3439,6 +3553,7 @@ function AddConnectionWizard({
   }
 
   function selectProvider(value: string) {
+    if (managedTrial && !managedTrialProviders.includes(value)) return;
     setForm((current) => {
       if (current.provider === value) return current;
       setGeneratedExternalId("");
@@ -3543,6 +3658,27 @@ function AddConnectionWizard({
             .map((region) => region.trim())
             .filter(Boolean);
 
+    if (managedTrial) {
+      if (!managedTrialEnvelope) {
+        setFormError("Managed trial limits are unavailable. Refresh before creating a connection.");
+        return;
+      }
+      if (!managedTrialEnvelope.providers.includes(form.provider)) {
+        setFormError("This provider is unavailable in the managed trial.");
+        return;
+      }
+      if (
+        regions.length === 0 ||
+        regions.length > managedTrialEnvelope.max_regions ||
+        regions.includes("all")
+      ) {
+        setFormError(
+          `Managed trial connections require one to ${managedTrialEnvelope.max_regions} explicit AWS regions.`,
+        );
+        return;
+      }
+    }
+
     if (!displayName) {
       setFormError("A display name is required.");
       return;
@@ -3572,9 +3708,9 @@ function AddConnectionWizard({
       external_id: externalId,
       regions,
       auth_params: authParams,
-      inventory_scope: isAws && awsScope === "organization" ? "organization" : "account",
-      scan_mode: form.scan_mode,
-      auto_scan_on_create: form.auto_scan_on_create,
+      inventory_scope: managedTrial ? "account" : isAws && awsScope === "organization" ? "organization" : "account",
+      scan_mode: managedTrial ? "full" : form.scan_mode,
+      auto_scan_on_create: managedTrial ? false : form.auto_scan_on_create,
     };
 
     setSubmitting(true);
@@ -3583,6 +3719,10 @@ function AddConnectionWizard({
       // Drop the secret from client state the moment it is persisted.
       setForm((current) => ({ ...current, external_id: "" }));
       setCreatedRecord(created);
+      if (created.last_scan_id) {
+        setScanId(created.last_scan_id);
+        setScanState("ok");
+      }
       // Refresh the background list + toast, but keep the wizard open so the
       // operator sees the live Verify step before finishing.
       onCreated(created);
@@ -3596,6 +3736,7 @@ function AddConnectionWizard({
 
   return (
     <div
+      ref={dialogRef}
       className="fixed inset-0 z-[80] flex items-start justify-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm"
       role="dialog"
       aria-modal="true"
@@ -3634,8 +3775,31 @@ function AddConnectionWizard({
                 <legend className="text-xs font-medium uppercase tracking-[0.18em] text-[var(--text-tertiary)]">
                   Choose a provider
                 </legend>
+                {managedTrial ? (
+                  managedTrialEnvelope ? (
+                    <div className="rounded-xl border border-sky-500/30 bg-sky-500/10 px-3 py-2.5 text-[11px] leading-5 text-[var(--text-secondary)]">
+                      <p className="font-medium text-[var(--foreground)]">
+                        {providerConnectionCount} of {managedTrialEnvelope.cloud_connections_per_provider} AWS connections
+                      </p>
+                      <p>
+                        {managedTrialEnvelope.scan_credits_24h} scans per rolling 24 hours ·{" "}
+                        {managedTrialEnvelope.active_scan_jobs === 1
+                          ? "one"
+                          : managedTrialEnvelope.active_scan_jobs} active scan
+                        {managedTrialEnvelope.active_scan_jobs === 1 ? "" : "s"} and{" "}
+                        {managedTrialEnvelope.retained_scan_jobs} retained jobs
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-[11px] text-amber-700 dark:text-amber-200">
+                      Trial limits are unavailable. Refresh before creating a connection.
+                    </div>
+                  )
+                ) : null}
                 <div className="grid gap-2 sm:grid-cols-2">
-                  {PROVIDER_OPTIONS.map((option) => {
+                  {PROVIDER_OPTIONS.filter(
+                    (option) => !managedTrial || managedTrialProviders.includes(option.value),
+                  ).map((option) => {
                     const selected = form.provider === option.value;
                     return (
                       <button
@@ -3680,7 +3844,7 @@ function AddConnectionWizard({
                       aria-label="AWS onboarding scope"
                       className="mb-3 grid grid-cols-2 gap-1 rounded-xl border border-[color:var(--border-subtle)] bg-[color:var(--surface-muted)] p-1"
                     >
-                      {(["account", "organization"] as const).map((scope) => {
+                      {(managedTrial ? (["account"] as const) : (["account", "organization"] as const)).map((scope) => {
                         const active = awsScope === scope;
                         return (
                           <button
@@ -3936,6 +4100,7 @@ function AddConnectionWizard({
                   <input
                     type="checkbox"
                     checked={form.auto_scan_on_create}
+                    disabled={managedTrial}
                     onChange={(event) =>
                       setForm((current) => ({ ...current, auto_scan_on_create: event.target.checked }))
                     }
@@ -3947,7 +4112,9 @@ function AddConnectionWizard({
                       Run first scan after connect
                     </span>
                     <span className="mt-0.5 block text-[11px] text-[var(--text-secondary)]">
-                      Default on. Starts a read-only inventory + CIS scan once the connection is saved.
+                      {managedTrial
+                        ? "Managed trials require verification before an explicit first scan."
+                        : "Optional. Enable only when a scan should start before the explicit Verify step."}
                     </span>
                   </span>
                 </label>
@@ -3955,6 +4122,7 @@ function AddConnectionWizard({
                   <input
                     type="checkbox"
                     checked={form.scan_mode === "continuous"}
+                    disabled={managedTrial}
                     onChange={(event) =>
                       setForm((current) => ({
                         ...current,
@@ -3967,7 +4135,9 @@ function AddConnectionWizard({
                   <span className="min-w-0">
                     <span className="block text-sm font-medium text-[var(--foreground)]">Continuous</span>
                     <span className="mt-0.5 block text-[11px] text-[var(--text-secondary)]">
-                      Event-driven mid-interval refresh between full cadence scans.
+                      {managedTrial
+                        ? "Continuous scans are unavailable in managed trials."
+                        : "Event-driven mid-interval refresh between full cadence scans."}
                     </span>
                     {form.scan_mode === "continuous" ? (
                       <span
@@ -3990,6 +4160,7 @@ function AddConnectionWizard({
                       <input
                         type="checkbox"
                         checked={allRegions}
+                        disabled={managedTrial}
                         onChange={(event) => setAllRegions(event.target.checked)}
                         className="mt-0.5 h-4 w-4 shrink-0 accent-emerald-500"
                         data-testid="wizard-all-regions"
@@ -3997,7 +4168,11 @@ function AddConnectionWizard({
                       <span className="min-w-0">
                         <span className="block text-sm font-medium text-[var(--foreground)]">All enabled regions</span>
                         <span className="mt-0.5 block text-[11px] text-[var(--text-secondary)]">
-                          Fan the scan across every region enabled in the account. Leave off to scan specific regions.
+                          {managedTrial
+                            ? managedTrialEnvelope
+                              ? `Managed trials require one to ${managedTrialEnvelope.max_regions} explicit regions.`
+                              : "Managed trial region limits are unavailable. Refresh before continuing."
+                            : "Fan the scan across every region enabled in the account. Leave off to scan specific regions."}
                         </span>
                       </span>
                     </label>
@@ -4045,10 +4220,17 @@ function AddConnectionWizard({
                       The connection is active. Run a first read-only scan now, or close and scan later from the table.
                     </p>
                     {scanState === "ok" ? (
-                      <p className="flex flex-wrap items-center gap-1.5 text-xs text-emerald-700 dark:text-emerald-200">
-                        <ShieldCheck className="h-3.5 w-3.5" />
-                        First scan started{scanId ? ` — ${scanId}` : "."}
-                      </p>
+                      <div className="flex flex-wrap items-center gap-2 text-xs text-emerald-700 dark:text-emerald-200">
+                        <span className="inline-flex items-center gap-1.5">
+                          <ShieldCheck className="h-3.5 w-3.5" />
+                          First scan started{scanId ? ` — ${scanId}` : "."}
+                        </span>
+                        {scanId ? (
+                          <Link href={`/scan?id=${encodeURIComponent(scanId)}`} className="font-medium underline underline-offset-2">
+                            Track scan
+                          </Link>
+                        ) : null}
+                      </div>
                     ) : scanState === "error" ? (
                       <div className="space-y-2">
                         <p className="flex items-start gap-1.5 text-xs text-red-700 dark:text-red-300">
