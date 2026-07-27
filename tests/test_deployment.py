@@ -486,6 +486,22 @@ def test_deployment_freshness_workflow_uses_bearer_token_and_parses_tool_count()
     assert "--resolve-only" in workflow
 
 
+def test_surface_freshness_targets_the_latest_published_release():
+    """Unreleased source versions must not create distribution drift alerts."""
+    workflow = (ROOT / ".github" / "workflows" / "surface-freshness.yml").read_text()
+
+    assert "Get expected version from latest published release" in workflow
+    assert "repos/$GITHUB_REPOSITORY/releases/latest" in workflow
+    assert "EXPECTED_VERSION: ${{ steps.expected.outputs.version }}" in workflow
+    assert '--expected "$EXPECTED_VERSION"' in workflow
+    assert '--expected-glama-tool-count "${{ steps.expected.outputs.tool_count }}"' in workflow
+    assert 'git show "${RELEASE_SHA}:docs/PRODUCT_METRICS.json"' in workflow
+    assert 'select(.name == "MCP tools")' in workflow
+    assert 'METRICS_VERSION" != "$VERSION"' in workflow
+    assert "persist-credentials: false" in workflow
+    assert "Expected version from published release" in workflow
+
+
 def test_docs_workflow_never_deploys_pages_from_release_tags():
     """Release tags may build docs, but Pages deploy is protected to main only."""
     workflow = (ROOT / ".github" / "workflows" / "docs.yml").read_text()
@@ -574,11 +590,62 @@ def test_publish_registries_workflow_validates_smithery_best_effort_and_curated_
     assert "integrations/openclaw/vulnerability-intel" in workflow
     assert '_publish_skill "integrations/openclaw" "agent-bom"' not in workflow
     assert 'git fetch --no-tags --depth=1 origin "$RELEASE_SHA"' in workflow
-    assert 'check_glama_listing.py --verify-manifest --git-ref "${{ steps.meta.outputs.release_sha }}"' in workflow
+    assert 'check_glama_listing.py --verify-manifest --git-ref "${{ needs.release.outputs.release_sha }}"' in workflow
+    assert workflow.count("ref: ${{ needs.release.outputs.release_sha }}") == 1
+    assert workflow.count("ref: ${{ github.event.repository.default_branch }}") == 3
+    assert workflow.count("persist-credentials: false") == 4
     assert "workflow_run.head_sha || github.ref" not in workflow
     assert "actions: read" in workflow
     assert "jq -n" in workflow
     assert "dockerfile: $dockerfile" in workflow
+
+
+def test_publish_registries_manual_repair_resolves_latest_release_only():
+    """Manual repair cannot fan out an older release to other registries."""
+    workflow = (ROOT / ".github" / "workflows" / "publish-registries.yml").read_text()
+
+    assert "Resolve published release" in workflow
+    assert "repos/${GITHUB_REPOSITORY}/releases/latest" in workflow
+    assert "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" in workflow
+    assert workflow.count("needs: release") == 3
+    assert "release_tag:" not in workflow
+    assert "REQUESTED_TAG" not in workflow
+    assert "releases/tags/${REQUESTED_TAG}" not in workflow
+    assert "GITHUB_REF_NAME" not in workflow
+    assert "VERSION=$(grep '^version' pyproject.toml" not in workflow
+
+
+def test_publish_registries_uses_release_metrics_for_glama_and_clawhub_assets():
+    """Current checker code must evaluate exact release evidence and assets."""
+    workflow = (ROOT / ".github" / "workflows" / "publish-registries.yml").read_text()
+
+    assert "tool_count: ${{ steps.release.outputs.tool_count }}" in workflow
+    assert 'git show "${RELEASE_SHA}:docs/PRODUCT_METRICS.json"' in workflow
+    assert 'METRICS_VERSION" != "$VERSION"' in workflow
+    assert 'select(.name == "MCP tools")' in workflow
+    assert "EXPECTED_TOOL_COUNT: ${{ needs.release.outputs.tool_count }}" in workflow
+    assert '--expected-tool-count "$EXPECTED_TOOL_COUNT"' in workflow
+    assert workflow.count("ref: ${{ needs.release.outputs.release_sha }}") == 1
+
+
+def test_glama_rebuild_webhook_is_secret_and_missing_secret_is_honest():
+    """A missing webhook must not leak a URL or claim a rebuild happened."""
+    workflow = (ROOT / ".github" / "workflows" / "publish-registries.yml").read_text()
+
+    assert "GLAMA_WEBHOOK_URL: ${{ secrets.GLAMA_WEBHOOK_URL }}" in workflow
+    assert "GLAMA_WEBHOOK_URL: ${{ vars.GLAMA_WEBHOOK_URL }}" not in workflow
+    assert "id: glama_trigger" in workflow
+    assert 'echo "rebuild_triggered=false" >> "$GITHUB_OUTPUT"' in workflow
+    assert "No Glama rebuild was triggered" in workflow
+    assert "set GLAMA_WEBHOOK_URL as a repository Actions secret" in workflow
+    assert "REBUILD_TRIGGERED: ${{ steps.glama_trigger.outputs.rebuild_triggered }}" in workflow
+    assert 'if [ "$REBUILD_TRIGGERED" = "true" ]; then' in workflow
+    assert 'HTTP_STATUS" -lt 300' in workflow
+    assert 'HTTP_STATUS" -lt 400' not in workflow
+    assert "EVENT_NAME: ${{ github.event_name }}" in workflow
+    assert 'if [ "$EVENT_NAME" = "workflow_dispatch" ]; then' in workflow
+    assert "::error::Manual Glama repair" in workflow
+    assert "exit 1" in workflow
 
 
 def test_refresh_latest_container_keeps_release_code_but_applies_runtime_security_overlay():

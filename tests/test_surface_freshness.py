@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import subprocess
+import urllib.error
 from pathlib import Path
 from types import ModuleType
 
@@ -31,6 +32,11 @@ def test_glama_listing_json_contract_reports_stale_listing(monkeypatch, capsys):
 
     monkeypatch.setattr(script, "_load_readme_tool_count", lambda: "69")
     monkeypatch.setattr(script, "_fetch", lambda _url, _timeout: stale_page)
+    monkeypatch.setattr(
+        script,
+        "_fetch_json",
+        lambda _url, _timeout: {"tools": [{"name": f"tool_{index}"} for index in range(69)]},
+    )
 
     assert script.main(["--expected", "0.89.2", "--json", "--retries", "1"]) == 1
     captured = capsys.readouterr()
@@ -41,6 +47,82 @@ def test_glama_listing_json_contract_reports_stale_listing(monkeypatch, capsys):
     assert payload["expected"] == "0.89.2"
     assert payload["listing_version"] == "0.88.4"
     assert "missing current Glama listing token" in payload["error"]
+
+
+def test_glama_listing_requires_public_api_tool_inventory(monkeypatch, capsys):
+    """Rendered README claims do not substitute for Glama-indexed MCP tools."""
+    script = _load_script("check_glama_listing.py")
+    current_page = "v0.98.2 MCP server mode exposes 77 MCP tools"
+
+    monkeypatch.setattr(script, "_fetch", lambda _url, _timeout: current_page)
+    monkeypatch.setattr(script, "_fetch_json", lambda _url, _timeout: {"tools": []})
+
+    assert script.main(["--expected", "0.98.2", "--expected-tool-count", "77", "--json", "--retries", "1"]) == 1
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["status"] == "stale"
+    assert payload["tool_count"] == 0
+    assert payload["expected_tool_count"] == 77
+    assert "public API exposes 0 tools; expected 77" in payload["error"]
+
+
+def test_glama_listing_accepts_exact_public_api_tool_inventory(monkeypatch, capsys):
+    script = _load_script("check_glama_listing.py")
+    current_page = "v0.98.2 MCP server mode exposes 77 MCP tools"
+
+    monkeypatch.setattr(script, "_fetch", lambda _url, _timeout: current_page)
+    monkeypatch.setattr(
+        script,
+        "_fetch_json",
+        lambda _url, _timeout: {"tools": [{"name": f"tool_{index}"} for index in range(77)]},
+    )
+
+    assert script.main(["--expected", "0.98.2", "--expected-tool-count", "77", "--json", "--retries", "1"]) == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["status"] == "fresh"
+    assert payload["tool_count"] == 77
+    assert payload["expected_tool_count"] == 77
+
+
+def test_glama_api_failure_is_unreachable_and_resets_previous_retry_count(monkeypatch, capsys):
+    """A later API outage must not retain an earlier attempt's observed count."""
+    script = _load_script("check_glama_listing.py")
+    current_page = "v0.98.2 MCP server mode exposes 77 MCP tools"
+    api_results = iter(
+        [
+            {"tools": [{"name": f"tool_{index}"} for index in range(76)]},
+            urllib.error.URLError("temporary outage"),
+        ]
+    )
+
+    def fetch_json(_url, _timeout):
+        result = next(api_results)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(script, "_fetch", lambda _url, _timeout: current_page)
+    monkeypatch.setattr(script, "_fetch_json", fetch_json)
+
+    assert (
+        script.main(
+            [
+                "--expected",
+                "0.98.2",
+                "--expected-tool-count",
+                "77",
+                "--json",
+                "--retries",
+                "2",
+                "--delay-seconds",
+                "0",
+            ]
+        )
+        == 1
+    )
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["status"] == "unreachable"
+    assert payload["tool_count"] is None
+    assert "failed to verify Glama public API tool inventory" in payload["error"]
 
 
 def test_glama_build_manifest_verify_passes():
@@ -178,10 +260,7 @@ def test_surface_freshness_blank_env_vars_use_defaults(monkeypatch):
     monkeypatch.setenv("GLAMA_LISTING_URL", "")
 
     assert script._env_or("DOCKER_IMAGE", script.DEFAULT_DOCKER_IMAGE) == script.DEFAULT_DOCKER_IMAGE
-    assert (
-        script._env_or("SMITHERY_SERVER_QUALIFIED_NAME", script.DEFAULT_SMITHERY_SERVER)
-        == script.DEFAULT_SMITHERY_SERVER
-    )
+    assert script._env_or("SMITHERY_SERVER_QUALIFIED_NAME", script.DEFAULT_SMITHERY_SERVER) == script.DEFAULT_SMITHERY_SERVER
 
     glama = _load_script("check_glama_listing.py")
     assert glama._env_or("GLAMA_LISTING_URL", glama.DEFAULT_URL) == glama.DEFAULT_URL
@@ -192,12 +271,26 @@ def test_surface_freshness_main_skips_blank_docker_and_smithery_env(monkeypatch,
     monkeypatch.setenv("DOCKER_IMAGE", "")
     monkeypatch.setenv("SMITHERY_SERVER_QUALIFIED_NAME", "")
 
-    monkeypatch.setattr(script, "probe_pypi", lambda expected, **_kw: {
-        "surface": "PyPI", "status": "fresh", "version": expected, "expected": expected,
-    })
-    monkeypatch.setattr(script, "probe_glama", lambda expected, **_kw: {
-        "surface": "Glama", "status": "fresh", "version": expected, "expected": expected,
-    })
+    monkeypatch.setattr(
+        script,
+        "probe_pypi",
+        lambda expected, **_kw: {
+            "surface": "PyPI",
+            "status": "fresh",
+            "version": expected,
+            "expected": expected,
+        },
+    )
+    monkeypatch.setattr(
+        script,
+        "probe_glama",
+        lambda expected, **_kw: {
+            "surface": "Glama",
+            "status": "fresh",
+            "version": expected,
+            "expected": expected,
+        },
+    )
 
     seen: dict[str, str] = {}
 
@@ -218,4 +311,3 @@ def test_surface_freshness_main_skips_blank_docker_and_smithery_env(monkeypatch,
     assert report["all_fresh"] is True
     assert seen["docker"] == script.DEFAULT_DOCKER_IMAGE
     assert seen["smithery"] == script.DEFAULT_SMITHERY_SERVER
-
