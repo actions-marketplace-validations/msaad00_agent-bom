@@ -503,6 +503,15 @@ export default function MeshPage() {
   const fitVisible = useCallback(() => {
     void flowInstance?.fitView({ ...viewportOptions, duration: 240 });
   }, [flowInstance, viewportOptions]);
+
+  useEffect(() => {
+    if (!captureMode || !flowInstance || displayNodes.length === 0) return;
+    const timer = window.setTimeout(() => {
+      void flowInstance.fitView({ ...viewportOptions, duration: 0 });
+    }, 120);
+    return () => window.clearTimeout(timer);
+  }, [captureMode, displayEdges.length, displayNodes.length, flowInstance, viewportOptions]);
+
   const fitSelection = useCallback(() => {
     if (!flowInstance || !selectedNodeId) return;
     const node = flowInstance.getNode(selectedNodeId);
@@ -581,7 +590,7 @@ export default function MeshPage() {
   }
 
   return (
-    <div className={`${captureMode ? "h-screen" : "h-[calc(100vh-3.5rem)]"} flex flex-col bg-background text-foreground`}>
+    <div className={`${captureMode ? "h-[calc(100vh-4rem)]" : "h-[calc(100vh-3.5rem)]"} flex flex-col bg-background text-foreground`}>
       {/* Header */}
       {captureMode ? (
         <div className="border-b border-[var(--border-subtle)] px-5 py-2.5">
@@ -731,7 +740,7 @@ export default function MeshPage() {
             onMoveEnd={presentation.onMoveEnd}
             onInit={(instance) => {
               setFlowInstance(instance);
-              void instance.setViewport(presentation.viewport);
+              if (!captureMode) void instance.setViewport(presentation.viewport);
             }}
             onPaneClick={() => { setSelectedNode(null); setSelectedNodeId(null); setHoveredNodeId(null); }}
           >

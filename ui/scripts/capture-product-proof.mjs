@@ -1672,6 +1672,14 @@ async function installRoutes(page) {
     schema_version: "gateway.feed.v1",
     tenant_id: "tenant-alpha",
     generated_at: CREATED_AT,
+    health: {
+      state: "sample",
+      live: false,
+      heartbeat_at: CREATED_AT,
+      age_seconds: 0,
+      stale_after_seconds: 120,
+      reason: "deterministic_capture",
+    },
     count: 4,
     events: [
       { ts: CREATED_AT, agent: "developer-copilot", action_type: "tool_call_blocked", target: "github.repo-write", detail: "Repo-write blocked by default-deny prod policy", tenant: "tenant-alpha", shadow: false, source: "gateway" },
@@ -1946,7 +1954,7 @@ async function writeScreenshotManifest(outputDir = IMAGE_DIR) {
     {
       path: "new-scan-live.png",
       page: "/scan?capture=1",
-      scope: "New Scan workspace with collector plan, read-only boundary, expected evidence, connected sources, and recent job context",
+      scope: "New Scan workspace with scope summary, read-only boundary, expected evidence, connected sources, and job navigation",
     },
     {
       path: "jobs-pipeline-live.png",
@@ -2114,8 +2122,8 @@ async function main() {
     await capture(page, "/scan?capture=1", "new-scan-live.png", async (scanPage) => {
       await scanPage.getByRole("heading", { name: /New Scan|Run scan/i }).first().waitFor({ state: "visible", timeout: 10_000 });
     }, {
-      expectedText: ["New Scan", "What this scan produces", "Read-only boundary", /Collector plan/i, /Recent scans/i],
-      expectedApiPaths: ["/v1/cloud/connections", "/v1/sources", "/v1/jobs"],
+      expectedText: ["New Scan", "What this scan collects and produces", "Read-only boundary", /Scope now/i, /Scan jobs/i],
+      expectedApiPaths: ["/v1/cloud/connections", "/v1/sources"],
     });
     await capture(page, "/jobs?capture=1", "jobs-pipeline-live.png", async (jobsPage) => {
       await jobsPage.getByTestId(`job-pipeline-${SCAN_ID}`).waitFor({ state: "visible", timeout: 20_000 });
@@ -2139,6 +2147,7 @@ async function main() {
       minGraphNodes: 7,
       minGraphEdges: 6,
     });
+    await page.setViewportSize({ width: 1440, height: 1120 });
     await capture(page, "/mesh?capture=1", "mesh-live.png", async (meshPage) => {
       // ReactFlow can preserve a hidden, pre-measurement node tree across an
       // App Router transition. A hard reload gives the capture a fresh canvas
@@ -2157,9 +2166,10 @@ async function main() {
       const showAll = meshPage.getByRole("button", { name: "Show all", exact: true });
       if (await showAll.count()) {
         await showAll.click();
-        await meshPage.waitForTimeout(400);
+        await meshPage.waitForTimeout(800);
       }
       await fitReactFlow(meshPage);
+      await meshPage.waitForTimeout(500);
       await scrollTo(meshPage, 0);
     }, {
       expectedText: [
@@ -2173,6 +2183,7 @@ async function main() {
       minGraphNodes: 4,
       minGraphEdges: 3,
     });
+    await page.setViewportSize({ width: 1440, height: 980 });
     await capture(page, "/security-graph?capture=1", "security-graph-live.png", async (securityGraphPage) => {
       await securityGraphPage
         .getByRole("img", { name: /Selected exposure path graph for/i })
@@ -2203,7 +2214,7 @@ async function main() {
       await advancedControls.locator(":scope > summary").click();
       await fitReactFlow(lineagePage);
       await lineagePage.locator(".react-flow__controls-zoomout").first().click({ force: true });
-      await scrollTo(lineagePage, 380);
+      await scrollTo(lineagePage, 140);
       await lineagePage.waitForTimeout(350);
     }, {
       expectedText: [
@@ -2273,12 +2284,13 @@ async function main() {
     });
     await capture(page, "/runtime?tab=gateway&capture=1", "gateway-policies-live.png", async (gatewayPage) => {
       await gatewayPage.getByText("Calls today").first().waitFor({ state: "visible", timeout: 8000 });
-      await gatewayPage.getByText("Gateway live feed").first().waitFor({ state: "visible", timeout: 8000 });
+      await gatewayPage.getByText("Gateway activity").first().waitFor({ state: "visible", timeout: 8000 });
       await scrollTo(gatewayPage, 0);
     }, {
-      expectedText: ["Calls today", "4,485", "Gateway live feed", "developer-copilot", "Repo-write blocked"],
+      expectedText: ["Calls today", "4,485", "Gateway activity", "developer-copilot", "Repo-write blocked"],
       expectedApiPaths: ["/v1/gateway/policies", "/v1/gateway/feed", "/v1/gateway/feed/kpis"],
     });
+    await page.setViewportSize({ width: 1440, height: 1120 });
     await capture(page, "/audit?capture=1", "identity-audit-live.png", async (auditPage) => {
       const filteredResponse = auditPage.waitForResponse((response) => {
         const url = new URL(response.url());
@@ -2287,14 +2299,16 @@ async function main() {
       const resourceFilter = auditPage.getByPlaceholder("Filter by resource…");
       await resourceFilter.fill("identity");
       await filteredResponse;
-      await auditPage.getByText("agent_identity.issued").waitFor({ state: "visible", timeout: 8_000 });
-      await scrollTo(auditPage, 0);
+      const issuedEvent = auditPage.getByText("agent_identity.issued");
+      await issuedEvent.waitFor({ state: "visible", timeout: 8_000 });
+      await issuedEvent.evaluate((element) => element.scrollIntoView({ block: "center", behavior: "instant" }));
       await auditPage.waitForTimeout(350);
     }, {
       expectedText: ["agent_identity.issued", "agent_identity.rotated", "agent_identity.revoked", "identity/id_89c1a6f406bd7189"],
       rejectedText: ["scan.completed", "gateway.policy.denied", "compliance.bundle.signed"],
       expectedApiPaths: ["/v1/audit", "/v1/audit/integrity"],
     });
+    await page.setViewportSize({ width: 1440, height: 980 });
     await capture(page, "/findings?capture=1", "dependency-map-live.png", async (findingsPage) => {
       await findingsPage.getByRole("heading", { name: /Findings|Issues|Vulnerabilit/i }).first().waitFor({
         state: "visible",
@@ -2304,9 +2318,9 @@ async function main() {
       });
       await scrollTo(findingsPage, 0);
     }, {
-      expectedText: ["Findings queue", "15 filtered", "DEMO-VULN-21441", "DEMO-VULN-77881"],
+      expectedText: ["Findings queue", "15 findings", "DEMO-VULN-21441", "DEMO-VULN-77881"],
       expectedApiPaths: ["/v1/findings", "/v1/findings/triage"],
-      rejectedText: ["17 filtered"],
+      rejectedText: ["17 findings"],
     });
     await capture(page, "/remediation?capture=1", "remediation-live.png", undefined, {
       expectedText: ["Risk campaigns", "Package remediation plan", "Upgrade openssl to 3.0.14", "DEMO-VULN-21441"],
