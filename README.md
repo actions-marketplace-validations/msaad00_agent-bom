@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/msaad00/agent-bom/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/msaad00/agent-bom/ci.yml?branch=main&style=flat&label=Build" alt="Build"></a>
   <a href="https://pypi.org/project/agent-bom/"><img src="https://img.shields.io/pypi/v/agent-bom?style=flat&label=PyPI&cacheSeconds=60" alt="PyPI"></a>
-  <a href="https://pypi.org/project/agent-bom/"><img src="https://img.shields.io/pypi/pyversions/agent-bom?style=flat&label=Python" alt="Python versions"></a>
+  <a href="https://pypi.org/project/agent-bom/"><img src="https://img.shields.io/badge/Python-3.11%E2%80%933.14-blue?style=flat" alt="Python 3.11 through 3.14"></a>
   <a href="https://hub.docker.com/r/agentbom/agent-bom"><img src="https://img.shields.io/docker/pulls/agentbom/agent-bom?style=flat&label=Docker%20pulls" alt="Docker pulls"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue?style=flat" alt="Apache-2.0 license"></a>
   <a href="https://securityscorecards.dev/viewer/?uri=github.com/msaad00/agent-bom"><img src="https://img.shields.io/ossf-scorecard/github.com/msaad00/agent-bom?style=flat&label=OpenSSF%20scorecard" alt="OpenSSF Scorecard"></a>
@@ -62,6 +62,13 @@ observed.
 
 ## Who it is for
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/msaad00/agent-bom/main/docs/images/persona-value-dark.svg">
+    <img src="https://raw.githubusercontent.com/msaad00/agent-bom/main/docs/images/persona-value-light.svg" alt="Developer, AppSec, platform, GRC, and AI or MCP owner workflows on the shared evidence model" width="1000" />
+  </picture>
+</p>
+
 | Role | Start here | Primary outcome |
 |---|---|---|
 | Local developers | `agent-bom scan .` | Find and explain issues before code leaves the workstation |
@@ -75,19 +82,7 @@ observed.
 AppSec and GRC remain separate workflows: findings and reachability are not
 presented as audit certification. See [product boundaries](docs/PRODUCT_BOUNDARIES.md).
 
-<details>
-<summary><b>Audience workflow map</b></summary>
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/msaad00/agent-bom/main/docs/images/persona-value-dark.svg">
-    <img src="https://raw.githubusercontent.com/msaad00/agent-bom/main/docs/images/persona-value-light.svg" alt="Developer, AppSec, platform, GRC, and AI or MCP owner workflows on the shared evidence model" width="1000" />
-  </picture>
-</p>
-
-</details>
-
-<details>
+<details open>
 <summary><b>Product gallery</b></summary>
 
 The gallery uses deterministic sample data, visibly labeled in the UI. It is
@@ -158,6 +153,7 @@ real identity, TLS, PostgreSQL, encryption, and audit keys before exposing it.
 | Docker Compose | [Pilot compose](deploy/docker-compose.pilot.yml) |
 | Helm / Kubernetes | `helm install agent-bom oci://ghcr.io/msaad00/charts/agent-bom --version 0.98.2` |
 | EKS | [Terraform module](deploy/terraform/platform-eks) |
+| Snowflake SPCS / Native App | `scripts/deploy/install.sh snowflake-native` · [install guide](docs/snowflake-native-app/INSTALL.md) |
 | Air-gapped | [Image bundle guide](site-docs/deployment/airgapped-image-bundle.md) |
 
 > Examples target this release candidate; confirm release availability before copying an
@@ -182,9 +178,10 @@ MCP server mode exposes 77 MCP tools, 6 resources, and 8 workflow prompts, all
 read-first: discovery and analysis never mutate a scanned target.
 
 The CLI, Docker, API, Helm chart, MCP server, gateway, and SDK are distribution
-surfaces of the same product. EKS remains a deployment profile; Snowflake and
-Snowpark remain connector/runtime integrations rather than hosted-core
-dependencies.
+surfaces of the same product. The Snowflake SPCS / Native App lane runs inside
+the customer's Snowflake account; it is a customer-owned deployment target,
+not an agent-bom-hosted service. Snowflake and Snowpark also remain connector
+and runtime integrations for the other deployment profiles.
 
 </details>
 
