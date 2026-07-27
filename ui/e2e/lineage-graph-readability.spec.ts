@@ -222,15 +222,22 @@ async function captureGraphScreenshot(page: Page, testInfo: TestInfo, theme: "da
   await expect(page.getByTestId("graph-compression-summary")).toContainText(/compressed|rendered/);
 
   const largeOverview = page.getByTestId("large-graph-overview");
+  const application = page.getByRole("application");
+  const desktopNode = application.getByText("Desktop Agent", { exact: true });
+  // Graph mode is selected after the bounded graph finishes loading. Under a
+  // busy CI worker, branching on an immediate `isVisible()` can choose the
+  // React Flow path before either renderer has mounted. Wait for one truthful
+  // renderer signal, then assert against that renderer.
+  await expect.poll(async () =>
+    (await largeOverview.isVisible()) || (await desktopNode.isVisible()),
+  ).toBe(true);
   if (await largeOverview.isVisible()) {
     await expect(largeOverview).toBeVisible();
     await expect(page.getByText("Pan, zoom, search, filter, and select nodes for evidence.")).toBeVisible();
   } else {
-    const canvas = page.getByRole("application");
-    await expect(canvas.getByText("Desktop Agent").first()).toBeVisible();
-    await expect(canvas.getByText("CVE-2026-103").first()).toBeVisible();
+    await expect(desktopNode).toBeVisible();
+    await expect(application.getByText("CVE-2026-103", { exact: true })).toBeVisible();
     await expect(page.getByText("Legend").first()).toBeVisible();
-    const application = page.getByRole("application").first();
     // Topology with the legend collapsed — proves the nodes fill the canvas
     // and read clearly at default zoom.
     await application.screenshot({
@@ -283,11 +290,20 @@ test("lineage graph controls zoom, move, persist, lock, fit, and auto-layout", a
   expect(before).not.toBeNull();
 
   await page.getByRole("button", { name: "Edit layout" }).click();
-  await node.dragTo(canvas, { targetPosition: { x: 220, y: 220 } });
-  const saved = await page.evaluate(() =>
-    Object.keys(localStorage).some((key) => key.startsWith("agent-bom:graph-presentation:v1:")),
+  const editableNode = await node.boundingBox();
+  const canvasBox = await canvas.boundingBox();
+  expect(editableNode).not.toBeNull();
+  expect(canvasBox).not.toBeNull();
+  await page.mouse.move(
+    editableNode!.x + editableNode!.width / 2,
+    editableNode!.y + editableNode!.height / 2,
   );
-  expect(saved).toBe(true);
+  await page.mouse.down();
+  await page.mouse.move(canvasBox!.x + 220, canvasBox!.y + 220, { steps: 8 });
+  await page.mouse.up();
+  await expect.poll(() => page.evaluate(() =>
+    Object.keys(localStorage).some((key) => key.startsWith("agent-bom:graph-presentation:v1:")),
+  )).toBe(true);
 
   await canvas.hover();
   await page.mouse.wheel(0, -240);
