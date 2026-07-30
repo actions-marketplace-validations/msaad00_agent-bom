@@ -435,11 +435,12 @@ async def get_compliance(
 
     tenant_jobs = _tenant_jobs(request)
     if scan_id:
-        tenant_jobs = [
-            job
-            for job in tenant_jobs
-            if job.job_id == scan_id or (job.result and str(job.result.get("scan_id") or "") == scan_id)
-        ]
+        matching_jobs = []
+        for job in tenant_jobs:
+            result_scan_id = str(job.result.get("scan_id") or "") if job.result else ""
+            if job.job_id == scan_id or result_scan_id == scan_id:
+                matching_jobs.append(job)
+        tenant_jobs = matching_jobs
 
     # Collect blast_radius entries from all completed scans
     all_blast: list[dict] = []
@@ -756,13 +757,21 @@ def _list_cis_benchmark_checks_impl(
 
 
 def _coerce_cis_row(row: dict[str, Any]) -> dict[str, Any]:
+    from agent_bom.cloud.cis_remediation import fail_closed_remediation_payload
+
     coerced = dict(row)
     remediation = coerced.get("remediation")
     if isinstance(remediation, str):
         try:
-            coerced["remediation"] = json.loads(remediation)
+            remediation = json.loads(remediation)
         except json.JSONDecodeError:
-            coerced["remediation"] = {}
+            remediation = {}
+    remediation = fail_closed_remediation_payload(remediation)
+    coerced["remediation"] = remediation
+    coerced["fix_cli"] = ""
+    coerced["fix_console"] = str(remediation.get("fix_console") or coerced.get("fix_console") or "")
+    coerced["effort"] = "manual"
+    coerced["requires_human_review"] = True
     return coerced
 
 
