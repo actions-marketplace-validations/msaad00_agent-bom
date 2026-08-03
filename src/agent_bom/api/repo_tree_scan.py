@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent_bom.models import Agent, AgentType, MCPServer, ServerSurface
+from agent_bom.traversal import iter_discovery_files
 
 _WEAK_CRYPTO_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     ("MD5 hash", re.compile(r"\bhashlib\.md5\b|\bMD5\.new\b|\bmd5\s*\(", re.IGNORECASE), "medium"),
@@ -95,7 +96,7 @@ def _scan_weak_crypto(project: Path) -> WeakCryptoScanResult:
         return result
 
     file_count = 0
-    for file_path in sorted(project.rglob("*")):
+    for file_path in sorted(iter_discovery_files(project, extra_skip_dirs=_WEAK_CRYPTO_SKIP_DIRS)):
         if not file_path.is_file():
             continue
         if any(part in _WEAK_CRYPTO_SKIP_DIRS for part in file_path.parts):
@@ -206,9 +207,7 @@ def scan_cloned_repo_tree(
                     )
                 )
             if skill_result.credential_env_vars:
-                warnings.append(
-                    f"{len(skill_result.credential_env_vars)} credential env var(s) referenced in skill/instruction files"
-                )
+                warnings.append(f"{len(skill_result.credential_env_vars)} credential env var(s) referenced in skill/instruction files")
             skill_audit = audit_skill_result(skill_result)
             result.skill_audit_data = {
                 "findings": [
@@ -363,9 +362,7 @@ def scan_cloned_repo_tree(
                     pkg_key = f"{comp.ecosystem}:{comp.package_name}"
                     if pkg_key not in seen_pkgs:
                         seen_pkgs.add(pkg_key)
-                        ai_packages.append(
-                            Package(name=comp.package_name, version="latest", ecosystem=comp.ecosystem)
-                        )
+                        ai_packages.append(Package(name=comp.package_name, version="latest", ecosystem=comp.ecosystem))
             if ai_packages:
                 ai_provenance = {
                     "source_type": "ai_inventory",
