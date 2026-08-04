@@ -28,7 +28,7 @@
     },
     {
       "name": "Test files",
-      "value": 1125,
+      "value": 1128,
       "source": "tests/",
       "notes": "Counts files matching test_*.py."
     },
@@ -46,7 +46,7 @@
     },
     {
       "name": "Python modules",
-      "value": 828,
+      "value": 829,
       "source": "src/agent_bom",
       "notes": "Counts all Python files recursively."
     },

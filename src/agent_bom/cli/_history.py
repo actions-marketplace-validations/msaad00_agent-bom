@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Optional, cast
 import click
 from rich.console import Console
 
+from agent_bom.compliance_coverage import blast_radius_tag_kwargs
 from agent_bom.output import print_diff
 from agent_bom.output.compliance_narrative import ACCEPTED_FRAMEWORK_SLUGS
 
@@ -108,30 +109,21 @@ def _report_from_json(data: dict) -> "_NarrativeReport":
                     agent_server_links.add(agent_link_key)
                     agent.mcp_servers.append(server)
 
-        blast_radii.append(
-            BlastRadius(
-                vulnerability=vuln,
-                package=package,
-                affected_servers=servers,
-                affected_agents=agents,
-                exposed_credentials=list(br.get("exposed_credentials", [])),
-                exposed_tools=[],
-                risk_score=float(br.get("risk_score") or 0.0),
-                owasp_tags=list(br.get("owasp_tags", [])),
-                atlas_tags=list(br.get("atlas_tags", [])),
-                nist_ai_rmf_tags=list(br.get("nist_ai_rmf_tags", [])),
-                owasp_mcp_tags=list(br.get("owasp_mcp_tags", [])),
-                owasp_agentic_tags=list(br.get("owasp_agentic_tags", [])),
-                eu_ai_act_tags=list(br.get("eu_ai_act_tags", [])),
-                nist_csf_tags=list(br.get("nist_csf_tags", [])),
-                iso_27001_tags=list(br.get("iso_27001_tags", [])),
-                soc2_tags=list(br.get("soc2_tags", [])),
-                cis_tags=list(br.get("cis_tags", [])),
-                cmmc_tags=list(br.get("cmmc_tags", [])),
-                nist_800_53_tags=list(br.get("nist_800_53_tags", [])),
-                fedramp_tags=list(br.get("fedramp_tags", [])),
-            )
+        blast_radius = BlastRadius(
+            vulnerability=vuln,
+            package=package,
+            affected_servers=servers,
+            affected_agents=agents,
+            exposed_credentials=list(br.get("exposed_credentials", [])),
+            exposed_tools=[],
+            risk_score=float(br.get("risk_score") or 0.0),
         )
+        # Driven off the canonical field registry so a newly added framework
+        # cannot be silently dropped on reload the way ATT&CK and PCI DSS were
+        # when these were enumerated by hand.
+        for tag_field, tags in blast_radius_tag_kwargs(br).items():
+            setattr(blast_radius, tag_field, tags)
+        blast_radii.append(blast_radius)
 
     summary = data.get("summary") or {}
     return _NarrativeReport(
@@ -603,6 +595,32 @@ def rescan_command(baseline: str, output: Optional[str], md: Optional[str], enri
     sys.exit(1 if remaining else 0)
 
 
+_MAX_RENDERED_FAILING_CONTROLS = 20
+
+
+def _render_failing_controls_markdown(lines: list, failing_controls: list) -> None:
+    """Render the per-control auditor drill under a framework's exec paragraph.
+
+    The exec read (status, score, narrative) answers "where do we stand"; this
+    answers "on what evidence". Without the finding ids an auditor cannot walk
+    the control assertion back to the scan output that produced it, which is the
+    engineer half of the two-altitude read. Bounded so a large estate stays
+    scannable — the JSON output carries the complete set.
+    """
+    if not failing_controls:
+        return
+    lines.append("| Control | Status | Findings | Packages |")
+    lines.append("|---|---|---|---|")
+    for control in failing_controls[:_MAX_RENDERED_FAILING_CONTROLS]:
+        findings = ", ".join(control.affected_findings) or "—"
+        packages = ", ".join(control.affected_packages) or "—"
+        lines.append(f"| {control.control_id} {control.title} | {control.status} | {findings} | {packages} |")
+    hidden = len(failing_controls) - _MAX_RENDERED_FAILING_CONTROLS
+    if hidden > 0:
+        lines.append(f"| … {hidden} more | | | |")
+    lines.append("")
+
+
 def _render_nist_catalog_markdown(lines: list, catalog: dict) -> None:
     """Render the catalog-backed NIST 800-53 line + per-control drill.
 
@@ -696,6 +714,7 @@ def compliance_narrative_cmd(scan_file: str, framework: Optional[str], output_fo
                     "",
                 ]
             )
+            _render_failing_controls_markdown(lines, fw.failing_controls)
             if fw.recommendations:
                 lines.append("Recommendations:")
                 for recommendation in fw.recommendations:

@@ -616,3 +616,74 @@ def test_narrative_from_an_undated_artifact_still_renders(tmp_path):
     # Age unknown is reported as a pass with an explicit unknown-age reason,
     # never a fabricated stale-evidence failure.
     assert {c["control_id"] for c in fw["failing_controls"]} == {"SI-10"}
+
+
+def test_report_from_json_preserves_every_compliance_tag_field():
+    """Reloading a saved scan must carry every framework's tags, not a hand-listed subset.
+
+    ``agent-bom report compliance-narrative scan.json`` rebuilds BlastRadius rows
+    from the saved JSON. The constructor call enumerated the tag fields by hand
+    and missed two, so ATT&CK and PCI DSS evidence that is present in the
+    artifact was silently dropped: the narrative reported those frameworks as
+    unevaluated while the API, reading the same evidence, reported mapped
+    controls.
+    """
+    from agent_bom.cli._history import _report_from_json
+    from agent_bom.compliance_coverage import COMPLIANCE_TAG_FIELDS
+
+    row = {
+        "vulnerability_id": "CVE-2025-4242",
+        "severity": "high",
+        "package": "requests@1.0.0",
+        "ecosystem": "pypi",
+        "affected_agents": ["claude"],
+        "affected_servers": ["filesystem"],
+    }
+    # One distinctive tag per framework so a dropped field is unambiguous.
+    expected = {field: [f"TAG-{field}"] for field in COMPLIANCE_TAG_FIELDS}
+    row.update(expected)
+
+    report = _report_from_json({"summary": {}, "blast_radius": [row]})
+
+    assert len(report.blast_radii) == 1
+    rebuilt = report.blast_radii[0]
+    dropped = [field for field, tags in expected.items() if list(getattr(rebuilt, field, []) or []) != tags]
+    assert not dropped, f"compliance tag fields dropped on reload: {dropped}"
+
+
+def test_narrative_markdown_renders_the_failing_control_drill(tmp_path):
+    """The default markdown narrative must carry the auditor's engineer-level drill.
+
+    It rendered only the per-framework exec paragraph, status, score and
+    recommendations — no control ids, no packages, no finding ids. An auditor
+    reading the shipped default could not tie any control assertion back to the
+    evidence behind it: `grep -c "CVE-" narrative.md` returned 0.
+    """
+    runner = CliRunner()
+    report = tmp_path / "report.json"
+    report.write_text(
+        json.dumps(
+            {
+                "summary": {"total_agents": 1, "total_packages": 1, "total_vulnerabilities": 1},
+                "blast_radius": [
+                    {
+                        "vulnerability_id": "CVE-2025-7788",
+                        "severity": "critical",
+                        "package": "langchain@0.0.150",
+                        "ecosystem": "pypi",
+                        "affected_agents": ["claude"],
+                        "affected_servers": ["filesystem"],
+                        "owasp_tags": ["LLM05"],
+                    }
+                ],
+            }
+        )
+    )
+
+    result = runner.invoke(compliance_narrative_cmd, [str(report), "--framework", "owasp-llm", "--format", "markdown"])
+
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "LLM05" in out, out
+    assert "CVE-2025-7788" in out, out
+    assert "langchain@0.0.150" in out, out
