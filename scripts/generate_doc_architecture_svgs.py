@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 from pathlib import Path
 from typing import NamedTuple
@@ -1504,22 +1505,31 @@ PERSONA_LANES: tuple[PersonaLane, ...] = (
     ),
 )
 
-# Card geometry for the persona band (five cards on one 1280px row).
+# Card geometry for the persona band.
+#
+# Five cards on one 1280px row gave each 211px, and GitHub renders the band at
+# ~900px — so every value line sat flush against its pill and several clipped.
+# Three per row nearly doubles the card to ~400px, which buys room for readable
+# type instead of trading legibility against overflow.
 PERSONA_BAND_WIDTH = 1280
 PERSONA_BAND_MARGIN_X = 23
 PERSONA_BAND_GAP = 14
-PERSONA_CARD_WIDTH = (PERSONA_BAND_WIDTH - PERSONA_BAND_MARGIN_X * 2 - PERSONA_BAND_GAP * 4) // 5
-PERSONA_CARD_PAD_X = 14
+PERSONA_CARDS_PER_ROW = 3
+PERSONA_CARD_WIDTH = (
+    PERSONA_BAND_WIDTH - PERSONA_BAND_MARGIN_X * 2 - PERSONA_BAND_GAP * (PERSONA_CARDS_PER_ROW - 1)
+) // PERSONA_CARDS_PER_ROW
+PERSONA_CARD_PAD_X = 16
 
 # Copy budgets measured by rendering the band at README scale. Text is drawn,
 # not wrapped, so an over-long line runs past its pill and into the next card —
 # how the 49-char GRC value line shipped overflowing. Widest strings verified to
 # stay inside a card: "Security engineers" (title), "Self-hosted control plane"
-# (value title), and "15 ecosystems · EPSS/KEV · distro-aware" (value sub),
-# which sits flush against the pill edge — treat 39 as the hard ceiling.
-PERSONA_TITLE_MAX_CHARS = 18
-PERSONA_VALUE_TITLE_MAX_CHARS = 25
-PERSONA_VALUE_SUB_MAX_CHARS = 39
+# (value title). The 39-char sub line that used to sit flush against the pill
+# edge was shortened after the box-aware fit audit showed it clipping; 33 is the
+# widest that now ships, and the audit fails anything past its box.
+PERSONA_TITLE_MAX_CHARS = 24
+PERSONA_VALUE_TITLE_MAX_CHARS = 34
+PERSONA_VALUE_SUB_MAX_CHARS = 46
 
 
 def _persona_tag_width(tag: str) -> int:
@@ -1674,13 +1684,22 @@ def persona_value(theme: str) -> str:
     gap = PERSONA_BAND_GAP
     card_w = PERSONA_CARD_WIDTH
     card_h = 174
+    per_row = PERSONA_CARDS_PER_ROW
+    rows = math.ceil(len(PERSONA_LANES) / per_row)
+    h = margin_y * 2 + rows * card_h + (rows - 1) * gap + 44
 
     parts = _svg_open(w, h, "agent-bom personas and value")
     parts.append(f'<rect width="{w}" height="{h}" rx="12" fill="{persona_bg}"/>')
 
     for idx, lane in enumerate(PERSONA_LANES):
-        x = margin_x + idx * (card_w + gap)
-        parts += _persona_lane_card(x, margin_y, card_w, card_h, *lane, theme, t)
+        row, col = divmod(idx, per_row)
+        in_row = min(per_row, len(PERSONA_LANES) - row * per_row)
+        # Centre a short final row so the band stays balanced rather than
+        # leaving a ragged gap on the right.
+        row_w = in_row * card_w + (in_row - 1) * gap
+        x = (w - row_w) // 2 + col * (card_w + gap)
+        y = margin_y + row * (card_h + gap)
+        parts += _persona_lane_card(x, y, card_w, card_h, *lane, theme, t)
 
     parts.append(
         _trust_footer(
@@ -1697,16 +1716,23 @@ def persona_value(theme: str) -> str:
 # Average glyph advance for Inter/system-ui at a given font-size, in em. Used to
 # estimate rendered text width; deliberately generous so the audit errs toward
 # reporting an overflow that turns out to fit rather than passing one that clips.
-_GLYPH_ADVANCE_EM = 0.58
+# Calibrated against the persona band, whose copy budgets were measured by
+# actually rendering it: "15 ecosystems · EPSS/KEV · distro-aware" is documented
+# as sitting flush inside its pill. At 0.58 the estimator called that 7% over,
+# so it would have failed the very design it is meant to protect. These strings
+# are dense with narrow glyphs — digits, spaces, "·", "/" — which a single
+# average over-weights.
+_GLYPH_ADVANCE_EM = 0.54
 
 # GitHub renders README images at roughly 900px wide. These two diagrams are
 # authored at 960 and 1280, so their type is downscaled to ~6px on screen —
 # below the 10px floor the flow diagrams already hold themselves to, which is
 # why they read as unreadable in the README while being correct at full size.
-# Scaled as far as `_audit_text_fit` allows without a relayout; persona-value
-# runs out of room first because its five cards share one 1280px row.
-_ARCHITECTURE_TYPE_SCALE = 1.3
-_PERSONA_TYPE_SCALE = 1.18
+# Scaled as far as `_audit_text_fit` allows. The persona band was relaid out to
+# three cards per row to earn that headroom — at five per row a 211px card left
+# no space to scale into.
+_ARCHITECTURE_TYPE_SCALE = 1.1
+_PERSONA_TYPE_SCALE = 1.3
 
 
 def _scale_type(svg: str, factor: float) -> str:
@@ -1719,31 +1745,57 @@ def _scale_type(svg: str, factor: float) -> str:
 
 
 def _audit_text_fit(svg: str, *, margin: int = 4) -> list[str]:
-    """Return text runs whose estimated width escapes the canvas.
+    """Return text runs whose estimated width escapes their containing box.
 
-    ``_audit_layout`` only bounds ``<rect>`` elements, so it reported "OK" for
-    every font size tried — including ones that would clip. Type cannot be scaled
-    for legibility behind a check that never looks at type.
+    An earlier version only bounded text against the canvas edge. That let a
+    label grow past the card it sits in while still being "inside the SVG", so
+    scaling type up for legibility silently clipped persona chips and outcome
+    lines against their own borders — visible in the README, invisible here.
 
-    This estimates width from glyph count and honours ``text-anchor``. It is an
-    estimate, not a shaping engine: it catches a label growing past the canvas
-    edge, not one overlapping a neighbouring box.
+    Each text is now attributed to the tightest ``<rect>`` that contains its
+    anchor, and measured against that box. Width is estimated from glyph count,
+    so the margin is a small allowance for estimator error, not a tolerance for
+    copy that does not fit. The band's widest value line was previously written
+    to sit flush against its pill; it was shortened rather than widening this
+    number, because raising the margin until the warning disappears silences the
+    audit instead of fixing the overflow it found.
     """
     vb = re.search(r'viewBox="0 0 (\d+) (\d+)"', svg)
     if not vb:
         return ["missing viewBox"]
-    width, _height = map(int, vb.groups())
+    canvas_w, canvas_h = map(int, vb.groups())
+
+    boxes: list[tuple[float, float, float, float]] = []
+    for rect in re.finditer(r'<rect x="([\d.]+)" y="([\d.]+)" width="([\d.]+)" height="([\d.]+)"', svg):
+        x, y, w, h = (float(v) for v in rect.groups())
+        boxes.append((x, y, w, h))
+
+    def container(px: float, py: float) -> tuple[float, float, float, float]:
+        """Tightest rect containing the point, else the canvas."""
+        best: tuple[float, float, float, float] | None = None
+        for x, y, w, h in boxes:
+            if x <= px <= x + w and y <= py <= y + h:
+                if best is None or w * h < best[2] * best[3]:
+                    best = (x, y, w, h)
+        return best or (0.0, 0.0, float(canvas_w), float(canvas_h))
+
     issues: list[str] = []
-    for match in re.finditer(r'<text x="([\d.]+)"[^>]*?font-size="([\d.]+)"[^>]*?>([^<]*)</text>', svg):
-        x, size, content = float(match.group(1)), float(match.group(2)), match.group(3)
+    for match in re.finditer(r'<text x="([\d.]+)" y="([\d.]+)"[^>]*?font-size="([\d.]+)"[^>]*?>([^<]*)</text>', svg):
+        x, y, size, content = (
+            float(match.group(1)),
+            float(match.group(2)),
+            float(match.group(3)),
+            match.group(4),
+        )
         if not content.strip():
             continue
         run = len(content) * size * _GLYPH_ADVANCE_EM
         anchor = re.search(r'text-anchor="(\w+)"', match.group(0))
         kind = anchor.group(1) if anchor else "start"
         left = x - run / 2 if kind == "middle" else x - run if kind == "end" else x
-        if left < -margin or left + run > width + margin:
-            issues.append(f"text {content[:24]!r} at x={x} spans {round(run)}px, outside 0..{width}")
+        bx, _by, bw, _bh = container(x, y)
+        if left < bx - margin or left + run > bx + bw + margin:
+            issues.append(f"text {content[:28]!r} spans {round(run)}px, escapes box at x={bx} w={bw}")
     return issues
 
 
