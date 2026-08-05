@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-import time
 
 import pytest
 from starlette.testclient import TestClient
@@ -62,62 +61,57 @@ def test_demo_story_route_does_not_block_the_event_loop(story_client: TestClient
     whole request duration — so four concurrent callers serialised into 6.6s on
     a single worker. The route is ``async def``; calling the synchronous builder
     inside it hands the loop no yield point at all.
+
+    Asserted structurally rather than by timing or by a second event loop, after
+    three versions that each failed for reasons unrelated to the code:
+
+    * a fixed 500 ms ceiling lost to 542 ms of xdist scheduler noise;
+    * a noise-calibrated ceiling lost to a 921 ms stall on a contended runner;
+    * comparing against the pytest thread was vacuous, because ``TestClient``
+      drives the app on its own loop in another thread;
+    * driving a second loop with ``asyncio.run`` to capture the real loop thread
+      hung CI for 25 minutes — the module-level ``CapacityLimiter`` binds to the
+      loop that first uses it, so a second loop deadlocks against it.
+
+    What this asserts instead: the offload is actually invoked, and the builder
+    runs on a different thread than the caller. Work on a worker thread cannot
+    block the loop, by construction, and removing the offload removes the call.
     """
+    import threading
+
+    import anyio.to_thread
+
     from agent_bom.api.routes import demo_estate as demo_routes
 
-    build_seconds = 1.0
-    calls: list[str] = []
+    caller_threads: list[int] = []
+    build_threads: list[int] = []
     real_builder = demo_routes.build_enterprise_demo_story
+    real_run_sync = anyio.to_thread.run_sync
 
-    def slow_builder(*, tenant_id: str):
-        calls.append(tenant_id)
-        # Stand in for the ~1.6s real build with a sleep long enough that an
-        # on-loop call is unmistakable, without paying the real cost in CI.
-        time.sleep(build_seconds)
+    async def recording_run_sync(func, *args, **kwargs):
+        # Runs on the event loop, so this is the thread a blocking build would
+        # have occupied.
+        caller_threads.append(threading.get_ident())
+        return await real_run_sync(func, *args, **kwargs)
+
+    def recording_builder(*, tenant_id: str):
+        build_threads.append(threading.get_ident())
         return real_builder(tenant_id=tenant_id)
 
     demo_routes.reset_demo_story_cache()
 
-    # The request has to run on the SAME event loop as the heartbeat, so drive
-    # the ASGI app directly. ``TestClient`` runs the app on its own private
-    # loop in another thread, where a blocking route would never be observable.
-    async def exercise() -> float:
-        import httpx
-
-        from agent_bom.api.server import app
-
-        stalls: list[float] = []
-        stop = False
-
-        async def heartbeat() -> None:
-            while not stop:
-                start = time.perf_counter()
-                await asyncio.sleep(0.005)
-                stalls.append(time.perf_counter() - start - 0.005)
-
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://probe") as client:
-            beat = asyncio.create_task(heartbeat())
-            await asyncio.sleep(0.02)
-            response = await client.get("/v1/demo-estate/story")
-            stop = True
-            await beat
-        assert response.status_code == 200, response.text
-        return max(stalls)
-
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(demo_routes, "build_enterprise_demo_story", slow_builder)
-        worst_stall = asyncio.run(exercise())
+        mp.setattr(demo_routes.anyio.to_thread, "run_sync", recording_run_sync)
+        mp.setattr(demo_routes, "build_enterprise_demo_story", recording_builder)
+        response = story_client.get("/v1/demo-estate/story")
 
-    assert calls, "the builder should have run at least once"
-    # Asserted as a fraction of the build rather than a wall-clock ceiling: an
-    # in-route build parks the loop for essentially the whole build (measured
-    # ~1,648 ms of a 1,643 ms request), while an offloaded one leaves only
-    # response serialisation on the loop. Anything under half the build proves
-    # the work is not running there, on a fast box or a slow one.
-    assert worst_stall < build_seconds * 0.5, (
-        f"event loop stalled {worst_stall * 1000:.0f} ms of a {build_seconds * 1000:.0f} ms build — the estate build is running on the loop"
+    assert response.status_code == 200, response.text
+    assert build_threads, "the builder should have run at least once"
+    assert caller_threads, (
+        "the route never offloaded — anyio.to_thread.run_sync was not called, so the ~1.6s estate build ran inline on the event loop"
     )
+    on_loop = [tid for tid in build_threads if tid in set(caller_threads)]
+    assert not on_loop, f"the estate build ran on the calling (event-loop) thread {on_loop[0]} — it must be offloaded"
 
 
 def test_demo_story_is_built_once_per_tenant_and_reused(story_client: TestClient) -> None:
