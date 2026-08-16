@@ -8642,6 +8642,59 @@ paths:
           minimum: 1
           title: Limit
           type: integer
+      - description: Zero-based execution offset.
+        in: query
+        name: offset
+        required: false
+        schema:
+          default: 0
+          description: Zero-based execution offset.
+          maximum: 100000
+          minimum: 0
+          title: Offset
+          type: integer
+      - description: Optional provider filter.
+        in: query
+        name: provider
+        required: false
+        schema:
+          anyOf:
+          - enum:
+            - aws
+            - azure
+            - gcp
+            type: string
+          - type: 'null'
+          description: Optional provider filter.
+          title: Provider
+      - description: Optional lifecycle status filter.
+        in: query
+        name: status
+        required: false
+        schema:
+          anyOf:
+          - enum:
+            - queued
+            - running
+            - scan_complete
+            - partial
+            - disabled
+            - denied
+            - failed
+            type: string
+          - type: 'null'
+          description: Optional lifecycle status filter.
+          title: Status
+      - description: Optional target, account, or execution-id search.
+        in: query
+        name: q
+        required: false
+        schema:
+          default: ''
+          description: Optional target, account, or execution-id search.
+          maxLength: 200
+          title: Q
+          type: string
       - in: header
         name: X-Agent-Bom-Role
         required: false
@@ -8695,10 +8748,11 @@ paths:
         \ / ``failed`` plus\ncleanup status \u2014 never a false clean.\n\nFail-closed\
         \ and honest:\n- side-scan OFF (``AGENT_BOM_SIDESCAN`` unset) \u2192 ``200``\
         \ ``status=disabled``\n  with enablement guidance (no cloud call is made).\n\
-        - provider extra / read-only credentials unavailable \u2192 ``200``\n  ``status=unavailable``\
-        \ with the actionable, sanitized reason.\n- Azure requires ``collector_resource_group``\
-        \ \u2192 ``400``.\nCredentials are never accepted here; the executor resolves\
-        \ read-only\ncredentials from the provider's default chain (``credentialed_smoke=false``)."
+        - provider extra / scoped lifecycle credentials unavailable \u2192 ``200``\n\
+        \  ``status=unavailable`` with the actionable, sanitized reason.\n- Azure\
+        \ requires ``collector_resource_group`` \u2192 ``400``.\nCredentials are never\
+        \ accepted here; the executor resolves separately\nscoped lifecycle credentials\
+        \ from the provider's default chain\n(``credentialed_smoke=false``)."
       operationId: cloud_side_scan_trigger_v1_cloud_side_scan_post
       parameters:
       - in: header

@@ -43,7 +43,7 @@ ProviderClientFactory = Callable[..., dict[str, Any]]
 DEFAULT_SIDE_SCAN_STATE_DB = Path.home() / ".agent-bom" / "side_scan_state.db"
 
 # Env override so every surface (CLI, API, MCP, scheduler) reads and writes the
-# SAME durable lifecycle store — a deployment points them all at one path.
+# SAME durable lifecycle store when SQLite is selected.
 SIDE_SCAN_STATE_DB_ENV = "AGENT_BOM_SIDE_SCAN_STATE_DB"
 
 
@@ -51,8 +51,8 @@ def side_scan_state_db_path() -> Path:
     """Resolve the shared side-scan lifecycle store path (env override or default).
 
     Keeping every surface on one resolver is what makes CLI/API/MCP execution
-    status consistent: a scan triggered over REST is readable by the CLI and the
-    UI because they all open the same SQLite file.
+    status consistent for the SQLite tier. Multi-replica control planes select
+    the shared Postgres backend through ``get_side_scan_state_store`` instead.
     """
     raw = os.environ.get(SIDE_SCAN_STATE_DB_ENV)
     if raw and raw.strip():
@@ -108,6 +108,9 @@ class CloudSideScanExecutionResult:
     target_id: str
     account_id: str
     location: str
+    execution_id: str = ""
+    execution_status: str = ""
+    cleanup_status: str = ""
     snapshot_id: str | None = None
     scan_disk_id: str | None = None
     packages: list[Package] = field(default_factory=list)
@@ -125,6 +128,9 @@ class CloudSideScanExecutionResult:
             "target_id": self.target_id,
             "account_id": self.account_id,
             "location": self.location,
+            "execution_id": self.execution_id,
+            "execution_status": self.execution_status,
+            "cleanup_status": self.cleanup_status,
             "snapshot_id": self.snapshot_id,
             "scan_disk_id": self.scan_disk_id,
             "package_count": len(self.packages),
@@ -254,6 +260,11 @@ async def run_cloud_side_scan_targets(
             account_id=target.account_id,
             location=target.location,
         )
+        persisted_execution = getattr(lifecycle, "execution", None)
+        if persisted_execution is not None:
+            result.execution_id = str(getattr(persisted_execution, "execution_id", ""))
+            result.execution_status = str(getattr(getattr(persisted_execution, "status", None), "value", ""))
+            result.cleanup_status = str(getattr(getattr(persisted_execution, "cleanup_status", None), "value", ""))
         mount_point: Path | None = None
         scan_disk_id = ""
         try:
@@ -291,6 +302,9 @@ async def run_cloud_side_scan_targets(
             if callable(persisted_cleanup):
                 try:
                     execution = persisted_cleanup(target, collector_id)
+                    result.execution_id = str(getattr(execution, "execution_id", result.execution_id))
+                    result.execution_status = str(getattr(getattr(execution, "status", None), "value", result.execution_status))
+                    result.cleanup_status = str(getattr(getattr(execution, "cleanup_status", None), "value", result.cleanup_status))
                     result.warnings.extend(str(code) for code in getattr(execution, "warning_codes", ()) if code)
                     result.cleaned_up = getattr(getattr(execution, "cleanup_status", None), "value", "") == "complete"
                 except Exception as exc:  # noqa: BLE001
@@ -311,6 +325,7 @@ async def run_cloud_side_scan_targets(
                     except Exception as exc:  # noqa: BLE001
                         result.warnings.append(f"delete snapshot failed: {sanitize_text(exc)}")
                 result.cleaned_up = not result.warnings
+                result.cleanup_status = "complete" if result.cleaned_up else "partial"
             if result.warnings:
                 result.cleaned_up = False
         results.append(result)
@@ -338,8 +353,9 @@ def _default_provider_clients(provider: str, *, account_id: str, region: str | N
             credential = DefaultAzureCredential()
             client = ComputeManagementClient(credential, subscription_id=account_id)
         except Exception as exc:  # noqa: BLE001 - sanitized, actionable, no secret leakage
+            detail = sanitize_text(exc)
             raise SideScanConfigError(
-                f"Azure Managed Disk side-scan could not resolve read-only credentials for the collector subscription: {sanitize_text(exc)}"
+                f"Azure Managed Disk side-scan could not resolve scoped lifecycle credentials for the collector subscription: {detail}"
             ) from exc
         return {
             "snapshots_client": client.snapshots,
@@ -361,7 +377,7 @@ def _default_provider_clients(provider: str, *, account_id: str, region: str | N
             }
         except Exception as exc:  # noqa: BLE001 - sanitized, actionable, no secret leakage
             raise SideScanConfigError(
-                f"GCP Persistent Disk side-scan could not resolve read-only credentials: {sanitize_text(exc)}"
+                f"GCP Persistent Disk side-scan could not resolve scoped lifecycle credentials: {sanitize_text(exc)}"
             ) from exc
     raise SideScanConfigError(f"cross-cloud side-scan supports only azure|gcp, not {provider!r}")
 
@@ -416,7 +432,7 @@ async def run_provider_side_scan(
     if provider == "azure" and not str(collector_resource_group or "").strip():
         raise SideScanConfigError("Azure Managed Disk side-scan requires --collector-resource-group for the in-account collector VM")
 
-    from .side_scan_lifecycle import SQLiteSideScanStateStore, new_side_scan_execution
+    from .side_scan_lifecycle import get_side_scan_state_store, new_side_scan_execution
     from .side_scan_provider_adapters import (
         AzureManagedDiskLifecycleAdapter,
         GcpPersistentDiskLifecycleAdapter,
@@ -438,7 +454,7 @@ async def run_provider_side_scan(
         encryption="unknown",
     )
 
-    store = SQLiteSideScanStateStore(state_db_path if state_db_path is not None else side_scan_state_db_path())
+    store = get_side_scan_state_store(state_db_path=state_db_path)
     execution = store.create_or_get(
         new_side_scan_execution(
             tenant_id=tenant_id,

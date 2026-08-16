@@ -9,24 +9,36 @@ import pytest
 from agent_bom.cloud.side_scan_lifecycle import (
     CleanupStatus,
     ExecutionStatus,
+    InMemorySideScanStateStore,
+    PostgresSideScanStateStore,
     SideScanStateConflictError,
     SideScanTemporaryResource,
     SQLiteSideScanStateStore,
     TemporaryResourceStatus,
+    get_side_scan_state_store,
     new_side_scan_execution,
+    reset_side_scan_state_store,
     side_scan_provider_capabilities,
 )
 
 
-def _execution(*, tenant_id: str = "tenant-a", idempotency_key: str = "scan-request-1"):
+def _execution(
+    *,
+    tenant_id: str = "tenant-a",
+    idempotency_key: str = "scan-request-1",
+    provider: str = "azure",
+    account_id: str = "subscription-1",
+    target_id: str = "/subscriptions/subscription-1/disks/os-disk",
+    now: str = "2026-07-17T20:00:00Z",
+):
     return new_side_scan_execution(
         tenant_id=tenant_id,
-        provider="azure",
-        account_id="subscription-1",
-        target_id="/subscriptions/subscription-1/disks/os-disk",
+        provider=provider,
+        account_id=account_id,
+        target_id=target_id,
         collector_id="collector-1",
         idempotency_key=idempotency_key,
-        now="2026-07-17T20:00:00Z",
+        now=now,
     )
 
 
@@ -41,10 +53,69 @@ def test_provider_capabilities_ship_cli_executors_with_smoke_pending() -> None:
         assert capabilities[provider].lifecycle_contract is True, provider
 
     # Live-cloud proof is honest: AWS EBS has none claimed either, and Azure/GCP
-    # stay smoke-pending until an owner supplies read-only credentials.
+    # stay smoke-pending until an owner supplies scoped lifecycle credentials.
     assert capabilities["aws"].credentialed_smoke is False
     assert capabilities["azure"].credentialed_smoke is False
     assert capabilities["gcp"].credentialed_smoke is False
+
+
+def test_in_memory_store_preserves_tenant_and_cas_contracts() -> None:
+    store = InMemorySideScanStateStore()
+    original = store.create_or_get(_execution())
+    assert store.create_or_get(_execution()) == original
+    assert store.get(tenant_id="tenant-b", execution_id=original.execution_id) is None
+
+    running = original.transition(status=ExecutionStatus.RUNNING, phase="snapshot")
+    store.save(running, expected_version=original.state_version)
+    with pytest.raises(SideScanStateConflictError):
+        store.save(running, expected_version=original.state_version)
+
+
+def test_store_factory_uses_ephemeral_backend_only_when_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AGENT_BOM_SIDE_SCAN_STATE_DB", raising=False)
+    monkeypatch.delenv("AGENT_BOM_POSTGRES_URL", raising=False)
+    monkeypatch.delenv("AGENT_BOM_DB", raising=False)
+    monkeypatch.setenv("AGENT_BOM_EPHEMERAL_STORE", "1")
+    reset_side_scan_state_store()
+    try:
+        first = get_side_scan_state_store()
+        assert isinstance(first, InMemorySideScanStateStore)
+        assert get_side_scan_state_store() is first
+    finally:
+        reset_side_scan_state_store()
+
+
+def test_postgres_store_enables_tenant_rls(monkeypatch: pytest.MonkeyPatch) -> None:
+    statements: list[str] = []
+    rls_calls: list[tuple[str, str]] = []
+
+    class Connection:
+        def execute(self, sql, params=None):
+            statements.append(" ".join(str(sql).split()))
+            return self
+
+        def commit(self):
+            return None
+
+    class ConnectionContext:
+        def __enter__(self):
+            return Connection()
+
+        def __exit__(self, *_args):
+            return False
+
+    class Pool:
+        def connection(self):
+            return ConnectionContext()
+
+    monkeypatch.setattr(
+        "agent_bom.api.postgres_common._ensure_tenant_rls",
+        lambda _connection, table, column: rls_calls.append((table, column)),
+    )
+    PostgresSideScanStateStore(pool=Pool())
+
+    assert any("CREATE TABLE IF NOT EXISTS side_scan_execution_state" in sql for sql in statements)
+    assert rls_calls == [("side_scan_execution_state", "tenant_id")]
 
 
 @pytest.mark.parametrize("status", [ExecutionStatus.DISABLED, ExecutionStatus.DENIED, ExecutionStatus.FAILED])
@@ -221,6 +292,44 @@ def test_sqlite_store_returns_only_tenant_scoped_cleanup_retries(tmp_path: Path)
     restarted = SQLiteSideScanStateStore(tmp_path / "side-scan-state.db")
     assert restarted.get(tenant_id="tenant-a", execution_id=cleaned.execution_id) == cleaned
     assert restarted.list_cleanup_due(tenant_id="tenant-a") == []
+
+
+def test_sqlite_store_pages_and_filters_full_execution_history(tmp_path: Path) -> None:
+    store = SQLiteSideScanStateStore(tmp_path / "side-scan-state.db")
+    azure = store.create_or_get(
+        _execution(
+            idempotency_key="azure-1",
+            target_id="/subscriptions/subscription-1/disks/payments-db",
+            now="2026-07-17T20:00:00Z",
+        )
+    )
+    gcp = store.create_or_get(
+        _execution(
+            idempotency_key="gcp-1",
+            provider="gcp",
+            account_id="project-1",
+            target_id="projects/project-1/zones/us-central1-a/disks/agent-api",
+            now="2026-07-17T20:01:00Z",
+        )
+    )
+    failed = gcp.transition(status=ExecutionStatus.FAILED, phase="finished", now="2026-07-17T20:02:00Z")
+    store.save(failed, expected_version=gcp.state_version)
+
+    assert store.count(tenant_id="tenant-a") == 2
+    page, total = store.list_page_with_total(tenant_id="tenant-a", limit=1, offset=0)
+    assert page == [failed]
+    assert total == 2
+    assert store.list_page(tenant_id="tenant-a", limit=1, offset=1) == [azure]
+    assert store.count(tenant_id="tenant-a", provider="gcp", status="failed", query="agent-api") == 1
+    assert store.list_page(
+        tenant_id="tenant-a",
+        limit=25,
+        offset=0,
+        provider="gcp",
+        status="failed",
+        query="agent-api",
+    ) == [failed]
+    assert store.count(tenant_id="tenant-b") == 0
 
 
 def test_serialized_state_contains_metadata_only() -> None:

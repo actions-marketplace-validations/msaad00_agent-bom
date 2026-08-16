@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import {
   CheckCircle2,
@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 
 import { PageEmptyState, PageErrorState, PageLoadingState } from "@/components/states/page-state";
+import { PaginationBar } from "@/components/pagination-bar";
 import { useAuthState } from "@/components/auth-provider";
 import {
   api,
@@ -25,6 +26,8 @@ import {
   type SideScanTriggerRequest,
 } from "@/lib/api";
 import { securityGraphHref } from "@/lib/page-links";
+
+const EXECUTION_PAGE_SIZE = 25;
 
 // Terminal execution states that never imply a clean workload — mirrors the
 // honest lifecycle statuses (queued/running/scan_complete/partial/failed/…).
@@ -106,7 +109,7 @@ function ExecutionRow({ record }: { record: SideScanExecutionRecord }) {
   const StatusIcon = tone.icon;
   const spinning = record.status === "running" || record.status === "queued";
   return (
-    <tr className="border-t border-[color:var(--border-subtle)] hover:bg-[color:var(--surface-muted)]">
+    <tr data-testid="cwpp-execution-row" className="border-t border-[color:var(--border-subtle)] hover:bg-[color:var(--surface-muted)]">
       <td className="px-3 py-2 align-top">
         <span className={`inline-flex items-center gap-1.5 text-sm font-medium ${tone.className}`}>
           <StatusIcon className={`h-4 w-4 ${spinning ? "animate-spin" : ""}`} />
@@ -152,19 +155,48 @@ export default function CwppSideScanPage() {
   const [form, setForm] = useState<SideScanTriggerRequest>(EMPTY_FORM);
   const [submitting, setSubmitting] = useState(false);
   const [triggerNote, setTriggerNote] = useState<{ tone: "ok" | "warn" | "err"; text: string } | null>(null);
+  const [executionPage, setExecutionPage] = useState(1);
+  const [executionProvider, setExecutionProvider] = useState("all");
+  const [executionStatus, setExecutionStatus] = useState("all");
+  const [executionQuery, setExecutionQuery] = useState("");
+  const [debouncedExecutionQuery, setDebouncedExecutionQuery] = useState("");
+  const requestIdentity = useRef(0);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedExecutionQuery(executionQuery);
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [executionQuery]);
+
+  useEffect(
+    () => () => {
+      requestIdentity.current += 1;
+    },
+    [],
+  );
 
   const load = useCallback(async () => {
+    const requestId = ++requestIdentity.current;
     setLoading(true);
     setError(null);
     try {
-      const resp = await api.listSideScans(50);
+      const resp = await api.listSideScans({
+        limit: EXECUTION_PAGE_SIZE,
+        offset: (executionPage - 1) * EXECUTION_PAGE_SIZE,
+        ...(executionProvider !== "all" ? { provider: executionProvider as "aws" | "azure" | "gcp" } : {}),
+        ...(executionStatus !== "all" ? { status: executionStatus } : {}),
+        ...(debouncedExecutionQuery.trim() ? { query: debouncedExecutionQuery.trim() } : {}),
+      });
+      if (requestId !== requestIdentity.current) return;
       setData(resp);
     } catch (err) {
+      if (requestId !== requestIdentity.current) return;
       setError(err instanceof Error ? err.message : "Failed to load side-scan executions.");
     } finally {
-      setLoading(false);
+      if (requestId === requestIdentity.current) setLoading(false);
     }
-  }, []);
+  }, [debouncedExecutionQuery, executionPage, executionProvider, executionStatus]);
 
   useEffect(() => {
     void load();
@@ -214,6 +246,11 @@ export default function CwppSideScanPage() {
     [form, load],
   );
 
+  const executions = data?.executions ?? [];
+  const executionStatuses = ["queued", "running", "scan_complete", "partial", "disabled", "denied", "failed"];
+  const executionTotalItems = data?.page?.total ?? executions.length;
+  const executionTotalPages = Math.max(1, Math.ceil(executionTotalItems / EXECUTION_PAGE_SIZE));
+
   if (loading && !data) {
     return <PageLoadingState title="Loading CWPP side-scans" detail="Reading recent agentless disk side-scan executions and provider capabilities." data-testid="cwpp-loading" />;
   }
@@ -227,7 +264,6 @@ export default function CwppSideScanPage() {
     );
   }
 
-  const executions = data?.executions ?? [];
   const capabilities = data?.capabilities ?? [];
 
   return (
@@ -277,7 +313,7 @@ export default function CwppSideScanPage() {
 
       {/* Trigger — in-product action + headless (CLI) parity side by side. */}
       <section className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-        <form onSubmit={onSubmit} className="rounded-xl border border-[color:var(--border-subtle)] bg-[color:var(--surface)] p-4">
+        <form onSubmit={onSubmit} className="min-w-0 rounded-xl border border-[color:var(--border-subtle)] bg-[color:var(--surface)] p-4">
           <h2 className="flex items-center gap-2 text-sm font-semibold text-[color:var(--foreground)]">
             <Play className="h-4 w-4 text-[color:var(--accent)]" /> Run a side-scan
           </h2>
@@ -342,7 +378,7 @@ export default function CwppSideScanPage() {
           )}
         </form>
 
-        <div className="rounded-xl border border-[color:var(--border-subtle)] bg-[color:var(--surface-muted)] p-4">
+        <div className="min-w-0 rounded-xl border border-[color:var(--border-subtle)] bg-[color:var(--surface-muted)] p-4">
           <h2 className="flex items-center gap-2 text-sm font-semibold text-[color:var(--foreground)]">
             <Terminal className="h-4 w-4 text-[color:var(--text-secondary)]" /> Headless equivalent (CLI)
           </h2>
@@ -353,7 +389,49 @@ export default function CwppSideScanPage() {
 
       {/* Recent executions. */}
       <section>
-        <h2 className="mb-2 text-sm font-semibold uppercase tracking-wide text-[color:var(--text-secondary)]">Recent executions</h2>
+        <div className="mb-2 flex flex-wrap items-center gap-2">
+          <h2 className="mr-auto text-sm font-semibold uppercase tracking-wide text-[color:var(--text-secondary)]">Recent executions</h2>
+          <label className="sr-only" htmlFor="cwpp-provider-filter">Filter executions by provider</label>
+          <select
+            id="cwpp-provider-filter"
+            aria-label="Filter executions by provider"
+            value={executionProvider}
+            onChange={(event) => {
+              setExecutionProvider(event.target.value);
+              setExecutionPage(1);
+            }}
+            className="h-8 rounded-md border border-[color:var(--border-subtle)] bg-[color:var(--surface)] px-2 text-xs text-[color:var(--foreground)]"
+          >
+            <option value="all">All providers</option>
+            <option value="aws">AWS</option>
+            <option value="azure">Azure</option>
+            <option value="gcp">GCP</option>
+          </select>
+          <label className="sr-only" htmlFor="cwpp-status-filter">Filter executions by status</label>
+          <select
+            id="cwpp-status-filter"
+            aria-label="Filter executions by status"
+            value={executionStatus}
+            onChange={(event) => {
+              setExecutionStatus(event.target.value);
+              setExecutionPage(1);
+            }}
+            className="h-8 rounded-md border border-[color:var(--border-subtle)] bg-[color:var(--surface)] px-2 text-xs text-[color:var(--foreground)]"
+          >
+            <option value="all">All statuses</option>
+            {executionStatuses.map((status) => <option key={status} value={status}>{statusTone(status).label}</option>)}
+          </select>
+          <input
+            value={executionQuery}
+            onChange={(event) => {
+              setExecutionQuery(event.target.value);
+              setExecutionPage(1);
+            }}
+            aria-label="Filter executions by target or account"
+            placeholder="Target or account"
+            className="h-8 w-44 rounded-md border border-[color:var(--border-subtle)] bg-[color:var(--surface)] px-2 text-xs text-[color:var(--foreground)] placeholder:text-[color:var(--text-tertiary)]"
+          />
+        </div>
         {executions.length === 0 ? (
           <PageEmptyState
             icon={Disc3}
@@ -382,6 +460,17 @@ export default function CwppSideScanPage() {
             </table>
           </div>
         )}
+        {executionTotalItems > 0 ? (
+          <PaginationBar
+            className="mt-3"
+            page={executionPage}
+            totalPages={executionTotalPages}
+            totalItems={executionTotalItems}
+            itemLabel="executions"
+            onPrevious={() => setExecutionPage((current) => Math.max(1, current - 1))}
+            onNext={() => setExecutionPage((current) => Math.min(executionTotalPages, current + 1))}
+          />
+        ) : null}
       </section>
     </div>
   );
