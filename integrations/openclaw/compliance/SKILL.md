@@ -1,11 +1,12 @@
 ---
 name: agent-bom-compliance
 description: >-
-  AI compliance and policy engine — evaluate scan results against OWASP LLM Top 10,
-  MITRE ATLAS, EU AI Act, NIST AI RMF, and custom policy-as-code rules. Generate
-  SBOMs in CycloneDX or SPDX format. Use when the user mentions compliance checking,
-  security policy enforcement, SBOM generation, or regulatory frameworks.
-version: 0.70.12
+  AI compliance and policy engine — evaluate scan results against OWASP, NIST,
+  SOC 2, ISO 27001, CMMC, EU AI Act, AISVS v1.0, and related frameworks.
+  Generate SBOMs and compliance reports. Use when:
+  "compliance report", "NIST", "SOC 2", "ISO 27001", "OWASP", "EU AI Act",
+  "AISVS", "generate SBOM", "policy check".
+version: 0.101.0
 license: Apache-2.0
 compatibility: >-
   Requires Python 3.11+. Install via pipx or pip. OWASP/NIST/EU AI Act/MITRE
@@ -18,16 +19,18 @@ metadata:
   source: https://github.com/msaad00/agent-bom
   pypi: https://pypi.org/project/agent-bom/
   scorecard: https://securityscorecards.dev/viewer/?uri=github.com/msaad00/agent-bom
-  tests: 6040
+  tests: 7239
   install:
     pipx: agent-bom
     pip: agent-bom
+    docker: ghcr.io/msaad00/agent-bom:0.101.0
   openclaw:
     requires:
       bins: []
       env: []
       credentials: none
     credential_policy: "Zero credentials required for OWASP/NIST/EU AI Act compliance and SBOM generation. CIS benchmark checks (AWS, Azure, GCP, Snowflake) optionally accept cloud credentials — only used locally to call cloud APIs, never transmitted elsewhere."
+    credential_handling: "Use only operator-configured cloud SDK credentials for explicitly requested CIS checks. Do not ask users to paste secrets, and never print cloud tokens, private keys, passwords, or connection strings."
     optional_env:
       - name: AWS_PROFILE
         purpose: "AWS CIS benchmark checks — uses boto3 with your local AWS profile"
@@ -101,18 +104,32 @@ metadata:
 
 # agent-bom-compliance — AI Compliance & Policy Engine
 
-Evaluate AI infrastructure scan results against security frameworks and enforce
-policy-as-code rules. Generate SBOMs in standard formats.
+Evaluate AI infrastructure scan results against 14 security and regulatory
+frameworks. Enforce policy-as-code rules. Generate SBOMs in standard formats.
+Run AISVS v1.0 and CIS benchmark checks.
 
 ## Install
 
 ```bash
 pipx install agent-bom
-agent-bom compliance        # run compliance check on latest scan
-agent-bom generate-sbom     # generate CycloneDX SBOM
+agent-bom scan --compliance --compliance-export nist-ai-rmf
+agent-bom scan -f cyclonedx -o sbom.json
 ```
 
-## Tools (4)
+## When to Use
+
+- "compliance report" / "run compliance"
+- "NIST" / "NIST AI RMF" / "NIST CSF" / "NIST 800-53"
+- "SOC 2" / "SOC2"
+- "ISO 27001"
+- "OWASP" / "OWASP LLM Top 10" / "OWASP Agentic Top 10"
+- "EU AI Act"
+- "AISVS" / "AI Security Verification Standard"
+- "CMMC" / "FedRAMP"
+- "generate SBOM" / "CycloneDX" / "SPDX"
+- "policy check" / "policy enforcement"
+
+## Tools (5)
 
 | Tool | Description |
 |------|-------------|
@@ -120,43 +137,60 @@ agent-bom generate-sbom     # generate CycloneDX SBOM
 | `policy_check` | Evaluate results against custom security policy (17 conditions) |
 | `cis_benchmark` | Run CIS benchmark checks against cloud accounts |
 | `generate_sbom` | Generate SBOM (CycloneDX or SPDX format) |
+| `aisvs_benchmark` | OWASP AISVS v1.0 compliance — 9 AI security checks |
 
-## Supported Frameworks
+## Supported Frameworks (15)
 
 - **OWASP LLM Top 10** (2025) — prompt injection, supply chain, data leakage
+- **OWASP MCP Top 10** — MCP-specific security risks
 - **OWASP Agentic Top 10** — tool poisoning, rug pulls, credential theft
 - **MITRE ATLAS** — adversarial ML threat framework
-- **EU AI Act** — risk classification, transparency, SBOM requirements
+- **MITRE ATT&CK Enterprise** — adversary techniques tagged via CWE → CAPEC → ATT&CK on every blast-radius finding
 - **NIST AI RMF** — govern, map, measure, manage lifecycle
-- **CIS Foundations** — AWS, Azure v3.0, GCP v3.0, Snowflake benchmarks
+- **NIST CSF 2.0** — identify, protect, detect, respond, recover
+- **NIST 800-53 Rev 5** — federal security controls (CM-8, RA-5, SI-2, SR-3)
+- **FedRAMP Moderate** — derived from NIST 800-53 controls
+- **EU AI Act** — risk classification, transparency, SBOM requirements
+- **ISO 27001:2022** — information security controls (Annex A)
+- **SOC 2** — Trust Services Criteria
+- **CIS Controls v8** — implementation groups IG1/IG2/IG3
+- **CMMC 2.0** — cybersecurity maturity model (Level 1-3)
+- **PCI DSS v4.0** — payment-card data security requirements
 
-## Example Workflows
+OWASP AISVS v1.0 ships as a **benchmark surface** alongside the tag-mapped frameworks (9 verification checks).
+
+## Examples
 
 ```
-# Run compliance check
-compliance(frameworks=["owasp_llm", "eu_ai_act"])
+# Run compliance check against multiple frameworks
+compliance(frameworks=["owasp_llm", "eu_ai_act", "nist_ai_rmf"])
 
 # Enforce custom policy
 policy_check(policy={"max_critical": 0, "max_high": 5})
 
 # Generate SBOM
 generate_sbom(format="cyclonedx")
+
+# Run AISVS v1.0 compliance
+aisvs_benchmark()
+
+# Run AWS CIS benchmark
+cis_benchmark(provider="aws")
 ```
 
 ## Privacy & Data Handling
 
-**OWASP, NIST, EU AI Act, MITRE ATLAS, SBOM generation, and policy checks**
-run entirely locally on scan data already in memory. No network calls, no
-credentials needed for these features.
+**OWASP, NIST, EU AI Act, MITRE ATLAS, AISVS, SBOM generation, and policy
+checks** run entirely locally on scan data already in memory. No network calls,
+no credentials needed for these features.
 
 **CIS benchmark checks** (optional, user-initiated) call cloud provider APIs
 using your locally configured credentials. These are read-only API calls to
-AWS, Azure, GCP, or Snowflake. No data is stored or transmitted beyond the
-cloud provider's own API. You must explicitly run `cis_benchmark(provider=...)`
+AWS, Azure, GCP, or Snowflake. You must explicitly run `cis_benchmark(provider=...)`
 and confirm before any cloud API calls are made.
 
 ## Verification
 
 - **Source**: [github.com/msaad00/agent-bom](https://github.com/msaad00/agent-bom) (Apache-2.0)
-- **6,040+ tests** with CodeQL + OpenSSF Scorecard
+- **7,100+ tests** with CodeQL + OpenSSF Scorecard
 - **No telemetry**: Zero tracking, zero analytics

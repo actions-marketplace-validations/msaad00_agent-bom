@@ -1,11 +1,14 @@
-"""Ingest Trivy, Grype, and Syft JSON reports into agent-bom models."""
+"""Ingest Trivy, Grype, Syft, and SARIF reports into agent-bom models."""
 
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from agent_bom.models import Package, Severity, Vulnerability
+from agent_bom.models import Package, Severity, Vulnerability, compute_confidence
+
+if TYPE_CHECKING:
+    from agent_bom.finding import Finding
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +50,98 @@ def _map_severity(raw: str) -> Severity:
         "medium": Severity.MEDIUM,
         "moderate": Severity.MEDIUM,
         "low": Severity.LOW,
+        "info": Severity.LOW,
+        "informational": Severity.LOW,
         "none": Severity.NONE,
         "negligible": Severity.NONE,
         "unknown": Severity.UNKNOWN,
     }
     return mapping.get(raw.lower(), Severity.UNKNOWN)
+
+
+def _trivy_cvss_score(cvss_block: dict) -> float | None:
+    """Extract the best available CVSS v3 score from a Trivy CVSS block."""
+    preferred_sources = ("nvd", "ghsa", "redhat", "amazon", "oracle", "bitnami")
+    for source in preferred_sources:
+        payload = cvss_block.get(source)
+        if not isinstance(payload, dict):
+            continue
+        score_val = payload.get("V3Score")
+        if score_val is None:
+            continue
+        try:
+            return float(score_val)
+        except (TypeError, ValueError):
+            continue
+    for payload in cvss_block.values():
+        if not isinstance(payload, dict):
+            continue
+        score_val = payload.get("V3Score")
+        if score_val is None:
+            continue
+        try:
+            return float(score_val)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _string_list(values: Any) -> list[str]:
+    """Return non-empty string values while preserving input order."""
+    if not isinstance(values, list):
+        return []
+    return [value for value in values if isinstance(value, str) and value]
+
+
+def _cwe_ids(values: Any) -> list[str]:
+    return [value for value in _string_list(values) if value.upper().startswith("CWE-")]
+
+
+def _aliases(primary_id: str, *sources: Any) -> list[str]:
+    seen: set[str] = {primary_id}
+    aliases: list[str] = []
+    for source in sources:
+        for value in _string_list(source):
+            if value in seen:
+                continue
+            seen.add(value)
+            aliases.append(value)
+    return aliases
+
+
+def _trivy_advisory_source(vuln: dict[str, Any]) -> str | None:
+    data_source = vuln.get("DataSource") or {}
+    if isinstance(data_source, dict):
+        source_id = data_source.get("ID")
+        if isinstance(source_id, str) and source_id:
+            return source_id
+        source_name = data_source.get("Name")
+        if isinstance(source_name, str) and source_name:
+            return source_name
+    severity_source = vuln.get("SeveritySource")
+    return severity_source if isinstance(severity_source, str) and severity_source else None
+
+
+def _grype_advisory_source(vuln: dict[str, Any]) -> str | None:
+    namespace = vuln.get("namespace")
+    if isinstance(namespace, str) and namespace:
+        return namespace
+    data_source = vuln.get("dataSource")
+    return data_source if isinstance(data_source, str) and data_source else None
+
+
+def _grype_related_aliases(vuln: dict[str, Any]) -> list[str]:
+    related = vuln.get("relatedVulnerabilities") or []
+    if not isinstance(related, list):
+        return []
+    aliases: list[str] = []
+    for item in related:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id")
+        if isinstance(item_id, str) and item_id:
+            aliases.append(item_id)
+    return aliases
 
 
 # ── Trivy parser ─────────────────────────────────────────────────────────────
@@ -85,28 +175,28 @@ def parse_trivy_json(data: dict[str, Any]) -> list[Package]:
 
             pkg = pkg_map[key]
 
-            # Extract CVSS score
             cvss_block: dict = vuln.get("CVSS") or {}
-            cvss_score: float | None = None
-            for source in ("nvd", "ghsa"):
-                score_val = cvss_block.get(source, {}).get("V3Score")
-                if score_val is not None:
-                    try:
-                        cvss_score = float(score_val)
-                    except (TypeError, ValueError):
-                        pass
-                    break
+            cvss_score = _trivy_cvss_score(cvss_block)
 
             references: list[str] = vuln.get("References") or []
+            vuln_id = vuln.get("VulnerabilityID", "")
+            advisory_source = _trivy_advisory_source(vuln)
 
             vuln_obj = Vulnerability(
-                id=vuln.get("VulnerabilityID", ""),
+                id=vuln_id,
                 summary=vuln.get("Title") or vuln.get("Description") or "",
                 severity=_map_severity(vuln.get("Severity", "")),
+                severity_source=vuln.get("SeveritySource") or None,
                 cvss_score=cvss_score,
                 fixed_version=vuln.get("FixedVersion") or None,
                 references=list(references),
+                published_at=vuln.get("PublishedDate") or None,
+                modified_at=vuln.get("LastModifiedDate") or None,
+                aliases=_aliases(vuln_id, vuln.get("VendorIDs"), vuln.get("Aliases")),
+                cwe_ids=_cwe_ids(vuln.get("CweIDs")),
+                advisory_sources=[advisory_source] if advisory_source else [],
             )
+            vuln_obj.confidence = compute_confidence(vuln_obj)
             # Avoid duplicate vuln IDs on the same package
             existing_ids = {v.id for v in pkg.vulnerabilities}
             if vuln_obj.id not in existing_ids:
@@ -164,15 +254,25 @@ def parse_grype_json(data: dict[str, Any]) -> list[Package]:
             fixed_version = fix_versions[0] if fix_versions else None
 
         references: list[str] = vuln_data.get("urls") or []
+        vuln_id = vuln_data.get("id", "")
+        related_aliases = _grype_related_aliases(vuln_data)
+        advisory_source = _grype_advisory_source(vuln_data)
 
         vuln_obj = Vulnerability(
-            id=vuln_data.get("id", ""),
+            id=vuln_id,
             summary=vuln_data.get("description") or "",
             severity=_map_severity(vuln_data.get("severity", "")),
+            severity_source=vuln_data.get("namespace") or None,
             cvss_score=cvss_score,
             fixed_version=fixed_version,
             references=list(references),
+            published_at=vuln_data.get("publishedDate") or vuln_data.get("published") or None,
+            modified_at=vuln_data.get("modifiedDate") or vuln_data.get("modified") or None,
+            aliases=_aliases(vuln_id, vuln_data.get("aliases"), related_aliases),
+            cwe_ids=_cwe_ids(vuln_data.get("cwes")),
+            advisory_sources=[advisory_source] if advisory_source else [],
         )
+        vuln_obj.confidence = compute_confidence(vuln_obj)
         existing_ids = {v.id for v in pkg.vulnerabilities}
         if vuln_obj.id not in existing_ids:
             pkg.vulnerabilities.append(vuln_obj)
@@ -230,17 +330,101 @@ def parse_syft_json(data: dict[str, Any]) -> list[Package]:
 # ── Auto-detect ───────────────────────────────────────────────────────────────
 
 
+def is_sarif_document(data: dict[str, Any]) -> bool:
+    """Return True when *data* looks like a SARIF 2.x document."""
+    if not isinstance(data, dict):
+        return False
+    runs = data.get("runs")
+    if not isinstance(runs, list):
+        return False
+    version = str(data.get("version") or "")
+    if version.startswith("2."):
+        return True
+    schema = data.get("$schema")
+    return isinstance(schema, str) and "sarif" in schema.lower()
+
+
+def _severity_from_label(label: str) -> Severity:
+    try:
+        return Severity(label.lower())
+    except ValueError:
+        return Severity.UNKNOWN
+
+
+def _sarif_hub_findings_to_packages(findings: list["Finding"]) -> list[Package]:
+    """Group hub-classified SARIF findings into synthetic sast packages."""
+    from agent_bom.finding import Finding
+
+    file_findings: dict[str, list[Finding]] = {}
+    for item in findings:
+        if not isinstance(item, Finding):
+            continue
+        file_path = item.asset.location or item.asset.name.split(":", 1)[0]
+        file_findings.setdefault(file_path or "unknown", []).append(item)
+
+    packages: list[Package] = []
+    for file_path, rows in file_findings.items():
+        vulns: list[Vulnerability] = []
+        seen: set[str] = set()
+        for finding in rows:
+            evidence = finding.evidence or {}
+            rule_id = str(evidence.get("rule_id") or finding.title or "sarif-rule")
+            line_token = ""
+            if finding.asset.name and ":" in finding.asset.name:
+                line_token = finding.asset.name.rsplit(":", 1)[-1]
+            dedup_key = f"{rule_id}:{line_token}"
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            vulns.append(
+                Vulnerability(
+                    id=rule_id,
+                    summary=finding.description or finding.title,
+                    severity=_severity_from_label(finding.severity),
+                    cwe_ids=list(finding.cwe_ids),
+                    cvss_score=finding.cvss_score,
+                    references=[],
+                )
+            )
+        if vulns:
+            tool_name = str((rows[0].evidence or {}).get("external_tool") or "sarif")
+            packages.append(
+                Package(
+                    name=file_path,
+                    version="0.0.0",
+                    ecosystem="sast",
+                    vulnerabilities=vulns,
+                    description=f"SARIF findings from {tool_name}",
+                )
+            )
+    return packages
+
+
+def parse_sarif_json(data: dict[str, Any]) -> list[Package]:
+    """Parse a SARIF 2.x document into synthetic per-file sast packages."""
+    from agent_bom.compliance_hub_ingest import parse_sarif_document
+
+    if not is_sarif_document(data):
+        raise ValueError("payload is not a SARIF document")
+    findings = parse_sarif_document(data)
+    return _sarif_hub_findings_to_packages(findings)
+
+
 def detect_and_parse(data: dict[str, Any]) -> list[Package]:
     """Auto-detect the scanner JSON format and parse into Package objects.
 
     Detection rules (checked in order):
-    - ``Results`` key present and at least one result has ``Vulnerabilities`` → Trivy
+    - ``runs`` + SARIF ``version`` / ``$schema`` → SARIF (Semgrep, CodeQL, Bandit, …)
+    - ``Results`` key present → Trivy
     - ``matches`` key present → Grype
     - ``artifacts`` key present and ``schema`` key present → Syft
 
     Raises:
         ValueError: if the format cannot be identified.
     """
+    if is_sarif_document(data):
+        return parse_sarif_json(data)
+
     if "Results" in data:
         results = data["Results"]
         if isinstance(results, list):

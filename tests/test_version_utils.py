@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from agent_bom.version_utils import (
+    compare_version_order,
     compare_versions,
     normalize_version,
     strip_pip_extras,
     validate_version,
+    version_in_range,
 )
 
 # ---------------------------------------------------------------------------
@@ -41,8 +43,8 @@ def test_validate_version_go_valid():
     assert validate_version("v1.2.3", "go") is True
 
 
-def test_validate_version_go_invalid():
-    assert validate_version("1.2.3", "go") is False  # Go requires v prefix
+def test_validate_version_go_accepts_parser_normalized_form():
+    assert validate_version("1.2.3", "go") is True
 
 
 def test_validate_version_maven_valid():
@@ -185,3 +187,429 @@ def test_compare_versions_maven():
 
 def test_compare_versions_with_v_prefix():
     assert compare_versions("v1.0.0", "v2.0.0", "npm") is True
+
+
+def test_compare_version_order_deb_numeric_segments():
+    assert compare_version_order("6.5+20250216-2", "6.5+20250216-10", "deb") == -1
+
+
+def test_compare_version_order_apk_revision_segments():
+    assert compare_version_order("1.2.4-r2", "1.2.4-r10", "apk") == -1
+
+
+def test_compare_version_order_rpm_release_segments():
+    assert compare_version_order("3.0.7-24.el9", "3.0.7-25.el9", "rpm") == -1
+
+
+def test_version_in_range_deb():
+    assert version_in_range("6.5+20250216-2", "0", "6.5+20250216-3", None, "deb") is True
+    assert version_in_range("6.5+20250216-3", "0", "6.5+20250216-3", None, "deb") is False
+
+
+def test_version_in_range_apk():
+    assert version_in_range("1.2.4-r2", "0", "1.2.4-r10", None, "apk") is True
+    assert version_in_range("1.2.4-r10", "0", "1.2.4-r10", None, "apk") is False
+
+
+def test_apk_prerelease_suffixes_sort_below_release():
+    # Per the apk version spec, ``_alpha`` / ``_beta`` / ``_pre`` / ``_rc``
+    # sort STRICTLY BELOW the bare release; ``_p`` (and ``-rN``) sort above.
+    assert compare_version_order("1.2.3_alpha1", "1.2.3", "apk") == -1
+    assert compare_version_order("1.2.3_beta1", "1.2.3", "apk") == -1
+    assert compare_version_order("1.2.3_pre1", "1.2.3", "apk") == -1
+    assert compare_version_order("1.2.3_rc1", "1.2.3", "apk") == -1
+    assert compare_version_order("1.2.3", "1.2.3_alpha1", "apk") == 1
+    # Post-release suffix sorts above the release.
+    assert compare_version_order("1.2.3_p1", "1.2.3", "apk") == 1
+    # Ordering within and across suffix classes.
+    assert compare_version_order("1.2.3_alpha1", "1.2.3_beta1", "apk") == -1
+    assert compare_version_order("1.2.3_pre1", "1.2.3_rc1", "apk") == -1
+    assert compare_version_order("1.2.3_rc1", "1.2.3_rc2", "apk") == -1
+    assert compare_version_order("1.2.3_alpha1", "1.2.3_p1", "apk") == -1
+
+
+def test_apk_prerelease_host_stays_vulnerable_before_fix():
+    # Regression: a vulnerable pre-release host (1.2.3_alpha1) must NOT read
+    # clean against a fix of 1.2.3 — the pre-release precedes the fix.
+    assert version_in_range("1.2.3_alpha1", "0", "1.2.3", None, "apk") is True
+    assert version_in_range("1.2.3_rc1", "0", "1.2.3", None, "apk") is True
+    # The released fix itself is not affected.
+    assert version_in_range("1.2.3", "0", "1.2.3", None, "apk") is False
+    # A post-release rebuild is also past the fix.
+    assert version_in_range("1.2.3_p1", "0", "1.2.3", None, "apk") is False
+
+
+def test_apk_suffix_with_revision():
+    assert compare_version_order("1.2.3_alpha1-r0", "1.2.3-r0", "apk") == -1
+    assert compare_version_order("1.2.3_rc1-r2", "1.2.3_rc1-r1", "apk") == 1
+
+
+def test_rpm_tilde_prerelease_ordering_unaffected():
+    # apk changes must not perturb rpm tilde handling: ``~`` sorts below.
+    assert compare_version_order("1.2.3~rc1", "1.2.3", "rpm") == -1
+    assert compare_version_order("1.2.3", "1.2.3~rc1", "rpm") == 1
+    assert compare_version_order("1.2.3~beta", "1.2.3~rc1", "rpm") == -1
+
+
+def test_version_in_range_rpm():
+    assert version_in_range("3.0.7-24.el9", "0", "3.0.7-25.el9", None, "rpm") is True
+    assert version_in_range("3.0.7-25.el9", "0", "3.0.7-25.el9", None, "rpm") is False
+
+
+def test_version_in_range_pypi_fixed_requests_regression():
+    """PyPI ranges fixed before 2.33.0 must not report that version as affected."""
+    assert version_in_range("2.33.0", None, "2.6.0", None, "pypi") is False
+    assert version_in_range("2.33.0", "2.3.0", "2.31.0", None, "pypi") is False
+    assert version_in_range("2.25.0", "2.3.0", "2.31.0", None, "pypi") is True
+
+
+def test_version_in_range_go_pseudo_vs_tagged_bounds():
+    """Regression: a Go pseudo-version scanned against ordinary tagged bounds.
+
+    The pseudo-version branch used to ``continue`` past any bound that lacked a
+    pseudo timestamp and then unconditionally ``return True``, so a tagged
+    introduced/fixed/last_affected bound never constrained range membership and
+    every pseudo-version was reported as affected. Each bound must now be
+    honoured via ``compare_version_order`` (which collapses the pseudo-version
+    to its ``X.Y.Z`` base for the comparison).
+    """
+    older = "v1.2.3-20210101000000-abcdef123456"  # base 1.2.3
+    newer = "v1.6.0-20210101000000-abcdef123456"  # base 1.6.0
+
+    # Pseudo-vs-tagged comparison must now be decisive, not None.
+    assert compare_version_order(older, "v1.5.0", "go") == -1
+    assert compare_version_order(newer, "v1.2.3", "go") == 1
+
+    # introduced tagged above the pseudo base -> not yet affected.
+    assert version_in_range(older, "v1.5.0", None, None, "go") is False
+    # fixed tagged at/below the pseudo base -> already fixed, not affected.
+    assert version_in_range(newer, None, "v1.2.3", None, "go") is False
+    # last_affected tagged below the pseudo base -> out of range, not affected.
+    assert version_in_range(newer, None, None, "v1.2.0", "go") is False
+
+    # Truly affected pseudo-versions stay affected.
+    assert version_in_range(older, "v1.0.0", None, None, "go") is True
+    assert version_in_range(newer, None, "v2.0.0", None, "go") is True
+    assert version_in_range(newer, "v1.0.0", "v2.0.0", None, "go") is True
+
+    # Package parsers commonly normalize away the leading v. Internal Go
+    # comparison must preserve identical semantics for that canonical form.
+    unprefixed = older.removeprefix("v")
+    assert validate_version(unprefixed, "go") is True
+    assert compare_version_order(unprefixed, "v1.5.0", "go") == -1
+    assert version_in_range(unprefixed, "v1.5.0", None, None, "go") is False
+    # A pseudo-version is a PRE-RELEASE of its base tag, so it sorts strictly
+    # below it: a fix released at v1.2.3 does not cover a build that predates
+    # v1.2.3. Collapsing the two to equality here reported the package as
+    # already patched and hid the vulnerability.
+    assert compare_version_order(unprefixed, "v1.2.3", "go") == -1
+    assert version_in_range(unprefixed, None, "v1.2.3", None, "go") is True
+    assert version_in_range(unprefixed, None, None, "v1.2.0", "go") is False
+
+    # Pseudo-vs-pseudo bounds still resolve by timestamp.
+    assert (
+        version_in_range(
+            "v1.0.0-20200101000000-aaaaaaaaaaaa",
+            "v1.0.0-20210101000000-bbbbbbbbbbbb",
+            None,
+            None,
+            "go",
+        )
+        is False
+    )
+
+
+def test_npm_canary_prerelease_compare_avoids_false_positive():
+    """Regression: ``next@16.2.4`` must not match a fix bound of ``13.4.20-canary.13``.
+
+    PEP 440 ``packaging.Version`` rejects npm SemVer pre-release tags like
+    ``-canary.13`` / ``-rc.1`` / ``-beta.4`` as invalid. Without a pre-release
+    fall-back, ``compare_version_order`` returned ``None`` and the OSV/GHSA
+    range matcher conservatively marked the package as affected — producing
+    a false positive on ``CVE-2023-46298`` for ``next@16.2.4`` (a Next.js 16
+    install was flagged by an advisory whose fix was a Next.js 13 canary).
+    """
+    # Direct comparator: 16.2.4 is greater than 13.4.20-canary.13.
+    assert compare_version_order("16.2.4", "13.4.20-canary.13", "npm") == 1
+    assert compare_version_order("13.4.20-canary.13", "16.2.4", "npm") == -1
+
+    # Range matcher must NOT mark 16.2.4 as affected.
+    assert version_in_range("16.2.4", "0.9.9", "13.4.20-canary.13", None, "npm") is False
+
+    # But the truly vulnerable cases stay vulnerable.
+    assert version_in_range("13.4.19", "0.9.9", "13.4.20-canary.13", None, "npm") is True
+    assert version_in_range("1.0.0", "0.9.9", "13.4.20-canary.13", None, "npm") is True
+
+
+def test_npm_other_semver_prerelease_tags_compare_correctly():
+    """Other npm pre-release tag stems must round-trip the same way."""
+    # rc / beta / alpha / pre / nightly / next / snapshot — all SemVer 2.0
+    # pre-release stems that PEP 440 doesn't accept directly. The fall-back
+    # comparator strips them so a higher stable release is correctly seen as
+    # newer than a pre-release of an older line.
+    assert compare_version_order("5.0.0", "4.18.0-rc.1", "npm") == 1
+    assert compare_version_order("3.0.0", "2.0.0-beta.4", "npm") == 1
+    assert compare_version_order("2.0.0", "1.0.0-alpha.0", "npm") == 1
+    assert compare_version_order("2.0.0", "1.99.0-pre.5", "npm") == 1
+    assert compare_version_order("4.0.0", "3.5.0-nightly.20240101", "npm") == 1
+
+
+# ---------------------------------------------------------------------------
+# Regression: PyPI post-release normalization must not corrupt rc/alpha tags
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_pypi_rc_not_treated_as_post_release():
+    """The bare ``r`` post spelling must not swallow the ``r`` inside ``rc``.
+
+    Regression for the ``\\.?(post|rev|r)`` substitution turning ``1.0rc1``
+    into ``1.0.postc1`` — a corruption that broke comparison for every
+    release candidate flowing through SCA matching.
+    """
+    from packaging.version import Version
+
+    for raw, base in (("1.0rc1", "1.0"), ("1.0.0rc2", "1.0.0")):
+        result = normalize_version(raw, "pypi")
+        assert "post" not in result, f"{raw} -> {result} (should stay a pre-release)"
+        assert Version(result).is_prerelease is True
+        assert Version(result).pre is not None  # genuinely an ``rc`` pre-release
+        assert Version(result).post is None  # NOT corrupted into a post-release
+        # An rc sorts strictly below its base release; a post-release would be >.
+        assert compare_version_order(raw, base, "pypi") == -1
+
+
+def test_normalize_pypi_alpha_not_treated_as_post_release():
+    result = normalize_version("2.0a1", "pypi")
+    from packaging.version import Version
+
+    assert "post" not in result
+    assert Version(result).is_prerelease is True
+    assert Version(result).pre is not None
+
+
+def test_normalize_pypi_real_post_releases_still_normalize():
+    """Genuine post-releases (``post``/``rev``/``r<NN>``) keep normalizing."""
+    from packaging.version import Version
+
+    assert "post1" in normalize_version("1.0.post1", "pypi")
+    assert Version(normalize_version("1.0.post1", "pypi")).post == 1
+
+    rev = normalize_version("1.0rev2", "pypi")
+    assert Version(rev).post == 2
+
+    r_form = normalize_version("1.0r5", "pypi")
+    assert Version(r_form).post == 5
+    # A post-release sorts ABOVE its base release.
+    assert compare_version_order("1.0r5", "1.0", "pypi") == 1
+
+
+def test_normalize_pypi_legacy_c_spelling_still_maps_to_rc():
+    from packaging.version import Version
+
+    result = normalize_version("1.0c1", "pypi")
+    assert Version(result) == Version("1.0rc1")
+    assert Version(result).is_prerelease is True
+
+
+# ---------------------------------------------------------------------------
+# Regression: unparseable SemVer pre-release sorts STRICTLY below its release
+# ---------------------------------------------------------------------------
+
+
+def test_semver_prerelease_orders_below_equal_tagged_release():
+    """``X-canary`` / ``X-nightly`` / ``X-snapshot`` < ``X`` (and reverse > X).
+
+    packaging.Version cannot parse these npm SemVer tags, so the comparator
+    strips the suffix and compares the base release. Collapsing to equality
+    here let a canary build read as already past a fix bound (a false
+    negative that hid the vulnerability) — it must sort strictly below.
+    """
+    for tag in ("canary.13", "nightly.20240101", "snapshot", "next.7"):
+        pre = f"13.4.20-{tag}"
+        assert compare_version_order(pre, "13.4.20", "npm") == -1
+        assert compare_version_order("13.4.20", pre, "npm") == 1
+
+    # And the range matcher: a canary BEFORE the fix bound stays affected.
+    assert version_in_range("13.4.20-canary.13", "0.9.9", "13.4.20", None, "npm") is True
+    # while the released fix itself is not affected.
+    assert version_in_range("13.4.20", "0.9.9", "13.4.20", None, "npm") is False
+
+
+def test_version_in_range_git_sha_bounds_not_affected():
+    """Git-commit advisory bounds must not mark every semver version as affected."""
+    sha_intro = "a" * 40
+    sha_fix = "b" * 40
+    assert version_in_range("99.99.99", sha_intro, sha_fix, None, "pypi") is False
+    assert version_in_range("10.0.1", sha_intro, None, None, "pypi") is False
+    assert version_in_range("1.0.0", None, sha_fix, None, "pypi") is False
+
+
+# ---------------------------------------------------------------------------
+# Regression: local-version-style advisory bounds must not fail open
+# ---------------------------------------------------------------------------
+
+
+def test_version_in_range_local_suffix_bound_not_unbounded():
+    """A ``last_affected`` like ``2.6.0-NA`` must not match every version.
+
+    PYSEC advisories for torch carry wheel local-version artifacts in their
+    bounds (``2.6.0-NA``, ``2.6.0-cu124``). ``packaging.Version`` rejects
+    them, the comparator returned ``None``, every guard fell through, and the
+    range matched unboundedly — flagging ``torch@2.13.0`` with advisories
+    that describe <= 2.6.0.
+    """
+    # Exact audit repro: previously True (fail-open), must be False.
+    assert version_in_range("2.13.0", "0", "", "2.6.0-NA", "pypi") is False
+    assert version_in_range("2.13.0", "0", "", "2.6.0-cu124", "pypi") is False
+    assert version_in_range("2.13.0", "0", "", "2.7.1-NA", "pypi") is False
+    # Plain bound control (already correct today).
+    assert version_in_range("2.13.0", "0", "", "2.6.0", "pypi") is False
+
+
+def test_version_in_range_local_suffix_bound_keeps_true_positives():
+    """Sanitized suffixed bounds must still match genuinely affected versions."""
+    assert version_in_range("2.4.0", "0", "", "2.6.0-NA", "pypi") is True
+    assert version_in_range("2.5.1", "0", "", "2.6.0-cu124", "pypi") is True
+    assert version_in_range("2.6.0", "0", "", "2.6.0-NA", "pypi") is True
+    # Suffixed *fixed* bound: versions below the base stay affected.
+    assert version_in_range("2.4.0", "0", "2.6.0-NA", None, "pypi") is True
+
+
+def test_compare_version_order_sanitizes_local_suffix_bounds():
+    """Unknown ``-suffix`` bounds compare on their parseable base version."""
+    assert compare_version_order("2.13.0", "2.6.0-NA", "pypi") == 1
+    assert compare_version_order("2.4.0", "2.6.0-NA", "pypi") == -1
+    assert compare_version_order("2.4.0", "2.6.0-cu124", "pypi") == -1
+    # Equal base: the suffixed side orders ABOVE the bare release (mirrors
+    # PEP 440 local-version ordering), so a bare version never reads as
+    # already past a suffixed fix bound.
+    assert compare_version_order("2.6.0", "2.6.0-NA", "pypi") == -1
+    assert compare_version_order("2.6.0-NA", "2.6.0", "pypi") == 1
+
+
+def test_compare_npm_arbitrary_semver_prerelease_uses_semver_precedence():
+    """Unknown npm prerelease identifiers must sort below their release."""
+    assert compare_version_order("1.0.0-foo", "1.0.0", "npm") == -1
+    assert compare_version_order("1.0.0-foo.2", "1.0.0-foo.10", "npm") == -1
+    assert compare_version_order("1.0.0-1", "1.0.0-foo", "npm") == -1
+    assert version_in_range("1.0.0-foo", "0", "1.0.0", None, "npm") is True
+
+
+def test_version_in_range_fails_closed_on_unparseable_bounds():
+    """A bound that cannot be compared is never grounds for a match."""
+    # Unparseable upper bound (not sanitizable): cannot place the version
+    # below it -> no match, instead of the old unbounded True.
+    assert version_in_range("1.5.0", "1.0.0", "not-a-version-at-all", None, "pypi") is False
+    assert version_in_range("1.5.0", "1.0.0", "", "not-a-version-at-all", "pypi") is False
+    # Unparseable *introduced* with a parseable upper bound that DOES match:
+    # keep the match (dropping it would suppress real vulnerabilities).
+    assert version_in_range("1.5.0", "!!garbage!!", "2.0.0", None, "pypi") is True
+    assert version_in_range("2.5.0", "!!garbage!!", "2.0.0", None, "pypi") is False
+    # Unparseable introduced and NO other bound: the only comparison failed,
+    # so no match may be claimed.
+    assert version_in_range("1.5.0", "!!garbage!!", None, None, "pypi") is False
+
+
+# ---------------------------------------------------------------------------
+# Maven version order
+#
+# Pinned to the Apache Maven POM Reference "Version Order Specification":
+# tokens split on '.', '-', '_' and digit<->character transitions; trailing
+# "null" values (0, "", final, ga) trimmed; qualifier order
+#   alpha < beta < milestone < rc = cr < snapshot < "" = final = ga = release < sp
+# Comparison is case-insensitive.
+# ---------------------------------------------------------------------------
+
+
+def test_maven_spec_trimming_examples():
+    """The trimming examples given verbatim in the Maven spec."""
+    for equivalent in ("1.0.0", "1.ga", "1.final", "1.0", "1.", "1-", "1_", "1.RELEASE"):
+        assert compare_version_order(equivalent, "1", "maven") == 0, equivalent
+    assert compare_version_order("1.0.0-foo.0.0", "1-foo", "maven") == 0
+    assert compare_version_order("1.0.0-0.0.0", "1", "maven") == 0
+
+
+def test_maven_spec_qualifier_ordering():
+    ordered = [
+        "1-alpha",
+        "1-a1",
+        "1-beta",
+        "1-b1",
+        "1-milestone",
+        "1-m1",
+        "1-rc",
+        "1-snapshot",
+        "1",
+        "1-sp",
+    ]
+    for lower, higher in zip(ordered, ordered[1:]):
+        assert compare_version_order(lower, higher, "maven") == -1, f"{lower} !< {higher}"
+        assert compare_version_order(higher, lower, "maven") == 1, f"{higher} !> {lower}"
+
+
+def test_maven_rc_equals_cr_and_is_case_insensitive():
+    assert compare_version_order("1-rc1", "1-cr1", "maven") == 0
+    assert compare_version_order("3.2-ALPHA1", "3.2-alpha1", "maven") == 0
+
+
+def test_maven_numeric_ordering():
+    assert compare_version_order("1.10", "1.9", "maven") == 1
+    assert compare_version_order("5.3.20", "5.3.9", "maven") == 1
+    assert compare_version_order("2.0", "10.0", "maven") == -1
+
+
+def test_maven_unknown_qualifier_sorts_above_release():
+    """Unknown qualifiers compare lexically and sort after the known set."""
+    assert compare_version_order("2.5.6.SEC03", "2.5.6", "maven") == 1
+    assert compare_version_order("2.5.7.SR023", "2.5.7.SR0", "maven") == 1
+    assert compare_version_order("2.5.7.SR2", "2.5.7.SR10", "maven") == -1
+
+
+def test_maven_alphabetic_token_sorts_below_numeric_token():
+    assert compare_version_order("1-alpha", "1-1", "maven") == -1
+
+
+def test_go_pseudo_version_all_three_documented_forms_are_recognised():
+    """The Go modules reference documents THREE pseudo-version forms.
+
+    Only ``vX.0.0-<ts>-<sha>`` was recognised; the ``-0.<ts>-`` and
+    ``-<pre>.0.<ts>-`` forms fell through as uncomparable, so an advisory bound
+    written in either form could not rule a version out.
+    """
+    from agent_bom.version_utils import _go_pseudo_timestamp
+
+    assert _go_pseudo_timestamp("v0.0.0-20220524220425-1d687d428aca") == "20220524220425"
+    assert _go_pseudo_timestamp("v1.2.4-0.20191109021931-daa7c04131f5") == "20191109021931"
+    assert _go_pseudo_timestamp("v1.2.3-pre.0.20191109021931-daa7c04131f5") == "20191109021931"
+    # Not pseudo-versions.
+    assert _go_pseudo_timestamp("v1.2.3") is None
+    assert _go_pseudo_timestamp("v1.2.3-rc1") is None
+
+
+def test_go_pseudo_version_orders_against_a_tagged_version():
+    """CVE-2022-41721 / GO-2023-1495: fixed at ``0.1.1-0.20221104162952-702349b0e862``.
+
+    Live OSV does NOT report it for golang.org/x/net@0.16.0 — 0.16.0 is far past
+    the fix. The bound being uncomparable made it a fail-open false positive.
+    """
+    fixed = "0.1.1-0.20221104162952-702349b0e862"
+    assert compare_version_order("0.16.0", fixed, "go") == 1
+    assert version_in_range("0.16.0", "0.0.0-20220524220425-1d687d428aca", fixed, None, "go") is False
+    # Other direction — a version genuinely inside the window still matches.
+    assert version_in_range("0.1.0", "0.0.0-20220524220425-1d687d428aca", fixed, None, "go") is True
+
+
+def test_go_pseudo_version_sorts_below_its_base_tag():
+    """A pseudo-version is a pre-release of its base: ``v1.2.4-0.…`` < ``v1.2.4``."""
+    assert compare_version_order("v1.2.4-0.20191109021931-daa7c04131f5", "v1.2.4", "go") == -1
+    assert compare_version_order("v1.2.4", "v1.2.4-0.20191109021931-daa7c04131f5", "go") == 1
+    assert compare_version_order("v1.2.4-0.20191109021931-daa7c04131f5", "v1.2.3", "go") == 1
+
+
+def test_version_in_range_maven_release_qualifier_bounds():
+    # CVE-2009-1190 (GHSA-wjjr-h4wh-w6vv): introduced 1.1.0, fixed 3.0.0.RELEASE.
+    assert version_in_range("5.3.20", "1.1.0", "3.0.0.RELEASE", None, "maven") is False
+    assert version_in_range("2.5.0", "1.1.0", "3.0.0.RELEASE", None, "maven") is True
+    # GHSA-cxrj-66c5-9fmh: introduced 5.0.5.RELEASE, fixed 5.0.6.RELEASE.
+    assert version_in_range("5.0.5.RELEASE", "5.0.5.RELEASE", "5.0.6.RELEASE", None, "maven") is True
+    assert version_in_range("5.0.6.RELEASE", "5.0.5.RELEASE", "5.0.6.RELEASE", None, "maven") is False

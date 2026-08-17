@@ -4,6 +4,7 @@ repos:
     hooks:
       - id: check-yaml
         args: [--unsafe]
+        exclude: "^deploy/helm/.*/templates/.*\\.ya?ml$"
       - id: check-json
         exclude: "tsconfig.*\\.json$"
       - id: check-toml
@@ -18,8 +19,12 @@ repos:
       - id: mixed-line-ending
         args: [--fix=lf]
 
+  # Must match the ruff pinned in uv.lock, which is what CI resolves. They
+  # diverged (0.9.7 here, 0.16.1 there) and the formatter's style changed
+  # between those releases, so the hook and CI were formatting to two different
+  # targets with nothing comparing them. `make format-check` now does.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.9.7
+    rev: v0.16.2
     hooks:
       - id: ruff
         args: [--fix]
@@ -29,9 +34,9 @@ repos:
     rev: v1.15.0
     hooks:
       - id: mypy
-        args: [--ignore-missing-imports, --no-error-summary, --follow-imports=skip]
+        args: [--ignore-missing-imports, --no-error-summary, --disable-error-code, import-untyped]
         files: ^src/
-        additional_dependencies: []
+        additional_dependencies: ["pydantic>=2.0", types-PyYAML]
         pass_filenames: true
 
   - repo: https://github.com/PyCQA/bandit
@@ -41,3 +46,67 @@ repos:
         args: [--severity-level, medium, -r]
         files: ^src/
         exclude: ^tests/
+
+  - repo: local
+    hooks:
+      # Catches new AGENT_BOM_* env vars added under src/agent_bom/ that are
+      # neither declared in config.py nor allowlisted. The generator is pure
+      # AST-parsing so it runs cleanly under the pre-commit env without the
+      # project venv. Same gate the CI Lint stage runs — pre-commit just
+      # surfaces it locally before push.
+      - id: env-var-reference-drift
+        name: env-var reference drift (config.py + allowlist gate)
+        entry: python3 scripts/generate_env_var_reference.py --check
+        language: system
+        pass_filenames: false
+        files: ^(src/agent_bom/.*\.py|src/agent_bom/config\.py|scripts/env_var_allowlist\.txt|docs/operations/ENV_VARS\.md)$
+      - id: comment-hygiene-guard
+        name: comment hygiene (no chat/POC/task-id noise in source)
+        # Rejects conversational comments, assistant self-references, and internal
+        # task/audit breadcrumbs in product source before they reach a commit.
+        # Same gate the CI Lint stage runs. Pure stdlib, no project venv needed.
+        entry: python3 scripts/check_comment_hygiene.py
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: exception-sanitization-guard
+        name: exception sanitization (no raw exception text in HTTP responses or logs)
+        # Rejects new detail=str(exc) / detail=f"...{exc}" HTTPException bodies and
+        # raw-exception log f-strings on API/cloud/runtime paths. Raw exception
+        # strings carry secrets, ARNs, paths, and connection strings; they must go
+        # through agent_bom.security.sanitize_error / sanitize_text. Pure stdlib.
+        entry: python3 scripts/check_exception_sanitization.py
+        language: system
+        pass_filenames: false
+        files: ^(src/agent_bom/(api|cloud|runtime)/.*\.py|src/agent_bom/proxy\.py|scripts/check_exception_sanitization\.py)$
+      - id: duplicate-artifact-guard
+        name: Finder duplicate artifact guard
+        # --working-tree also catches untracked Finder copies (e.g. 'nav 2.tsx')
+        # that break local tsc/pytest collection but are never staged, so the
+        # tracked-only CI guard misses them. Build/cache dirs are ignored.
+        entry: python3 scripts/check_duplicate_artifacts.py --working-tree
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: release-workflow-lint
+        name: release workflow call-graph (needs + reusable-workflow permissions)
+        # Catches the two release startup_failure classes (undeclared needs.<job>
+        # refs; reusable-workflow permission under-grant under a deny-all
+        # top-level) before they reach a tag push. actionlint misses the
+        # permission case. Network-free, dependency-free.
+        entry: python3 scripts/lint_release_workflow.py .github/workflows/release.yml
+        language: system
+        pass_filenames: false
+        files: ^\.github/workflows/(release|docs|deploy-mcp-sse)\.yml$
+      - id: release-surface-consistency
+        name: release surface and generated atlas consistency
+        entry: python3 scripts/check_release_consistency.py
+        language: system
+        pass_filenames: false
+        files: ^(pyproject\.toml|README\.md|PYPI_README\.md|DOCKER_HUB_README\.md|CHANGELOG\.md|docs/(DATA_MODEL\.md|openapi/v1\.(json|yaml)|PRODUCT_|RELEASE_|PUBLISHING|MCP_SECURITY_MODEL|AI_INFRASTRUCTURE_SCANNING|ENTERPRISE_DEPLOYMENT)|site-docs/|src/agent_bom/(api/|mcp_registry\.json)|integrations/(mcp-registry|glama|openclaw)/|deploy/|Dockerfile|uv\.lock|scripts/(check_release_consistency|regenerate_data_model_atlas)\.py)
+      - id: release-evidence-matrix
+        name: release evidence surface matrix
+        entry: python3 scripts/check_release_evidence_matrix.py
+        language: system
+        pass_filenames: false
+        files: ^(docs/release/release-evidence-matrix\.json|docs/RELEASE_VERIFICATION\.md|\.github/workflows/(ci|release|demo-deploy-cloudrun)\.yml|action\.yml|Dockerfile|ui/Dockerfile|deploy/helm/agent-bom/|deploy/docker/Dockerfile\.collector|integrations/(mcp-registry|glama|smithery)|scripts/(check_release_evidence_matrix|check_surface_freshness|verify_release_wheel)\.py)

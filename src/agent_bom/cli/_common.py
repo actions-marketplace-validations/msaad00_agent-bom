@@ -2,28 +2,84 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import threading
 from pathlib import Path
+from typing import Any
 
+import click
 from rich.console import Console
 
 from agent_bom import __version__
-from agent_bom.security import sanitize_env_vars
+from agent_bom.graph.severity import SEVERITY_POLICY_ORDER
+from agent_bom.mcp_blocklist import sanitize_security_intelligence_entry
+from agent_bom.output.brand_tokens import cli_banner_plain
+from agent_bom.security import sanitize_env_vars, sanitize_sensitive_payload
 
 logger = logging.getLogger(__name__)
 
-BANNER = r"""
-   ___                    __     ____  ____  __  ___
-  / _ | ___ ____ ___  ___/ /_   / __ )/ __ \/  |/  /
- / __ |/ _ `/ -_) _ \/ __/_  / / __  / / / / /|_/ /
-/_/ |_/\_, /\__/_//_/\__/ /_/ /____/\____/_/  /_/
-      /___/
-  Security scanner for AI infrastructure
-"""
+# Canonical CLI lockup — product name agent-bom, mark is BOM-with-agent-O.
+BANNER = cli_banner_plain(version=__version__)
 
-SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "none": 0, "unknown": -1}
+SEVERITY_ORDER = {label.lower(): rank for label, rank in SEVERITY_POLICY_ORDER.items()}
+PORT_RANGE = click.IntRange(1, 65535)
+LISTEN_PORT_RANGE = click.IntRange(1024, 65535)
+OPTIONAL_PORT_RANGE = click.IntRange(0, 65535)
+
+
+def read_json_file_for_cli(path: str | Path, *, label: str = "JSON file") -> Any:
+    """Read a JSON file and raise concise Click errors for CLI users."""
+    file_path = Path(path)
+    try:
+        return json.loads(file_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(f"{label} JSON error in {file_path}: line {exc.lineno}, column {exc.colno}: {exc.msg}") from exc
+    except OSError as exc:
+        raise click.ClickException(f"Could not read {label.lower()} {file_path}: {exc.strerror or exc}") from exc
+
+
+import contextlib  # noqa: E402 — kept beside the helper that uses it for grep-locality
+
+
+@contextlib.contextmanager
+def rich_log_handler_during_progress(console: Console, *, logger_name: str = "agent_bom.scanners"):
+    """Route warnings from ``logger_name`` through Rich for the duration.
+
+    When a Rich ``Progress`` / ``Live`` region is active, a ``logger.warning(...)``
+    that goes through a plain stderr handler punches through the live region:
+    each warning line pushes the spinner down, the spinner redraws below it,
+    and the terminal accumulates a stack of "Scanning N packages" lines
+    instead of a single redrawing one.
+
+    Bind a ``RichHandler`` to the same ``Console`` for the duration of the
+    progress block so log records render *above* the live region without
+    breaking the redraw, then restore the original handlers on exit.
+    """
+    from rich.logging import RichHandler
+
+    target = logging.getLogger(logger_name)
+    saved_handlers = list(target.handlers)
+    saved_propagate = target.propagate
+
+    rich_h = RichHandler(
+        console=console,
+        show_time=True,
+        show_path=False,
+        markup=False,
+        rich_tracebacks=False,
+        log_time_format="%H:%M:%S",
+        omit_repeated_times=False,
+    )
+    rich_h.setLevel(logging.WARNING)
+    target.handlers = [rich_h]
+    target.propagate = False
+    try:
+        yield
+    finally:
+        target.handlers = saved_handlers
+        target.propagate = saved_propagate
 
 
 def _make_console(quiet: bool = False, output_format: str = "console", no_color: bool = False) -> Console:
@@ -41,13 +97,61 @@ def _make_console(quiet: bool = False, output_format: str = "console", no_color:
     return Console(no_color=no_color)
 
 
+def _sync_runtime_consoles(console: Console) -> None:
+    """Point shared module-level consoles at the active CLI console."""
+    for module_name in (
+        "agent_bom.scanners",
+        "agent_bom.enrichment",
+        "agent_bom.resolver",
+        "agent_bom.transitive",
+        "agent_bom.parsers",
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not sync console for %s: %s", module_name, exc)
+            continue
+        if hasattr(module, "console"):
+            setattr(module, "console", console)
+
+
+def _coerce_agent_type_for_inventory(raw_value: object, *, agent_name: str):
+    """Map unknown pushed-inventory agent types to custom without aborting scans."""
+    from agent_bom.models import AgentType
+
+    value = str(raw_value or "custom").strip() or "custom"
+    try:
+        return AgentType(value)
+    except ValueError:
+        logger.warning("Unknown inventory agent_type %r for %s; treating as custom", value, agent_name)
+        return AgentType.CUSTOM
+
+
 def _build_agents_from_inventory(inventory_data: dict, source_path: str) -> list:
     """Build Agent objects from parsed inventory dict (JSON or CSV)."""
-    from agent_bom.models import Agent, AgentType, MCPServer, MCPTool, Package, TransportType
+    from agent_bom.asset_provenance import sanitize_discovery_provenance
+    from agent_bom.models import Agent, MCPServer, MCPTool, Package, TransportType
 
     agents = []
+    inventory_provenance = sanitize_discovery_provenance(
+        inventory_data.get("discovery_provenance"),
+        defaults={
+            "source_type": "operator_pushed_inventory",
+            "observed_via": ["operator_inventory"],
+            "source": inventory_data.get("source"),
+            "collector": "inventory",
+            "confidence": "high",
+        },
+    )
     for agent_data in inventory_data.get("agents", []):
         mcp_servers = []
+        agent_provenance = sanitize_discovery_provenance(
+            agent_data.get("discovery_provenance"),
+            defaults={
+                **(inventory_provenance or {}),
+                "source": agent_data.get("source", inventory_data.get("source")),
+            },
+        )
         for server_data in agent_data.get("mcp_servers", []):
             # Parse pre-populated tools (e.g. from Snowflake/cloud inventory)
             tools = []
@@ -65,13 +169,24 @@ def _build_agents_from_inventory(inventory_data: dict, source_path: str) -> list
 
             # Parse pre-known packages (e.g. from cloud asset scan)
             packages = []
+            package_provenance = sanitize_discovery_provenance(
+                server_data.get("discovery_provenance"),
+                defaults=agent_provenance,
+            )
             for pkg_data in server_data.get("packages", []):
                 if isinstance(pkg_data, str):
                     if "@" in pkg_data:
                         name, version = pkg_data.rsplit("@", 1)
                     else:
                         name, version = pkg_data, "unknown"
-                    packages.append(Package(name=name, version=version, ecosystem="unknown"))
+                    packages.append(
+                        Package(
+                            name=name,
+                            version=version,
+                            ecosystem="unknown",
+                            discovery_provenance=package_provenance,
+                        )
+                    )
                 elif isinstance(pkg_data, dict):
                     packages.append(
                         Package(
@@ -79,6 +194,10 @@ def _build_agents_from_inventory(inventory_data: dict, source_path: str) -> list
                             version=pkg_data.get("version", "unknown"),
                             ecosystem=pkg_data.get("ecosystem", "unknown"),
                             purl=pkg_data.get("purl"),
+                            discovery_provenance=sanitize_discovery_provenance(
+                                pkg_data.get("discovery_provenance"),
+                                defaults=package_provenance,
+                            ),
                         )
                     )
 
@@ -92,18 +211,40 @@ def _build_agents_from_inventory(inventory_data: dict, source_path: str) -> list
                 config_path=agent_data.get("config_path"),
                 working_dir=server_data.get("working_dir"),
                 mcp_version=server_data.get("mcp_version"),
+                security_blocked=bool(server_data.get("security_blocked", False)),
+                security_warnings=list(server_data.get("security_warnings", []) or []),
+                security_intelligence=[
+                    sanitize_security_intelligence_entry(item)
+                    for item in (server_data.get("security_intelligence", []) or [])
+                    if isinstance(item, dict)
+                ],
+                discovery_provenance=package_provenance,
                 tools=tools,
                 packages=packages,
             )
             mcp_servers.append(server)
 
+        sanitized_metadata = {}
+        if isinstance(agent_data.get("metadata"), dict):
+            metadata_payload = sanitize_sensitive_payload(agent_data.get("metadata", {}))
+            sanitized_metadata = metadata_payload if isinstance(metadata_payload, dict) else {}
+
         agent = Agent(
             name=agent_data.get("name", "unknown"),
-            agent_type=AgentType(agent_data.get("agent_type", agent_data.get("type", "custom"))),
+            agent_type=_coerce_agent_type_for_inventory(
+                agent_data.get("agent_type", agent_data.get("type", "custom")),
+                agent_name=agent_data.get("name", "unknown"),
+            ),
             config_path=agent_data.get("config_path", source_path),
             mcp_servers=mcp_servers,
             version=agent_data.get("version"),
             source=agent_data.get("source", inventory_data.get("source")),
+            source_id=agent_data.get("source_id"),
+            device_fingerprint=agent_data.get("device_fingerprint"),
+            metadata=sanitized_metadata,
+            discovered_at=agent_data.get("discovered_at") or agent_data.get("first_seen") or "",
+            last_seen=agent_data.get("last_seen") or agent_data.get("last_seen_at"),
+            discovery_provenance=agent_provenance,
         )
         agents.append(agent)
 
@@ -113,16 +254,106 @@ def _build_agents_from_inventory(inventory_data: dict, source_path: str) -> list
 _update_check_result: str | None = None
 _update_check_done = threading.Event()
 
+# Upgrade guidance depends on *how* agent-bom was installed. Only a pip install
+# can be driven with `pip install --upgrade`; every other method must be
+# upgraded through its own tool (running pip against a frozen binary, pipx venv,
+# uv tool, or Homebrew Cellar is a no-op at best and corrupts the install at
+# worst). The releases page is the upgrade path for standalone frozen binaries.
+_RELEASES_URL = "https://github.com/msaad00/agent-bom/releases/latest"
+# Published container image; override with AGENT_BOM_DOCKER_IMAGE.
+_DEFAULT_DOCKER_IMAGE = "agentbom/agent-bom"
+
+
+def _detect_install_method() -> tuple[str, str]:
+    """Infer how this agent-bom was installed and the matching upgrade command.
+
+    Returns ``(method, upgrade_command)`` where ``method`` is one of
+    ``frozen`` / ``docker`` / ``pipx`` / ``uv`` / ``brew`` / ``pip``. Callers
+    must only *execute* the command when ``method == "pip"`` — for every other
+    method the string is what the operator should run themselves.
+    """
+    import os
+    import sys
+
+    truthy = {"1", "true", "yes", "on"}
+
+    # Frozen / standalone binary (PyInstaller / cx_Freeze .pkg/.msi). There is no
+    # pip in this interpreter, so the only upgrade path is a fresh download.
+    if getattr(sys, "frozen", False):
+        return "frozen", f"re-download the latest release binary from {_RELEASES_URL}"
+
+    # Docker / OCI container.
+    if os.path.exists("/.dockerenv") or os.environ.get("AGENT_BOM_IN_CONTAINER", "").strip().lower() in truthy:
+        image = os.environ.get("AGENT_BOM_DOCKER_IMAGE") or _DEFAULT_DOCKER_IMAGE
+        return "docker", f"docker pull {image}:latest"
+
+    # Path-based detection for isolated-tool installers. sys.prefix (the active
+    # environment root) is the most reliable signal; the module path and launcher
+    # path are cross-checked for repacked layouts. Normalize to forward slashes so
+    # the substring checks are OS-agnostic and easy to exercise in tests.
+    parts: list[str] = [str(getattr(sys, "prefix", "") or "")]
+    try:
+        parts.append(str(Path(__file__).resolve()))
+    except OSError:
+        pass
+    argv = getattr(sys, "argv", None)
+    if argv:
+        parts.append(str(argv[0] or ""))
+    haystack = "/".join(parts).replace("\\", "/").lower()
+
+    if "/pipx/venvs/" in haystack:
+        return "pipx", "pipx upgrade agent-bom"
+    if "/uv/tools/" in haystack:
+        return "uv", "uv tool upgrade agent-bom"
+    if "/cellar/" in haystack or "/homebrew/" in haystack or "/linuxbrew/" in haystack:
+        return "brew", "brew upgrade agent-bom"
+    return "pip", "pip install --upgrade agent-bom"
+
+
+def _update_check_cache_file() -> Path:
+    """Path for the once-a-day update-check stamp.
+
+    Honors ``AGENT_BOM_STATE_DIR`` so the write lands off ``$HOME`` (e.g. on a
+    tiny CloudShell home) when the operator redirects state; otherwise uses the
+    per-user XDG cache dir.
+    """
+    import os
+
+    state_dir = os.environ.get("AGENT_BOM_STATE_DIR")
+    base = Path(state_dir) if state_dir else Path.home() / ".cache" / "agent-bom"
+    return base / "update-check.txt"
+
+
+def _should_skip_update_check() -> bool:
+    import os
+    import sys
+
+    truthy = {"1", "true", "yes", "on"}
+    if os.environ.get("AGENT_BOM_SKIP_UPDATE_CHECK", "").strip().lower() in truthy:
+        return True
+    if os.environ.get("AGENT_BOM_OFFLINE", "").strip().lower() in truthy:
+        return True
+    # The update-check thread starts before Click parses subcommand flags, so
+    # honor ``--offline`` on argv for air-gap invocations like
+    # ``agent-bom agents --demo --offline``.
+    if "--offline" in sys.argv:
+        return True
+    return False
+
 
 def _check_for_update_bg() -> None:
     """Background thread: compare __version__ against PyPI latest. Non-blocking."""
     global _update_check_result  # noqa: PLW0603
-    try:
-        import urllib.request
+    import errno
 
-        cache_dir = Path.home() / ".cache" / "agent-bom"
-        cache_file = cache_dir / "update-check.txt"
-        cache_dir.mkdir(parents=True, exist_ok=True)
+    if _should_skip_update_check():
+        _update_check_result = None
+        _update_check_done.set()
+        return
+
+    try:
+        cache_file = _update_check_cache_file()
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
 
         # Only hit PyPI once per 24 hours
         import time
@@ -132,23 +363,30 @@ def _check_for_update_bg() -> None:
             _update_check_done.set()
             return
 
-        with urllib.request.urlopen(  # noqa: S310  # nosec B310
-            "https://pypi.org/pypi/agent-bom/json", timeout=5
-        ) as resp:
-            data = json.loads(resp.read())
+        from agent_bom.http_client import fetch_json
+
+        data = fetch_json("https://pypi.org/pypi/agent-bom/json", timeout=5)
         latest = data["info"]["version"]
 
         def _vt(v: str) -> tuple[int, ...]:
             return tuple(int(x) for x in v.split(".") if x.isdigit())
 
         if _vt(latest) > _vt(__version__):
+            _, upgrade_command = _detect_install_method()
             msg = (
-                f"[yellow]Update available:[/yellow] agent-bom {__version__} → [bold]{latest}[/bold]\n"
-                f"  Run: [cyan]pip install --upgrade agent-bom[/cyan]"
+                f"[yellow]Update available:[/yellow] agent-bom {__version__} → [bold]{latest}[/bold]\n  Run: [cyan]{upgrade_command}[/cyan]"
             )
         else:
             msg = ""
-        cache_file.write_text(msg)
+        try:
+            cache_file.write_text(msg)
+        except OSError as exc:
+            # A full disk must not lose the update notice or crash the scan —
+            # degrade to no-cache (the result is still served this run).
+            if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+                logger.debug("Disk full writing update-check stamp %s — skipping cache", cache_file)
+            else:
+                logger.debug("Could not write update-check stamp %s: %s", cache_file, exc)
         _update_check_result = msg or None
     except Exception:  # noqa: BLE001
         _update_check_result = None

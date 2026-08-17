@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 
 INIT_SQL = Path(__file__).parent.parent / "deploy" / "supabase" / "postgres" / "init.sql"
+MIGRATION = Path(__file__).parent.parent / "scripts" / "migrations" / "backfill_cis_benchmark_checks.py"
 SQL = INIT_SQL.read_text()
 
 
@@ -78,22 +79,236 @@ def test_all_expected_tables_exist():
     expected = {
         "teams",
         "scan_jobs",
+        "cis_benchmark_checks",
         "findings",
         "agents",
         "policy_results",
         "api_keys",
         "job_queue",
+        "api_rate_limits",
         "fleet_agents",
+        "fleet_endpoints",
         "gateway_policies",
         "policy_audit_log",
+        "audit_log",
+        "trend_history",
         "scan_schedules",
         "osv_cache",
+        "graph_build_workspace_nodes",
+        "graph_build_workspace_edges",
     }
     assert expected.issubset(_tables()), f"Missing tables: {expected - _tables()}"
 
 
 def test_total_table_count():
-    assert len(_tables()) >= 12
+    assert len(_tables()) >= 15
+
+
+def test_gateway_policy_tables_have_tenant_columns():
+    assert "team_id" in _columns_for("gateway_policies")
+    assert "team_id" in _columns_for("policy_audit_log")
+
+
+def test_gateway_policy_rls_policies_exist():
+    assert "ALTER TABLE gateway_policies ENABLE ROW LEVEL SECURITY" in SQL
+    assert "CREATE POLICY gateway_policies_tenant_isolation ON gateway_policies" in SQL
+    assert "ALTER TABLE policy_audit_log ENABLE ROW LEVEL SECURITY" in SQL
+    assert "CREATE POLICY policy_audit_log_tenant_isolation ON policy_audit_log" in SQL
+
+
+def test_audit_and_trend_tables_exist_with_rls():
+    assert "ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY" in SQL
+    assert "CREATE POLICY audit_log_tenant_isolation ON audit_log" in SQL
+    assert "ALTER TABLE trend_history ENABLE ROW LEVEL SECURITY" in SQL
+    assert "CREATE POLICY trend_history_tenant_isolation ON trend_history" in SQL
+
+
+def test_remaining_tenant_tables_have_rls():
+    for table in ("findings", "agents", "policy_results", "job_queue"):
+        assert f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY" in SQL
+        assert f"CREATE POLICY {table}_tenant_isolation ON {table}" in SQL
+
+
+def test_graph_tables_have_rls_policies():
+    for table in (
+        "graph_nodes",
+        "graph_edges",
+        "graph_snapshots",
+        "attack_paths",
+        "interaction_risks",
+        "graph_filter_presets",
+        "graph_node_search",
+        "graph_build_workspace_nodes",
+        "graph_build_workspace_edges",
+    ):
+        assert f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY" in SQL
+        assert f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY" in SQL
+        assert f"CREATE POLICY {table}_tenant_isolation ON {table}" in SQL
+
+
+def test_graph_build_workspace_schema_is_migration_owned():
+    """The bounded producer must work with a DML-only runtime role."""
+    for table, columns in {
+        "graph_build_workspace_nodes": ("workspace_id", "tenant_id", "node_id", "seq", "payload", "entity_type"),
+        "graph_build_workspace_edges": (
+            "workspace_id",
+            "tenant_id",
+            "edge_key",
+            "seq",
+            "payload",
+            "source_id",
+            "target_id",
+        ),
+    }.items():
+        assert set(columns).issubset(_columns_for(table)), f"{table} missing workspace columns"
+    assert "idx_gbw_nodes_seq" in _indexes()
+    assert "idx_gbw_edges_seq" in _indexes()
+    versions = Path(__file__).parent.parent / "deploy" / "supabase" / "postgres" / "alembic" / "versions"
+    migration = versions / "20260720_03_graph_build_workspace.py"
+    body = migration.read_text()
+    assert 'down_revision = "20260720_02"' in body
+    assert "CREATE TABLE IF NOT EXISTS graph_build_workspace_nodes" in body
+    assert "CREATE TABLE IF NOT EXISTS graph_build_workspace_edges" in body
+    rls = versions / "20260721_01_graph_build_workspace_rls.py"
+    rls_body = rls.read_text()
+    assert 'down_revision = "20260720_03"' in rls_body
+    assert "graph_build_workspace_nodes" in rls_body
+    assert "FORCE ROW LEVEL SECURITY" in rls_body
+
+
+def test_graph_snapshot_json_fields_are_text_in_baseline():
+    assert "analysis_status" in _columns_for("graph_snapshots")
+    assert "risk_summary TEXT DEFAULT '{}'" in SQL
+    assert "analysis_status TEXT NOT NULL DEFAULT '{}'" in SQL
+
+
+def test_graph_edges_has_versioning_columns():
+    """graph_edges baseline must define the schema-v3 versioning + provenance
+    columns. Regression: these were only created by the app bootstrap in
+    api/postgres_graph.py, so fresh Postgres / read-only / migration-only
+    deployments failed with 'column "valid_from" does not exist'."""
+    cols = _columns_for("graph_edges")
+    for col in (
+        "valid_from",
+        "valid_to",
+        "confidence",
+        "provenance",
+        "source_scan_id",
+        "source_run_id",
+    ):
+        assert col in cols, f"graph_edges baseline missing schema-v3 column: {col}"
+    assert "idx_pg_graph_edges_valid" in _indexes()
+
+
+def test_graph_edges_versioning_migration_exists():
+    """An Alembic migration must add the versioning columns for databases
+    provisioned before they were added to the init.sql baseline."""
+    versions = Path(__file__).parent.parent / "deploy" / "supabase" / "postgres" / "alembic" / "versions"
+    migration = versions / "20260530_01_graph_edges_versioning_columns.py"
+    assert migration.exists(), "missing graph_edges versioning Alembic migration"
+    body = migration.read_text()
+    for col in ("valid_from", "valid_to", "confidence", "provenance", "source_scan_id", "source_run_id"):
+        assert f"ADD COLUMN IF NOT EXISTS {col}" in body, f"migration does not add {col}"
+    assert 'down_revision = "20260513_01"' in body
+
+
+def _attack_paths_store_columns() -> set[str]:
+    """Columns postgres_graph.py reads/writes on attack_paths (parsed from source)."""
+    source = (Path(__file__).parent.parent / "src" / "agent_bom" / "api" / "postgres_graph.py").read_text()
+    columns: set[str] = set()
+    insert_match = re.search(r"INSERT INTO attack_paths\s*\(([^)]*)\)", source)
+    assert insert_match, "attack_paths INSERT not found in postgres_graph.py"
+    columns.update(col.strip() for col in insert_match.group(1).split(",") if col.strip())
+    for select_match in re.finditer(r"SELECT\s+((?:(?!\bFROM\b)[\s\S])*?)\s+FROM attack_paths", source):
+        for token in select_match.group(1).split(","):
+            token = token.strip()
+            if re.fullmatch(r"[a-z_]+", token):
+                columns.add(token)
+    return columns
+
+
+def test_attack_paths_baseline_covers_every_store_column():
+    """Every attack_paths column the graph store reads/writes must ship in init.sql.
+
+    Regression: ``summary``, ``tool_exposure`` and ``technique_mappings`` were
+    only created by the app bootstrap in api/postgres_graph.py, so
+    migration-owned Postgres deployments (AGENT_BOM_POSTGRES_URL set → bootstrap
+    DDL skipped) 500'd on the first /v1/graph read with
+    'column "summary" does not exist'."""
+    cols = _columns_for("attack_paths")
+    store_cols = _attack_paths_store_columns()
+    assert store_cols, "no attack_paths columns parsed from postgres_graph.py"
+    missing = store_cols - cols
+    assert not missing, f"init.sql attack_paths missing store columns: {sorted(missing)}"
+
+
+def test_attack_paths_summary_columns_migration_exists():
+    """An Alembic migration must add the summary/exposure/technique columns for
+    databases migrated before they were added to the init.sql baseline."""
+    versions = Path(__file__).parent.parent / "deploy" / "supabase" / "postgres" / "alembic" / "versions"
+    migration = versions / "20260719_03_attack_paths_column_parity.py"
+    assert migration.exists(), "missing attack_paths column-parity Alembic migration"
+    body = migration.read_text()
+    for column, default in (("summary", "''"), ("tool_exposure", "'[]'"), ("technique_mappings", "'[]'")):
+        assert f"ADD COLUMN IF NOT EXISTS {column} TEXT DEFAULT {default}" in body, f"migration does not add {column}"
+    assert 'down_revision = "20260719_02"' in body
+
+
+def test_schema_summary_comment_is_current():
+    assert "--  Schema (21+ tables):" in SQL
+    assert "--   api_rate_limits      — legacy fixed-window buckets (deprecated)" in SQL
+    assert "--   api_rate_limit_hits  — shared sliding-window API rate-limiter events" in SQL
+    assert "--   audit_log          — signed API/security audit trail" in SQL
+    assert "--   trend_history      — persisted posture/vulnerability history" in SQL
+    assert "--   attack_paths       — persisted fix-first attack-path projections" in SQL
+    assert "--   graph_filter_presets — tenant-scoped saved graph filters" in SQL
+
+
+def test_llm_cost_tables_baseline_with_rls():
+    """llm_costs + llm_cost_budgets must ship in the init.sql baseline.
+
+    Regression: these were only created by the app bootstrap in
+    api/postgres_cost.py::_init_tables(), so fresh / replica / migration-only
+    Postgres deploys (read-only app role that cannot run CREATE TABLE) lacked
+    the cost store until an app instance happened to boot."""
+    tables = _tables()
+    assert "llm_costs" in tables
+    assert "llm_cost_budgets" in tables
+
+    cost_cols = _columns_for("llm_costs")
+    for col in ("tenant_id", "call_id", "cost_usd", "priced", "observed_at", "cost_center", "allocation_tags"):
+        assert col in cost_cols, f"llm_costs baseline missing column: {col}"
+
+    budget_cols = _columns_for("llm_cost_budgets")
+    for col in ("tenant_id", "agent", "limit_usd", "mode", "cost_center", "owner", "workflow"):
+        assert col in budget_cols, f"llm_cost_budgets baseline missing column: {col}"
+
+    for table in ("llm_costs", "llm_cost_budgets"):
+        assert f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY" in SQL
+        assert f"CREATE POLICY {table}_tenant_isolation ON {table}" in SQL
+    assert "uq_llm_cost_budgets_scope" in _indexes() or "uq_llm_cost_budgets_scope" in SQL
+    assert "PRIMARY KEY (tenant_id, agent, cost_center, owner, workflow)" in SQL
+
+
+def test_policy_audit_log_has_entry_id_dedup_key():
+    """policy_audit_log must carry entry_id (mirrors the SQLite PRIMARY KEY) +
+    a unique index so re-ingesting the same audit event is idempotent."""
+    assert "entry_id" in _columns_for("policy_audit_log")
+    assert "uq_policy_audit_log_entry" in SQL
+
+
+def test_api_rate_limits_table_exists():
+    cols = _columns_for("api_rate_limits")
+    for col in ("bucket_key", "window_started", "hits", "updated_at"):
+        assert col in cols, f"api_rate_limits missing column: {col}"
+    assert "idx_api_rate_limits_updated" in _indexes()
+
+
+def test_api_rate_limit_hits_table_exists():
+    cols = _columns_for("api_rate_limit_hits")
+    for col in ("bucket_key", "hit_at"):
+        assert col in cols, f"api_rate_limit_hits missing column: {col}"
+    assert "idx_api_rate_limit_hits_bucket_hit_at" in _indexes()
 
 
 # ── teams table ───────────────────────────────────────────────────────────────
@@ -129,6 +344,26 @@ def test_scan_jobs_has_triggered_by():
     assert "triggered_by" in SQL
 
 
+def test_scan_jobs_has_schedule_id_back_pointer():
+    cols = _columns_for("scan_jobs")
+    assert "schedule_id" in cols
+    assert "idx_jobs_schedule" in _indexes()
+
+
+def test_scan_jobs_has_batch_parent_child_columns():
+    cols = _columns_for("scan_jobs")
+    for col in ("batch_id", "parent_job_id", "child_job_ids", "target", "target_index", "target_count"):
+        assert col in cols
+    assert "idx_jobs_batch" in _indexes()
+    assert "idx_jobs_parent" in _indexes()
+
+
+def test_scan_jobs_keeps_team_id_as_rls_column_with_api_tenant_translation():
+    cols = _columns_for("scan_jobs")
+    assert "team_id" in cols
+    assert "tenant_id" not in cols
+
+
 def test_scan_jobs_do_block_migration_present():
     """Idempotent DO $$ block adds team_id to pre-existing scan_jobs."""
     assert "ADD COLUMN team_id" in SQL or "team_id" in _columns_for("scan_jobs")
@@ -136,6 +371,41 @@ def test_scan_jobs_do_block_migration_present():
 
 def test_scan_jobs_team_status_index():
     assert "idx_jobs_team_status" in _indexes()
+
+
+def test_scan_jobs_rls_policy_exists():
+    assert "ALTER TABLE scan_jobs ENABLE ROW LEVEL SECURITY" in SQL
+    assert "CREATE POLICY scan_jobs_tenant_isolation ON scan_jobs" in SQL
+
+
+def test_cis_benchmark_checks_table_is_indexed_and_tenant_scoped():
+    cols = _columns_for("cis_benchmark_checks")
+    for col in (
+        "scan_id",
+        "team_id",
+        "cloud",
+        "check_id",
+        "status",
+        "severity",
+        "cis_section",
+        "resource_ids",
+        "remediation",
+        "fix_cli",
+        "priority",
+        "guardrails",
+        "requires_human_review",
+    ):
+        assert col in cols, f"cis_benchmark_checks missing column: {col}"
+    assert "idx_cis_checks_team_cloud_status_priority" in _indexes()
+    assert "ALTER TABLE cis_benchmark_checks ENABLE ROW LEVEL SECURITY" in SQL
+    assert "CREATE POLICY cis_benchmark_checks_tenant_isolation ON cis_benchmark_checks" in SQL
+
+
+def test_cis_benchmark_backfill_migration_is_idempotent():
+    body = MIGRATION.read_text()
+    assert "build_cis_benchmark_check_rows" in body
+    assert "DELETE FROM cis_benchmark_checks WHERE scan_id = %s AND team_id = %s" in body
+    assert "INSERT INTO cis_benchmark_checks" in body
 
 
 # ── findings ─────────────────────────────────────────────────────────────────
@@ -213,7 +483,20 @@ def test_policy_results_status_values_documented():
 
 def test_api_keys_required_columns():
     cols = _columns_for("api_keys")
-    for col in ("key_id", "key_hash", "key_salt", "key_prefix", "name", "role", "team_id", "scopes", "revoked"):
+    for col in (
+        "key_id",
+        "key_hash",
+        "key_salt",
+        "key_prefix",
+        "name",
+        "role",
+        "team_id",
+        "scopes",
+        "revoked_at",
+        "rotation_overlap_until",
+        "replacement_key_id",
+        "revoked",
+    ):
         assert col in cols, f"api_keys missing column: {col}"
 
 
@@ -236,6 +519,46 @@ def test_api_keys_prefix_index():
     assert "idx_api_keys_prefix" in _indexes()
 
 
+def test_api_keys_rls_policy_exists():
+    assert "ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY" in SQL
+    assert "CREATE POLICY api_keys_tenant_isolation ON api_keys" in SQL
+
+
+# ── exceptions ────────────────────────────────────────────────────────────────
+
+
+def test_exceptions_required_columns():
+    cols = _columns_for("exceptions")
+    for col in (
+        "exception_id",
+        "vuln_id",
+        "package_name",
+        "server_name",
+        "reason",
+        "requested_by",
+        "approved_by",
+        "status",
+        "created_at",
+        "expires_at",
+        "approved_at",
+        "revoked_at",
+        "team_id",
+    ):
+        assert col in cols, f"exceptions missing column: {col}"
+
+
+def test_exceptions_indexes_exist():
+    indexes = _indexes()
+    assert "idx_exc_status" in indexes
+    assert "idx_exc_team" in indexes
+    assert "idx_exc_vuln" in indexes
+
+
+def test_exceptions_rls_policy_exists():
+    assert "ALTER TABLE exceptions ENABLE ROW LEVEL SECURITY" in SQL
+    assert "CREATE POLICY exceptions_tenant_isolation ON exceptions" in SQL
+
+
 # ── job_queue ─────────────────────────────────────────────────────────────────
 
 
@@ -252,8 +575,43 @@ def test_job_queue_status_partial_index():
 
 
 def test_job_queue_payload_jsonb():
-    assert "payload" in SQL
-    assert "JSONB" in SQL.split("payload")[1][:20].upper()
+    start = SQL.index("CREATE TABLE IF NOT EXISTS job_queue")
+    payload = SQL.index("payload", start)
+    assert "JSONB" in SQL[payload : payload + 30].upper()
+
+
+# ── scan_schedules RLS / tenant contract ────────────────────────────────────
+
+
+def test_scan_schedules_has_tenant_id_column():
+    cols = _columns_for("scan_schedules")
+    assert "tenant_id" in cols
+
+
+def test_scan_schedules_tenant_index_exists():
+    assert "idx_schedules_tenant_due" in _indexes()
+
+
+def test_rls_helpers_exist():
+    assert "CREATE OR REPLACE FUNCTION public.abom_current_tenant()" in SQL
+    assert "CREATE OR REPLACE FUNCTION public.abom_rls_bypass()" in SQL
+
+
+def test_fleet_agents_rls_policy_exists():
+    assert "ALTER TABLE fleet_agents ENABLE ROW LEVEL SECURITY" in SQL
+    assert "CREATE POLICY fleet_agents_tenant_isolation ON fleet_agents" in SQL
+
+
+def test_fleet_endpoints_has_tenant_key_and_rls_policy():
+    assert {"tenant_id", "endpoint_id", "completeness", "updated_at", "data"}.issubset(_columns_for("fleet_endpoints"))
+    assert "PRIMARY KEY (tenant_id, endpoint_id)" in SQL
+    assert "ALTER TABLE fleet_endpoints ENABLE ROW LEVEL SECURITY" in SQL
+    assert "CREATE POLICY fleet_endpoints_tenant_isolation ON fleet_endpoints" in SQL
+
+
+def test_scan_schedules_rls_policy_exists():
+    assert "ALTER TABLE scan_schedules ENABLE ROW LEVEL SECURITY" in SQL
+    assert "CREATE POLICY scan_schedules_tenant_isolation ON scan_schedules" in SQL
 
 
 # ── FK consistency ────────────────────────────────────────────────────────────
@@ -289,3 +647,19 @@ def test_all_creates_use_if_not_exists():
 
 def test_extensions_present():
     assert "CREATE EXTENSION IF NOT EXISTS pgcrypto" in SQL
+    assert "CREATE EXTENSION IF NOT EXISTS pg_trgm" in SQL
+
+
+def test_graph_hot_path_indexes_exist():
+    indexes = _indexes()
+    for index_name in (
+        "idx_pg_graph_nodes_scan_id_cover",
+        "idx_pg_graph_edges_scan_source_traversable",
+        "idx_pg_graph_edges_snapshot_key",
+        "idx_pg_attack_paths_source_risk",
+        "idx_pg_graph_node_search_trgm",
+        "idx_pg_graph_node_search_lower_trgm",
+    ):
+        assert index_name in indexes
+    assert "LOWER(search_text) gin_trgm_ops" in SQL
+    assert "WHERE traversable = 1" in SQL

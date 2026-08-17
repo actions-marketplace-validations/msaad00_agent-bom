@@ -14,12 +14,12 @@ from typing import Optional
 
 import yaml  # type: ignore[import-untyped]
 from rich.console import Console
+from rich.markup import escape
 
 # Re-export parser functions for backward compatibility
 from agent_bom.discovery.config_parsers import (  # noqa: F401
     _DANGEROUS_HOOK_PATTERNS,
     _parse_docker_mcp_catalog,
-    _parse_toolhive_servers,
     audit_cortex_hooks,
     audit_cortex_permissions,
     parse_claude_json_projects,
@@ -29,10 +29,35 @@ from agent_bom.discovery.config_parsers import (  # noqa: F401
     parse_mcp_config,
     parse_snowflake_connections,
 )
+from agent_bom.floating_refs import classify_image_reference
 from agent_bom.models import Agent, AgentStatus, AgentType, MCPServer, TransportType
-from agent_bom.security import sanitize_env_vars
+from agent_bom.security import sanitize_env_vars, sanitize_log_label
 
 console = Console(stderr=True)
+
+
+def _display_label(value: object, max_len: int = 500) -> str:
+    return escape(sanitize_log_label(value, max_len=max_len))
+
+
+def _read_text_no_symlink(path: Path, *, encoding: str = "utf-8") -> str:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            return fh.read().decode(encoding, errors="replace")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _read_json_config_no_symlink(path: Path) -> dict:
+    return json.loads(_read_text_no_symlink(path))
+
+
 logger = logging.getLogger(__name__)
 
 # Config file locations per platform
@@ -145,12 +170,6 @@ CONFIG_LOCATIONS: dict[AgentType, dict[str, list[str]]] = {
         "Linux": ["~/.config/Code/User/globalStorage/amazonwebservices.amazon-q-vscode/mcp.json"],
         "Windows": ["~/AppData/Roaming/Code/User/globalStorage/amazonwebservices.amazon-q-vscode/mcp.json"],
     },
-    AgentType.TOOLHIVE: {
-        # ToolHive MCP server manager — discovery via `thv list`, not config files
-        "Darwin": [],
-        "Linux": [],
-        "Windows": [],
-    },
     AgentType.DOCKER_MCP: {
         # Docker Desktop MCP Toolkit — discovery via registry.yaml + catalog
         "Darwin": [],
@@ -192,13 +211,69 @@ CONFIG_LOCATIONS: dict[AgentType, dict[str, list[str]]] = {
         "Linux": ["~/.tabnine/mcp_servers.json"],
         "Windows": ["~/.tabnine/mcp_servers.json"],
     },
+    AgentType.SOURCEGRAPH_CODY: {
+        # Sourcegraph Cody — VS Code extension + standalone config
+        "Darwin": [
+            "~/Library/Application Support/Code/User/globalStorage/sourcegraph.cody-ai/mcp.json",
+            "~/.cody/mcp.json",
+        ],
+        "Linux": [
+            "~/.config/Code/User/globalStorage/sourcegraph.cody-ai/mcp.json",
+            "~/.cody/mcp.json",
+        ],
+        "Windows": [
+            "~/AppData/Roaming/Code/User/globalStorage/sourcegraph.cody-ai/mcp.json",
+            "~/.cody/mcp.json",
+        ],
+    },
+    AgentType.AIDER: {
+        # Aider AI pair programming — YAML config with mcpServers
+        "Darwin": ["~/.aider/mcp.json", "~/.aider.conf.yml"],
+        "Linux": ["~/.aider/mcp.json", "~/.aider.conf.yml"],
+        "Windows": ["~/.aider/mcp.json", "~/.aider.conf.yml"],
+    },
+    AgentType.REPLIT_AGENT: {
+        # Replit Agent — .replit config or MCP config in workspace
+        "Darwin": [],
+        "Linux": [],
+        "Windows": [],
+    },
+    AgentType.VOID_EDITOR: {
+        # Void editor (open-source Cursor alternative) — uses VS Code-style config
+        "Darwin": ["~/.void/mcp.json", "~/Library/Application Support/Void/User/globalStorage/void.mcp/mcp.json"],
+        "Linux": ["~/.void/mcp.json", "~/.config/Void/User/globalStorage/void.mcp/mcp.json"],
+        "Windows": ["~/.void/mcp.json", "~/AppData/Roaming/Void/User/globalStorage/void.mcp/mcp.json"],
+    },
+    AgentType.AIDE: {
+        # Aide AI IDE (VS Code fork) — standard mcpServers format
+        "Darwin": ["~/.aide/mcp.json", "~/Library/Application Support/Aide/User/mcp.json"],
+        "Linux": ["~/.aide/mcp.json", "~/.config/Aide/User/mcp.json"],
+        "Windows": ["~/.aide/mcp.json", "~/AppData/Roaming/Aide/User/mcp.json"],
+    },
+    AgentType.TRAE: {
+        # Trae AI IDE (ByteDance) — standard mcpServers format
+        "Darwin": ["~/.trae/mcp.json", "~/Library/Application Support/Trae/User/mcp.json"],
+        "Linux": ["~/.trae/mcp.json", "~/.config/Trae/User/mcp.json"],
+        "Windows": ["~/.trae/mcp.json", "~/AppData/Roaming/Trae/User/mcp.json"],
+    },
+    AgentType.PIECES: {
+        # Pieces for Developers — desktop app + VS Code extension
+        "Darwin": ["~/Library/Application Support/com.pieces.os/mcp.json", "~/.pieces/mcp.json"],
+        "Linux": ["~/.pieces/mcp.json"],
+        "Windows": ["~/AppData/Roaming/Pieces/mcp.json", "~/.pieces/mcp.json"],
+    },
+    AgentType.MCP_CLI: {
+        # mcp-cli standalone tool — config in ~/.mcp/
+        "Darwin": ["~/.mcp/config.json"],
+        "Linux": ["~/.mcp/config.json"],
+        "Windows": ["~/.mcp/config.json"],
+    },
 }
 
 # Map agent types to their CLI binary names for installed-but-not-configured detection
 AGENT_BINARIES: dict[AgentType, str] = {
     AgentType.CLAUDE_CODE: "claude",
     AgentType.OPENCLAW: "openclaw",
-    AgentType.TOOLHIVE: "thv",
     AgentType.ZED: "zed",
     AgentType.CURSOR: "cursor",
     AgentType.WINDSURF: "windsurf",
@@ -208,6 +283,11 @@ AGENT_BINARIES: dict[AgentType, str] = {
     AgentType.GOOSE: "goose",
     AgentType.SNOWFLAKE_CLI: "snow",
     AgentType.JUNIE: "junie",
+    AgentType.AIDER: "aider",
+    AgentType.VOID_EDITOR: "void",
+    AgentType.AIDE: "aide",
+    AgentType.TRAE: "trae",
+    AgentType.MCP_CLI: "mcp",
 }
 
 # Project-level config files to search for
@@ -216,6 +296,9 @@ PROJECT_CONFIG_FILES = [
     "mcp.json",
     ".cursor/mcp.json",
     ".vscode/mcp.json",
+    ".windsurf/mcp.json",
+    ".claude/settings.json",
+    ".claude/settings.local.json",
     ".openclaw/openclaw.json",
     ".codex/config.toml",
     ".gemini/settings.json",
@@ -229,6 +312,33 @@ def get_platform() -> str:
 
 def expand_path(path_str: str) -> Path:
     return Path(os.path.expanduser(path_str)).resolve()
+
+
+def _project_scope_path(project_dir: Optional[str]) -> Path:
+    """Return the configured project scope path, preserving file inputs."""
+    return Path(project_dir).expanduser().resolve() if project_dir else Path.cwd()
+
+
+def _project_search_dir(project_dir: Optional[str]) -> Path:
+    """Return the directory used for project-adjacent discovery."""
+    path = _project_scope_path(project_dir)
+    return path.parent if path.is_file() else path
+
+
+def _project_config_candidates(project_dir: Optional[str]) -> list[Path]:
+    """Return explicit project config files to parse."""
+    path = _project_scope_path(project_dir)
+    if path.is_file():
+        return [path]
+    return [path / config_name for config_name in PROJECT_CONFIG_FILES]
+
+
+def _parse_project_config_file(config_path: Path) -> list[MCPServer]:
+    """Parse one project-level MCP config file."""
+    if config_path.suffix == ".toml":
+        return parse_codex_config(str(config_path))
+    config_data = _read_json_config_no_symlink(config_path)
+    return parse_mcp_config(config_data, str(config_path))
 
 
 def get_all_discovery_paths(plat: Optional[str] = None) -> list[tuple[str, str]]:
@@ -262,67 +372,6 @@ _CUSTOM_PARSERS: dict[AgentType, str] = {
 }
 
 
-def discover_toolhive() -> Optional[Agent]:
-    """Discover MCP servers managed by ToolHive via ``thv list``.
-
-    Returns an Agent with CONFIGURED status if servers are found,
-    INSTALLED_NOT_CONFIGURED if thv is on PATH but no servers,
-    or None if thv is not installed.
-    """
-    if not shutil.which("thv"):
-        return None
-
-    try:
-        result = subprocess.run(
-            ["thv", "list", "--output", "json"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return Agent(
-            name="toolhive",
-            agent_type=AgentType.TOOLHIVE,
-            config_path="thv (binary on PATH)",
-            status=AgentStatus.INSTALLED_NOT_CONFIGURED,
-        )
-
-    if result.returncode != 0:
-        return Agent(
-            name="toolhive",
-            agent_type=AgentType.TOOLHIVE,
-            config_path="thv (binary on PATH)",
-            status=AgentStatus.INSTALLED_NOT_CONFIGURED,
-        )
-
-    try:
-        data = json.loads(result.stdout)
-    except (json.JSONDecodeError, ValueError):
-        return Agent(
-            name="toolhive",
-            agent_type=AgentType.TOOLHIVE,
-            config_path="thv (binary on PATH)",
-            status=AgentStatus.INSTALLED_NOT_CONFIGURED,
-        )
-
-    servers = _parse_toolhive_servers(data)
-    if not servers:
-        return Agent(
-            name="toolhive",
-            agent_type=AgentType.TOOLHIVE,
-            config_path="thv (binary on PATH)",
-            status=AgentStatus.INSTALLED_NOT_CONFIGURED,
-        )
-
-    return Agent(
-        name="toolhive",
-        agent_type=AgentType.TOOLHIVE,
-        config_path="thv",
-        mcp_servers=servers,
-        status=AgentStatus.CONFIGURED,
-    )
-
-
 def _find_binary(binary_name: str) -> str | None:
     """Find a binary on PATH or in common install locations."""
     found = shutil.which(binary_name)
@@ -351,8 +400,6 @@ def detect_installed_agents(discovered_types: set[AgentType]) -> list[Agent]:
     for agent_type, binary_name in AGENT_BINARIES.items():
         if agent_type in discovered_types:
             continue
-        if agent_type == AgentType.TOOLHIVE:
-            continue  # Handled by discover_toolhive()
         found = _find_binary(binary_name)
         if not found:
             # Check install signal files (e.g. log files that prove installation)
@@ -372,10 +419,12 @@ def detect_installed_agents(discovered_types: set[AgentType]) -> list[Agent]:
     return installed
 
 
-def discover_global_configs(agent_types: Optional[list[AgentType]] = None) -> list[Agent]:
+def discover_global_configs(agent_types: Optional[list[AgentType]] = None, *, quiet: bool = False) -> list[Agent]:
     """Discover all global MCP client configurations."""
     agents: list[Agent] = []
     sys_platform = get_platform()
+    pending_cortex_metadata: dict = {}
+    cortex_metadata_path: Optional[str] = None
 
     if agent_types is None:
         agent_types = list(CONFIG_LOCATIONS.keys())
@@ -399,7 +448,11 @@ def discover_global_configs(agent_types: Optional[list[AgentType]] = None) -> li
                 # Skip symlinks whose target differs from the link path's parent tree
                 raw_path = Path(os.path.expanduser(path_str)) if "*" not in path_str else rp
                 if raw_path.is_symlink() and not rp.is_relative_to(raw_path.parent):
-                    logger.warning("Skipping symlink pointing outside parent: %s -> %s", raw_path, rp)
+                    logger.warning(
+                        "Skipping symlink pointing outside parent: %s -> %s",
+                        sanitize_log_label(raw_path),
+                        sanitize_log_label(rp),
+                    )
                     continue
                 safe_paths.append(rp)
 
@@ -414,11 +467,11 @@ def discover_global_configs(agent_types: Optional[list[AgentType]] = None) -> li
                     if agent_type == AgentType.CORTEX_CODE and config_path.name != "mcp.json":
                         metadata = parse_cortex_code_metadata(str(config_path))
                         if metadata:
-                            # Attach metadata to existing agent or store for later
-                            for a in agents:
-                                if a.agent_type == AgentType.CORTEX_CODE:
-                                    a.metadata.update(metadata)
-                                    break
+                            # Buffer the findings and flush after the path loop so they
+                            # attach regardless of whether the mcp.json (and thus the
+                            # CORTEX_CODE agent) is discovered before or after this file.
+                            pending_cortex_metadata.update(metadata)
+                            cortex_metadata_path = str(config_path)
                         continue
 
                     # Custom parsers for non-JSON formats
@@ -430,7 +483,7 @@ def discover_global_configs(agent_types: Optional[list[AgentType]] = None) -> li
                         servers = parse_snowflake_connections(str(config_path))
                     else:
                         # Default JSON parsing
-                        config_data = json.loads(config_path.read_text())
+                        config_data = _read_json_config_no_symlink(config_path)
                         servers = parse_mcp_config(config_data, str(config_path))
 
                         # Claude Code ~/.claude.json has project-level MCP servers
@@ -445,9 +498,31 @@ def discover_global_configs(agent_types: Optional[list[AgentType]] = None) -> li
                             mcp_servers=servers,
                         )
                         agents.append(agent)
-                        console.print(f"  [green]✓[/green] Found {agent_type.value} with {len(servers)} MCP server(s): {config_path}")
+                        if not quiet:
+                            console.print(
+                                f"  [green]✓[/green] Found {_display_label(agent_type.value)} "
+                                f"with {len(servers)} MCP server(s): {_display_label(config_path)}"
+                            )
                 except (json.JSONDecodeError, KeyError, TypeError, Exception) as e:
-                    console.print(f"  [yellow]⚠[/yellow] Error parsing {config_path}: {e}")
+                    if not quiet:
+                        console.print(f"  [yellow]⚠[/yellow] Error parsing {_display_label(config_path)}: {_display_label(e)}")
+
+    if pending_cortex_metadata:
+        cortex_agent = next((a for a in agents if a.agent_type == AgentType.CORTEX_CODE), None)
+        if cortex_agent is not None:
+            cortex_agent.metadata.update(pending_cortex_metadata)
+        else:
+            # No mcp.json was found, but the auxiliary security findings still
+            # matter — surface them on a standalone CORTEX_CODE agent.
+            agents.append(
+                Agent(
+                    name=AgentType.CORTEX_CODE.value,
+                    agent_type=AgentType.CORTEX_CODE,
+                    config_path=cortex_metadata_path or AgentType.CORTEX_CODE.value,
+                    status=AgentStatus.INSTALLED_NOT_CONFIGURED,
+                    metadata=pending_cortex_metadata,
+                )
+            )
 
     return agents
 
@@ -455,20 +530,12 @@ def discover_global_configs(agent_types: Optional[list[AgentType]] = None) -> li
 def discover_project_configs(project_dir: Optional[str] = None) -> list[Agent]:
     """Discover project-level MCP configurations."""
     agents = []
-    search_dir = Path(project_dir) if project_dir else Path.cwd()
+    search_dir = _project_search_dir(project_dir)
 
-    for config_name in PROJECT_CONFIG_FILES:
-        config_path = search_dir / config_name
+    for config_path in _project_config_candidates(project_dir):
         if config_path.exists():
             try:
-                servers: list[MCPServer] = []
-
-                if config_name.endswith(".toml"):
-                    # Codex project config
-                    servers = parse_codex_config(str(config_path))
-                else:
-                    config_data = json.loads(config_path.read_text())
-                    servers = parse_mcp_config(config_data, str(config_path))
+                servers = _parse_project_config_file(config_path)
 
                 if servers:
                     agent = Agent(
@@ -478,9 +545,11 @@ def discover_project_configs(project_dir: Optional[str] = None) -> list[Agent]:
                         mcp_servers=servers,
                     )
                     agents.append(agent)
-                    console.print(f"  [green]✓[/green] Found project config with {len(servers)} MCP server(s): {config_path}")
+                    console.print(
+                        f"  [green]✓[/green] Found project config with {len(servers)} MCP server(s): {_display_label(config_path)}"
+                    )
             except (json.JSONDecodeError, KeyError, TypeError, Exception) as e:
-                console.print(f"  [yellow]⚠[/yellow] Error parsing {config_path}: {e}")
+                console.print(f"  [yellow]⚠[/yellow] Error parsing {_display_label(config_path)}: {_display_label(e)}")
 
     return agents
 
@@ -641,6 +710,8 @@ def discover_compose_mcp_servers(project_dir: Optional[str] = None) -> Optional[
                 version=pkg_version,
                 ecosystem="docker",
                 is_direct=True,
+                floating_reference=(floating := classify_image_reference(image)) is not None,
+                floating_reference_reason=floating.reason if floating else None,
             )
         ]
 
@@ -652,6 +723,7 @@ def discover_compose_mcp_servers(project_dir: Optional[str] = None) -> Optional[
             transport=TransportType.STDIO,
             packages=packages,
             config_path=str(compose_path),
+            security_warnings=[floating.to_security_warning()] if floating else [],
         )
         mcp_servers.append(server)
 
@@ -885,6 +957,8 @@ def discover_container_labels() -> Optional[Agent]:
                 version=image_name.split(":")[-1] if ":" in image_name else "latest",
                 ecosystem="docker",
                 is_direct=True,
+                floating_reference=(floating := classify_image_reference(image_name)) is not None,
+                floating_reference_reason=floating.reason if floating else None,
             )
         ]
 
@@ -897,6 +971,7 @@ def discover_container_labels() -> Optional[Agent]:
             url=url,
             packages=packages,
             config_path=f"docker://{cid[:12]}",
+            security_warnings=[floating.to_security_warning()] if floating else [],
         )
         mcp_servers.append(server)
 
@@ -1113,7 +1188,7 @@ def discover_filesystem_mcps(root: Path) -> list[Agent]:
                 try:
                     resolved = config_path.resolve()
                     if not resolved.is_relative_to(root):
-                        logger.warning("Skipping path outside root: %s", config_path)
+                        logger.warning("Skipping path outside root: %s", sanitize_log_label(config_path))
                         continue
                 except (OSError, ValueError):
                     continue
@@ -1124,7 +1199,7 @@ def discover_filesystem_mcps(root: Path) -> list[Agent]:
                 try:
                     servers: list[MCPServer] = []
                     if config_path.suffix == ".json":
-                        config_data = json.loads(config_path.read_text(encoding="utf-8"))
+                        config_data = _read_json_config_no_symlink(config_path)
                         servers = parse_mcp_config(config_data, str(config_path))
                     elif config_path.suffix == ".toml" and agent_type == AgentType.CODEX_CLI:
                         servers = parse_codex_config(str(config_path))
@@ -1140,12 +1215,12 @@ def discover_filesystem_mcps(root: Path) -> list[Agent]:
                         agents.append(agent)
                         logger.info(
                             "Discovered %s with %d server(s) in filesystem: %s",
-                            agent_type.value,
+                            sanitize_log_label(agent_type.value),
                             len(servers),
-                            config_path,
+                            sanitize_log_label(config_path),
                         )
                 except Exception:
-                    logger.debug("Failed to parse %s", config_path, exc_info=True)
+                    logger.debug("Failed to parse %s", sanitize_log_label(config_path), exc_info=True)
 
     return agents
 
@@ -1161,10 +1236,12 @@ def discover_all(
     k8s_all_namespaces: bool = False,
     k8s_context: Optional[str] = None,
 ) -> list[Agent]:
-    """Run full discovery: global configs + project configs + CLI agents.
+    """Run discovery for the local machine or a specific project.
 
     Args:
-        project_dir: Optional project directory to scan.
+        project_dir: Optional project directory to scan. When provided,
+            discovery is scoped to that project instead of ambient
+            machine-wide MCP configuration.
         dynamic: Enable dynamic content-based discovery layer.
         dynamic_max_depth: Maximum depth for dynamic filesystem scanning.
         include_processes: Also scan running host processes for MCP servers (psutil).
@@ -1174,48 +1251,45 @@ def discover_all(
         k8s_all_namespaces: Query all Kubernetes namespaces.
         k8s_context: kubectl context to use (uses current context if None).
     """
-    console.print("\n[bold blue]🔍 Discovering MCP configurations...[/bold blue]\n")
+    from agent_bom.output.console_render import safe_emoji
 
-    agents = discover_global_configs()
+    console.print(f"\n[bold blue]{safe_emoji('🔍', '>')} Discovering MCP configurations...[/bold blue]\n")
+    project_search_dir = str(_project_search_dir(project_dir)) if project_dir else None
 
     if project_dir:
-        agents.extend(discover_project_configs(project_dir))
+        agents = discover_project_configs(project_dir)
     else:
+        agents = discover_global_configs()
         agents.extend(discover_project_configs())
 
     # Docker Compose MCP server discovery
-    compose_agent = discover_compose_mcp_servers(project_dir)
+    compose_agent = discover_compose_mcp_servers(project_search_dir)
     if compose_agent:
         console.print(
-            f"  [green]✓[/green] Found {len(compose_agent.mcp_servers)} MCP server(s) in Docker Compose: {compose_agent.config_path}"
+            f"  [green]✓[/green] Found {len(compose_agent.mcp_servers)} MCP server(s) "
+            f"in Docker Compose: {_display_label(compose_agent.config_path)}"
         )
         agents.append(compose_agent)
 
-    # ToolHive CLI-based discovery
-    thv_agent = discover_toolhive()
-    if thv_agent:
-        if thv_agent.mcp_servers:
-            console.print(f"  [green]✓[/green] Found toolhive with {len(thv_agent.mcp_servers)} MCP server(s) (via thv list)")
-        else:
-            console.print("  [dim]  toolhive: installed but not configured[/dim]")
-        agents.append(thv_agent)
-
-    # Docker Desktop MCP Toolkit discovery
-    docker_agent = discover_docker_mcp()
-    if docker_agent:
-        if docker_agent.mcp_servers:
-            total_tools = sum(len(s.tools) for s in docker_agent.mcp_servers)
-            console.print(
-                f"  [green]✓[/green] Found docker-mcp with "
-                f"{len(docker_agent.mcp_servers)} enabled server(s), "
-                f"{total_tools} tool(s) (via Docker Desktop MCP Toolkit)"
-            )
-        else:
-            console.print("  [dim]  docker-mcp: installed but not configured[/dim]")
-        agents.append(docker_agent)
+    if not project_dir:
+        # Tooling and desktop integrations are ambient host discovery surfaces,
+        # so skip them when the caller explicitly scopes discovery to a project.
+        # Docker Desktop MCP Toolkit discovery
+        docker_agent = discover_docker_mcp()
+        if docker_agent:
+            if docker_agent.mcp_servers:
+                total_tools = sum(len(s.tools) for s in docker_agent.mcp_servers)
+                console.print(
+                    f"  [green]✓[/green] Found docker-mcp with "
+                    f"{len(docker_agent.mcp_servers)} enabled server(s), "
+                    f"{total_tools} tool(s) (via Docker Desktop MCP Toolkit)"
+                )
+            else:
+                console.print("  [dim]  docker-mcp: installed but not configured[/dim]")
+            agents.append(docker_agent)
 
     # Running process discovery (opt-in, requires psutil)
-    if include_processes:
+    if include_processes and not project_dir:
         proc_agent = discover_running_processes()
         if proc_agent:
             console.print(f"  [green]✓[/green] Found {len(proc_agent.mcp_servers)} MCP server process(es) via psutil")
@@ -1224,7 +1298,7 @@ def discover_all(
             console.print("  [dim]  process scan: no MCP server processes found[/dim]")
 
     # Docker container discovery (opt-in)
-    if include_containers:
+    if include_containers and not project_dir:
         container_agent = discover_container_labels()
         if container_agent:
             console.print(f"  [green]✓[/green] Found {len(container_agent.mcp_servers)} MCP container(s) via docker inspect")
@@ -1245,12 +1319,15 @@ def discover_all(
         else:
             console.print("  [dim]  k8s-mcp scan: no MCP pods/CRDs found (or kubectl not available)[/dim]")
 
-    # Detect installed-but-not-configured agents
-    discovered_types = {a.agent_type for a in agents}
-    installed_agents = detect_installed_agents(discovered_types)
-    for ia in installed_agents:
-        console.print(f"  [dim]  {ia.name}: installed but not configured[/dim]")
-    agents.extend(installed_agents)
+    installed_agents: list[Agent] = []
+    if not project_dir:
+        # Installed-but-not-configured agents are ambient host signals, so
+        # keep them out of explicitly project-scoped scans.
+        discovered_types = {a.agent_type for a in agents}
+        installed_agents = detect_installed_agents(discovered_types)
+        for ia in installed_agents:
+            console.print(f"  [dim]  {_display_label(ia.name)}: installed but not configured[/dim]")
+        agents.extend(installed_agents)
 
     # Dynamic content-based discovery layer (opt-in)
     if dynamic:
@@ -1261,7 +1338,7 @@ def discover_all(
         console.print("\n  [bold cyan]🔎 Running dynamic discovery...[/bold cyan]")
         known_paths = {a.config_path for a in agents if a.config_path}
         dyn_result = discover_dynamic(
-            root=_DynPath(project_dir) if project_dir else _DynPath.cwd(),
+            root=_DynPath(project_search_dir) if project_search_dir else _DynPath.cwd(),
             max_depth=dynamic_max_depth,
             exclude_paths=known_paths,
         )
@@ -1272,6 +1349,9 @@ def discover_all(
             )
         agents = merge_discoveries(agents, dyn_result.agents)
 
+    from agent_bom.discovery.identity import deduplicate_discovered_agents
+
+    agents = deduplicate_discovered_agents(agents)
     configured = [a for a in agents if a.status == AgentStatus.CONFIGURED]
     if not configured and not installed_agents:
         console.print("  [yellow]No MCP configurations found.[/yellow]")

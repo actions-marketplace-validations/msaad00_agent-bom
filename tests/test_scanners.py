@@ -49,8 +49,35 @@ def test_cvss_to_severity_none_score():
 def test_osv_severity_unknown_label_not_medium():
     """OSV vuln with unrecognized severity label must return UNKNOWN, not MEDIUM."""
     vuln = {"database_specific": {"severity": "BOGUS"}}
-    severity, _ = parse_osv_severity(vuln)
+    severity, _, _sev_src = parse_osv_severity(vuln)
     assert severity == Severity.UNKNOWN
+
+
+def test_osv_prefixed_advisory_without_score_uses_medium_fallback():
+    """OSV-issued advisories with no score still need a non-unknown triage band."""
+    vuln = {"id": "OSV-2026-0001", "summary": "advisory without score"}
+    severity, score, sev_src = parse_osv_severity(vuln)
+    assert severity == Severity.MEDIUM
+    assert score is None
+    assert sev_src == "osv_heuristic"
+
+
+def test_advisory_id_severity_fallback_keeps_unknown_ids_unknown():
+    from agent_bom.scanners.risk import advisory_id_severity_fallback
+
+    severity, sev_src = advisory_id_severity_fallback("VENDOR-2026-1")
+
+    assert severity == Severity.UNKNOWN
+    assert sev_src is None
+
+
+def test_debian_advisory_without_score_uses_medium_fallback():
+    """Debian advisories without CVSS still need a visible triage band."""
+    vuln = {"id": "DEBIAN-CVE-2026-0001", "summary": "distro advisory without score"}
+    severity, score, sev_src = parse_osv_severity(vuln)
+    assert severity == Severity.MEDIUM
+    assert score is None
+    assert sev_src == "distro_advisory_heuristic"
 
 
 def test_ghsa_severity_unknown_label_not_medium():
@@ -178,51 +205,83 @@ def test_parse_cvss4_malformed():
 
 def test_parse_osv_severity_cvss_score():
     vuln = {"severity": [{"type": "CVSS_V3", "score": "9.8"}]}
-    sev, score = parse_osv_severity(vuln)
+    sev, score, _sev_src = parse_osv_severity(vuln)
     assert sev == Severity.CRITICAL
     assert score == 9.8
 
 
 def test_parse_osv_severity_cvss_vector():
     vuln = {"severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]}
-    sev, score = parse_osv_severity(vuln)
+    sev, score, _sev_src = parse_osv_severity(vuln)
     assert sev == Severity.CRITICAL
 
 
 def test_parse_osv_severity_database_specific():
     vuln = {"database_specific": {"severity": "HIGH"}}
-    sev, score = parse_osv_severity(vuln)
+    sev, score, _sev_src = parse_osv_severity(vuln)
     assert sev == Severity.HIGH
 
 
 def test_parse_osv_severity_moderate():
     vuln = {"database_specific": {"severity": "MODERATE"}}
-    sev, score = parse_osv_severity(vuln)
+    sev, score, _sev_src = parse_osv_severity(vuln)
     assert sev == Severity.MEDIUM
 
 
+def test_parse_osv_severity_debian_affected_vendor_severity():
+    vuln = {
+        "id": "DEBIAN-CVE-2024-0001",
+        "affected": [
+            {
+                "package": {"ecosystem": "Debian:12", "name": "openssl"},
+                "database_specific": {"severity": "important"},
+            }
+        ],
+    }
+    sev, score, sev_src = parse_osv_severity(vuln)
+    assert sev == Severity.HIGH
+    assert score is None
+    assert sev_src == "osv_affected_database"
+
+
+def test_parse_osv_severity_affected_cvss_vector():
+    vuln = {
+        "id": "DEBIAN-CVE-2024-0002",
+        "affected": [
+            {
+                "package": {"ecosystem": "Debian:12", "name": "bash"},
+                "ecosystem_specific": {"severity_vectors": ["CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"]},
+            }
+        ],
+    }
+    sev, score, sev_src = parse_osv_severity(vuln)
+    assert sev == Severity.CRITICAL
+    assert score is not None
+    assert sev_src == "cvss"
+
+
 def test_parse_osv_severity_no_data():
-    sev, score = parse_osv_severity({})
+    sev, score, _sev_src = parse_osv_severity({})
     assert sev == Severity.UNKNOWN  # no data must not inflate to MEDIUM
     assert score is None
 
 
 def test_parse_osv_severity_cvss4():
     vuln = {"severity": [{"type": "CVSS_V4", "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"}]}
-    sev, score = parse_osv_severity(vuln)
+    sev, score, _sev_src = parse_osv_severity(vuln)
     assert score is not None
 
 
 def test_parse_osv_severity_invalid_score():
     vuln = {"severity": [{"type": "CVSS_V3", "score": "not-a-number"}]}
-    sev, score = parse_osv_severity(vuln)
+    sev, score, _sev_src = parse_osv_severity(vuln)
     # Falls back to UNKNOWN since it can't parse — not MEDIUM
     assert sev == Severity.UNKNOWN
 
 
 def test_parse_osv_severity_out_of_range():
     vuln = {"severity": [{"type": "CVSS_V3", "score": "15.0"}]}
-    sev, score = parse_osv_severity(vuln)
+    sev, score, _sev_src = parse_osv_severity(vuln)
     assert score is None  # Out of 0-10 range
 
 
@@ -258,7 +317,7 @@ def test_parse_fixed_version_prerelease():
         ]
     }
     result = parse_fixed_version(vuln, "foo")
-    assert result == "1.0.0rc1"
+    assert result is None
 
 
 def test_parse_fixed_version_empty():
@@ -355,6 +414,27 @@ def test_build_vulnerabilities_ghsa_with_cve_alias():
     vulns = build_vulnerabilities(vuln_data, pkg)
     assert len(vulns) == 1
     assert vulns[0].id == "CVE-2025-0001"
+
+
+def test_build_vulnerabilities_extracts_affected_symbols():
+    pkg = Package(name="axios", version="1.6.0", ecosystem="npm")
+    vuln_data = [
+        {
+            "id": "GHSA-xxxx-yyyy-zzzz",
+            "summary": "axios advisory",
+            "database_specific": {"vulnerable_functions": ["get", "request"]},
+            "affected": [
+                {
+                    "package": {"name": "axios", "ecosystem": "npm"},
+                    "ecosystem_specific": {"imports": [{"path": "axios", "symbols": ["defaults"]}]},
+                }
+            ],
+        }
+    ]
+    vulns = build_vulnerabilities(vuln_data, pkg)
+    assert "get" in vulns[0].affected_symbols
+    assert "request" in vulns[0].affected_symbols
+    assert "defaults" in vulns[0].affected_symbols
 
 
 def test_build_vulnerabilities_no_summary():

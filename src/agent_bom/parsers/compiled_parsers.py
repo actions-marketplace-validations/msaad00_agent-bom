@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+import httpx
 
 from agent_bom.models import MCPServer, Package
 
@@ -120,10 +124,10 @@ def verify_go_checksums(
         # Fetch expected hash from the checksum database
         lookup_url = f"{checksum_db_url}/lookup/{mod}@{ver_key}"
         try:
-            req = urllib.request.Request(lookup_url)  # noqa: S310  # nosec B310 — HTTPS enforced above
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # nosec B310
-                body = resp.read().decode("utf-8", errors="replace")
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+            from agent_bom.http_client import fetch_bytes
+
+            body = fetch_bytes(lookup_url, timeout=timeout).decode("utf-8", errors="replace")
+        except (OSError, ValueError, ConnectionError, RuntimeError, httpx.HTTPError) as exc:
             logger.warning(
                 "go.sum verification skipped for %s — checksum DB unreachable: %s",
                 key,
@@ -191,9 +195,9 @@ def resolve_go_version(
     list_url = f"{proxy_url}/{encoded_module}/@v/list"
 
     try:
-        req = urllib.request.Request(list_url)  # noqa: S310  # nosec B310 — HTTPS enforced above
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # nosec B310
-            body = resp.read().decode("utf-8", errors="replace")
+        from agent_bom.http_client import fetch_bytes
+
+        body = fetch_bytes(list_url, timeout=timeout).decode("utf-8", errors="replace")
     except Exception as exc:  # noqa: BLE001 — never raise; return original version on any failure
         logger.warning(
             "GOPROXY version resolution failed for %s — returning original version: %s",
@@ -278,9 +282,9 @@ def resolve_maven_version(
     _maven_prerelease_re = re.compile(r"-(SNAPSHOT|RC\d*|M\d+)$", re.IGNORECASE)
 
     try:
-        req = urllib.request.Request(api_url)  # noqa: S310  # nosec B310 — HTTPS enforced above
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # nosec B310
-            raw_body = resp.read().decode("utf-8", errors="replace")
+        from agent_bom.http_client import fetch_bytes
+
+        raw_body = fetch_bytes(api_url, timeout=timeout).decode("utf-8", errors="replace")
     except Exception as exc:  # noqa: BLE001 — never raise; return original on failure
         logger.warning(
             "Maven Central version resolution failed for %s:%s — returning original version: %s",
@@ -355,9 +359,9 @@ def resolve_cargo_version(
     user_agent = f"agent-bom/{__version__} (github.com/msaad00/agent-bom)"
 
     try:
-        req = urllib.request.Request(api_url, headers={"User-Agent": user_agent})  # noqa: S310  # nosec B310 — HTTPS enforced above
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # nosec B310
-            raw_body = resp.read().decode("utf-8", errors="replace")
+        from agent_bom.http_client import fetch_bytes
+
+        raw_body = fetch_bytes(api_url, timeout=timeout, headers={"User-Agent": user_agent}).decode("utf-8", errors="replace")
     except Exception as exc:  # noqa: BLE001 — never raise; return original on failure
         logger.warning(
             "crates.io version resolution failed for %s — returning original version: %s",
@@ -408,7 +412,12 @@ def _parse_go_mod_requires(
         return direct, indirect, replace_map
 
     block_re = re.compile(r"require\s*\(([^)]+)\)", re.DOTALL)
-    single_re = re.compile(r"^require\s+(\S+)\s+(\S+)(.*)", re.MULTILINE)
+    # Horizontal-whitespace only between tokens: ``\s`` also matches newlines, so
+    # the old pattern matched the block opener ``require (`` and captured ``(`` as
+    # the module + the next dependency line as its version — a phantom package
+    # that, offline, was treated as DB-uncovered and silently dropped the whole
+    # report. ``[ \t]+`` keeps the match on one line and skips the block opener.
+    single_re = re.compile(r"^require[ \t]+(\S+)[ \t]+(\S+)([^\n]*)$", re.MULTILINE)
     replace_re = re.compile(r"^replace\s+(\S+)(?:\s+\S+)?\s+=>\s+(\S+)\s+(\S+)", re.MULTILINE)
 
     # Block-style: require ( ... )
@@ -654,6 +663,13 @@ def _parse_pom_modules(root_dir: Path, depth: int = 0) -> list[Package]:
         xml_root = tree.getroot()
     except ET.ParseError as exc:
         logger.debug("Failed to parse pom.xml in %s: %s", root_dir, exc)
+        from agent_bom.coverage import record_manifest_parse_warning
+
+        record_manifest_parse_warning(
+            ecosystem="maven",
+            path=str(pom),
+            detail=f"pom.xml failed to parse ({exc}); Maven dependencies were not scanned",
+        )
         return []
 
     # Namespace may or may not be present
@@ -771,11 +787,91 @@ def parse_maven_packages(directory: Path, *, resolve_versions: bool = False) -> 
     return unique
 
 
+def _cargo_dep_version(spec: object, workspace_spec: object | None = None) -> Optional[str]:
+    """Extract the declared version from a Cargo.toml dependency spec.
+
+    Accepts the short form (``serde = "1.0"``) and the table form
+    (``serde = { version = "1.0", features = [...] }``). Returns None for
+    path/git/workspace deps that carry no concrete version requirement.
+    """
+    if isinstance(spec, str):
+        return spec or None
+    if isinstance(spec, dict):
+        if spec.get("workspace") is True:
+            return _cargo_dep_version(workspace_spec)
+        if "path" in spec or "git" in spec:
+            return None
+        version = spec.get("version")
+        return version if isinstance(version, str) and version else None
+    return None
+
+
+def _cargo_dependency_tables(data: dict) -> list[tuple[dict, bool]]:
+    """Return Cargo dependency tables with direct/development attribution."""
+
+    tables: list[tuple[dict, bool]] = []
+    for table, direct in (("dependencies", True), ("dev-dependencies", False), ("build-dependencies", False)):
+        deps = data.get(table)
+        if isinstance(deps, dict):
+            tables.append((deps, direct))
+
+    targets = data.get("target")
+    if isinstance(targets, dict):
+        for target_cfg in targets.values():
+            if not isinstance(target_cfg, dict):
+                continue
+            for table, direct in (("dependencies", True), ("dev-dependencies", False), ("build-dependencies", False)):
+                deps = target_cfg.get(table)
+                if isinstance(deps, dict):
+                    tables.append((deps, direct))
+    return tables
+
+
+def _parse_cargo_toml(cargo_toml: Path) -> list[Package]:
+    """Parse declared dependencies from Cargo.toml (manifest-only fallback).
+
+    Used when a Rust project has no Cargo.lock. Versions are SemVer *requirements*
+    (e.g. ``"1.0"``, ``"^1.2"``) rather than the exact pins a lockfile carries, so
+    coverage is approximate — but vastly better than the previous silent zero.
+    """
+    try:
+        import tomllib
+
+        data = tomllib.loads(cargo_toml.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return []
+
+    pkgs: list[Package] = []
+    seen: set[str] = set()
+    workspace = data.get("workspace")
+    workspace_deps = workspace.get("dependencies") if isinstance(workspace, dict) else None
+    if not isinstance(workspace_deps, dict):
+        workspace_deps = {}
+
+    for deps, direct in _cargo_dependency_tables(data):
+        for name, spec in deps.items():
+            version = _cargo_dep_version(spec, workspace_deps.get(name))
+            if not version or name in seen:
+                continue
+            seen.add(name)
+            pkgs.append(
+                Package(
+                    name=name,
+                    version=version,
+                    ecosystem="cargo",
+                    purl=f"pkg:cargo/{name}@{version}",
+                    is_direct=direct,
+                    version_source="manifest",
+                )
+            )
+    return pkgs
+
+
 def parse_cargo_packages(directory: Path, *, resolve_versions: bool = False) -> list[Package]:
-    """Parse packages from Cargo.lock.
+    """Parse packages from Cargo.lock, falling back to Cargo.toml.
 
     Args:
-        directory: Project directory containing ``Cargo.lock``.
+        directory: Project directory containing ``Cargo.lock`` and/or ``Cargo.toml``.
         resolve_versions: When ``True``, packages with unresolved versions
             (``"*"``, ``""``, ``"latest"`` or ``"unknown"``) are queried
             against the crates.io REST API to obtain their latest stable
@@ -788,7 +884,7 @@ def parse_cargo_packages(directory: Path, *, resolve_versions: bool = False) -> 
     if cargo_lock.exists():
         current_name: Optional[str] = None
         current_version: Optional[str] = None
-        for raw_line in cargo_lock.read_text().splitlines():
+        for raw_line in cargo_lock.read_text(encoding="utf-8", errors="replace").splitlines():
             stripped_line = raw_line.strip()
             if stripped_line.startswith('name = "'):
                 current_name = stripped_line.split('"')[1]
@@ -805,6 +901,10 @@ def parse_cargo_packages(directory: Path, *, resolve_versions: bool = False) -> 
                 )
                 current_name = None
                 current_version = None
+    elif (directory / "Cargo.toml").exists():
+        # Manifest-only project (no lockfile): parse declared deps so the whole
+        # cargo ecosystem isn't silently missed.
+        cargo_packages = _parse_cargo_toml(directory / "Cargo.toml")
 
     if resolve_versions:
         for pkg in cargo_packages:
@@ -1236,44 +1336,109 @@ def parse_conda_packages(directory: Path) -> list[Package]:
     return unique
 
 
+def _normalize_python_dist_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _resolve_uv_cached_version(name: str) -> tuple[str, Path] | None:
+    """Return an exact package version from uv's local cache, if present."""
+    cache_root = Path(os.environ.get("UV_CACHE_DIR") or Path.home() / ".cache" / "uv")
+    if not cache_root.exists():
+        return None
+
+    wanted = _normalize_python_dist_name(name)
+    matches: list[tuple[float, str, Path]] = []
+    inspected = 0
+    for metadata_path in cache_root.glob("archive-v*/**/*.dist-info/METADATA"):
+        inspected += 1
+        if inspected > 5000:
+            break
+        try:
+            dist_info_name = metadata_path.parent.name.rsplit(".dist-info", 1)[0]
+            candidate_name = dist_info_name.rsplit("-", 1)[0]
+            if _normalize_python_dist_name(candidate_name) != wanted:
+                continue
+            metadata = metadata_path.read_text(encoding="utf-8", errors="replace")
+            version = ""
+            declared_name = ""
+            for line in metadata.splitlines():
+                if line.startswith("Name: "):
+                    declared_name = line.removeprefix("Name: ").strip()
+                elif line.startswith("Version: "):
+                    version = line.removeprefix("Version: ").strip()
+                if declared_name and version:
+                    break
+            if version and (not declared_name or _normalize_python_dist_name(declared_name) == wanted):
+                matches.append((metadata_path.stat().st_mtime, version, metadata_path))
+        except Exception as exc:
+            logger.debug("Failed to inspect uv cache package metadata at %s: %s", metadata_path, exc)
+    if not matches:
+        return None
+    _, version, path = max(matches, key=lambda item: item[0])
+    return version, path
+
+
+def _uvx_package_from_command(name: str, declared_version: str, server: MCPServer) -> Package:
+    is_floating = declared_version in {"latest", "*"}
+    cached = _resolve_uv_cached_version(name) if is_floating else None
+    version = cached[0] if cached else declared_version
+    pkg = Package(
+        name=name,
+        version=version,
+        ecosystem="pypi",
+        purl=f"pkg:pypi/{name}@{version}",
+        is_direct=True,
+    )
+    pkg.declared_version = declared_version
+    if not is_floating:
+        pkg.resolved_version = version
+        pkg.version_source = "command_pin"
+        pkg.version_confidence = "exact"
+        pkg.version_evidence = [{"type": "command_pin", "source_file": server.config_path or "", "parser": "uvx"}]
+    elif cached:
+        _, evidence_path = cached
+        pkg.resolved_version = version
+        pkg.version_source = "tool_cache"
+        pkg.version_confidence = "high"
+        pkg.version_resolved_at = datetime.now(timezone.utc).isoformat()
+        pkg.version_evidence = [{"type": "tool_cache", "path": str(evidence_path), "parser": "uvx"}]
+        pkg.floating_reference = True
+        pkg.floating_reference_reason = "uvx command omitted an explicit package version"
+    else:
+        pkg.resolved_from_registry = True
+        pkg.version_source = "registry_fallback"
+        pkg.registry_version = declared_version
+        pkg.floating_reference = True
+        pkg.floating_reference_reason = "uvx command omitted an explicit package version"
+    return pkg
+
+
 def detect_uvx_package(server: MCPServer) -> list[Package]:
     """Extract package info from uvx/uv commands."""
     packages: list[Package] = []
     if server.command not in ("uvx", "uv"):
         return packages
 
-    args = server.args
-    for i, arg in enumerate(args):
-        if arg in ("run", "tool") and i + 1 < len(args):
-            pkg_arg = args[i + 1]
-            match = re.match(r"^([a-zA-Z0-9_.-]+)(?:==(.+))?$", pkg_arg)
-            if match:
-                name = match.group(1)
-                version = match.group(2) or "latest"
-                packages.append(
-                    Package(
-                        name=name,
-                        version=version,
-                        ecosystem="pypi",
-                        purl=f"pkg:pypi/{name}@{version}",
-                        is_direct=True,
-                    )
-                )
-            break
-        elif not arg.startswith("-") and arg not in ("run", "tool"):
-            match = re.match(r"^([a-zA-Z0-9_.-]+)(?:==(.+))?$", arg)
-            if match:
-                name = match.group(1)
-                version = match.group(2) or "latest"
-                packages.append(
-                    Package(
-                        name=name,
-                        version=version,
-                        ecosystem="pypi",
-                        purl=f"pkg:pypi/{name}@{version}",
-                        is_direct=True,
-                    )
-                )
-            break
+    args = list(server.args)
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        # ``uv tool run <pkg>`` stacks two sub-commands before the package.
+        # Reading the token immediately after the FIRST one resolved
+        # ``uv tool run flask==0.12.2`` to a package literally named "run".
+        if arg in ("run", "tool"):
+            index += 1
+            continue
+        if arg == "--from" and index + 1 < len(args):
+            arg = args[index + 1]
+        elif arg.startswith("-"):
+            index += 1
+            continue
+        match = re.match(r"^([a-zA-Z0-9_.-]+)(?:==(.+))?$", arg)
+        if match:
+            name = match.group(1)
+            version = match.group(2) or "latest"
+            packages.append(_uvx_package_from_command(name, version, server))
+        break
 
     return packages

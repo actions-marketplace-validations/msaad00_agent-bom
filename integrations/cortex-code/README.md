@@ -1,4 +1,4 @@
-# agent-bom + Cortex Code CLI Integration
+# agent-bom + Cortex CoCo / Cortex Code Integration
 
 ## Add agent-bom as an MCP Server
 
@@ -9,7 +9,7 @@ Add to `~/.snowflake/cortex/mcp.json`:
   "mcpServers": {
     "agent-bom": {
       "command": "uvx",
-      "args": ["agent-bom", "mcp-server"]
+      "args": ["agent-bom", "mcp", "server"]
     }
   }
 }
@@ -22,13 +22,13 @@ Or if installed via pip/pipx:
   "mcpServers": {
     "agent-bom": {
       "command": "agent-bom",
-      "args": ["mcp-server"]
+      "args": ["mcp", "server"]
     }
   }
 }
 ```
 
-This gives Cortex Code access to 23 security scanning tools via natural language.
+This gives Cortex CoCo access to agent-bom's MCP security and analysis tools via natural language.
 
 ## Install as a Cortex Code Skill
 
@@ -47,7 +47,7 @@ cp integrations/cortex-code/SKILL.md .cortex/skills/agent-bom/SKILL.md
 
 ## What You Get
 
-### As MCP Server (32 tools)
+### As MCP Server
 
 All agent-bom MCP tools become available in Cortex Code:
 
@@ -57,16 +57,18 @@ All agent-bom MCP tools become available in Cortex Code:
 | `check` | Pre-install CVE check for a package |
 | `blast_radius` | Map CVE impact across agents and credentials |
 | `policy_check` | Evaluate security policy against findings |
-| `registry_lookup` | Query 427+ MCP server security metadata |
+| `registry_lookup` | Query 1081 MCP server security metadata records |
 | `generate_sbom` | Generate CycloneDX or SPDX SBOM |
-| `compliance` | Map findings to 13 compliance frameworks |
+| `compliance` | Map findings to OWASP, NIST, MITRE, EU AI Act, and related frameworks |
 | `remediate` | Prioritized remediation plan |
+| `skill_scan` | Scan CLAUDE.md, AGENTS.md, and other instruction files |
+| `skill_verify` | Verify Sigstore provenance for instruction files |
 | `skill_trust` | Trust assessment for SKILL.md files |
 | `code_scan` | SAST scanning with CWE mapping |
 | `context_graph` | Lateral movement analysis |
 | `cis_benchmark` | CIS benchmark for AWS/Azure/GCP/Snowflake |
 | `gpu_infra_scan` | GPU/AI compute infrastructure scanning |
-| ... and 10 more | See `agent-bom mcp-server --help` |
+| ... and more | See `agent-bom mcp server --help` |
 
 ### As Skill
 
@@ -76,9 +78,9 @@ Cortex Code can use agent-bom CLI commands directly:
 - "Generate an SBOM for compliance"
 - "What's the blast radius of CVE-2024-21538?"
 
-## Cortex Code Security Coverage
+## Cortex CoCo Security Coverage
 
-agent-bom fills these security gaps in Cortex Code:
+agent-bom fills these security gaps in Cortex CoCo:
 
 | Cortex Code guidance | agent-bom automation |
 |---------------------|---------------------|
@@ -86,11 +88,32 @@ agent-bom fills these security gaps in Cortex Code:
 | "Only install from trusted sources" | Trust assessment with 17 behavioral risk patterns |
 | Manual permission review | Blast radius analysis showing credential exposure |
 | No CVE scanning | Full enrichment: OSV + NVD + EPSS + CISA KEV |
-| No compliance mapping | 13 frameworks: OWASP, NIST, EU AI Act, ISO 27001 |
-| No runtime enforcement | Proxy with 7 real-time detectors |
+| No compliance mapping | Framework-aware evidence across OWASP, NIST, EU AI Act, ISO 27001, SOC 2, CIS, and more |
+| No runtime enforcement | Runtime proxy with 7 inline detectors, plus the broader 8-detector protection engine |
+
+## Runtime proxy and config audit
+
+Wrap third-party MCP servers when you want live traffic inspection:
+
+```bash
+agent-bom proxy "npx @modelcontextprotocol/server-filesystem /workspace"
+```
+
+Or auto-wrap eligible JSON MCP configs:
+
+```bash
+agent-bom proxy-configure --log-dir ~/.agent-bom/logs --detect-credentials --apply
+```
+
+For Cortex, agent-bom also audits:
+
+- `~/.snowflake/cortex/permissions.json` for overly broad cached approvals
+- `~/.snowflake/cortex/hooks.json` for risky shell hooks or unrestricted triggers
+- `~/.snowflake/cortex/settings.json` for auxiliary config context
 
 ## Auto-Discovery
 
-agent-bom already discovers Cortex Code's MCP configuration at
+agent-bom already discovers Cortex CoCo's MCP configuration at
 `~/.snowflake/cortex/mcp.json`. Running `agent-bom scan` will
-automatically find and scan your Cortex Code MCP servers.
+automatically find and scan your Cortex Code MCP servers plus the associated
+settings, permissions, and hooks files.

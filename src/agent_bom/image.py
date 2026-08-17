@@ -1,20 +1,19 @@
-"""Docker image scanning — extract packages from container images.
+"""Native Docker image scanning — extract packages from container images.
 
-Three strategies, tried in order:
+Primary strategy:
 
-1. **Grype** (richest): if ``grype`` is on PATH, run:
-       grype <image> -o json
-   Returns packages + CVEs in a single call — no OSV query needed.
+1. **Docker save + native OCI parser**:
+   - ``docker inspect`` to confirm the image exists / pull if needed
+   - ``docker save`` to a temporary tarball
+   - parse layers natively via :mod:`agent_bom.oci_parser`
 
-2. **Syft** (packages-only): if ``syft`` is on PATH, run:
-       syft <image> -o cyclonedx-json
-   and parse the output with the existing CycloneDX parser.
+Fallback strategy:
 
-3. **Docker CLI fallback**: if neither Grype nor Syft is available but ``docker`` is:
-   - ``docker inspect`` to confirm the image exists / get metadata
-   - Snapshot the container filesystem via ``docker create`` + ``docker export``
-     then scan common package manager manifest files (pip, npm, etc.)
-   - This is a best-effort approach; Grype/Syft will always produce richer results.
+2. **Docker export + filesystem parser**:
+   - ``docker create`` + ``docker export`` to a temporary tarball
+   - scan package manager files directly from the container filesystem
+
+The scanner is native-first and must fail loudly if package extraction fails.
 
 Usage from cli.py::
 
@@ -27,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -34,18 +34,25 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from agent_bom.config import _bool
 from agent_bom.models import Package, PermissionProfile, Severity, Vulnerability
+from agent_bom.package_utils import parse_debian_source_name
 from agent_bom.sbom import parse_cyclonedx
+from agent_bom.scanners.risk import cvss_to_severity, severity_from_label
 from agent_bom.security import validate_image_ref
 
 _logger = logging.getLogger(__name__)
+_PLATFORM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*){1,2}$")
+# Legacy RPM database paths decoded by the same native header-record parser as
+# OCI layers. Kept here for the flattened ``docker export`` fallback.
+_LEGACY_RPMDB_PATHS = ("var/lib/rpm/Packages", "var/lib/rpm/Packages.db")
 
 
 class ImageScanError(Exception):
     """Raised when an image cannot be scanned."""
 
 
-# ─── Grype strategy (preferred) ───────────────────────────────────────────────
+# ─── Legacy external-scanner helpers (kept for auth/env compatibility) ──────
 
 _GRYPE_TYPE_MAP: dict[str, str] = {
     "java-archive": "maven",
@@ -64,6 +71,16 @@ _GRYPE_TYPE_MAP: dict[str, str] = {
 
 def _grype_available() -> bool:
     return shutil.which("grype") is not None
+
+
+def _validate_platform(platform: Optional[str]) -> Optional[str]:
+    if platform is None:
+        return None
+    if not _PLATFORM_RE.match(platform):
+        from agent_bom.security import SecurityError
+
+        raise SecurityError(f"Invalid container platform: {platform!r}")
+    return platform
 
 
 def _build_scanner_env(
@@ -85,45 +102,51 @@ def _build_scanner_env(
     return env
 
 
-def _scan_with_grype(
-    image_ref: str,
-    registry_user: Optional[str] = None,
-    registry_pass: Optional[str] = None,
-    platform: Optional[str] = None,
-) -> list[Package]:
-    """Run Grype and return packages with vulnerabilities pre-populated.
+def _cvss_score_from_grype_vulnerability(vuln_data: dict) -> Optional[float]:
+    for cvss in vuln_data.get("cvss", []):
+        metrics = cvss.get("metrics", {})
+        score = metrics.get("baseScore")
+        if score is not None:
+            return float(score)
+    return None
 
-    Grype returns packages + CVEs in a single call, covering all ecosystems
-    (npm, cargo, go modules, maven, gems, .NET, deb, rpm, apk, Python).
-    No secondary OSV query is needed for image packages.
-    """
-    cmd = ["grype", image_ref, "-o", "json", "--quiet"]
-    if platform:
-        cmd += ["--platform", platform]
-    env = _build_scanner_env(registry_user, registry_pass, "GRYPE")
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            env=env,
-        )
-    except FileNotFoundError:
-        raise ImageScanError("grype not found")
-    except subprocess.TimeoutExpired:
-        raise ImageScanError(f"grype timed out scanning {image_ref}")
 
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        raise ImageScanError(f"grype exited {result.returncode}: {stderr[:200]}")
+def _severity_from_grype_vulnerability(vuln_data: dict, cvss_score: Optional[float]) -> Severity:
+    severity = severity_from_label(vuln_data.get("severity"))
+    if severity == Severity.UNKNOWN and cvss_score is not None:
+        return cvss_to_severity(cvss_score)
+    return severity
 
-    try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError as e:
-        raise ImageScanError(f"grype produced invalid JSON: {e}")
 
-    # Build Package objects keyed by (ecosystem, name, version)
+def _related_grype_vulnerabilities(match: dict, vuln_data: dict) -> list[dict]:
+    related: list[dict] = []
+    for source in (match.get("relatedVulnerabilities"), vuln_data.get("relatedVulnerabilities")):
+        if isinstance(source, list):
+            related.extend(item for item in source if isinstance(item, dict))
+    return related
+
+
+def _debian_related_cve_fallback(match: dict, vuln_data: dict) -> tuple[Optional[Severity], Optional[float]]:
+    vuln_id = str(vuln_data.get("id") or "")
+    if not vuln_id.startswith("DEBIAN-CVE-"):
+        return None, None
+    for related in _related_grype_vulnerabilities(match, vuln_data):
+        related_id = str(related.get("id") or "")
+        if not related_id.startswith("CVE-"):
+            continue
+        related_score = _cvss_score_from_grype_vulnerability(related)
+        related_severity = _severity_from_grype_vulnerability(related, related_score)
+        if related_severity != Severity.UNKNOWN or related_score is not None:
+            return related_severity, related_score
+    return None, None
+
+
+def _image_grype_fallback_enabled() -> bool:
+    return _bool("AGENT_BOM_IMAGE_GRYPE_FALLBACK", False)
+
+
+def _packages_from_grype_json(data: dict) -> list[Package]:
+    """Build Package objects with pre-populated vulnerabilities from Grype JSON."""
     pkg_map: dict[tuple[str, str, str], Package] = {}
 
     for match in data.get("matches", []):
@@ -143,32 +166,23 @@ def _scan_with_grype(
 
         pkg = pkg_map[key]
 
-        # Build Vulnerability from Grype match
         vuln_id = vuln_data.get("id", "")
         if not vuln_id:
             continue
 
-        raw_sev = vuln_data.get("severity", "unknown").upper()
-        try:
-            severity = Severity[raw_sev]
-        except KeyError:
-            severity = Severity.NONE
+        cvss_score = _cvss_score_from_grype_vulnerability(vuln_data)
+        severity = _severity_from_grype_vulnerability(vuln_data, cvss_score)
+        if severity == Severity.UNKNOWN and cvss_score is None:
+            fallback_severity, fallback_score = _debian_related_cve_fallback(match, vuln_data)
+            if fallback_score is not None:
+                cvss_score = fallback_score
+            if fallback_severity is not None:
+                severity = fallback_severity
 
-        # Extract CVSS score from Grype's cvss array
-        cvss_score: Optional[float] = None
-        for cvss in vuln_data.get("cvss", []):
-            metrics = cvss.get("metrics", {})
-            score = metrics.get("baseScore")
-            if score is not None:
-                cvss_score = float(score)
-                break
-
-        # Fixed version
         fix_info = vuln_data.get("fix", {})
         fixed_versions = fix_info.get("versions", [])
         fixed_version = fixed_versions[0] if fixed_versions else None
 
-        # Avoid duplicating the same CVE on a package
         if not any(v.id == vuln_id for v in pkg.vulnerabilities):
             pkg.vulnerabilities.append(
                 Vulnerability(
@@ -181,6 +195,102 @@ def _scan_with_grype(
             )
 
     return list(pkg_map.values())
+
+
+def _run_grype_json(
+    target: str,
+    *,
+    registry_user: Optional[str] = None,
+    registry_pass: Optional[str] = None,
+    platform: Optional[str] = None,
+    timeout: int = 300,
+) -> dict:
+    """Run Grype against a target and return parsed JSON."""
+    platform = _validate_platform(platform)
+    cmd = ["grype", target, "-o", "json", "--quiet"]
+    if platform:
+        cmd += ["--platform", platform]
+    env = _build_scanner_env(registry_user, registry_pass, "GRYPE")
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+    except FileNotFoundError:
+        raise ImageScanError("grype not found")
+    except subprocess.TimeoutExpired:
+        raise ImageScanError(f"grype timed out scanning {target}")
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        raise ImageScanError(f"grype exited {result.returncode}: {stderr[:200]}")
+
+    stdout = result.stdout.strip()
+    if not stdout:
+        raise ImageScanError("grype produced empty output")
+
+    # Grype may print log lines before JSON on some versions; parse the last JSON object.
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        data = None
+        for idx, char in enumerate(stdout):
+            if char != "{":
+                continue
+            try:
+                data, _end = decoder.raw_decode(stdout[idx:])
+            except json.JSONDecodeError:
+                continue
+        if data is None:
+            raise ImageScanError("grype produced invalid JSON")
+        return data
+
+
+def _scan_with_grype(
+    image_ref: str,
+    registry_user: Optional[str] = None,
+    registry_pass: Optional[str] = None,
+    platform: Optional[str] = None,
+) -> list[Package]:
+    """Run Grype and return packages with vulnerabilities pre-populated.
+
+    Grype returns packages + CVEs in a single call, covering all ecosystems
+    (npm, cargo, go modules, maven, gems, .NET, deb, rpm, apk, Python).
+    No secondary OSV query is needed for image packages.
+    """
+    image_ref = validate_image_ref(image_ref)
+    data = _run_grype_json(
+        image_ref,
+        registry_user=registry_user,
+        registry_pass=registry_pass,
+        platform=platform,
+    )
+    return _packages_from_grype_json(data)
+
+
+def _grype_archive_target(tar_path: Path) -> str:
+    """Return the Grype target string for a saved image archive."""
+    resolved = tar_path.resolve()
+    if resolved.is_dir():
+        return f"oci-dir:{resolved}"
+    suffix = resolved.suffix.lower()
+    if suffix in {".tar", ".tgz"} or resolved.name.endswith(".tar.gz"):
+        return f"docker-archive:{resolved}"
+    return f"oci-archive:{resolved}"
+
+
+def _scan_archive_with_grype(tar_path: str | Path) -> list[Package]:
+    """Run Grype against a docker save / OCI archive tarball or layout directory."""
+    path = Path(tar_path)
+    if not path.exists():
+        raise ImageScanError(f"Image archive not found: {tar_path}")
+    target = _grype_archive_target(path)
+    data = _run_grype_json(target)
+    return _packages_from_grype_json(data)
 
 
 # ─── Syft strategy ────────────────────────────────────────────────────────────
@@ -197,6 +307,8 @@ def _scan_with_syft(
     platform: Optional[str] = None,
 ) -> list[Package]:
     """Run Syft and parse its CycloneDX JSON output."""
+    image_ref = validate_image_ref(image_ref)
+    platform = _validate_platform(platform)
     cmd = ["syft", image_ref, "-o", "cyclonedx-json", "--quiet"]
     if platform:
         cmd += ["--platform", platform]
@@ -235,6 +347,8 @@ def _docker_available() -> bool:
 
 def _docker_inspect(image_ref: str, platform: Optional[str] = None) -> dict:
     """Return docker inspect output for the image (pulls if needed)."""
+    image_ref = validate_image_ref(image_ref)
+    platform = _validate_platform(platform)
     try:
         result = subprocess.run(
             ["docker", "inspect", "--type", "image", image_ref],
@@ -258,7 +372,12 @@ def _docker_inspect(image_ref: str, platform: Optional[str] = None) -> dict:
             timeout=300,
         )
         if pull.returncode != 0:
-            raise ImageScanError(f"Image not found locally and pull failed: {image_ref}")
+            # Keep the daemon's own reason. `_docker_available` only proves the
+            # binary exists, so the common failure here is a stopped daemon or a
+            # missing registry credential — both unactionable without the stderr.
+            reason = (pull.stderr or pull.stdout or "").strip().splitlines()
+            detail = f" — {reason[-1][:300]}" if reason else ""
+            raise ImageScanError(f"Image not found locally and pull failed: {image_ref}{detail}")
         result = subprocess.run(
             ["docker", "inspect", "--type", "image", image_ref],
             capture_output=True,
@@ -361,55 +480,72 @@ def _packages_from_tar(tar_path: Path) -> list[Package]:
     """Extract packages from a container filesystem tar archive.
 
     Scans for:
-    - Python: site-packages RECORD/METADATA files
+    - Python: ``*.dist-info/METADATA`` (modern) and legacy
+      ``*.egg-info/PKG-INFO`` / ``*.egg-info/METADATA`` (setuptools/pip on
+      older base images)
     - Node: node_modules/*/package.json (name + version)
     - OS packages: /var/lib/dpkg/status (Debian/Ubuntu)
     - OS packages: /var/lib/rpm/Packages (handled via sqlite3 in Python)
+
+    OS-package entries are tagged with the distribution detected from
+    ``os-release`` so downstream CVE matching pins the correct distro release.
     """
     packages: list[Package] = []
+    os_packages: list[Package] = []
     seen: set[tuple[str, str]] = set()
 
-    def _add(name: str, version: str, ecosystem: str, purl: Optional[str] = None) -> None:
+    def _add(name: str, version: str, ecosystem: str, purl: Optional[str] = None, source_package: Optional[str] = None) -> None:
         key = (name, ecosystem)
         if key not in seen:
             seen.add(key)
-            packages.append(
-                Package(
-                    name=name,
-                    version=version,
-                    ecosystem=ecosystem,
-                    purl=purl or f"pkg:{ecosystem}/{name}@{version}",
-                    is_direct=False,
-                    resolved_from_registry=False,
-                )
+            pkg = Package(
+                name=name,
+                version=version,
+                ecosystem=ecosystem,
+                purl=purl or f"pkg:{ecosystem}/{name}@{version}",
+                is_direct=False,
+                resolved_from_registry=False,
+                source_package=source_package,
             )
+            packages.append(pkg)
+            if ecosystem in ("deb", "apk", "rpm"):
+                os_packages.append(pkg)
 
     try:
         with tarfile.open(tar_path, "r") as tf:
             names = tf.getnames()
 
-            # --- Python: dist-info METADATA ---
+            # --- Python: dist-info METADATA (modern) + egg-info PKG-INFO/METADATA (legacy) ---
+            # Older base images (e.g. Debian buster) ship pip/setuptools/wheel
+            # as ``*.egg-info/PKG-INFO`` instead of ``*.dist-info/METADATA``.
+            # Both use the same RFC822 headers; ``_add`` de-dupes by name so a
+            # package present in both layouts is counted once.
             for member_name in names:
                 if member_name.endswith(".dist-info/METADATA"):
-                    try:
-                        member = tf.getmember(member_name)
-                        f = tf.extractfile(member)
-                        if f is None:
-                            continue
-                        pkg_name = pkg_version = ""
-                        for raw_line in f:
-                            line = raw_line.decode("utf-8", errors="ignore").strip()
-                            if line.startswith("Name:"):
-                                pkg_name = line.split(":", 1)[1].strip()
-                            elif line.startswith("Version:"):
-                                pkg_version = line.split(":", 1)[1].strip()
-                            if pkg_name and pkg_version:
-                                break
-                        if pkg_name and pkg_version:
-                            _add(pkg_name, pkg_version, "pypi")
-                    except Exception:
-                        _logger.debug("Skipped Python package in %s: %s", member_name, Exception)
+                    pass
+                elif member_name.endswith(".egg-info/PKG-INFO") or member_name.endswith(".egg-info/METADATA"):
+                    pass
+                else:
+                    continue
+                try:
+                    member = tf.getmember(member_name)
+                    f = tf.extractfile(member)
+                    if f is None:
                         continue
+                    pkg_name = pkg_version = ""
+                    for raw_line in f:
+                        line = raw_line.decode("utf-8", errors="ignore").strip()
+                        if line.startswith("Name:"):
+                            pkg_name = line.split(":", 1)[1].strip()
+                        elif line.startswith("Version:"):
+                            pkg_version = line.split(":", 1)[1].strip()
+                        if pkg_name and pkg_version:
+                            break
+                    if pkg_name and pkg_version:
+                        _add(pkg_name, pkg_version, "pypi")
+                except Exception:
+                    _logger.debug("Skipped Python package metadata in %s", member_name)
+                    continue
 
             # --- Node: node_modules/*/package.json ---
             for member_name in names:
@@ -436,15 +572,27 @@ def _packages_from_tar(tar_path: Path) -> list[Package]:
                     f = tf.extractfile(member)
                     if f:
                         content = f.read().decode("utf-8", errors="ignore")
-                        pkg_name = pkg_version = ""
+                        pkg_name = pkg_version = pkg_source = ""
                         for line in content.splitlines():
                             if line.startswith("Package:"):
                                 pkg_name = line.split(":", 1)[1].strip()
+                            elif line.startswith("Source:"):
+                                # Debian/Ubuntu advisories (OSV + Security Tracker)
+                                # are keyed by source package; the dpkg DB only
+                                # ships binary names, so capture Source for
+                                # binary→source matching (e.g. libc6 → glibc).
+                                pkg_source = parse_debian_source_name(line.split(":", 1)[1].strip()) or ""
                             elif line.startswith("Version:"):
                                 pkg_version = line.split(":", 1)[1].strip()
                             elif line == "" and pkg_name and pkg_version:
-                                _add(pkg_name, pkg_version, "deb", f"pkg:deb/debian/{pkg_name}@{pkg_version}")
-                                pkg_name = pkg_version = ""
+                                _add(
+                                    pkg_name,
+                                    pkg_version,
+                                    "deb",
+                                    f"pkg:deb/debian/{pkg_name}@{pkg_version}",
+                                    source_package=pkg_source or None,
+                                )
+                                pkg_name = pkg_version = pkg_source = ""
                 except Exception:
                     _logger.debug("Failed to parse dpkg status from container")
 
@@ -457,28 +605,47 @@ def _packages_from_tar(tar_path: Path) -> list[Package]:
                     if f:
                         content = f.read().decode("utf-8", errors="ignore")
                         pkg_name = pkg_version = ""
+                        source_package: str | None = None
                         for line in content.splitlines():
                             if line.startswith("P:"):
                                 pkg_name = line[2:].strip()
                             elif line.startswith("V:"):
                                 pkg_version = line[2:].strip()
+                            elif line.startswith("o:") or line.startswith("O:"):
+                                source_package = line[2:].strip() or None
                             elif line == "" and pkg_name and pkg_version:
-                                _add(pkg_name, pkg_version, "apk", f"pkg:apk/alpine/{pkg_name}@{pkg_version}")
+                                _add(
+                                    pkg_name,
+                                    pkg_version,
+                                    "apk",
+                                    f"pkg:apk/alpine/{pkg_name}@{pkg_version}",
+                                    source_package=source_package,
+                                )
                                 pkg_name = pkg_version = ""
+                                source_package = None
                         # Handle last entry if file doesn't end with blank line
                         if pkg_name and pkg_version:
-                            _add(pkg_name, pkg_version, "apk", f"pkg:apk/alpine/{pkg_name}@{pkg_version}")
+                            _add(
+                                pkg_name,
+                                pkg_version,
+                                "apk",
+                                f"pkg:apk/alpine/{pkg_name}@{pkg_version}",
+                                source_package=source_package,
+                            )
                 except Exception:
                     _logger.debug("Failed to parse Alpine apk db from container")
 
-            # --- RHEL/Fedora: rpm database ---
-            # rpm stores a plain text list at /var/lib/rpm/Packages or rpmdb.sqlite
-            # Fallback: look for rpm manifest written by some base images
-            for rpm_path in ("var/lib/rpm/rpmdb.sqlite", "var/lib/rpm/Packages"):
-                if rpm_path in names:
-                    # Can't easily parse binary rpm db from tar; skip to
-                    # installed-rpms manifest if present
-                    break
+            # --- RHEL/Fedora: legacy BerkeleyDB/NDB rpm database ---
+            legacy_rpmdb = next((p for p in _LEGACY_RPMDB_PATHS if p in names), None)
+            if legacy_rpmdb and "var/log/installed-rpms" not in names:
+                from agent_bom.oci_parser import OCIParseError, _query_legacy_rpmdb
+
+                try:
+                    decoded_rpms = _query_legacy_rpmdb(tf, legacy_rpmdb)
+                except OCIParseError:
+                    raise ImageScanError("Legacy RPM database could not be decoded safely") from None
+                for rpm_name, rpm_ver in decoded_rpms:
+                    _add(rpm_name, rpm_ver, "rpm", f"pkg:rpm/redhat/{rpm_name}@{rpm_ver}")
 
             rpm_manifest = "var/log/installed-rpms"
             if rpm_manifest in names:
@@ -507,6 +674,36 @@ def _packages_from_tar(tar_path: Path) -> list[Package]:
                 except Exception:
                     _logger.debug("Failed to parse rpm manifest from container")
 
+            # --- Distro detection (os-release) ---
+            # Tag OS packages with the distribution release so CVE matching
+            # pins the correct distro (e.g. Debian 10) instead of falling back
+            # to scanning every supported release. ``/etc/os-release`` is a
+            # symlink to ``/usr/lib/os-release`` on Debian/Ubuntu, so probe the
+            # canonical file too.
+            distro_name = distro_version = None
+            for os_release_path in ("etc/os-release", "usr/lib/os-release"):
+                if os_release_path not in names:
+                    continue
+                try:
+                    member = tf.getmember(os_release_path)
+                    f = tf.extractfile(member)
+                    if f is None:
+                        continue
+                    for raw_line in f:
+                        line = raw_line.decode("utf-8", errors="ignore").strip()
+                        if line.startswith("ID="):
+                            distro_name = line.split("=", 1)[1].strip().strip('"').strip("'").lower() or None
+                        elif line.startswith("VERSION_ID="):
+                            distro_version = line.split("=", 1)[1].strip().strip('"').strip("'") or None
+                    if distro_name or distro_version:
+                        break
+                except Exception:
+                    _logger.debug("Failed to parse os-release from container: %s", os_release_path)
+            if distro_name or distro_version:
+                for pkg in os_packages:
+                    pkg.distro_name = pkg.distro_name or distro_name
+                    pkg.distro_version = pkg.distro_version or distro_version
+
     except tarfile.TarError as e:
         raise ImageScanError(f"Failed to read container filesystem: {e}")
 
@@ -514,9 +711,35 @@ def _packages_from_tar(tar_path: Path) -> list[Package]:
 
 
 def _scan_with_docker(image_ref: str, platform: Optional[str] = None) -> list[Package]:
-    """Export container filesystem and scan package manager files."""
+    """Scan a Docker image natively and fail if no packages can be extracted."""
+    from agent_bom.oci_parser import OCIParseError, scan_oci
+
+    image_ref = validate_image_ref(image_ref)
+    platform = _validate_platform(platform)
+
     # Confirm image exists / pull it
     _docker_inspect(image_ref, platform=platform)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        oci_tar_path = Path(tmpdir) / "image.tar"
+        save = subprocess.run(
+            ["docker", "save", "-o", str(oci_tar_path), image_ref],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if save.returncode != 0:
+            stderr = (save.stderr or "").strip()
+            raise ImageScanError(f"docker save failed: {stderr[:200]}")
+
+        try:
+            packages, _strategy = scan_oci(oci_tar_path)
+        except OCIParseError as exc:
+            _logger.debug("Native OCI parse failed for %s: %s", image_ref, exc)
+        else:
+            if packages:
+                return packages
+            _logger.debug("Native OCI parse returned 0 packages for %s; falling back to docker export", image_ref)
 
     container_id: Optional[str] = None
     try:
@@ -542,7 +765,13 @@ def _scan_with_docker(image_ref: str, platform: Optional[str] = None) -> list[Pa
             if export.returncode != 0:
                 raise ImageScanError("docker export failed")
 
-            return _packages_from_tar(tar_path)
+            packages = _packages_from_tar(tar_path)
+            if packages:
+                return packages
+
+        raise ImageScanError(
+            f"Native image scan extracted 0 packages from {image_ref}. This is likely an extraction or parser failure, not a clean scan."
+        )
 
     finally:
         if container_id:
@@ -577,6 +806,7 @@ def detect_multi_arch(image_ref: str) -> list[str]:
     Returns list of platform strings like ``["linux/amd64", "linux/arm64"]``.
     Returns empty list if not a manifest list or docker is unavailable.
     """
+    image_ref = validate_image_ref(image_ref)
     if not _docker_available():
         return []
     try:
@@ -619,10 +849,9 @@ def scan_image(
 ) -> tuple[list[Package], str]:
     """Scan a Docker image and return (packages, strategy_used).
 
-    Strategy order (native first, external tools as fallback):
-    1. Docker CLI export → native OCI parser (no Grype/Syft needed)
-    2. Grype fallback (if installed — provides packages + CVEs in one call)
-    3. Syft fallback (if installed — packages only)
+    Strategy order:
+    1. Docker save → native OCI parser
+    2. Docker export → native filesystem parser
 
     Args:
         image_ref: Docker image reference, e.g. ``myapp:latest``,
@@ -632,38 +861,23 @@ def scan_image(
         platform: Target platform for multi-arch images (e.g. ``linux/amd64``).
 
     Returns:
-        A tuple ``(packages, strategy)`` where strategy is one of
-        ``"native"``, ``"grype"``, ``"syft"``.
+        A tuple ``(packages, strategy)`` where strategy is ``"native"``.
 
     Raises:
-        ImageScanError: If no scanner is available or the image cannot
-                        be found/pulled.
+        ImageScanError: If Docker is unavailable, the image cannot be found/pulled,
+                        or native package extraction fails.
     """
     validate_image_ref(image_ref)
+    _validate_platform(platform)
 
-    # Strategy 1: Native — Docker export + OCI parser (preferred, no external scanner)
-    if _docker_available():
-        try:
-            packages = _scan_with_docker(image_ref, platform)
-            if packages:
-                return packages, "native"
-        except Exception as exc:
-            _logger.debug("Native image scan failed, trying fallbacks: %s", exc)
+    if not _docker_available():
+        raise ImageScanError(
+            "Docker is not available. Install Docker to enable native image scanning, "
+            "or use 'docker save <image> -o image.tar' and pass the tarball with --image-tar."
+        )
 
-    # Strategy 2: Grype fallback (packages + CVEs in one call)
-    if _grype_available():
-        packages = _scan_with_grype(image_ref, registry_user, registry_pass, platform)
-        return packages, "grype"
-
-    # Strategy 3: Syft fallback (packages only, CVEs added by OSV later)
-    if _syft_available():
-        packages = _scan_with_syft(image_ref, registry_user, registry_pass, platform)
-        return packages, "syft"
-
-    raise ImageScanError(
-        "Docker is not available. Install Docker to enable native image scanning, "
-        "or use 'docker save <image> -o image.tar' and pass the tarball with --image-tar."
-    )
+    packages = _scan_with_docker(image_ref, platform)
+    return packages, "native"
 
 
 def scan_image_tar(tar_path: str) -> tuple[list[Package], str]:
@@ -687,9 +901,22 @@ def scan_image_tar(tar_path: str) -> tuple[list[Package], str]:
     if not path.exists():
         raise ImageScanError(f"Image tarball not found: {tar_path}")
     try:
-        return scan_oci(path)
+        packages, strategy = scan_oci(path)
     except OCIParseError as e:
         raise ImageScanError(f"OCI parse error: {e}") from e
+
+    if _image_grype_fallback_enabled() and _grype_available():
+        try:
+            grype_packages = _scan_archive_with_grype(path)
+        except ImageScanError as exc:
+            _logger.debug("Grype archive fallback skipped for %s: %s", tar_path, exc)
+        else:
+            if grype_packages:
+                grype_vulns = sum(len(pkg.vulnerabilities) for pkg in grype_packages)
+                if grype_vulns > 0 or len(grype_packages) > len(packages):
+                    return grype_packages, "grype-archive"
+
+    return packages, strategy
 
 
 def image_to_purl(image_ref: str) -> str:

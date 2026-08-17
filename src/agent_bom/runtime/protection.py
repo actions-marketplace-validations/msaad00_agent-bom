@@ -1,29 +1,133 @@
 """Runtime protection engine — unified detector orchestration.
 
-Connects all seven runtime detectors, OTel trace ingestion, and the alert
+Connects all eight runtime detectors, OTel trace ingestion, and the alert
 dispatcher into a single protection pipeline. Activated via the API
 (``POST /v1/protect/start``) or CLI (``agent-bom protect``).
+
+**Deep Defense Mode** (``shield=True``):
+Adds correlated multi-detector threat scoring, automatic threat-level
+escalation, sliding-window alert correlation, and kill-switch capability.
+When multiple detectors fire within a short window, deep defense mode
+computes a composite threat score and can escalate the session to
+CRITICAL, triggering automated containment (block tool calls, freeze
+baseline, notify SIEM).
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass
+import os
+import time
+from collections import Counter, deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
 
 from agent_bom.alerts.dispatcher import AlertDispatcher
 from agent_bom.otel_ingest import parse_otel_traces
 from agent_bom.runtime.detectors import (
     ArgumentAnalyzer,
+    BiasTriggerDetector,
     CredentialLeakDetector,
+    CrossAgentCorrelator,
+    HallucinationDetector,
     RateLimitTracker,
     ResponseInspector,
     SequenceAnalyzer,
     ToolDriftDetector,
+    ToxicityDetector,
     VectorDBInjectionDetector,
 )
+from agent_bom.runtime.incident_feedback import (
+    IncidentKind,
+    RuntimeIncidentRecord,
+    RuntimeIncidentSink,
+)
+from agent_bom.security import sanitize_sensitive_payload, sanitize_text
 
 logger = logging.getLogger(__name__)
+
+
+# ── Deep defense: threat levels ──────────────────────────────────────────────
+
+
+class ThreatLevel(str, Enum):
+    """Session-wide threat level, escalated by correlated alerts."""
+
+    NORMAL = "normal"
+    ELEVATED = "elevated"  # 2+ detectors firing in window
+    HIGH = "high"  # 3+ detectors OR critical alert
+    CRITICAL = "critical"  # correlated attack pattern confirmed
+
+    def __gt__(self, other: object) -> bool:  # type: ignore[override]
+        if not isinstance(other, ThreatLevel):
+            return NotImplemented
+        return _THREAT_ORDINAL[self] > _THREAT_ORDINAL[other]
+
+    def __ge__(self, other: object) -> bool:  # type: ignore[override]
+        if not isinstance(other, ThreatLevel):
+            return NotImplemented
+        return _THREAT_ORDINAL[self] >= _THREAT_ORDINAL[other]
+
+    def __lt__(self, other: object) -> bool:  # type: ignore[override]
+        if not isinstance(other, ThreatLevel):
+            return NotImplemented
+        return _THREAT_ORDINAL[self] < _THREAT_ORDINAL[other]
+
+    def __le__(self, other: object) -> bool:  # type: ignore[override]
+        if not isinstance(other, ThreatLevel):
+            return NotImplemented
+        return _THREAT_ORDINAL[self] <= _THREAT_ORDINAL[other]
+
+
+# Ordinal values for correct ThreatLevel comparison (not lexicographic)
+_THREAT_ORDINAL: dict["ThreatLevel", int] = {
+    ThreatLevel.NORMAL: 0,
+    ThreatLevel.ELEVATED: 1,
+    ThreatLevel.HIGH: 2,
+    ThreatLevel.CRITICAL: 3,
+}
+
+# Severity weights for composite scoring
+_SEVERITY_WEIGHTS: dict[str, float] = {
+    "critical": 4.0,
+    "high": 2.5,
+    "medium": 1.0,
+    "low": 0.3,
+    "info": 0.0,
+}
+
+# Threat level thresholds (composite score within correlation window)
+_THREAT_THRESHOLDS = {
+    ThreatLevel.ELEVATED: 3.0,
+    ThreatLevel.HIGH: 6.0,
+    ThreatLevel.CRITICAL: 10.0,
+}
+
+
+@dataclass
+class _CorrelationEntry:
+    """A single alert in the correlation window."""
+
+    timestamp: float
+    detector: str
+    severity: str
+    tool_name: str
+
+
+@dataclass
+class ShieldAssessment:
+    """Result of deep defense correlation analysis."""
+
+    threat_level: ThreatLevel
+    composite_score: float
+    detectors_triggered: list[str]
+    correlation_window_seconds: float
+    alert_count_in_window: int
+    escalated: bool  # True if threat level changed this cycle
+    blocked: bool  # True if kill-switch activated
 
 
 @dataclass
@@ -34,52 +138,281 @@ class ProtectionStats:
     traces_processed: int = 0
     tool_calls_analyzed: int = 0
     alerts_generated: int = 0
-    detectors_active: int = 7
+    detectors_active: int = 11
+    # Deep defense stats
+    shield_active: bool = False
+    threat_level: str = ThreatLevel.NORMAL.value
+    escalations: int = 0
+    blocks: int = 0
+    correlation_window_alerts: int = 0
+
+
+@dataclass
+class RuntimeSessionNode:
+    """Node in a runtime session graph."""
+
+    id: str
+    kind: str
+    label: str
+    first_seen: str
+    metadata: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": sanitize_text(self.id, max_len=300),
+            "kind": sanitize_text(self.kind, max_len=100),
+            "label": sanitize_text(self.label, max_len=300),
+            "first_seen": self.first_seen,
+            "metadata": sanitize_sensitive_payload(self.metadata),
+        }
+
+
+@dataclass
+class RuntimeSessionEdge:
+    """Directed edge in a runtime session graph."""
+
+    source: str
+    target: str
+    relation: str
+    timestamp: str
+    metadata: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "source": sanitize_text(self.source, max_len=300),
+            "target": sanitize_text(self.target, max_len=300),
+            "relation": sanitize_text(self.relation, max_len=100),
+            "timestamp": self.timestamp,
+            "metadata": sanitize_sensitive_payload(self.metadata),
+        }
+
+
+@dataclass
+class RuntimeSessionGraph:
+    """Structured record of runtime entities and interactions."""
+
+    nodes: dict[str, RuntimeSessionNode] = field(default_factory=dict)
+    edges: list[RuntimeSessionEdge] = field(default_factory=list)
+
+    def ensure_node(self, node_id: str, kind: str, label: str, metadata: dict[str, object] | None = None) -> None:
+        if node_id not in self.nodes:
+            self.nodes[node_id] = RuntimeSessionNode(
+                id=node_id,
+                kind=kind,
+                label=label,
+                first_seen=datetime.now(timezone.utc).isoformat(),
+                metadata=metadata or {},
+            )
+        elif metadata:
+            self.nodes[node_id].metadata.update(metadata)
+
+    def add_edge(
+        self,
+        source: str,
+        target: str,
+        relation: str,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        self.edges.append(
+            RuntimeSessionEdge(
+                source=source,
+                target=target,
+                relation=relation,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                metadata=metadata or {},
+            )
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        timeline: list[dict[str, object]] = []
+        for node in self.nodes.values():
+            if node.kind in {"tool_call", "tool_response", "alert"}:
+                timeline.append(
+                    {
+                        "timestamp": node.first_seen,
+                        "kind": sanitize_text(node.kind, max_len=100),
+                        "id": sanitize_text(node.id, max_len=300),
+                        "label": sanitize_text(node.label, max_len=300),
+                        "metadata": sanitize_sensitive_payload(node.metadata),
+                    }
+                )
+        for edge in self.edges:
+            timeline.append(
+                {
+                    "timestamp": edge.timestamp,
+                    "kind": "interaction",
+                    "source": sanitize_text(edge.source, max_len=300),
+                    "target": sanitize_text(edge.target, max_len=300),
+                    "relation": sanitize_text(edge.relation, max_len=100),
+                    "metadata": sanitize_sensitive_payload(edge.metadata),
+                }
+            )
+        timeline.sort(key=lambda item: str(item.get("timestamp", "")))
+        return {
+            "node_count": len(self.nodes),
+            "edge_count": len(self.edges),
+            "nodes": [node.to_dict() for node in self.nodes.values()],
+            "edges": [edge.to_dict() for edge in self.edges],
+            "timeline_event_count": len(timeline),
+            "timeline": timeline,
+        }
 
 
 class ProtectionEngine:
     """Orchestrates runtime detectors with OTel ingestion and alert dispatch.
 
+    Args:
+        dispatcher: Alert dispatcher for routing alerts to SIEM/Slack/etc.
+        shield: Enable deep defense mode (correlated multi-detector scoring,
+            threat-level escalation, kill-switch capability).
+        correlation_window: Seconds to correlate alerts across detectors (default 30s).
+        block_on_critical: Auto-block tool calls when threat level reaches CRITICAL.
+
     Typical lifecycle::
 
-        engine = ProtectionEngine(dispatcher)
+        engine = ProtectionEngine(dispatcher, shield=True)
         engine.start()
-        # ... receive OTel traces or individual tool calls ...
-        alerts = await engine.process_trace(otel_data)
         alerts = await engine.process_tool_call("read_file", {"path": "/etc/passwd"})
+        assessment = engine.assess_threat()  # deep defense assessment
         engine.stop()
     """
 
-    def __init__(self, dispatcher: AlertDispatcher | None = None) -> None:
-        self.drift_detector = ToolDriftDetector()
+    def __init__(
+        self,
+        dispatcher: AlertDispatcher | None = None,
+        *,
+        shield: bool = False,
+        correlation_window: float = 30.0,
+        block_on_critical: bool = True,
+        feedback_sink: RuntimeIncidentSink | str | None = None,
+    ) -> None:
+        self.drift_detector = ToolDriftDetector(restore=shield)
         self.arg_analyzer = ArgumentAnalyzer()
         self.cred_detector = CredentialLeakDetector()
         self.rate_tracker = RateLimitTracker()
         self.seq_analyzer = SequenceAnalyzer()
         self.response_inspector = ResponseInspector()
         self.vector_db_detector = VectorDBInjectionDetector()
+        self.bias_detector = BiasTriggerDetector()
+        self.toxicity_detector = ToxicityDetector()
+        self.hallucination_detector = HallucinationDetector()
+        self._correlator = CrossAgentCorrelator()
         self.dispatcher = dispatcher or AlertDispatcher()
         self._active = False
         self._stats = ProtectionStats()
+
+        # Deep defense state
+        self._shield = shield
+        self._correlation_window = correlation_window
+        self._block_on_critical = block_on_critical
+        self._threat_level = ThreatLevel.NORMAL
+        self._correlation_buffer: deque[_CorrelationEntry] = deque()
+        self._blocked = False
+        self._allowed_tools: set[str] | None = None  # None = all allowed
+        self._session_graph = RuntimeSessionGraph()
+
+        # Runtime → graph feedback sink (the feedback direction of the moat).
+        # Default-off: with no path (and no AGENT_BOM_RUNTIME_FEEDBACK_PATH env)
+        # the sink is inert and emission is a no-op.
+        if isinstance(feedback_sink, RuntimeIncidentSink):
+            self._feedback_sink = feedback_sink
+        else:
+            self._feedback_sink = RuntimeIncidentSink(feedback_sink)
+
+    # ── Persistent kill-switch state ──────────────────────────────────────
+
+    @staticmethod
+    def _state_path() -> Path:
+        """Path to the persistent kill-switch state file."""
+        state_dir = Path(os.environ.get("AGENT_BOM_STATE_DIR", Path.home() / ".agent-bom"))
+        state_dir.mkdir(parents=True, exist_ok=True)
+        return state_dir / "killswitch.json"
+
+    def _persist_state(self) -> None:
+        """Write kill-switch state to disk so it survives process restarts."""
+        try:
+            state = {
+                "blocked": self._blocked,
+                "threat_level": self._threat_level.value,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            path = self._state_path()
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state))
+            tmp.replace(path)  # atomic
+        except OSError:
+            logger.debug("Could not persist kill-switch state (non-fatal)")
+
+    def _restore_state(self) -> None:
+        """Restore kill-switch state from disk on startup."""
+        try:
+            path = self._state_path()
+            if not path.exists():
+                return
+            state = json.loads(path.read_text())
+            if state.get("blocked"):
+                self._blocked = True
+                self._threat_level = ThreatLevel(state.get("threat_level", ThreatLevel.CRITICAL.value))
+                logger.warning(
+                    "Restored kill-switch state from disk — session was blocked at %s",
+                    state.get("updated_at", "unknown"),
+                )
+        except (OSError, json.JSONDecodeError, ValueError):
+            logger.debug("Could not restore kill-switch state (non-fatal)")
 
     def start(self) -> None:
         """Activate protection engine."""
         self._active = True
         self._stats.started_at = datetime.now(timezone.utc).isoformat()
-        logger.info("Protection engine started")
+        self._stats.shield_active = self._shield
+        if self._shield:
+            self._restore_state()
+            logger.info("Protection engine started (deep defense mode)")
+        else:
+            logger.info("Protection engine started")
 
     def stop(self) -> None:
         """Deactivate protection engine."""
         self._active = False
+        self._blocked = False
+        self._threat_level = ThreatLevel.NORMAL
+        self._persist_state()
         logger.info("Protection engine stopped")
 
     @property
     def active(self) -> bool:
         return self._active
 
+    @property
+    def shield_active(self) -> bool:
+        """True if deep defense mode is enabled."""
+        return self._shield
+
+    @property
+    def threat_level(self) -> ThreatLevel:
+        """Current session threat level."""
+        return self._threat_level
+
+    @property
+    def is_blocked(self) -> bool:
+        """True if kill-switch has been activated (CRITICAL threat)."""
+        return self._blocked
+
+    def set_allowed_tools(self, tools: list[str]) -> None:
+        """Restrict tool calls to an explicit allowlist (deep defense containment)."""
+        self._allowed_tools = set(tools)
+
+    def unblock(self) -> None:
+        """Manually deactivate kill-switch and reset to ELEVATED."""
+        self._blocked = False
+        self._threat_level = ThreatLevel.ELEVATED
+        self._allowed_tools = None
+        self._persist_state()
+        logger.info("Kill-switch deactivated, threat level reset to ELEVATED")
+
     def status(self) -> dict:
         """Return current engine status and statistics."""
-        return {
+        base = {
             "active": self._active,
             "started_at": self._stats.started_at,
             "traces_processed": self._stats.traces_processed,
@@ -93,9 +426,295 @@ class ProtectionEngine:
                 "SequenceAnalyzer",
                 "ResponseInspector",
                 "VectorDBInjectionDetector",
+                "BiasTriggerDetector",
+                "ToxicityDetector",
+                "HallucinationDetector",
+                "CrossAgentCorrelator",
             ],
             "detectors_active": self._stats.detectors_active,
+            "session_graph": self._session_graph.to_dict(),
+            "incident_summary": self._build_incident_summary(),
         }
+        if self._shield:
+            base["shield"] = {
+                "active": True,
+                "threat_level": self._threat_level.value,
+                "blocked": self._blocked,
+                "escalations": self._stats.escalations,
+                "blocks": self._stats.blocks,
+                "correlation_window_seconds": self._correlation_window,
+                "alerts_in_window": self._count_window_alerts(),
+            }
+        return base
+
+    def _build_incident_summary(self) -> dict[str, object]:
+        """Aggregate runtime incidents into a compact API/UI-friendly summary."""
+        alert_nodes = [node for node in self._session_graph.nodes.values() if node.kind == "alert"]
+        severity_counts: Counter[str] = Counter()
+        detector_counts: Counter[str] = Counter()
+        recent_incidents: list[dict[str, object]] = []
+        blocked_incidents = 0
+
+        for node in sorted(alert_nodes, key=lambda item: item.first_seen, reverse=True):
+            metadata = node.metadata or {}
+            details = metadata.get("details", {})
+            if not isinstance(details, dict):
+                details = {}
+            severity = str(metadata.get("severity") or "unknown").lower()
+            detector = str(node.label or "unknown")
+            severity_counts[severity] += 1
+            detector_counts[detector] += 1
+            if details.get("action") == "blocked" or detector == "shield_killswitch":
+                blocked_incidents += 1
+            if len(recent_incidents) < 5:
+                recent_incidents.append(
+                    {
+                        "ts": node.first_seen,
+                        "detector": detector,
+                        "severity": severity,
+                        "message": metadata.get("message", ""),
+                        "action": details.get("action", ""),
+                    }
+                )
+
+        return {
+            "total_incidents": len(alert_nodes),
+            "blocked_incidents": blocked_incidents,
+            "alerts_by_severity": dict(sorted(severity_counts.items())),
+            "alerts_by_detector": dict(sorted(detector_counts.items())),
+            "latest_incident_at": recent_incidents[0]["ts"] if recent_incidents else "",
+            "recent_incidents": recent_incidents,
+        }
+
+    def _record_tool_call_graph(self, tool_name: str, arguments: dict, agent_id: str = "") -> None:
+        agent_key = f"agent:{agent_id or 'unknown'}"
+        tool_key = f"tool:{tool_name}"
+        call_key = f"call:{self._stats.tool_calls_analyzed}:{tool_name}"
+        self._session_graph.ensure_node(agent_key, "agent", agent_id or "unknown-agent")
+        self._session_graph.ensure_node(tool_key, "tool", tool_name)
+        self._session_graph.ensure_node(
+            call_key,
+            "tool_call",
+            tool_name,
+            metadata={"arguments": sanitize_sensitive_payload(arguments), "agent_id": agent_id or ""},
+        )
+        self._session_graph.add_edge(agent_key, call_key, "invokes")
+        self._session_graph.add_edge(call_key, tool_key, "targets")
+
+    def _record_tool_response_graph(self, tool_name: str, response_text: str) -> None:
+        tool_key = f"tool:{tool_name}"
+        response_key = f"response:{self._stats.tool_calls_analyzed}:{tool_name}:{len(self._session_graph.edges)}"
+        self._session_graph.ensure_node(tool_key, "tool", tool_name)
+        self._session_graph.ensure_node(
+            response_key,
+            "tool_response",
+            tool_name,
+            metadata={"preview": sanitize_sensitive_payload(response_text[:200], key="response_preview"), "length": len(response_text)},
+        )
+        self._session_graph.add_edge(tool_key, response_key, "returns")
+
+    def _record_alert_graph(self, alerts: list[dict], tool_name: str) -> None:
+        tool_key = f"tool:{tool_name}"
+        self._session_graph.ensure_node(tool_key, "tool", tool_name)
+        for idx, alert in enumerate(alerts):
+            alert_id = f"alert:{alert.get('detector', 'unknown')}:{len(self._session_graph.edges)}:{idx}"
+            self._session_graph.ensure_node(
+                alert_id,
+                "alert",
+                alert.get("detector", "unknown"),
+                metadata={
+                    "severity": alert.get("severity"),
+                    "message": alert.get("message"),
+                    "details": alert.get("details", {}),
+                },
+            )
+            self._session_graph.add_edge(tool_key, alert_id, "triggered")
+
+    # ── Runtime → graph feedback emission ────────────────────────────────
+
+    def _feedback_timestamp(self) -> str:
+        """Timestamp used for emitted incident records.
+
+        Centralized so tests can monkeypatch a fixed clock and keep emission
+        deterministic; production uses wall-clock UTC.
+        """
+        return datetime.now(timezone.utc).isoformat()
+
+    def _emit_feedback(
+        self,
+        agent_id: str,
+        kind: IncidentKind,
+        *,
+        severity: str,
+        node_ids: list[str] | None = None,
+        tool_labels: list[str] | None = None,
+        count: int = 1,
+        detail: dict[str, object] | None = None,
+    ) -> None:
+        """Emit one runtime-observed incident to the durable feedback sink.
+
+        Additive and fail-safe: when the sink is disabled (default) or a write
+        fails, this is a silent no-op and never disturbs the relay.
+        """
+        if not self._feedback_sink.enabled:
+            return
+        try:
+            record = RuntimeIncidentRecord(
+                agent_id=agent_id or "unknown",
+                kind=kind.value,
+                observed_at=self._feedback_timestamp(),
+                severity=severity or "high",
+                observed_node_ids=list(node_ids or []),
+                observed_tool_labels=list(tool_labels or []),
+                count=max(1, count),
+                detail=detail or {},
+            )
+            self._feedback_sink.emit(record)
+        except Exception:  # pragma: no cover - belt-and-suspenders fail-safe
+            logger.debug("Runtime feedback emission failed (non-fatal)", exc_info=True)
+
+    # ── Deep defense internals ───────────────────────────────────────────
+
+    def _prune_correlation_buffer(self) -> None:
+        """Remove entries older than the correlation window."""
+        cutoff = time.monotonic() - self._correlation_window
+        while self._correlation_buffer and self._correlation_buffer[0].timestamp < cutoff:
+            self._correlation_buffer.popleft()
+
+    def _count_window_alerts(self) -> int:
+        self._prune_correlation_buffer()
+        return len(self._correlation_buffer)
+
+    def _record_alerts(self, alerts: list[dict], tool_name: str = "") -> None:
+        """Add alerts to the correlation buffer (deep defense mode only)."""
+        if not self._shield:
+            return
+        now = time.monotonic()
+        for alert in alerts:
+            self._correlation_buffer.append(
+                _CorrelationEntry(
+                    timestamp=now,
+                    detector=alert.get("detector", "unknown"),
+                    severity=alert.get("severity", "info"),
+                    tool_name=tool_name or alert.get("details", {}).get("tool", ""),
+                )
+            )
+
+    def assess_threat(self) -> ShieldAssessment:
+        """Compute correlated threat assessment from recent alerts.
+
+        Scores all alerts within the correlation window, identifies which
+        detectors fired, and escalates threat level when thresholds are crossed.
+        Also factors in cross-agent lateral movement alerts from CrossAgentCorrelator.
+        """
+        self._prune_correlation_buffer()
+
+        # Cross-agent lateral movement — feed HIGH alerts into correlation buffer
+        lateral_alerts = self._correlator.detect_lateral_movement()
+        for la in lateral_alerts:
+            logger.warning("Cross-agent lateral movement: %s", la.get("message", ""))
+            self._correlation_buffer.append(
+                _CorrelationEntry(
+                    timestamp=time.monotonic(),
+                    detector="cross_agent_correlator",
+                    severity=la.get("severity", "high"),
+                    tool_name=la.get("tool", ""),
+                )
+            )
+            # Feedback: each converging agent was observed in lateral movement
+            # over this tool — record so the next scan's graph reflects it.
+            la_tool = str(la.get("tool", "") or "")
+            la_severity = str(la.get("severity", "high") or "high")
+            raw_agents = la.get("agents")
+            la_agents: list[object] = raw_agents if isinstance(raw_agents, list) else []
+            for observed_agent in la_agents:
+                self._emit_feedback(
+                    str(observed_agent),
+                    IncidentKind.LATERAL_MOVEMENT,
+                    severity=la_severity,
+                    tool_labels=[la_tool] if la_tool else [],
+                    count=len(la_agents) or 1,
+                    detail={"detector": "cross_agent_correlator", "tool": la_tool},
+                )
+
+        entries = list(self._correlation_buffer)
+        if not entries:
+            return ShieldAssessment(
+                threat_level=self._threat_level,
+                composite_score=0.0,
+                detectors_triggered=[],
+                correlation_window_seconds=self._correlation_window,
+                alert_count_in_window=0,
+                escalated=False,
+                blocked=self._blocked,
+            )
+
+        # Composite score: sum of severity weights, with detector diversity bonus
+        score = sum(_SEVERITY_WEIGHTS.get(e.severity, 0) for e in entries)
+        detectors = sorted(set(e.detector for e in entries))
+        # Diversity bonus: multiple independent detectors firing = correlated attack
+        if len(detectors) >= 3:
+            score *= 1.5
+        elif len(detectors) >= 2:
+            score *= 1.2
+
+        # Determine new threat level
+        previous = self._threat_level
+        new_level = ThreatLevel.NORMAL
+        for level in (ThreatLevel.CRITICAL, ThreatLevel.HIGH, ThreatLevel.ELEVATED):
+            if score >= _THREAT_THRESHOLDS[level]:
+                new_level = level
+                break
+
+        escalated = new_level > previous if new_level != previous else False
+        self._threat_level = new_level
+        self._stats.threat_level = new_level.value
+
+        if escalated:
+            self._stats.escalations += 1
+            logger.warning("Threat level escalated: %s → %s (score=%.1f, detectors=%s)", previous.value, new_level.value, score, detectors)
+
+        # Kill-switch on CRITICAL
+        blocked = False
+        if new_level == ThreatLevel.CRITICAL and self._block_on_critical and not self._blocked:
+            self._blocked = True
+            self._stats.blocks += 1
+            blocked = True
+            self._persist_state()
+            logger.critical("KILL-SWITCH ACTIVATED — blocking tool calls (score=%.1f)", score)
+
+        return ShieldAssessment(
+            threat_level=new_level,
+            composite_score=round(score, 2),
+            detectors_triggered=detectors,
+            correlation_window_seconds=self._correlation_window,
+            alert_count_in_window=len(entries),
+            escalated=escalated,
+            blocked=blocked,
+        )
+
+    def _check_blocked(self, tool_name: str) -> list[dict]:
+        """Return a block alert if kill-switch is active and tool is not allowed."""
+        if not self._blocked:
+            return []
+        if self._allowed_tools is not None and tool_name in self._allowed_tools:
+            return []
+        return [
+            {
+                "type": "runtime_alert",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "detector": "shield_killswitch",
+                "severity": "critical",
+                "message": f"Tool call BLOCKED by deep defense kill-switch: {tool_name}",
+                "details": {
+                    "tool": tool_name,
+                    "threat_level": self._threat_level.value,
+                    "action": "blocked",
+                },
+            }
+        ]
+
+    # ── Public API ───────────────────────────────────────────────────────
 
     async def process_trace(self, trace_data: dict) -> list[dict]:
         """Process an OTel trace export through all detectors.
@@ -116,17 +735,47 @@ class ProtectionEngine:
 
         return all_alerts
 
-    async def process_tool_call(self, tool_name: str, arguments: dict) -> list[dict]:
+    async def process_tool_call(self, tool_name: str, arguments: dict, agent_id: str = "") -> list[dict]:
         """Analyze a single tool call through all detectors.
+
+        In deep defense mode, also checks kill-switch status and correlates
+        alerts for threat-level escalation.
 
         Args:
             tool_name: MCP tool being invoked.
             arguments: Tool call arguments.
+            agent_id: Optional caller identity for cross-agent correlation.
 
         Returns:
             List of alert dicts for any findings.
         """
         self._stats.tool_calls_analyzed += 1
+        self._record_tool_call_graph(tool_name, arguments, agent_id)
+
+        # Cross-agent correlation: record every call for lateral movement detection
+        if agent_id:
+            self._correlator.record_call(agent_id, tool_name, time.time())
+
+        # Deep defense: check kill-switch before processing
+        if self._shield:
+            block_alerts = self._check_blocked(tool_name)
+            if block_alerts:
+                self._record_alert_graph(block_alerts, tool_name)
+                # Feedback: the kill-switch fired against this agent/tool — make
+                # that observed containment durable for the next scan's graph.
+                self._emit_feedback(
+                    agent_id,
+                    IncidentKind.KILL_SWITCH,
+                    severity="critical",
+                    tool_labels=[tool_name],
+                    count=len(block_alerts),
+                    detail={"detector": "shield_killswitch", "tool": tool_name},
+                )
+                for alert_dict in block_alerts:
+                    await self.dispatcher.dispatch(alert_dict)
+                self._stats.alerts_generated += len(block_alerts)
+                return block_alerts
+
         all_alerts: list[dict] = []
 
         # Argument analysis — shell injection, path traversal, etc.
@@ -146,9 +795,38 @@ class ProtectionEngine:
             await self.dispatcher.dispatch(alert_dict)
 
         self._stats.alerts_generated += len(all_alerts)
+        if all_alerts:
+            self._record_alert_graph(all_alerts, tool_name)
+
+        # Deep defense: correlate and assess
+        if self._shield and all_alerts:
+            self._record_alerts(all_alerts, tool_name)
+            assessment = self.assess_threat()
+            if assessment.escalated:
+                escalation_alert = {
+                    "type": "runtime_alert",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "detector": "shield_correlation",
+                    "severity": assessment.threat_level.value,
+                    "message": (
+                        f"Threat level escalated to {assessment.threat_level.value.upper()} "
+                        f"(score={assessment.composite_score}, "
+                        f"detectors={assessment.detectors_triggered})"
+                    ),
+                    "details": {
+                        "threat_level": assessment.threat_level.value,
+                        "composite_score": assessment.composite_score,
+                        "detectors_triggered": assessment.detectors_triggered,
+                        "alert_count_in_window": assessment.alert_count_in_window,
+                        "blocked": assessment.blocked,
+                    },
+                }
+                all_alerts.append(escalation_alert)
+                await self.dispatcher.dispatch(escalation_alert)
+
         return all_alerts
 
-    async def process_tool_response(self, tool_name: str, response_text: str) -> list[dict]:
+    async def process_tool_response(self, tool_name: str, response_text: str, agent_id: str = "") -> list[dict]:
         """Check a tool response for credential leaks, injection, and cloaking.
 
         Runs all response-path detectors: CredentialLeakDetector,
@@ -157,15 +835,31 @@ class ProtectionEngine:
         Args:
             tool_name: MCP tool that produced the response.
             response_text: Response text to analyze.
+            agent_id: Optional caller identity, used to attribute runtime
+                feedback to the right agent node on the next scan.
 
         Returns:
             List of alert dicts for any findings detected.
         """
+        self._record_tool_response_graph(tool_name, response_text)
         all_alerts: list[dict] = []
 
         # Credential leak detection
         cred_alerts = self.cred_detector.check(tool_name, response_text)
-        all_alerts.extend(a.to_dict() for a in cred_alerts)
+        cred_alert_dicts = [a.to_dict() for a in cred_alerts]
+        all_alerts.extend(cred_alert_dicts)
+
+        # Feedback: a credential observed flowing through this tool means the
+        # agent was seen reaching a credential. Project it into the next scan.
+        if cred_alert_dicts:
+            self._emit_feedback(
+                agent_id,
+                IncidentKind.REACHED_CREDENTIAL,
+                severity=str(cred_alert_dicts[0].get("severity") or "high"),
+                tool_labels=[tool_name],
+                count=len(cred_alert_dicts),
+                detail={"detector": "credential_leak", "tool": tool_name},
+            )
 
         # Response inspection — cloaking, SVG, invisible unicode, injection
         resp_alerts = self.response_inspector.check(tool_name, response_text)
@@ -175,10 +869,22 @@ class ProtectionEngine:
         vec_alerts = self.vector_db_detector.check(tool_name, response_text)
         all_alerts.extend(a.to_dict() for a in vec_alerts)
 
+        # AI-safety response detectors: bias, toxicity, hallucination
+        for _ai_detector in (self.bias_detector, self.toxicity_detector, self.hallucination_detector):
+            all_alerts.extend(a.to_dict() for a in _ai_detector.check(tool_name, response_text))
+
         for alert_dict in all_alerts:
             await self.dispatcher.dispatch(alert_dict)
 
         self._stats.alerts_generated += len(all_alerts)
+        if all_alerts:
+            self._record_alert_graph(all_alerts, tool_name)
+
+        # Deep defense: correlate response-path alerts
+        if self._shield and all_alerts:
+            self._record_alerts(all_alerts, tool_name)
+            self.assess_threat()
+
         return all_alerts
 
     async def check_tool_drift(self, current_tools: list[str]) -> list[dict]:
@@ -197,4 +903,12 @@ class ProtectionEngine:
             await self.dispatcher.dispatch(alert_dict)
 
         self._stats.alerts_generated += len(all_alerts)
+        if all_alerts:
+            self._record_alert_graph(all_alerts, "tools/list")
+
+        # Deep defense: tool drift is a strong signal — weight it heavily
+        if self._shield and all_alerts:
+            self._record_alerts(all_alerts)
+            self.assess_threat()
+
         return all_alerts

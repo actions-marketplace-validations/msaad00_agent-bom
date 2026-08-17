@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from agent_bom.watch import (
     Alert,
@@ -143,6 +146,20 @@ def test_watch_cli_help():
 
     assert result.exit_code == 0
     assert "Watch MCP configs" in result.output
+    assert "agent-bom watch --log alerts.jsonl" in result.output
+
+
+def test_runtime_watch_remains_available():
+    """``agent-bom runtime watch`` remains available for existing operators."""
+    from click.testing import CliRunner
+
+    from agent_bom.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["runtime", "watch", "--help"])
+
+    assert result.exit_code == 0
+    assert "Watch MCP configs" in result.output
 
 
 # ── 7. WebhookAlertSink — successful delivery ────────────────────────────
@@ -161,7 +178,10 @@ def test_webhook_sink_success():
     mock_response = MagicMock()
     mock_response.status_code = 200
 
-    with patch("httpx.post", return_value=mock_response) as mock_post:
+    with (
+        patch("httpx.post", return_value=mock_response) as mock_post,
+        patch("agent_bom.security.validate_url", return_value=None),
+    ):
         sink = WebhookAlertSink("https://hooks.slack.com/test", retries=0)
         sink.send(alert)
 
@@ -188,12 +208,15 @@ def test_webhook_sink_retries_on_server_error():
     ok_resp = MagicMock()
     ok_resp.status_code = 200
 
-    with patch("httpx.post", side_effect=[fail_resp, ok_resp]) as mock_post:
-        with patch("time.sleep"):  # Skip actual sleep
-            sink = WebhookAlertSink("https://hooks.example.com/test", retries=2)
-            sink.send(alert)
+    with (
+        patch("httpx.post", side_effect=[fail_resp, ok_resp]) as mock_post,
+        patch("time.sleep"),
+        patch("agent_bom.security.validate_url", return_value=None),
+    ):
+        sink = WebhookAlertSink("https://hooks.example.com/test", retries=2)
+        sink.send(alert)
 
-            assert mock_post.call_count == 2
+        assert mock_post.call_count == 2
 
 
 # ── 9. WebhookAlertSink — no retry on 4xx ────────────────────────────────
@@ -206,7 +229,10 @@ def test_webhook_sink_no_retry_on_client_error():
     resp_403 = MagicMock()
     resp_403.status_code = 403
 
-    with patch("httpx.post", return_value=resp_403) as mock_post:
+    with (
+        patch("httpx.post", return_value=resp_403) as mock_post,
+        patch("agent_bom.security.validate_url", return_value=None),
+    ):
         sink = WebhookAlertSink("https://hooks.example.com/test", retries=2)
         sink.send(alert)
 
@@ -226,12 +252,15 @@ def test_webhook_sink_retries_on_network_error():
     ok_resp = MagicMock()
     ok_resp.status_code = 200
 
-    with patch("httpx.post", side_effect=[httpx.ConnectError("fail"), ok_resp]) as mock_post:
-        with patch("time.sleep"):
-            sink = WebhookAlertSink("https://hooks.example.com/test", retries=2)
-            sink.send(alert)
+    with (
+        patch("httpx.post", side_effect=[httpx.ConnectError("fail"), ok_resp]) as mock_post,
+        patch("time.sleep"),
+        patch("agent_bom.security.validate_url", return_value=None),
+    ):
+        sink = WebhookAlertSink("https://hooks.example.com/test", retries=2)
+        sink.send(alert)
 
-            assert mock_post.call_count == 2
+        assert mock_post.call_count == 2
 
 
 # ── 11. WebhookAlertSink — exhausted retries ─────────────────────────────
@@ -243,14 +272,54 @@ def test_webhook_sink_exhausted_retries():
 
     alert = Alert(alert_type="config_changed", severity="info", summary="Test")
 
-    with patch("httpx.post", side_effect=httpx.ConnectError("fail")) as mock_post:
-        with patch("time.sleep"):
-            sink = WebhookAlertSink("https://hooks.example.com/test", retries=1)
-            # Should not raise
-            sink.send(alert)
+    with (
+        patch("httpx.post", side_effect=httpx.ConnectError("fail")) as mock_post,
+        patch("time.sleep"),
+        patch("agent_bom.security.validate_url", return_value=None),
+    ):
+        sink = WebhookAlertSink("https://hooks.example.com/test", retries=1)
+        # Should not raise
+        sink.send(alert)
 
-            # 1 initial + 1 retry = 2 calls
-            assert mock_post.call_count == 2
+        # 1 initial + 1 retry = 2 calls
+        assert mock_post.call_count == 2
+
+
+def test_webhook_sink_failure_logs_redacted_destination_and_error(caplog):
+    import httpx
+
+    secret_url = "https://hooks.example.com/services/T000/B111/SUPERSECRET?token=ALSOSECRET"
+    alert = Alert(alert_type="config_changed", severity="high", summary="Test")
+    # Pin capture to the emitting logger and restore its propagation: under
+    # worksteal, an earlier test can leave agent_bom.watch with propagate=False,
+    # which silently empties caplog and makes this redaction check a false pass.
+    watch_logger = logging.getLogger("agent_bom.watch")
+    prev_propagate = watch_logger.propagate
+    watch_logger.propagate = True
+    caplog.set_level(logging.WARNING, logger="agent_bom.watch")
+
+    try:
+        with (
+            patch("httpx.post", side_effect=httpx.ConnectError(f"failed for {secret_url}")),
+            patch("time.sleep"),
+            patch("agent_bom.security.validate_url", return_value=None),
+        ):
+            WebhookAlertSink(secret_url, retries=0).send(alert)
+    finally:
+        watch_logger.propagate = prev_propagate
+
+    from agent_bom.security import redact_secret_url
+
+    assert redact_secret_url(secret_url) in caplog.text
+    assert "SUPERSECRET" not in caplog.text
+    assert "ALSOSECRET" not in caplog.text
+    assert "/services/" not in caplog.text
+
+
+def test_webhook_sink_rejects_unbounded_retry_configuration():
+    with patch("agent_bom.security.validate_url", return_value=None):
+        with pytest.raises(ValueError, match="retries"):
+            WebhookAlertSink("https://hooks.example.com/test", retries=11)
 
 
 # ── 12. WebhookAlertSink — payload format ────────────────────────────────
@@ -274,7 +343,10 @@ def test_webhook_payload_format():
         resp.status_code = 200
         return resp
 
-    with patch("httpx.post", side_effect=capture_post):
+    with (
+        patch("httpx.post", side_effect=capture_post),
+        patch("agent_bom.security.validate_url", return_value=None),
+    ):
         sink = WebhookAlertSink("https://hooks.slack.com/test")
         sink.send(alert)
 

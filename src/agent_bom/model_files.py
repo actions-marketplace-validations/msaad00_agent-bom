@@ -9,9 +9,16 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import urllib.error
-import urllib.request
+import os
+import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+from agent_bom.floating_refs import classify_model_revision, is_hex_digest
+from agent_bom.model_pickle_scan import PICKLE_BEARING_EXTENSIONS, scan_pickle_file_flags
+
+if TYPE_CHECKING:
+    from agent_bom.finding import Finding
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +57,95 @@ _SECURITY_FLAGS: dict[str, dict] = {
     },
 }
 
+_UNSAFE_MODEL_EXTENSIONS = frozenset({".pt", ".pth", ".pkl", ".joblib", ".bin"})
+_MODEL_INDEX_FILENAMES = frozenset({"model.safetensors.index.json", "pytorch_model.bin.index.json"})
+_MODEL_MANIFEST_FILENAMES = frozenset({"config.json", "tokenizer_config.json", "adapter_config.json"})
+
+
+def _extract_repo_reference(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate or candidate.startswith("/"):
+        return None
+    return candidate if "/" in candidate else None
+
+
+def _safe_resolve_directory(directory: str | Path) -> Path:
+    """Resolve a scan root and constrain it to known-safe local roots.
+
+    Allowed roots:
+    - current user's home directory
+    - current working directory
+    - system temp directory
+    - optional extra roots from AGENT_BOM_SAFE_SCAN_ROOTS (os.pathsep-separated)
+    """
+    raw_directory = os.fspath(directory).strip()
+    if not raw_directory:
+        raise ValueError("Directory is empty")
+
+    expanded = os.path.expanduser(raw_directory)
+    if os.path.isabs(expanded):
+        candidate = os.path.realpath(expanded)
+    else:
+        candidate = os.path.realpath(os.path.join(os.getcwd(), expanded))
+
+    allowed_roots = {
+        os.path.realpath(str(Path.home())),
+        os.path.realpath(str(Path.cwd())),
+        os.path.realpath(tempfile.gettempdir()),
+    }
+
+    extra_roots = os.environ.get("AGENT_BOM_SAFE_SCAN_ROOTS", "")
+    for root in extra_roots.split(os.pathsep):
+        root = root.strip()
+        if root:
+            allowed_roots.add(os.path.realpath(root))
+
+    if not any(os.path.commonpath([root, candidate]) == root for root in allowed_roots):
+        raise ValueError(f"Directory escapes safe scan roots: {candidate}")
+
+    return Path(candidate)
+
+
+def _allowed_scan_roots() -> list[str]:
+    roots = {
+        os.path.realpath(str(Path.home())),
+        os.path.realpath(str(Path.cwd())),
+        os.path.realpath(tempfile.gettempdir()),
+    }
+    extra_roots = os.environ.get("AGENT_BOM_SAFE_SCAN_ROOTS", "")
+    for root in extra_roots.split(os.pathsep):
+        root = root.strip()
+        if root:
+            roots.add(os.path.realpath(root))
+    return sorted(roots)
+
+
+_ZIP_MAGICS = (b"PK\x03\x04", b"PK\x05\x06")
+# Pickle protocol-2+ streams begin with the PROTO opcode (0x80) followed by a
+# one-byte protocol number (1..5). Higher protocols (5) cover modern torch.
+_PICKLE_PROTOCOLS = frozenset({1, 2, 3, 4, 5})
+
+
+def _looks_like_pickle_header(file_path: Path) -> bool:
+    """Cheap content sniff: does this file *start* like a pickle or torch zip?
+
+    Reads only the first few bytes (no deserialization, bounded I/O). Used to
+    discover pickle-bearing content hiding under a benign or non-pickle-bearing
+    extension, which extension-only discovery would miss entirely.
+    """
+    try:
+        with open(file_path, "rb") as fh:
+            head = fh.read(4)
+    except OSError:
+        return False
+    if not head:
+        return False
+    if head[:4] in _ZIP_MAGICS:
+        return True
+    return head[:1] == b"\x80" and len(head) >= 2 and head[1] in _PICKLE_PROTOCOLS
+
 
 def _human_size(size_bytes: int | float) -> str:
     """Convert bytes to human-readable size string."""
@@ -72,12 +168,17 @@ def scan_model_files(
 
     Warnings are generated for security-relevant findings (e.g., pickle files).
     """
-    directory = Path(directory)
+    try:
+        directory = _safe_resolve_directory(directory)
+    except ValueError as exc:
+        logger.warning("Model scan refused: %s", exc)
+        return [], [f"Model scan: {exc}"]
     if not directory.is_dir():
         return [], [f"Model scan: {directory} is not a directory"]
 
     results: list[dict] = []
     warnings: list[str] = []
+    scanned_for_pickle: set[str] = set()
 
     for ext, info in _MODEL_EXTENSIONS.items():
         for file_path in sorted(directory.rglob(f"*{ext}")):
@@ -92,16 +193,39 @@ def scan_model_files(
 
             size_bytes = stat.st_size
 
-            # For .bin files, apply size heuristic to filter non-model binaries
-            min_size_mb = info.get("min_size_mb", 0)
-            if min_size_mb and size_bytes < min_size_mb * 1024 * 1024:
-                continue
-
             security_flags = []
             if ext in _SECURITY_FLAGS:
                 flag = _SECURITY_FLAGS[ext].copy()
                 security_flags.append(flag)
                 warnings.append(f"Model file {file_path.name}: {flag['severity']} — {flag['type']}. {flag['description']}")
+
+            # Disassembly-based malicious-pickle detection. This walks the
+            # pickle opcode stream via pickletools.genops WITHOUT ever
+            # deserializing the model (no pickle.load / torch.load / joblib.load),
+            # so the no-execution guarantee is preserved while upgrading the
+            # signal from extension-only to content-aware.
+            #
+            # The SECURITY scan runs on every pickle-bearing file regardless of
+            # size: the ``min_size_mb`` heuristic only classifies whether a
+            # generic binary counts as a "real model file", and must never gate
+            # the scan — otherwise a small malicious pickle disguised as ``.bin``
+            # (< min_size_mb) would slip through unscanned.
+            if ext in PICKLE_BEARING_EXTENSIONS:
+                scanned_for_pickle.add(str(file_path))
+                try:
+                    pickle_flags, _ = scan_pickle_file_flags(file_path)
+                except Exception as exc:  # noqa: BLE001 — scanner must never break a scan
+                    logger.debug("Pickle opcode scan skipped for %s: %s", file_path, exc)
+                    pickle_flags = []
+                for pflag in pickle_flags:
+                    security_flags.append(pflag)
+                    warnings.append(f"Model file {file_path.name}: {pflag['severity']} — {pflag['type']}. {pflag['description']}")
+
+            # Size heuristic filters non-model generic binaries from inventory,
+            # but never suppresses a file the content scan already flagged.
+            min_size_mb = info.get("min_size_mb", 0)
+            if min_size_mb and size_bytes < min_size_mb * 1024 * 1024 and not security_flags:
+                continue
 
             results.append(
                 {
@@ -116,7 +240,433 @@ def scan_model_files(
                 }
             )
 
+    # Content-sniff discovery pass. Extension-only discovery (the loop above)
+    # never sees a pickle hidden under a benign extension (``.txt``, ``.dat``)
+    # or under a model extension that is not normally pickle-bearing
+    # (``.safetensors``, ``.onnx``). Sniff every remaining file's header for
+    # pickle / torch-zip magic and disassemble the pickle-bearing ones,
+    # regardless of extension, so the format cannot be spoofed by renaming.
+    results_by_path = {item["path"]: item for item in results}
+    for file_path in sorted(directory.rglob("*")):
+        if any(part.startswith(".") for part in file_path.parts):
+            continue
+        path_str = str(file_path)
+        if path_str in scanned_for_pickle:
+            continue
+        try:
+            if not file_path.is_file():
+                continue
+            stat = file_path.stat()
+        except OSError:
+            continue
+        if not _looks_like_pickle_header(file_path):
+            continue
+        scanned_for_pickle.add(path_str)
+        try:
+            pickle_flags, _ = scan_pickle_file_flags(file_path)
+        except Exception as exc:  # noqa: BLE001 — scanner must never break a scan
+            logger.debug("Pickle opcode scan skipped for %s: %s", file_path, exc)
+            pickle_flags = []
+        if not pickle_flags:
+            continue
+        existing = results_by_path.get(path_str)
+        if existing is not None:
+            # File was already inventoried under a (spoofed) model extension;
+            # attach the content findings instead of duplicating the entry.
+            for pflag in pickle_flags:
+                existing["security_flags"].append(pflag)
+                warnings.append(f"Model file {file_path.name}: {pflag['severity']} — {pflag['type']}. {pflag['description']}")
+            continue
+        for pflag in pickle_flags:
+            warnings.append(f"Model file {file_path.name}: {pflag['severity']} — {pflag['type']}. {pflag['description']}")
+        suffix = file_path.suffix.lower()
+        entry = {
+            "path": path_str,
+            "filename": file_path.name,
+            "extension": suffix,
+            "format": "Pickle (disguised)",
+            "ecosystem": "Unknown",
+            "size_bytes": stat.st_size,
+            "size_human": _human_size(stat.st_size),
+            "security_flags": list(pickle_flags),
+        }
+        results.append(entry)
+        results_by_path[path_str] = entry
+
     return results, warnings
+
+
+# ── Model security flag → finding promotion ──────────────────────────────
+#
+# Every ``security_flags`` type the model scanners can attach to a model-file
+# entry MUST appear in exactly one of the two tables below. A flag that is in
+# neither reaches no user-visible surface — the defect class this file has
+# shipped three times (``--require-model-signatures`` silently a no-op, a
+# CRITICAL ``HASH_MISMATCH`` promoted to nothing). ``tests/test_model_files.py``
+# reads the emitters' source and fails when a new type is left unclassified.
+#
+# ``severity`` is always taken from the emitted flag; ``default_severity`` is
+# only the fallback used when a flag arrives without one.
+
+_MALICIOUS_REMEDIATION = (
+    "Quarantine the artifact, verify its publisher and digest, and replace it with a trusted "
+    "safetensors or ONNX artifact. Do not deserialize the flagged file."
+)
+_INTEGRITY_REMEDIATION = (
+    "Re-fetch the artifact from its authoritative source, verify the publisher digest and signature, "
+    "and prefer signed safetensors/ONNX distributions before loading it."
+)
+
+MODEL_FLAG_PROMOTIONS: dict[str, dict] = {
+    "MALICIOUS_PICKLE": {
+        "detector": "pickletools-static-disassembly",
+        "finding_type": "MALICIOUS_MODEL",
+        "default_severity": "CRITICAL",
+        "title": "Malicious model payload",
+        "is_malicious": True,
+        "malicious_reason": "Content-confirmed executable pickle payload",
+        "cwe_ids": ["CWE-502"],
+        "risk_score": 10.0,
+        "remediation": _MALICIOUS_REMEDIATION,
+        "requires_signature_policy": False,
+    },
+    "SUSPICIOUS_PICKLE": {
+        "detector": "pickletools-static-disassembly",
+        "finding_type": "MALICIOUS_MODEL",
+        "default_severity": "HIGH",
+        "title": "Suspicious model payload",
+        "is_malicious": False,
+        "malicious_reason": None,
+        "cwe_ids": ["CWE-502"],
+        "risk_score": 7.0,
+        "remediation": _MALICIOUS_REMEDIATION,
+        "requires_signature_policy": False,
+    },
+    "HASH_MISMATCH": {
+        "detector": "sha256-digest-verification",
+        "finding_type": "MODEL_INTEGRITY",
+        "default_severity": "CRITICAL",
+        "title": "Model digest mismatch",
+        "is_malicious": False,
+        "malicious_reason": None,
+        "cwe_ids": ["CWE-345"],
+        "risk_score": 9.0,
+        "remediation": _INTEGRITY_REMEDIATION,
+        "requires_signature_policy": False,
+    },
+    "OVERSIZE_PICKLE_UNSCANNED": {
+        "detector": "pickletools-static-disassembly",
+        "finding_type": "MODEL_INTEGRITY",
+        "default_severity": "HIGH",
+        "title": "Model artifact not fully scanned",
+        "is_malicious": False,
+        "malicious_reason": None,
+        "cwe_ids": ["CWE-502"],
+        "risk_score": 6.5,
+        "remediation": (
+            "The artifact exceeds the pickle scan byte cap, so part of it is unverified — padding past the cap "
+            "is a known evasion. Raise AGENT_BOM_PICKLE_MAX_BYTES to scan it fully, or replace it with "
+            "safetensors/ONNX."
+        ),
+        "requires_signature_policy": False,
+    },
+    "PICKLE_SCAN_ERROR": {
+        "detector": "pickletools-static-disassembly",
+        "finding_type": "MODEL_INTEGRITY",
+        "default_severity": "LOW",
+        "title": "Model artifact could not be scanned",
+        "is_malicious": False,
+        "malicious_reason": None,
+        "cwe_ids": ["CWE-502"],
+        "risk_score": 3.0,
+        "remediation": (
+            "The static pickle scan could not complete, so this artifact carries NO malicious-payload verdict. "
+            "Treat it as unverified: re-fetch it from its authoritative source and re-scan."
+        ),
+        "requires_signature_policy": False,
+    },
+    "HASH_ERROR": {
+        "detector": "sha256-digest-verification",
+        "finding_type": "MODEL_INTEGRITY",
+        "default_severity": "MEDIUM",
+        "title": "Model digest could not be computed",
+        "is_malicious": False,
+        "malicious_reason": None,
+        "cwe_ids": ["CWE-345"],
+        "risk_score": 4.0,
+        "remediation": (
+            "The artifact could not be read for hashing, so its integrity is unverified. Check file permissions "
+            "and storage health, then re-run the scan."
+        ),
+        "requires_signature_policy": False,
+    },
+    "UNSIGNED": {
+        "detector": "sigstore-signature-presence",
+        "finding_type": "MODEL_INTEGRITY",
+        "default_severity": "MEDIUM",
+        "title": "Unsigned model artifact",
+        "is_malicious": False,
+        "malicious_reason": None,
+        "cwe_ids": ["CWE-347"],
+        "risk_score": 5.0,
+        "remediation": (
+            "No Sigstore/cosign signature was found next to the artifact. Publish and verify a signature, or "
+            "source the model from a signed distribution."
+        ),
+        # Absence of a signature is a policy violation only when the operator
+        # asked for signatures; otherwise it stays inventory metadata.
+        "requires_signature_policy": True,
+    },
+}
+
+INVENTORY_ONLY_MODEL_FLAGS: dict[str, str] = {
+    "PICKLE_DESERIALIZATION": (
+        "Describes the FORMAT of every .pkl file, not a property of this artifact. Promoting it would emit a "
+        "finding for every pickle in the estate regardless of content; the content verdict comes from "
+        "MALICIOUS_PICKLE / SUSPICIOUS_PICKLE instead."
+    ),
+    "JOBLIB_DESERIALIZATION": (
+        "Same format-shape warning as PICKLE_DESERIALIZATION, for joblib artifacts. Content verdicts come from "
+        "the opcode scan, not from the extension."
+    ),
+    "FILE_NOT_FOUND": (
+        "A scan-input error (the caller named a path that does not exist), not a property of a discovered "
+        "artifact. Surfaced to the caller as a scan warning; there is no asset to hang a finding on."
+    ),
+}
+
+
+def model_file_findings(
+    model_files: list[dict],
+    *,
+    require_model_signatures: bool = False,
+) -> list["Finding"]:
+    """Convert model artifact security flags to unified findings.
+
+    Promotion is driven by :data:`MODEL_FLAG_PROMOTIONS`; anything listed in
+    :data:`INVENTORY_ONLY_MODEL_FLAGS` stays inventory metadata with a
+    documented reason. Severity is read off the emitted flag so the scanner
+    that produced it remains the single source of truth.
+
+    ``require_model_signatures`` promotes signature-policy flags (``UNSIGNED``)
+    that are otherwise inventory-only, so ``--require-model-signatures``
+    actually gates a scan.
+    """
+    from agent_bom.compliance_hub import apply_hub_classification
+    from agent_bom.finding import Asset, Finding, FindingSource, FindingType
+    from agent_bom.security import sanitize_text
+
+    findings: list[Finding] = []
+    seen_ids: set[str] = set()
+    for model_file in model_files:
+        if not isinstance(model_file, dict):
+            continue
+        path = sanitize_text(model_file.get("path", "") or "", max_len=1000)
+        filename = sanitize_text(model_file.get("filename", "") or Path(path).name or "model artifact", max_len=255)
+        for raw_flag in model_file.get("security_flags", []) or []:
+            if not isinstance(raw_flag, dict):
+                continue
+            flag_type = raw_flag.get("type")
+            spec = MODEL_FLAG_PROMOTIONS.get(flag_type) if isinstance(flag_type, str) else None
+            if spec is None:
+                continue
+            if spec["requires_signature_policy"] and not require_model_signatures:
+                continue
+            description = sanitize_text(
+                raw_flag.get("description", "") or f"Model artifact scan reported {flag_type}.",
+                max_len=2000,
+            )
+            dangerous_imports = [
+                sanitize_text(value, max_len=200) for value in raw_flag.get("dangerous_imports", []) or [] if isinstance(value, str)
+            ][:32]
+            code_exec_opcodes = [
+                sanitize_text(value, max_len=80) for value in raw_flag.get("code_exec_opcodes", []) or [] if isinstance(value, str)
+            ][:32]
+            finding = apply_hub_classification(
+                Finding(
+                    finding_type=FindingType(spec["finding_type"]),
+                    source=FindingSource.MODEL_SCAN,
+                    asset=Asset(
+                        name=filename,
+                        asset_type="model_file",
+                        identifier=path or filename,
+                        location=path or None,
+                    ),
+                    severity=str(raw_flag.get("severity") or spec["default_severity"]),
+                    title=f"{spec['title']}: {filename}",
+                    description=description,
+                    cwe_ids=list(spec["cwe_ids"]),
+                    is_malicious=spec["is_malicious"],
+                    malicious_reason=spec["malicious_reason"],
+                    remediation_guidance=spec["remediation"],
+                    is_actionable=True,
+                    risk_score=spec["risk_score"],
+                    evidence={
+                        "detector": spec["detector"],
+                        "detection_type": flag_type,
+                        "format": sanitize_text(model_file.get("format", "") or "", max_len=120),
+                        "extension": sanitize_text(model_file.get("extension", "") or "", max_len=40),
+                        "size_bytes": model_file.get("size_bytes") if isinstance(model_file.get("size_bytes"), int) else None,
+                        "dangerous_imports": dangerous_imports,
+                        "code_exec_opcodes": code_exec_opcodes,
+                        "deserialized": False,
+                    },
+                )
+            )
+            if finding.id not in seen_ids:
+                findings.append(finding)
+                seen_ids.add(finding.id)
+    return findings
+
+
+def scan_model_manifests(
+    directory: str | Path,
+) -> tuple[list[dict], list[str]]:
+    """Scan a directory for model bundle manifests and lineage metadata."""
+    raw_directory = os.fspath(directory).strip()
+    if not raw_directory:
+        return [], ["Model manifest scan: directory is empty"]
+
+    expanded = os.path.expanduser(raw_directory)
+    resolved_input = os.path.realpath(expanded if os.path.isabs(expanded) else os.path.join(os.getcwd(), expanded))
+
+    matched_root = None
+    scan_root = None
+    for safe_root in _allowed_scan_roots():
+        try:
+            relative = os.path.relpath(resolved_input, safe_root)
+        except ValueError:
+            continue
+        scan_candidate = os.path.normpath(os.path.join(safe_root, relative))
+        if os.path.commonpath([safe_root, scan_candidate]) != safe_root:
+            continue
+        if scan_candidate != resolved_input:
+            continue
+        matched_root = safe_root
+        scan_root = scan_candidate
+        break
+
+    if matched_root is None or scan_root is None:
+        logger.warning("Model manifest scan refused outside safe roots")
+        return [], [f"Model manifest scan: Directory escapes safe scan roots: {resolved_input}"]
+
+    manifests: list[dict] = []
+    warnings: list[str] = []
+    scan_root_prefix = scan_root + os.sep
+    target_found = False
+
+    for root, dirs, files in os.walk(matched_root):
+        root = os.path.normpath(root)
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+
+        if root == scan_root:
+            target_found = True
+        elif root.startswith(scan_root_prefix):
+            target_found = True
+        elif scan_root.startswith(root + os.sep):
+            rel_to_target = os.path.relpath(scan_root, root)
+            next_segment = rel_to_target.split(os.sep, 1)[0]
+            dirs[:] = [d for d in dirs if d == next_segment]
+            continue
+        else:
+            dirs[:] = []
+            continue
+
+        if any(part.startswith(".") for part in Path(root).parts):
+            continue
+        for filename in sorted(files):
+            if not filename.endswith(".json"):
+                continue
+
+            file_path = os.path.normpath(os.path.join(root, filename))
+            if os.path.commonpath([scan_root, file_path]) != scan_root:
+                continue
+            file_name = os.path.basename(file_path)
+            if any(part.startswith(".") for part in Path(file_path).parts):
+                continue
+            if file_name not in _MODEL_INDEX_FILENAMES and file_name not in _MODEL_MANIFEST_FILENAMES:
+                continue
+
+            try:
+                with open(file_path, encoding="utf-8", errors="replace") as handle:
+                    payload_raw = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload_raw, dict):
+                continue
+            payload = payload_raw
+
+            manifest_type = "config"
+            repo_id = _extract_repo_reference(payload.get("_name_or_path")) or _extract_repo_reference(payload.get("name_or_path"))
+            base_model_id = None
+            shard_count = 0
+            security_flags: list[dict] = []
+
+            if file_name in _MODEL_INDEX_FILENAMES:
+                manifest_type = "weight_index"
+                weight_map = payload.get("weight_map", {})
+                if isinstance(weight_map, dict):
+                    shard_count = len({str(v) for v in weight_map.values() if isinstance(v, str)})
+                if not shard_count:
+                    security_flags.append(
+                        {
+                            "severity": "MEDIUM",
+                            "type": "EMPTY_WEIGHT_INDEX",
+                            "description": "Weight index manifest has no shard mapping; bundle integrity cannot be confirmed.",
+                        }
+                    )
+            elif file_name == "adapter_config.json":
+                manifest_type = "adapter"
+                base_model_id = _extract_repo_reference(payload.get("base_model_name_or_path"))
+                if not base_model_id:
+                    security_flags.append(
+                        {
+                            "severity": "MEDIUM",
+                            "type": "MISSING_BASE_MODEL",
+                            "description": "Adapter manifest does not declare a base model lineage reference.",
+                        }
+                    )
+            elif file_name == "tokenizer_config.json":
+                manifest_type = "tokenizer"
+
+            model_type = payload.get("model_type") if isinstance(payload.get("model_type"), str) else None
+            architectures = payload.get("architectures") if isinstance(payload.get("architectures"), list) else []
+            metadata = payload.get("metadata")
+            total_size = metadata.get("total_size") if isinstance(metadata, dict) and isinstance(metadata.get("total_size"), int) else None
+            revision = payload.get("revision")
+            if not isinstance(revision, str):
+                revision = payload.get("base_model_revision")
+            revision = revision if isinstance(revision, str) else None
+            commit_hash = payload.get("_commit_hash") or payload.get("commit_hash")
+            commit_hash = commit_hash if isinstance(commit_hash, str) and is_hex_digest(commit_hash) else None
+            reference_for_revision = base_model_id or repo_id
+            floating_ref = classify_model_revision(reference_for_revision, revision)
+            if floating_ref and not commit_hash:
+                security_flags.append(floating_ref.to_security_flag())
+
+            manifest = {
+                "path": file_path,
+                "filename": file_name,
+                "manifest_type": manifest_type,
+                "repo_id": repo_id,
+                "base_model_id": base_model_id,
+                "revision": revision,
+                "commit_hash": commit_hash,
+                "model_type": model_type,
+                "architectures": architectures,
+                "shard_count": shard_count,
+                "total_size_bytes": total_size,
+                "security_flags": security_flags,
+            }
+            manifests.append(manifest)
+
+            for flag in security_flags:
+                warnings.append(f"Model manifest {file_name}: {flag['severity']} — {flag['type']}. {flag['description']}")
+
+    if not target_found:
+        return [], [f"Model manifest scan: {scan_root} is not a directory"]
+
+    return manifests, warnings
 
 
 # ── Model weight provenance ─────────────────────────────────────
@@ -250,16 +800,19 @@ def check_huggingface_provenance(
         "gated": False,
         "downloads": None,
         "tags": [],
+        "model_advisories": [],
+        "model_advisory_feed": {},
         "security_flags": [],
     }
 
     url = f"https://huggingface.co/api/models/{model_name}"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "agent-bom"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 — URL prefix is hardcoded https://huggingface.co
-            data = json.loads(resp.read().decode())
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
+        from agent_bom.http_client import sync_get
+
+        resp = sync_get(url, timeout=timeout, headers={"User-Agent": "agent-bom"})
+        if resp is None:
+            raise ConnectionError("HuggingFace API unreachable after retries")
+        if resp.status_code == 404:
             result["security_flags"].append(
                 {
                     "severity": "HIGH",
@@ -267,16 +820,10 @@ def check_huggingface_provenance(
                     "description": f"Model '{model_name}' not found on HuggingFace. Cannot verify provenance.",
                 }
             )
-        else:
-            result["security_flags"].append(
-                {
-                    "severity": "MEDIUM",
-                    "type": "PROVENANCE_CHECK_FAILED",
-                    "description": f"HuggingFace API error {exc.code}: {exc.reason}",
-                }
-            )
-        return result
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+            return result
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
         result["security_flags"].append(
             {
                 "severity": "MEDIUM",
@@ -286,12 +833,21 @@ def check_huggingface_provenance(
         )
         return result
 
+    card_data = data.get("cardData") if isinstance(data.get("cardData"), dict) else {}
     result["author"] = data.get("author")
-    result["license"] = data.get("cardData", {}).get("license") if data.get("cardData") else data.get("license")
-    result["has_model_card"] = data.get("cardData") is not None or data.get("hasModelCard", False)
+    result["license"] = card_data.get("license") if card_data else data.get("license")
+    result["has_model_card"] = bool(card_data) or data.get("hasModelCard", False)
     result["gated"] = data.get("gated", False)
     result["downloads"] = data.get("downloads")
-    result["tags"] = data.get("tags", [])
+    tags = data.get("tags", [])
+    result["tags"] = tags if isinstance(tags, list) else []
+
+    from agent_bom.model_advisories import feed_posture, match_model_advisories, model_advisories_to_dict
+
+    feed = None
+    advisories = match_model_advisories(model_name, registry="huggingface", tags=result["tags"], card_data=card_data, feed=feed)
+    result["model_advisories"] = model_advisories_to_dict(advisories)
+    result["model_advisory_feed"] = feed_posture(feed)
 
     # Check if siblings include sha256-bearing files
     siblings = data.get("siblings", [])
@@ -316,3 +872,162 @@ def check_huggingface_provenance(
         )
 
     return result
+
+
+def summarize_model_supply_chain(
+    model_files: list[dict],
+    model_provenance: list[dict] | None = None,
+    model_hash_verification: dict | None = None,
+    model_manifests: list[dict] | None = None,
+) -> dict:
+    """Build a stable summary of model/weight supply-chain coverage.
+
+    This consolidates local model artifact scanning, HuggingFace provenance
+    checks, and optional hash verification into one operator-facing contract
+    that can be surfaced consistently in CLI, JSON, and docs.
+    """
+    provenance = model_provenance or []
+    hash_verification = model_hash_verification or {}
+    manifests = model_manifests or []
+
+    files_with_flags = 0
+    signed_files = 0
+    unsigned_files = 0
+    unsafe_files = 0
+    total_size_bytes = 0
+    ecosystems: set[str] = set()
+    formats: set[str] = set()
+
+    for model_file in model_files:
+        total_size_bytes += int(model_file.get("size_bytes", 0) or 0)
+        if model_file.get("security_flags"):
+            files_with_flags += 1
+        if model_file.get("signed") is True:
+            signed_files += 1
+        else:
+            unsigned_files += 1
+        if str(model_file.get("extension", "")).lower() in _UNSAFE_MODEL_EXTENSIONS:
+            unsafe_files += 1
+        ecosystem = model_file.get("ecosystem")
+        if ecosystem:
+            ecosystems.add(str(ecosystem))
+        fmt = model_file.get("format")
+        if fmt:
+            formats.add(str(fmt))
+
+    provenance_with_flags = sum(1 for item in provenance if item.get("security_flags"))
+    provenance_with_digest = sum(1 for item in provenance if item.get("has_digest") is True or item.get("sha256_available") is True)
+    gated_models = sum(1 for item in provenance if item.get("is_gated") is True or item.get("gated") is True)
+    sources = sorted({str(item.get("source", "huggingface")) for item in provenance})
+    model_advisories: list[dict] = []
+    for item in provenance:
+        advisories = item.get("model_advisories", [])
+        if not isinstance(advisories, list):
+            continue
+        model_advisories.extend(advisory for advisory in advisories if isinstance(advisory, dict))
+    advisory_severities = sorted({str(item.get("severity", "unknown")) for item in model_advisories})
+    manifest_types = sorted({str(item.get("manifest_type")) for item in manifests if item.get("manifest_type")})
+
+    from agent_bom.model_advisories import feed_posture
+
+    return {
+        "model_files": len(model_files),
+        "total_size_bytes": total_size_bytes,
+        "signed_files": signed_files,
+        "unsigned_files": unsigned_files,
+        "unsafe_format_files": unsafe_files,
+        "files_with_security_flags": files_with_flags,
+        "formats": sorted(formats),
+        "ecosystems": sorted(ecosystems),
+        "provenance_checks": len(provenance),
+        "provenance_with_digest": provenance_with_digest,
+        "gated_models": gated_models,
+        "provenance_with_security_flags": provenance_with_flags,
+        "provenance_sources": sources,
+        "ai_model_advisories": {
+            "count": len(model_advisories),
+            "severities": advisory_severities,
+            "items": model_advisories,
+            "feed": feed_posture(),
+        },
+        "manifest_files": len(manifests),
+        "manifest_types": manifest_types,
+        "manifests_with_repo_id": sum(1 for item in manifests if item.get("repo_id")),
+        "adapter_lineage_refs": sum(1 for item in manifests if item.get("base_model_id")),
+        "sharded_bundles": sum(1 for item in manifests if int(item.get("shard_count", 0) or 0) > 0),
+        "manifests_with_security_flags": sum(1 for item in manifests if item.get("security_flags")),
+        "hash_verification": {
+            "scanned": int(hash_verification.get("scanned", 0) or 0),
+            "verified": int(hash_verification.get("verified", 0) or 0),
+            "tampered": int(hash_verification.get("tampered", 0) or 0),
+            "unverified": int(hash_verification.get("unverified", 0) or 0),
+            "offline": int(hash_verification.get("offline", 0) or 0),
+            "has_tampering": bool(hash_verification.get("has_tampering", False)),
+        },
+    }
+
+
+def evaluate_model_provenance_policy(
+    model_files: list[dict],
+    *,
+    mode: str = "warn",
+    require_signatures: bool = False,
+    block_unsafe_formats: bool = False,
+) -> dict:
+    """Evaluate local model artifact policy without inventing new signing.
+
+    The evaluator consumes fields already produced by ``scan_model_files`` and
+    ``check_sigstore_signature``. ``warn`` mode reports violations without
+    blocking; ``enforce`` mode marks the policy as failed.
+    """
+
+    normalized_mode = mode if mode in {"off", "warn", "enforce"} else "warn"
+    violations: list[dict[str, str]] = []
+    warnings: list[dict[str, str]] = []
+
+    if normalized_mode == "off":
+        return {
+            "mode": "off",
+            "passed": True,
+            "require_signatures": require_signatures,
+            "block_unsafe_formats": block_unsafe_formats,
+            "violations": [],
+            "warnings": [],
+            "checked_files": len(model_files),
+        }
+
+    for model_file in model_files:
+        filename = str(model_file.get("filename") or Path(str(model_file.get("path", "model"))).name)
+        extension = str(model_file.get("extension", "")).lower()
+        if require_signatures and model_file.get("signed") is not True:
+            violations.append(
+                {
+                    "type": "UNSIGNED_MODEL",
+                    "severity": "HIGH",
+                    "file": filename,
+                    "message": "model artifact has no Sigstore/cosign-compatible signature evidence",
+                }
+            )
+        if block_unsafe_formats and extension in _UNSAFE_MODEL_EXTENSIONS:
+            violations.append(
+                {
+                    "type": "UNSAFE_MODEL_FORMAT",
+                    "severity": "HIGH",
+                    "file": filename,
+                    "message": f"model artifact uses unsafe or executable-on-load format {extension}",
+                }
+            )
+
+    if normalized_mode == "warn":
+        warnings = violations
+        violations = []
+
+    return {
+        "mode": normalized_mode,
+        "passed": not violations,
+        "require_signatures": require_signatures,
+        "block_unsafe_formats": block_unsafe_formats,
+        "violations": violations,
+        "warnings": warnings,
+        "checked_files": len(model_files),
+    }

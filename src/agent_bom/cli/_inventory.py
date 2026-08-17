@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from typing import Optional
 
 import click
 from rich.console import Console
 
-from agent_bom.cli._common import _make_console
+from agent_bom.cli._common import _build_agents_from_inventory, _make_console, read_json_file_for_cli
 from agent_bom.discovery import discover_all
+from agent_bom.inventory import _inventory_payload_and_version, _inventory_schema_path, _inventory_validator
+from agent_bom.mcp_blocklist import flag_blocklisted_mcp_servers
 from agent_bom.models import AIBOMReport
 from agent_bom.output import print_agent_tree, print_summary
 from agent_bom.parsers import extract_packages
@@ -23,7 +27,21 @@ from agent_bom.parsers import extract_packages
 @click.option("--transitive", is_flag=True, help="Resolve transitive dependencies for npx/uvx packages")
 @click.option("--max-depth", type=int, default=3, help="Maximum depth for transitive dependency resolution")
 @click.option("--quiet", "-q", is_flag=True, help="Suppress all output except results")
-def inventory(config: Optional[str], project: Optional[str], transitive: bool, max_depth: int, quiet: bool):
+@click.option("-f", "--format", "output_format", type=click.Choice(["console", "json"]), default="console", show_default=True)
+@click.option("--json", "as_json", is_flag=True, help="Deprecated alias for `--format json`.")
+@click.option("--demo", is_flag=True, help="Show the bundled demo inventory (matches `agent-bom scan --demo`).")
+@click.pass_context
+def inventory(
+    ctx: click.Context,
+    config: Optional[str],
+    project: Optional[str],
+    transitive: bool,
+    max_depth: int,
+    quiet: bool,
+    output_format: str,
+    as_json: bool,
+    demo: bool,
+):
     """Show discovered agents and MCP servers (no vulnerability scan)."""
     con = _make_console(quiet=quiet)
 
@@ -31,49 +49,108 @@ def inventory(config: Optional[str], project: Optional[str], transitive: bool, m
 
     _out.console = con
 
-    if config:
-        config_path = Path(config)
-        try:
-            config_data = json.loads(config_path.read_text())
-            from agent_bom.discovery import parse_mcp_config
-            from agent_bom.models import Agent, AgentType
+    if as_json and ctx.parent is not None and ctx.parent.info_name == "mcp":
+        click.echo("Warning: --json is deprecated; use -f json.", err=True)
+    json_output = as_json or output_format == "json"
+    discovery_stdout = redirect_stdout(StringIO()) if json_output else nullcontext()
+    discovery_stderr = redirect_stderr(StringIO()) if json_output else nullcontext()
+    inventory_source: Optional[str] = None
+    with discovery_stdout, discovery_stderr:
+        if demo:
+            from agent_bom.demo import DEMO_INVENTORY
 
-            servers = parse_mcp_config(config_data, str(config_path))
-            agents = (
-                [
-                    Agent(
-                        name=f"custom:{config_path.stem}",
-                        agent_type=AgentType.CUSTOM,
-                        config_path=str(config_path),
-                        mcp_servers=servers,
-                    )
-                ]
-                if servers
-                else []
-            )
-        except Exception as e:
-            con.print(f"[red]Error parsing config: {e}[/red]")
-            sys.exit(1)
-    else:
-        agents = discover_all(project_dir=project)
+            inventory_source = "agent-bom --demo"
+            agents = _build_agents_from_inventory(DEMO_INVENTORY, inventory_source)
+        elif config:
+            config_path = Path(config)
+            inventory_source = str(config_path)
+            try:
+                config_data = read_json_file_for_cli(config_path, label="MCP config")
+                from agent_bom.discovery import parse_mcp_config
+                from agent_bom.models import Agent, AgentType
+
+                servers = parse_mcp_config(config_data, str(config_path))
+                agents = (
+                    [
+                        Agent(
+                            name=f"custom:{config_path.stem}",
+                            agent_type=AgentType.CUSTOM,
+                            config_path=str(config_path),
+                            mcp_servers=servers,
+                        )
+                    ]
+                    if servers
+                    else []
+                )
+            except click.ClickException:
+                raise
+            except Exception as e:
+                raise click.ClickException(f"Error parsing MCP config {config_path}: {e}") from e
+        else:
+            project_inventory = _project_inventory_path(project)
+            if project_inventory is not None:
+                inventory_source = str(project_inventory)
+                from agent_bom.inventory import load_inventory
+
+                try:
+                    inventory_data = load_inventory(str(project_inventory))
+                except (OSError, ValueError) as exc:
+                    raise click.ClickException(f"Error loading project inventory {project_inventory}: {exc}") from exc
+                agents = _build_agents_from_inventory(inventory_data, str(project_inventory))
+            else:
+                agents = discover_all(project_dir=project)
 
     if not agents:
+        if json_output:
+            _print_inventory_json(agents, inventory_source)
+            return
         con.print("\n[yellow]No MCP configurations found.[/yellow]")
         sys.exit(0)
 
-    con.print("\n[bold blue]Extracting package dependencies...[/bold blue]\n")
-    if transitive:
-        con.print(f"  [cyan]Transitive resolution enabled (max depth: {max_depth})[/cyan]\n")
+    if not json_output:
+        con.print("\n[bold blue]Extracting package dependencies...[/bold blue]\n")
+        if transitive:
+            con.print(f"  [cyan]Transitive resolution enabled (max depth: {max_depth})[/cyan]\n")
+
+    flag_blocklisted_mcp_servers(agents)
 
     for agent in agents:
         for server in agent.mcp_servers:
             if server.security_blocked:
                 continue  # Don't extract from security-blocked servers
+            if server.packages:
+                continue
             server.packages = extract_packages(server, resolve_transitive=transitive, max_depth=max_depth)
+
+    if json_output:
+        _print_inventory_json(agents, inventory_source)
+        return
 
     report = AIBOMReport(agents=agents)
     print_summary(report)
     print_agent_tree(report)
+
+
+def _project_inventory_path(project: Optional[str]) -> Path | None:
+    if not project:
+        return None
+    project_path = Path(project)
+    if not project_path.is_dir():
+        return None
+    inventory_path = project_path / "inventory.json"
+    return inventory_path if inventory_path.is_file() else None
+
+
+def _print_inventory_json(agents, config: Optional[str]) -> None:
+    from agent_bom.discovery import get_all_discovery_paths, get_platform
+    from agent_bom.discovery.coverage import discovery_completeness_summary
+    from agent_bom.output.json_fmt import to_json
+
+    report = AIBOMReport(agents=agents, scan_sources=["agent_discovery"])
+    data = to_json(report)
+    path_entries = [("custom", str(Path(config)))] if config else get_all_discovery_paths(get_platform())
+    data["discovery_completeness"] = discovery_completeness_summary(path_entries, agents=agents)
+    click.echo(json.dumps(data, indent=2))
 
 
 @click.command()
@@ -88,46 +165,39 @@ def validate(inventory_file: str):
     """
     console = Console()
 
+    data = read_json_file_for_cli(inventory_file, label="inventory file")
+
     try:
-        import jsonschema
+        payload, schema_version = _inventory_payload_and_version(data)
+        schema_path = _inventory_schema_path(schema_version)
+        if not schema_path or not schema_path.exists():
+            console.print("[red]Schema file not found. Run from the agent-bom repo root.[/red]")
+            sys.exit(1)
+        validator = _inventory_validator(schema_version)
+    except ValueError as exc:
+        console.print(f"\n  [red]✗ Invalid — {exc}[/red]\n")
+        sys.exit(1)
     except ImportError:
         console.print("[red]jsonschema not installed. Run: pip install jsonschema[/red]")
         sys.exit(1)
-
-    _initial_schema = Path(__file__).parent.parent.parent / "schemas" / "inventory.schema.json"
-    schema_path: Path | None = _initial_schema
-    if not _initial_schema.exists():
-        # Fallback: look relative to installed package
-        import importlib.resources
-
-        try:
-            schema_path = Path(str(importlib.resources.files("agent_bom"))) / ".." / ".." / "schemas" / "inventory.schema.json"
-        except Exception:
-            schema_path = None
-
-    if not schema_path or not schema_path.exists():
-        console.print("[red]Schema file not found. Run from the agent-bom repo root.[/red]")
-        sys.exit(1)
-
-    with open(schema_path) as f:
-        schema = json.load(f)
-
-    with open(inventory_file) as f:
-        try:
-            data = json.load(f)
-        except json.JSONDecodeError as e:
-            console.print(f"[red]JSON parse error: {e}[/red]")
-            sys.exit(1)
-
-    validator = jsonschema.Draft202012Validator(schema)
-    errors = sorted(validator.iter_errors(data), key=lambda e: list(e.path))
+    errors = sorted(validator.iter_errors(payload), key=lambda e: list(e.path))
 
     if not errors:
-        agents = data.get("agents", [])
+        agents = payload.get("agents", [])
         total_servers = sum(len(a.get("mcp_servers", [])) for a in agents)
         total_packages = sum(len(s.get("packages", [])) for a in agents for s in a.get("mcp_servers", []))
-        console.print(f"\n  [green]✓ Valid[/green] — {len(agents)} agent(s), {total_servers} server(s), {total_packages} package(s)")
-        console.print(f"\n  [dim]Scan with:[/dim] agent-bom scan --inventory {inventory_file}")
+        # Split AI clients/hosts (specific agent_type) from background/framework
+        # agents (agent_type == custom), excluding synthetic sbom:/image: wrappers
+        # — mirrors models.classify_agent_kind so the count doesn't imply autonomy.
+        clients = sum(1 for a in agents if a.get("agent_type") and a.get("agent_type") != "custom")
+        background = sum(
+            1 for a in agents if a.get("agent_type") == "custom" and not str(a.get("name") or "").startswith(("sbom:", "image:"))
+        )
+        breakdown = f" ({clients} client(s), {background} background)" if (clients or background) else ""
+        console.print(
+            f"\n  [green]✓ Valid[/green] — {len(agents)} agent(s){breakdown}, {total_servers} server(s), {total_packages} package(s)"
+        )
+        console.print(f"\n  [dim]Scan exact inventory with:[/dim] agent-bom scan --inventory {inventory_file} --inventory-only")
     else:
         console.print(f"\n  [red]✗ Invalid — {len(errors)} error(s):[/red]\n")
         for err in errors:
@@ -161,25 +231,32 @@ def where(as_json: bool):
 
     current_platform = get_platform()
 
-    if as_json:
+    from agent_bom.cli._agent_mode import agent_mode_requested
+
+    agent_mode = agent_mode_requested()
+
+    if as_json or agent_mode:
         import json as _json
 
-        entries = []
-        for client, path in get_all_discovery_paths(current_platform):
-            expanded = str(expand_path(path)) if not path.startswith(".") else path
-            entries.append(
-                {
-                    "client": client,
-                    "path": path,
-                    "expanded": expanded,
-                    "exists": expand_path(path).exists() if not path.startswith(".") else Path(path).exists(),
-                }
-            )
-        click.echo(_json.dumps({"platform": current_platform, "paths": entries}, indent=2))
+        from agent_bom.discovery.coverage import discovery_coverage_summary
+
+        summary = discovery_coverage_summary(current_platform, get_all_discovery_paths(current_platform))
+        for entry in summary["paths"]:
+            path = str(entry["path"])
+            entry["expanded"] = str(expand_path(path)) if not path.startswith(".") else path
+        if agent_mode:
+            from agent_bom.cli._agent_mode import emit_command_envelope
+
+            emit_command_envelope(command="where", data=summary)
+            return
+        click.echo(_json.dumps(summary, indent=2))
         return
 
     console = Console()
     console.print("\n[bold]MCP Client Configuration Locations[/bold]\n")
+    from agent_bom.discovery.coverage import supported_clients
+
+    console.print(f"[dim]Code-backed first-class client types: {len(supported_clients())}[/dim]\n")
 
     total_paths = 0
     found_paths = 0
@@ -259,15 +336,22 @@ def completions_cmd(shell: str):
     Permanent setup (zsh):
       agent-bom completions zsh >> ~/.zshrc
     """
-    import os as _os
-    import subprocess as _sp
-
-    env = {**_os.environ, "_AGENT_BOM_COMPLETE": f"{shell}_source"}
+    # Use Click's completion API directly so the script is generated from
+    # the in-process command tree. The previous implementation shelled out to
+    # `agent-bom` via subprocess, which silently emitted an empty script when
+    # the binary was not on PATH (breaking `eval "$(agent-bom completions zsh)"`).
     try:
-        result = _sp.run(["agent-bom"], env=env, capture_output=True, text=True)
-        click.echo(result.stdout, nl=False)
+        from click.shell_completion import get_completion_class
+
+        from agent_bom.cli import main as _root_cli
+
+        completion_cls = get_completion_class(shell)
+        if completion_cls is None:
+            raise RuntimeError(f"Click does not support completion for shell {shell!r}")
+        comp = completion_cls(_root_cli, {}, "agent-bom", "_AGENT_BOM_COMPLETE")
+        click.echo(comp.source(), nl=False)
     except Exception:  # noqa: BLE001
-        # Fallback: print activation instructions
+        # Fallback: print activation instructions so the user can wire it up by hand.
         if shell == "bash":
             click.echo('eval "$(_AGENT_BOM_COMPLETE=bash_source agent-bom)"')
         elif shell == "zsh":

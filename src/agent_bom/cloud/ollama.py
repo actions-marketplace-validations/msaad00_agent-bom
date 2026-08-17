@@ -6,11 +6,11 @@ the ``~/.ollama/models`` manifest directory.  No extra dependencies required.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from pathlib import Path
 
+from agent_bom.discovery_envelope import RedactionStatus, ScanMode, attach_envelope_to_agents
 from agent_bom.models import Agent, AgentType, MCPServer, MCPTool, Package
 
 logger = logging.getLogger(__name__)
@@ -34,7 +34,7 @@ def discover(
     agents: list[Agent] = []
     warnings: list[str] = []
 
-    resolved_host = host or os.environ.get("OLLAMA_HOST", _DEFAULT_OLLAMA_HOST)
+    resolved_host: str = host or os.environ.get("OLLAMA_HOST") or _DEFAULT_OLLAMA_HOST
 
     # ── Strategy 1: Ollama API ───────────────────────────────────────────
     api_models = _discover_via_api(resolved_host)
@@ -127,6 +127,23 @@ def discover(
     else:
         warnings.append(f"Ollama not detected (no API at {resolved_host}, no manifests at {_MANIFEST_DIR})")
 
+    # Per-run discovery envelope (#2083 PR B). Ollama is local-only -- no
+    # network egress, just an HTTP call to localhost + filesystem reads of
+    # the manifest directory.
+    scope: list[str] = []
+    if resolved_host:
+        scope.append(f"ollama:host/{resolved_host}")
+    scope.append(f"ollama:manifest_dir/{_MANIFEST_DIR}")
+    attach_envelope_to_agents(
+        agents,
+        scan_mode=ScanMode.LOCAL_ONLY,
+        discovery_scope=tuple(scope),
+        permissions_used=(
+            "ollama:GET /api/tags",
+            "filesystem:read manifests",
+        ),
+        redaction_status=RedactionStatus.NOT_APPLICABLE,
+    )
     return agents, warnings
 
 
@@ -142,20 +159,19 @@ def _discover_via_api(host: str) -> list[dict] | None:
     except (ImportError, OSError) as exc:
         logger.debug("Ollama httpx API probe failed: %s", exc)
 
-    # Fallback: try with urllib (no extra dep)
+    # Fallback: try with sync httpx client (retry-capable)
     try:
-        import urllib.request
+        from agent_bom.http_client import sync_get
 
         url = f"{host}/api/tags"
         if not url.startswith(("http://", "https://")):
             return None
-        req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=3) as resp:  # nosec B310
-            if resp.status == 200:
-                data = json.loads(resp.read())
-                return data.get("models", [])
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.debug("Ollama urllib API probe failed: %s", exc)
+        fallback_resp = sync_get(url, timeout=3)
+        if fallback_resp is not None and fallback_resp.status_code == 200:
+            data = fallback_resp.json()
+            return data.get("models", [])
+    except (OSError, ValueError) as exc:
+        logger.debug("Ollama sync API probe failed: %s", exc)
 
     return None
 

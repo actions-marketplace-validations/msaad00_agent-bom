@@ -122,6 +122,7 @@ PYTHON_SDK_PATTERNS: list[SDKPattern] = [
     SDKPattern(re.compile(_py_import("ollama")), "ollama", AIComponentType.LLM_PROVIDER, "ollama", "pypi", "python"),
     SDKPattern(re.compile(_py_import("replicate")), "replicate", AIComponentType.LLM_PROVIDER, "replicate", "pypi", "python"),
     SDKPattern(re.compile(_py_import("deepseek")), "deepseek", AIComponentType.LLM_PROVIDER, "deepseek", "pypi", "python"),
+    SDKPattern(re.compile(_py_import("zhipuai")), "zhipu", AIComponentType.LLM_PROVIDER, "zhipuai", "pypi", "python"),
     SDKPattern(re.compile(_py_import("fireworks")), "fireworks", AIComponentType.LLM_PROVIDER, "fireworks-ai", "pypi", "python"),
     SDKPattern(re.compile(_py_import("ai21")), "ai21", AIComponentType.LLM_PROVIDER, "ai21", "pypi", "python"),
     SDKPattern(re.compile(_py_import("cerebras")), "cerebras", AIComponentType.LLM_PROVIDER, "cerebras-cloud-sdk", "pypi", "python"),
@@ -248,6 +249,13 @@ PYTHON_SDK_PATTERNS: list[SDKPattern] = [
     SDKPattern(re.compile(_py_import("wandb")), "wandb", AIComponentType.MLOPS, "wandb", "pypi", "python"),
     SDKPattern(re.compile(_py_import("neptune")), "neptune", AIComponentType.MLOPS, "neptune", "pypi", "python"),
     SDKPattern(re.compile(_py_import("clearml")), "clearml", AIComponentType.MLOPS, "clearml", "pypi", "python"),
+    # AI observability / eval tracing
+    SDKPattern(re.compile(_py_import("langsmith")), "langsmith", AIComponentType.OBSERVABILITY, "langsmith", "pypi", "python"),
+    SDKPattern(re.compile(_py_import("langfuse")), "langfuse", AIComponentType.OBSERVABILITY, "langfuse", "pypi", "python"),
+    SDKPattern(re.compile(_py_import("arize")), "arize", AIComponentType.OBSERVABILITY, "arize", "pypi", "python"),
+    SDKPattern(re.compile(_py_import("phoenix")), "phoenix", AIComponentType.OBSERVABILITY, "arize-phoenix", "pypi", "python"),
+    SDKPattern(re.compile(_py_import("braintrust")), "braintrust", AIComponentType.OBSERVABILITY, "braintrust", "pypi", "python"),
+    SDKPattern(re.compile(_py_import("trubrics")), "trubrics", AIComponentType.OBSERVABILITY, "trubrics", "pypi", "python"),
     # Inference servers
     SDKPattern(re.compile(_py_import("vllm")), "vllm", AIComponentType.INFERENCE_SERVER, "vllm", "pypi", "python"),
 ]
@@ -361,6 +369,18 @@ JS_SDK_PATTERNS: list[SDKPattern] = [
         "npm",
         "javascript",
     ),
+    # AI observability / eval tracing
+    SDKPattern(re.compile(_js_import("langsmith")), "langsmith", AIComponentType.OBSERVABILITY, "langsmith", "npm", "javascript"),
+    SDKPattern(re.compile(_js_import("langfuse")), "langfuse", AIComponentType.OBSERVABILITY, "langfuse", "npm", "javascript"),
+    SDKPattern(
+        re.compile(_js_import("@helicone/helicone")),
+        "helicone",
+        AIComponentType.OBSERVABILITY,
+        "@helicone/helicone",
+        "npm",
+        "javascript",
+    ),
+    SDKPattern(re.compile(_js_import("braintrust")), "braintrust", AIComponentType.OBSERVABILITY, "braintrust", "npm", "javascript"),
 ]
 
 # ── Java SDK patterns ────────────────────────────────────────────────────────
@@ -578,6 +598,13 @@ MODEL_PATTERNS: list[ModelPattern] = [
     ModelPattern(re.compile(rf"{_WB}deepseek-(?:chat|coder|reasoner)(?:-v\d+(?:\.\d+)?)?{_WB}"), "deepseek"),
     ModelPattern(re.compile(rf"{_WB}deepseek-r1(?:-\d+b)?(?:-distill)?{_WB}", re.I), "deepseek"),
     ModelPattern(re.compile(rf"{_WB}deepseek-v[23](?:\.\d+)?(?:-\d+b)?{_WB}", re.I), "deepseek"),
+    # Zhipu GLM models
+    ModelPattern(
+        re.compile(rf"{_WB}glm-4(?:-(?:plus|air|flash|long|x|v(?:-plus)?))?(?:-\d+b)?{_WB}", re.I),
+        "zhipu",
+    ),
+    ModelPattern(re.compile(rf"{_WB}glm-4\.6(?:-(?:plus|flash|air))?{_WB}", re.I), "zhipu"),
+    ModelPattern(re.compile(rf"{_WB}chatglm[23](?:-6b|-turbo)?{_WB}", re.I), "zhipu"),
     # Qwen models
     ModelPattern(re.compile(rf"{_WB}qwen-?[23](?:\.\d+)?(?:-\d+b)?(?:-instruct)?{_WB}", re.I), "alibaba"),
     # Embedding models

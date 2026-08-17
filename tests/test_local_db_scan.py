@@ -9,7 +9,10 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent_bom.models import Package, Severity
+from agent_bom.sbom import parse_cyclonedx
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -26,6 +29,7 @@ def _make_local_vuln(vuln_id: str = "CVE-2024-1111", severity: str = "high", cvs
     lv.summary = f"Test vuln {vuln_id}"
     lv.severity = severity
     lv.cvss_score = cvss
+    lv.cvss_vector = None
     lv.fixed_version = "2.32.0"
     lv.epss_probability = 0.12
     lv.epss_percentile = 0.75
@@ -57,6 +61,45 @@ def test_local_vuln_to_vulnerability_unknown_severity():
     lv = _make_local_vuln(severity="", cvss=None)
     v = _local_vuln_to_vulnerability(lv)
     assert v.severity == Severity.UNKNOWN  # unknown severity must not silently inflate to MEDIUM
+
+
+def test_local_vuln_to_vulnerability_derives_severity_from_cvss_vector():
+    from agent_bom.scanners import _local_vuln_to_vulnerability
+
+    lv = _make_local_vuln(vuln_id="DEBIAN-CVE-2014-6271", severity="unknown", cvss=None)
+    lv.cvss_vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    v = _local_vuln_to_vulnerability(lv)
+    assert v.severity == Severity.CRITICAL
+    assert v.severity_source == "cvss"
+    assert v.cvss_score == 9.8
+
+
+def test_local_vuln_to_vulnerability_osv_id_without_score_uses_medium_fallback():
+    from agent_bom.scanners import _local_vuln_to_vulnerability
+
+    lv = _make_local_vuln(vuln_id="OSV-2022-1074", severity="", cvss=None)
+    v = _local_vuln_to_vulnerability(lv)
+    assert v.severity == Severity.MEDIUM
+    assert v.severity_source == "osv_heuristic"
+
+
+def test_local_vuln_to_vulnerability_osv_alias_without_score_uses_medium_fallback():
+    from agent_bom.scanners import _local_vuln_to_vulnerability
+
+    lv = _make_local_vuln(vuln_id="CVE-2026-0001", severity="", cvss=None)
+    lv.aliases = ["PYSEC-2026-7"]
+    v = _local_vuln_to_vulnerability(lv)
+    assert v.severity == Severity.MEDIUM
+    assert v.severity_source == "osv_heuristic"
+
+
+def test_local_vuln_to_vulnerability_debian_id_without_score_uses_medium_fallback():
+    from agent_bom.scanners import _local_vuln_to_vulnerability
+
+    lv = _make_local_vuln(vuln_id="DEBIAN-CVE-2026-0001", severity="", cvss=None)
+    v = _local_vuln_to_vulnerability(lv)
+    assert v.severity == Severity.MEDIUM
+    assert v.severity_source == "distro_advisory_heuristic"
 
 
 def test_local_vuln_to_vulnerability_kev_flag():
@@ -103,9 +146,62 @@ def test_scan_packages_local_db_db_unavailable():
     with (
         patch("agent_bom.db.schema.db_freshness_days", return_value=1),
         patch("agent_bom.db.schema.init_db", side_effect=RuntimeError("locked")),
+        patch("agent_bom.db.schema.open_existing_db_readonly", side_effect=RuntimeError("readonly locked")),
     ):
         count, covered = _scan_packages_local_db([_make_pkg()])
     assert count == 0
+
+
+def test_scan_packages_local_db_falls_back_to_readonly_open(tmp_path):
+    """Read-only fallback still scans when writable init_db fails."""
+    from agent_bom.scanners import _scan_packages_local_db
+
+    pkg = _make_pkg()
+    lv = _make_local_vuln("CVE-2024-4444", "high", 7.9)
+    db_file = tmp_path / "scan.db"
+    db_file.write_text("placeholder", encoding="utf-8")
+    conn = MagicMock()
+
+    with (
+        patch("agent_bom.db.schema.db_freshness_days", return_value=1),
+        patch("agent_bom.db.schema.DB_PATH", db_file),
+        patch("agent_bom.db.schema.init_db", side_effect=RuntimeError("readonly mount")),
+        patch("agent_bom.db.schema.open_existing_db_readonly", return_value=conn),
+        patch("agent_bom.db.lookup.package_in_db", return_value=True),
+        patch("agent_bom.db.lookup_package", return_value=[lv]),
+    ):
+        count, covered = _scan_packages_local_db([pkg])
+
+    assert count == 1
+    assert len(pkg.vulnerabilities) == 1
+    assert covered == {"pypi:requests@2.28.0"}
+    conn.close.assert_called_once()
+
+
+def test_scan_packages_local_db_prefers_readonly_open_for_existing_db(tmp_path):
+    """Existing DBs should open read-only on the scan hot path."""
+    from agent_bom.scanners import _scan_packages_local_db
+
+    pkg = _make_pkg()
+    db_file = tmp_path / "scan.db"
+    db_file.write_text("placeholder", encoding="utf-8")
+    conn = MagicMock()
+
+    with (
+        patch("agent_bom.db.schema.db_freshness_days", return_value=1),
+        patch("agent_bom.db.schema.DB_PATH", db_file),
+        patch("agent_bom.db.schema.open_existing_db_readonly", return_value=conn) as mock_open_ro,
+        patch("agent_bom.db.schema.init_db") as mock_init_db,
+        patch("agent_bom.db.lookup.package_in_db", return_value=False),
+        patch("agent_bom.db.lookup_package", return_value=[]),
+    ):
+        count, covered = _scan_packages_local_db([pkg])
+
+    assert count == 0
+    assert covered == set()
+    mock_open_ro.assert_called_once_with(db_file)
+    mock_init_db.assert_not_called()
+    conn.close.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +227,55 @@ def test_scan_packages_local_db_finds_vulns(tmp_path):
     assert count == 1
     assert len(pkg.vulnerabilities) == 1
     assert pkg.vulnerabilities[0].id == "CVE-2024-2222"
+
+
+def test_cyclonedx_maven_purl_matches_groupid_artifact_advisories(tmp_path):
+    """CycloneDX Maven purls should match local DB groupId:artifactId advisories."""
+    from agent_bom.scanners import _scan_packages_local_db
+
+    packages = parse_cyclonedx(
+        {
+            "bomFormat": "CycloneDX",
+            "components": [
+                {
+                    "type": "library",
+                    "name": "log4j-core",
+                    "version": "2.14.1",
+                    "purl": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
+                }
+            ],
+        }
+    )
+    pkg = packages[0]
+    db_file = tmp_path / "scan.db"
+    db_file.write_text("placeholder", encoding="utf-8")
+    conn = MagicMock()
+    lv = _make_local_vuln("CVE-2021-44228", "critical", 10.0)
+    lookup_calls: list[tuple[str, str, str]] = []
+
+    def lookup_package_side_effect(_conn, ecosystem: str, name: str, version: str):
+        lookup_calls.append((ecosystem, name, version))
+        if (ecosystem, name, version) == ("maven", "org.apache.logging.log4j:log4j-core", "2.14.1"):
+            return [lv]
+        return []
+
+    def package_in_db_side_effect(_conn, ecosystem: str, name: str) -> bool:
+        return ecosystem == "maven" and name == "org.apache.logging.log4j:log4j-core"
+
+    with (
+        patch("agent_bom.db.schema.db_freshness_days", return_value=1),
+        patch("agent_bom.db.schema.DB_PATH", db_file),
+        patch("agent_bom.db.schema.open_existing_db_readonly", return_value=conn),
+        patch("agent_bom.db.lookup.package_in_db", side_effect=package_in_db_side_effect),
+        patch("agent_bom.db.lookup_package", side_effect=lookup_package_side_effect),
+    ):
+        count, covered = _scan_packages_local_db(packages)
+
+    assert pkg.lookup_names == ["log4j-core", "org.apache.logging.log4j:log4j-core"]
+    assert ("maven", "org.apache.logging.log4j:log4j-core", "2.14.1") in lookup_calls
+    assert count == 1
+    assert covered == {"maven:log4j-core@2.14.1"}
+    assert [v.id for v in pkg.vulnerabilities] == ["CVE-2021-44228"]
 
 
 def test_scan_packages_local_db_no_duplicates(tmp_path):
@@ -191,3 +336,157 @@ def test_scan_packages_calls_osv_for_uncovered_packages():
         asyncio.run(scan_packages([pkg]))
 
     assert mock_osv.called
+
+
+def test_scan_packages_only_skips_exact_db_covered_version():
+    """Local DB coverage must be version-specific, not ecosystem-name global."""
+    from agent_bom.scanners import scan_packages
+
+    covered = _make_pkg("requests", "2.28.0")
+    newer = _make_pkg("requests", "2.31.0")
+
+    with (
+        patch("agent_bom.scanners._scan_packages_local_db", return_value=(1, {"pypi:requests@2.28.0"})),
+        patch("agent_bom.scanners.query_osv_batch", return_value={}) as mock_osv,
+    ):
+        asyncio.run(scan_packages([covered, newer]))
+
+    assert mock_osv.called
+    osv_targets = mock_osv.call_args[0][0]
+    assert covered not in osv_targets
+    assert newer in osv_targets
+
+
+def test_scan_packages_offline_requires_local_db(monkeypatch):
+    """Offline mode must fail closed when the local DB is genuinely empty/missing."""
+    from agent_bom.scanners import IncompleteScanError, scan_packages
+
+    pkg = _make_pkg("requests", "2.28.0")
+    monkeypatch.setattr("agent_bom.scanners.offline_mode", True)
+
+    with (
+        patch("agent_bom.scanners._scan_packages_local_db", return_value=(0, set())),
+        patch("agent_bom.scanners._db_covered_ecosystems", return_value=set()),
+    ):
+        with pytest.raises(IncompleteScanError, match="populated local vulnerability DB"):
+            asyncio.run(scan_packages([pkg]))
+
+
+def test_scan_packages_demo_offline_uses_curated_advisories_without_local_db():
+    """Demo offline scans are deterministic and do not depend on ~/.agent-bom."""
+    from agent_bom.scanners import ScanOptions, scan_packages
+
+    vulnerable_npm = _make_pkg("express", "4.17.1", "npm")
+    vulnerable_pypi = _make_pkg("pillow", "9.0.0", "pypi")
+    intentionally_clean = _make_pkg("semver", "7.5.2", "npm")
+    intentional_typosquat = _make_pkg("reqeusts", "2.99.0", "pypi")
+
+    with (
+        patch("agent_bom.scanners._scan_packages_local_db") as mock_local_db,
+        patch("agent_bom.scanners._db_covered_ecosystems", return_value=set()),
+        patch("agent_bom.scanners.query_osv_batch") as mock_osv,
+    ):
+        count = asyncio.run(
+            scan_packages(
+                [vulnerable_npm, vulnerable_pypi, intentionally_clean, intentional_typosquat],
+                options=ScanOptions(offline=True, demo_advisories=True),
+            )
+        )
+
+    assert count >= 2
+    assert vulnerable_npm.vulnerabilities
+    assert vulnerable_pypi.vulnerabilities
+    assert intentionally_clean.vulnerabilities == []
+    assert intentional_typosquat.vulnerabilities == []
+    mock_local_db.assert_not_called()
+    mock_osv.assert_not_called()
+
+
+def test_scan_packages_demo_transitive_outside_curated_inventory_reaches_advisory_lookup():
+    """Demo closure must not silently cover packages discovered online."""
+    from agent_bom.scanners import ScanOptions, scan_packages
+
+    curated_direct = _make_pkg("semver", "7.5.2", "npm")
+    discovered_transitive = _make_pkg("left-pad", "1.3.0", "npm")
+
+    with (
+        patch(
+            "agent_bom.transitive.resolve_transitive_dependencies",
+            return_value=[discovered_transitive],
+        ),
+        patch("agent_bom.scanners._scan_packages_local_db", return_value=(0, set())) as mock_local_db,
+        patch("agent_bom.scanners.query_osv_batch", return_value={}) as mock_osv,
+    ):
+        asyncio.run(
+            scan_packages(
+                [curated_direct],
+                options=ScanOptions(resolve_transitive=True, demo_advisories=True),
+            )
+        )
+
+    local_targets = mock_local_db.call_args[0][0]
+    assert curated_direct not in local_targets
+    assert discovered_transitive in local_targets
+    osv_targets = mock_osv.call_args[0][0]
+    assert curated_direct not in osv_targets
+    assert discovered_transitive in osv_targets
+
+
+def test_scan_packages_offline_clean_pkg_in_covered_ecosystem_does_not_raise(monkeypatch):
+    """A package with no DB rows whose ecosystem the DB covers is CLEAN, not a gap.
+
+    An advisory DB only stores vulnerable versions, so a covered-ecosystem
+    package with no advisory rows is genuinely clean — it must not raise or
+    discard the report (the old behaviour failed closed on every such package).
+    """
+    from agent_bom.scanners import scan_packages
+
+    pkg = _make_pkg("requests", "2.28.0")  # pypi, no advisory rows
+    monkeypatch.setattr("agent_bom.scanners.offline_mode", True)
+
+    with (
+        patch("agent_bom.scanners._scan_packages_local_db", return_value=(0, set())),
+        patch("agent_bom.scanners._db_covered_ecosystems", return_value={"pypi"}),
+    ):
+        # Must complete without raising IncompleteScanError.
+        asyncio.run(scan_packages([pkg]))
+
+
+def test_scan_packages_offline_uncovered_ecosystem_warns_without_discarding(monkeypatch):
+    """A package in an ecosystem the DB has zero advisories for warns, not raises."""
+    from agent_bom.scanners import scan_packages
+
+    pkg = _make_pkg("serde", "1.0.0", eco="cargo")  # crates.io not covered
+    monkeypatch.setattr("agent_bom.scanners.offline_mode", True)
+
+    warnings: list[str] = []
+    with (
+        patch("agent_bom.scanners._scan_packages_local_db", return_value=(0, set())),
+        patch("agent_bom.scanners._db_covered_ecosystems", return_value={"pypi", "npm"}),
+        patch("agent_bom.scanners.record_scan_warning", side_effect=warnings.append),
+    ):
+        # Must complete without raising; emits a coverage-gap warning instead.
+        asyncio.run(scan_packages([pkg]))
+    assert any("offline coverage gap" in w for w in warnings), warnings
+
+
+def test_scan_packages_offline_gap_warning_omits_empty_ecosystem_parens(monkeypatch):
+    """A package that maps to no local-DB ecosystem must not render an empty
+    "advisories for ()" parenthetical in the coverage-gap warning."""
+    from agent_bom.scanners import scan_packages
+
+    pkg = _make_pkg("mystery", "1.0.0", eco="unknown-eco")  # maps to no DB ecosystem
+    monkeypatch.setattr("agent_bom.scanners.offline_mode", True)
+
+    warnings: list[str] = []
+    with (
+        patch("agent_bom.scanners._scan_packages_local_db", return_value=(0, set())),
+        patch("agent_bom.scanners._db_covered_ecosystems", return_value={"pypi", "npm"}),
+        patch("agent_bom.scanners.record_scan_warning", side_effect=warnings.append),
+    ):
+        asyncio.run(scan_packages([pkg]))
+
+    assert any("offline coverage gap" in w for w in warnings), warnings
+    assert all("()" not in w for w in warnings), warnings
+    # No double space left behind where the ecosystem list would have gone.
+    assert all("ecosystem(s)  " not in w for w in warnings), warnings

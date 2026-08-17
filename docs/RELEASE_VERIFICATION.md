@@ -1,0 +1,264 @@
+# Release Verification
+
+`agent-bom` release tags publish verifiable release assets, not just package
+files.
+
+For each tagged GitHub Release, expect:
+
+- Python distribution files: `agent_bom-<version>.tar.gz`, `agent_bom-<version>-py3-none-any.whl`
+- Sigstore bundles for each distribution: `*.sigstore.json`
+- SLSA provenance bundles for each distribution: `*.intoto.jsonl`
+- CycloneDX SBOM: `agent-bom-sbom.cdx.json`
+
+## Release matrix
+
+Run this matrix before tagging a release that will back a hosted POC or a
+customer self-hosted deployment. The goal is to prove the exact artifact shape
+that users will touch: package install, CLI, API, UI, hosted preflight, and
+signed release evidence.
+
+| Surface | Command | Release bar |
+|---|---|---|
+| Exact main CI | `uv run python scripts/check_release_main_ci.py --repo msaad00/agent-bom --sha "$(git rev-parse HEAD)" --branch main --workflow ci.yml` | Candidate equals current `main` and its exact `CI/CD Pipeline` main-push run is completed successfully; pending, canceled, stale, or PR-only runs fail closed. |
+| Version alignment | `uv run python scripts/check_release_consistency.py` | Package, docs, OpenAPI, Docker, Helm, and integration versions agree. |
+| Evidence matrix | `uv run python scripts/check_release_evidence_matrix.py` | Every published surface retains a named pre- or post-publish verification path. |
+| Product contract | `uv run python scripts/check_product_surface_contract.py` | README/product-surface claims match generated metrics and exposed surfaces. |
+| API schema | `uv run python scripts/generate_v1_schemas.py --check` | Published v1 schemas match the Pydantic models. |
+| CLI docs | `uv run python scripts/check_cli_reference_alignment.py` | CLI reference and implemented command tree agree. |
+| Security guards | `uv run python scripts/check_exception_sanitization.py` and `uv run python scripts/check_provisioning_readonly.py` | API/gateway/runtime errors are sanitized and cloud provisioning stays read-only. |
+| Backend tests | `uv run pytest -q` | Python 3.11/3.13/3.14 CI must pass; local focused suites should cover changed areas. |
+| UI build | `cd ui && npm run typecheck && npm run lint && npm run build && npm run bundle:check && npm run test:run` | The dashboard builds, tests pass, and client JS stays under budget. |
+| Dashboard bundle | `make build-ui` | Runs the export build (`NEXT_EXPORT=1`) and copies it to `src/agent_bom/ui_dist` with CSP hashes. **Required before the package build** — the UI-build row above leaves nothing in `src/agent_bom/ui_dist`, and `ui_dist` is gitignored, so a `uv build` without this step produces a dashboard-less wheel and a dashboard-less image. |
+| Package build | `make release-build` | Builds the dashboard, wheel, and sdist, then rejects any wheel missing the schemas, dashboard index, CSP manifest, or CSP script hashes. |
+| Packaged dashboard | `uv run python scripts/verify_release_wheel.py dist` | Every wheel passes the same dashboard and CSP contract used by the manual publish targets. |
+| PyPI smoke | `python -m venv /tmp/agent-bom-smoke && /tmp/agent-bom-smoke/bin/pip install agent-bom==<version> && /tmp/agent-bom-smoke/bin/agent-bom --version` | Published package installs in a fresh environment. |
+| Registry surface freshness (post-publish) | `PYTHONPATH=src python scripts/check_surface_freshness.py --out /tmp/agent-bom-surface-freshness.json` | PyPI, Docker, GHCR, Glama, and configured Smithery surfaces report the expected version and a non-empty inventory. Async rebuild acceptance is not release completion. |
+| Quickstart E2E | `agent-bom quickstart --run --offline --force --sample-dir /tmp/agent-bom-quickstart` | Generates a real inventory report, graph, and posture with no coverage warnings; package-CVE lookup is skipped because a fresh install has no local database. Run `agent-bom scan --demo --offline` separately for bundled CVE proof. |
+| Hosted preflight | `python scripts/deploy/hosted_poc_preflight.py --write-secret` | Hosted compose has an HTTPS URL, no unauth mode, non-placeholder secrets, private API/UI binds, and safe CORS. |
+
+Do not publish a release as hosted-ready when any required line above is red.
+After publishing, do not mark the release complete while the surface-freshness
+report is stale or unmonitored. Registry rebuilds may finish asynchronously;
+rerun the check until Glama and every configured public surface reflect the
+released version and expected inventory.
+
+### Source-to-published storefront transition
+
+During the four-PR sequence, code freeze, and after publication, the committed
+README surfaces use lifecycle-neutral wording: examples target the forward
+version, and operators must verify registry availability before copying an
+exact pin. Branch and matching-tag checks require that neutral state, so the
+public repository remains accurate without a fifth post-release documentation
+change.
+
+The protected release workflow then renders a temporary published copy with
+`scripts/render_docker_storefront.py`, promotes exactly the matching version to
+`Current stable version (pinned)`, validates that rendered file with
+`AGENT_BOM_RELEASE_FINALIZE=1`, and sends only that rendered copy to Docker Hub.
+The renderer rejects missing, duplicate, or unresolved neutral rows, and a
+failed Docker Hub update blocks the publishing job. The checked-in neutral
+file is not mutated by CI. Release completion still requires the post-publish
+surface-freshness gate above; a successful tag alone is insufficient.
+
+## Browser behavioral lock-in
+
+The route-catalog smoke opens every packaged route and rejects framework errors,
+404s, and enabled buttons without accessible names. Page-local E2E tests cover
+representative actions; this matrix does not claim one browser test per control.
+
+| Workspace | Browser behavior proved |
+|---|---|
+| Global shell | Theme state, sidebar collapse/expand, focus command, and command-palette navigation |
+| Overview and Findings | Shared seeded counts, deep-link query state, finding-class/severity filtering, and pagination |
+| Jobs | Source-to-job evidence links, persisted observed stage timing, and explicit unavailable telemetry when progress is empty |
+| Investigation graphs | Dark/light/mobile rendering, fit, selection, auto-layout, reset/edit lock, drag persistence, zoom, and large-estate roll-up navigation |
+| Remediation | Compact campaign disclosure, priority explanation, package detail, re-verification mutation, and mobile containment |
+| Compliance | Detail/heatmap switching, status/search filtering, and evidence-pack download request |
+| Scan and export | Scan submission through completed result and graph JSON download |
+| Connections and gateway | Connector wizard progression and live-feed state changes |
+
+Run the focused browser set with:
+
+```bash
+cd ui
+npx playwright test e2e/route-catalog-smoke.spec.ts e2e/jobs-workflow.spec.ts \
+  e2e/lineage-graph-readability.spec.ts e2e/security-graph-cockpit.spec.ts \
+  e2e/workspace-actions.spec.ts e2e/overview-findings-reconciliation.spec.ts \
+  e2e/scan-export.spec.ts e2e/connections-screenshot.spec.ts \
+  e2e/gateway-live-feed-card.spec.ts
+```
+
+## Download release assets
+
+```bash
+TAG=v0.101.0
+VERSION="${TAG#v}"
+mkdir -p /tmp/agent-bom-release && cd /tmp/agent-bom-release
+gh release download "$TAG" --repo msaad00/agent-bom
+```
+
+## Verify Python release signatures
+
+Verify the wheel or source distribution against the Sigstore bundle generated by
+release CI:
+
+```bash
+cosign verify-blob "agent_bom-${VERSION}-py3-none-any.whl" \
+  --bundle "agent_bom-${VERSION}-py3-none-any.whl.sigstore.json" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp 'https://github.com/msaad00/agent-bom/.github/workflows/release.yml@.*'
+```
+
+Do the same for the source tarball if you consume that artifact:
+
+```bash
+cosign verify-blob "agent_bom-${VERSION}.tar.gz" \
+  --bundle "agent_bom-${VERSION}.tar.gz.sigstore.json" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp 'https://github.com/msaad00/agent-bom/.github/workflows/release.yml@.*'
+```
+
+## Inspect SLSA provenance
+
+The release job exports GitHub Attestations as `.intoto.jsonl` bundles so the
+provenance is attached to the GitHub Release, not hidden inside Actions only.
+
+```bash
+head -n 5 "agent_bom-${VERSION}-py3-none-any.whl.intoto.jsonl"
+```
+
+If you want to verify provenance directly from GitHub Attestations instead of
+using the exported bundle:
+
+```bash
+gh attestation verify "agent_bom-${VERSION}-py3-none-any.whl" \
+  --repo msaad00/agent-bom
+```
+
+## Inspect the self-SBOM
+
+Release CI also publishes a CycloneDX SBOM for the Python environment used to
+build the release:
+
+```bash
+jq -r '.metadata.component.name, .metadata.component.version' agent-bom-sbom.cdx.json
+```
+
+You can also run `agent-bom` against that SBOM directly:
+
+```bash
+agent-bom sbom agent-bom-sbom.cdx.json -f json
+```
+
+## Release CI image scan gate
+
+After `agentbom/agent-bom:<tag>` and `agentbom/agent-bom-ui:<tag>` are pushed
+to Docker Hub, release CI:
+
+1. Verifies the UI tag is pullable (`docker manifest inspect` in
+   `docker-publish-ui`) so compose/Helm pins cannot race a missing Hub tag
+2. Pulls the published API/runtime image and runs a Trivy gate before minting
+   the GitHub Release
+
+```bash
+# both must resolve for the published tag
+docker pull "agentbom/agent-bom:${TAG}"
+docker pull "agentbom/agent-bom-ui:${TAG}"
+```
+
+| Step | Tool | Default policy |
+|---|---|---|
+| Pre-publish candidate | `agent-bom image` in `container-gate` | fail on fixable `MEDIUM+`, `.image-scan-ignore` allowlist |
+| Pre-publish dashboard | `Dashboard release gate` in `container-gate` | fail if the candidate image has no packaged `ui_dist`, or if `GET /` does not return the dashboard document |
+| Post-publish UI tag | `docker manifest inspect` in `docker-publish-ui` | fail if `agentbom/agent-bom-ui:<tag>` is not pullable |
+| Post-publish registry image | Trivy in `published-image-scan-gate` | fail on `CRITICAL,HIGH`, `--ignore-unfixed`, same allowlist |
+
+Override the published-image threshold with the repository variable
+`RELEASE_IMAGE_SCAN_FAIL_SEVERITIES` (comma-separated Trivy severities, e.g.
+`CRITICAL` or `CRITICAL,HIGH,MEDIUM`).
+
+Local dry-run against a release candidate image:
+
+```bash
+docker build -t agent-bom:release-test .
+trivy image --severity CRITICAL,HIGH --ignore-unfixed --ignorefile .image-scan-ignore agent-bom:release-test
+```
+
+Trivy SARIF from the release job is uploaded to the GitHub Security tab under
+category `release-published-image-trivy`.
+
+## Air-gap vulnerability database preload
+
+Air-gapped scans use a **pre-synced local SQLite cache** (`vulns.db`), not live
+OSV/GHSA calls. The preload path is:
+
+| Step | Command / artifact | Next step |
+|---|---|---|
+| 1. Sync on a connected bastion | `agent-bom db update` | Produces `~/.agent-bom/db/vulns.db` (~50 MB first run) |
+| 2. Verify freshness | `agent-bom db status` | Confirm OSV/Alpine/Debian/EPSS/KEV rows and sync timestamps |
+| 3. Bundle for transfer | `scripts/release/bundle-vuln-db.sh dist/airgap` | Writes `vulns.db`, `known_exploited_vulnerabilities.json`, `epss_scores-current.csv.gz`, and `sha256sums.txt` |
+| 4. Import on disconnected host | `cd dist/airgap && sha256sum -c sha256sums.txt` then copy the bundle directory | Mount or copy to the runtime DB path (same directory for sidecar KEV/EPSS feeds) |
+| 5. Point runtime at the cache | `AGENT_BOM_DB_PATH=/var/lib/agent-bom/vulns.db` | Sidecar feeds resolve from the DB parent dir, or set `AGENT_BOM_VULN_DB_BUNDLE_DIR` explicitly |
+| 6. Disable network refresh | `AGENT_BOM_VULN_DB_OFFLINE=1` or CLI `--offline` | Scans use the bundled cache only; rerun step 1–4 on a schedule |
+| 7. Smoke scan | `agent-bom agents --offline /workspace` | Expect `Vuln data: … local cache (offline — network skipped)` and KEV/EPSS enrichment from the bundle |
+
+Docker pilot compose already wires `AGENT_BOM_DB_PATH` to a named volume —
+preload by copying `vulns.db` into that volume before the first scan. Helm
+operators can start from
+`deploy/helm/agent-bom/examples/airgap-vuln-db-values.yaml` (Secret-mounted
+`vulns.db` + offline env flags).
+
+Image import for disconnected registries remains in
+[`site-docs/deployment/airgapped-image-bundle.md`](../site-docs/deployment/airgapped-image-bundle.md);
+combine that image bundle with the `vulns.db` bundle above for full offline
+scanning.
+
+Verify the air-gap vuln-DB bundle on a connected bastion before transfer:
+
+```bash
+scripts/release/bundle-vuln-db.sh dist/airgap
+cd dist/airgap
+sha256sum -c sha256sums.txt
+AGENT_BOM_DB_PATH="$PWD/vulns.db" AGENT_BOM_VULN_DB_OFFLINE=1 \
+  uv run pytest -q tests/test_enrichment_cache.py::test_offline_kev_loads_from_bundled_path
+```
+
+On the disconnected host, mount the whole `dist/airgap` directory (not only
+`vulns.db`) so KEV/EPSS sidecar feeds resolve next to the DB path.
+
+## Inspect scanner accuracy evidence
+
+Release candidates also carry a checked-in scanner accuracy baseline:
+
+```bash
+uv run python scripts/generate_accuracy_baseline.py --check
+jq '.runtime_red_team, .finding_state_accounting' docs/accuracy-baseline.json
+```
+
+The baseline separates active unresolved findings from VEX-suppressed,
+fixed-verified, accepted-risk, and false-positive states. It is intentionally
+not a claim of customer-wide real-world false-positive or false-negative rates;
+those require a published external corpus.
+
+## Inspect graph epic proof
+
+Graph release claims are backed by the closure artifact in
+[`docs/graph/SECURITY_GRAPH_EPIC_PROOF.md`](graph/SECURITY_GRAPH_EPIC_PROOF.md):
+
+```bash
+python scripts/check_graph_epic_proof.py
+pytest tests/test_graph_schema_ui_parity.py tests/test_graph_edge_counts.py tests/test_graph_visual_snapshot.py tests/test_effective_reach.py tests/test_evidence_policy.py
+```
+
+## What this proves
+
+- the distribution artifacts were signed by GitHub Actions OIDC via Sigstore
+- the build provenance is available as SLSA attestations
+- the release includes a self-SBOM that can be inspected or rescanned later
+- the published Docker image passed a Trivy gate at the configured severity threshold before the GitHub Release was minted
+- air-gapped operators can preload `vulns.db`, mount it at `AGENT_BOM_DB_PATH`, and run with `AGENT_BOM_VULN_DB_OFFLINE=1`
+- scanner accuracy claims are backed by a versioned local evidence artifact
+- graph readability/trust claims are linked to deterministic, checked-in proof
+
+This is the release trust baseline. Runtime trust, container attestations, and
+registry-specific provenance still live in their own workflows and docs.

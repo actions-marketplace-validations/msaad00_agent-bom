@@ -38,10 +38,68 @@ SF_PARAMS = {
 }
 
 
+# ─── tenant row access policy ────────────────────────────────────────────────
+
+
+def test_tenant_row_access_policy_applies_to_all_tenant_tables():
+    from agent_bom.api.snowflake_store import (
+        _SNOWFLAKE_TENANT_ROW_ACCESS_POLICY,
+        _SNOWFLAKE_TENANT_TABLES,
+        _ensure_tenant_row_access_policy,
+    )
+
+    cur = _mock_cursor()
+
+    _ensure_tenant_row_access_policy(cur, _SNOWFLAKE_TENANT_TABLES)
+
+    sql_calls = [call.args[0] for call in cur.execute.call_args_list]
+    rendered_sql = "\n".join(sql_calls)
+    assert "CREATE TABLE IF NOT EXISTS agent_bom_tenant_access" in rendered_sql
+    assert f"CREATE ROW ACCESS POLICY IF NOT EXISTS {_SNOWFLAKE_TENANT_ROW_ACCESS_POLICY}" in rendered_sql
+    assert "IS_ROLE_IN_SESSION('AGENT_BOM_RLS_ADMIN')" in rendered_sql
+    assert "snowflake_role = CURRENT_ROLE()" in rendered_sql
+    for table_name in _SNOWFLAKE_TENANT_TABLES:
+        assert f"ALTER TABLE {table_name} ADD ROW ACCESS POLICY {_SNOWFLAKE_TENANT_ROW_ACCESS_POLICY} ON (tenant_id)" in sql_calls
+
+
+def test_row_access_policy_duplicate_attachment_is_idempotent():
+    from agent_bom.api.snowflake_store import _execute_row_access_policy_ddl
+
+    cur = _mock_cursor()
+    cur.execute.side_effect = Exception("Row access policy already exists on table")
+
+    _execute_row_access_policy_ddl(cur, "ALTER TABLE scan_jobs ADD ROW ACCESS POLICY agent_bom_tenant_isolation ON (tenant_id)")
+
+
 # ─── build_connection_params ──────────────────────────────────────────────────
 
 
 class TestBuildConnectionParams:
+    def test_native_app_uses_spcs_oauth_token_file_and_ignores_external_credentials(self, monkeypatch, tmp_path):
+        token_file = tmp_path / "token"
+        token_file.write_text("short-lived-oauth-token", encoding="utf-8")
+        monkeypatch.setenv("AGENT_BOM_SNOWFLAKE_NATIVE_APP", "1")
+        monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "org-account")
+        monkeypatch.setenv("SNOWFLAKE_HOST", "org-account.snowflakecomputing.com")
+        monkeypatch.setenv("SNOWFLAKE_DATABASE", "AGENT_BOM_APP")
+        monkeypatch.setenv("SNOWFLAKE_SCHEMA", "CORE")
+        monkeypatch.setenv("SNOWFLAKE_TOKEN_FILE_PATH", str(token_file))
+        monkeypatch.setenv("SNOWFLAKE_USER", "must-not-be-used")
+        monkeypatch.setenv("SNOWFLAKE_PASSWORD", "must-not-be-used")
+        monkeypatch.setenv("SNOWFLAKE_PRIVATE_KEY_PATH", "/keys/must-not-be-used.p8")
+
+        from agent_bom.api.snowflake_store import build_connection_params
+
+        params = build_connection_params()
+        assert params == {
+            "account": "org-account",
+            "host": "org-account.snowflakecomputing.com",
+            "database": "AGENT_BOM_APP",
+            "schema": "CORE",
+            "authenticator": "oauth",
+            "token_file_path": str(token_file),
+        }
+
     def test_password_auth_deprecated(self, monkeypatch):
         """SNOWFLAKE_PASSWORD still works but emits DeprecationWarning."""
         monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "acct1")
@@ -120,6 +178,27 @@ class TestBuildConnectionParams:
 
 
 class TestResolveSnowflakeAuth:
+    def test_native_app_overrides_explicit_external_auth_with_spcs_oauth(self, monkeypatch, tmp_path):
+        token_file = tmp_path / "token"
+        token_file.write_text("short-lived-oauth-token", encoding="utf-8")
+        monkeypatch.setenv("AGENT_BOM_SNOWFLAKE_NATIVE_APP", "true")
+        monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "org-account")
+        monkeypatch.setenv("SNOWFLAKE_HOST", "org-account.snowflakecomputing.com")
+        monkeypatch.setenv("SNOWFLAKE_TOKEN_FILE_PATH", str(token_file))
+        monkeypatch.setenv("SNOWFLAKE_PASSWORD", "must-not-be-used")
+        monkeypatch.setenv("SNOWFLAKE_PRIVATE_KEY_PATH", "/keys/must-not-be-used.p8")
+
+        from agent_bom.cloud.snowflake import _resolve_snowflake_auth
+
+        kwargs = {"password": "caller-secret", "user": "caller-user"}
+        _resolve_snowflake_auth(kwargs, "snowflake_jwt")
+        assert kwargs == {
+            "account": "org-account",
+            "host": "org-account.snowflakecomputing.com",
+            "authenticator": "oauth",
+            "token_file_path": str(token_file),
+        }
+
     def test_explicit_authenticator(self, monkeypatch):
         monkeypatch.delenv("SNOWFLAKE_AUTHENTICATOR", raising=False)
         from agent_bom.cloud.snowflake import _resolve_snowflake_auth
@@ -241,9 +320,11 @@ class TestSnowflakeJobStore:
         conn = _mock_connection(cursor=cur)
         mock_connect.return_value = conn
         store = self._make_store()
-        result = store.get("j1")
+        result = store.get("j1", tenant_id="default")
         assert result is not None
         assert result.job_id == "j1"
+        sql = str(conn.cursor().execute.call_args_list[-1])
+        assert "WHERE job_id = %s AND tenant_id = %s" in sql
 
     @patch("agent_bom.api.snowflake_store._sf_connect")
     def test_get_not_found(self, mock_connect):
@@ -272,7 +353,9 @@ class TestSnowflakeJobStore:
         conn = _mock_connection(cursor=cur)
         mock_connect.return_value = conn
         store = self._make_store()
-        assert store.delete("j1") is True
+        assert store.delete("j1", tenant_id="default") is True
+        sql = str(conn.cursor().execute.call_args_list[-1])
+        assert "DELETE FROM scan_jobs WHERE job_id = %s AND tenant_id = %s" in sql
 
     @patch("agent_bom.api.snowflake_store._sf_connect")
     def test_delete_not_found(self, mock_connect):
@@ -295,13 +378,14 @@ class TestSnowflakeJobStore:
 
     @patch("agent_bom.api.snowflake_store._sf_connect")
     def test_list_summary(self, mock_connect):
-        cur = _mock_cursor(fetchall_val=[("j1", "done", "2025-01-01T00:00:00Z", "2025-01-01T00:01:00Z")])
+        cur = _mock_cursor(fetchall_val=[("j1", "tenant-alpha", "done", "2025-01-01T00:00:00Z", "2025-01-01T00:01:00Z")])
         conn = _mock_connection(cursor=cur)
         mock_connect.return_value = conn
         store = self._make_store()
         result = store.list_summary()
         assert len(result) == 1
         assert result[0]["job_id"] == "j1"
+        assert result[0]["tenant_id"] == "tenant-alpha"
 
     @patch("agent_bom.api.snowflake_store._sf_connect")
     def test_cleanup_expired(self, mock_connect):
@@ -331,6 +415,7 @@ class TestSnowflakeFleetStore:
             agent_id=agent_id,
             name=name,
             agent_type="claude_desktop",
+            tenant_id="tenant-alpha",
             updated_at=datetime.now(timezone.utc).isoformat(),
         )
 
@@ -341,8 +426,15 @@ class TestSnowflakeFleetStore:
         from agent_bom.api.snowflake_store import SnowflakeFleetStore
 
         SnowflakeFleetStore(SF_PARAMS)
-        create_call = conn.cursor().execute.call_args_list[0]
-        assert "CREATE TABLE IF NOT EXISTS fleet_agents" in create_call[0][0]
+        calls = [str(c) for c in conn.cursor().execute.call_args_list]
+        assert any(
+            "CREATE TABLE IF NOT EXISTS fleet_agents" in c
+            and "canonical_id VARCHAR NOT NULL DEFAULT ''" in c
+            and "tenant_id VARCHAR NOT NULL DEFAULT 'default'" in c
+            for c in calls
+        )
+        assert any("ALTER TABLE fleet_agents ADD COLUMN IF NOT EXISTS canonical_id" in c for c in calls)
+        assert any("ALTER TABLE fleet_agents ADD COLUMN IF NOT EXISTS tenant_id" in c for c in calls)
 
     @patch("agent_bom.api.snowflake_store._sf_connect")
     def test_put(self, mock_connect):
@@ -354,6 +446,8 @@ class TestSnowflakeFleetStore:
         calls = conn.cursor().execute.call_args_list
         merge_call = [c for c in calls if "MERGE INTO fleet_agents" in str(c)]
         assert len(merge_call) > 0
+        assert any(agent.canonical_id in str(c) for c in merge_call)
+        assert any(agent.tenant_id in str(c) for c in merge_call)
 
     @patch("agent_bom.api.snowflake_store._sf_connect")
     def test_get_found(self, mock_connect):
@@ -362,9 +456,11 @@ class TestSnowflakeFleetStore:
         conn = _mock_connection(cursor=cur)
         mock_connect.return_value = conn
         store = self._make_store()
-        result = store.get("a1")
+        result = store.get("a1", tenant_id="tenant-alpha")
         assert result is not None
         assert result.agent_id == "a1"
+        sql = str(conn.cursor().execute.call_args_list[-1])
+        assert "WHERE agent_id = %s AND tenant_id = %s" in sql
 
     @patch("agent_bom.api.snowflake_store._sf_connect")
     def test_get_not_found(self, mock_connect):
@@ -372,7 +468,7 @@ class TestSnowflakeFleetStore:
         conn = _mock_connection(cursor=cur)
         mock_connect.return_value = conn
         store = self._make_store()
-        assert store.get("missing") is None
+        assert store.get("missing", tenant_id="tenant-alpha") is None
 
     @patch("agent_bom.api.snowflake_store._sf_connect")
     def test_get_by_name(self, mock_connect):
@@ -386,12 +482,27 @@ class TestSnowflakeFleetStore:
         assert result.name == "test-agent"
 
     @patch("agent_bom.api.snowflake_store._sf_connect")
+    def test_get_by_canonical_id(self, mock_connect):
+        agent = self._make_agent()
+        cur = _mock_cursor(fetchone_val=(agent.model_dump_json(),))
+        conn = _mock_connection(cursor=cur)
+        mock_connect.return_value = conn
+        store = self._make_store()
+        result = store.get_by_canonical_id(agent.canonical_id, tenant_id="tenant-alpha")
+        assert result is not None
+        assert result.agent_id == "a1"
+        sql = str(conn.cursor().execute.call_args_list[-1])
+        assert "WHERE canonical_id = %s AND tenant_id = %s" in sql
+
+    @patch("agent_bom.api.snowflake_store._sf_connect")
     def test_delete(self, mock_connect):
         cur = _mock_cursor(rowcount=1)
         conn = _mock_connection(cursor=cur)
         mock_connect.return_value = conn
         store = self._make_store()
-        assert store.delete("a1") is True
+        assert store.delete("a1", tenant_id="tenant-alpha") is True
+        sql = str(conn.cursor().execute.call_args_list[-1])
+        assert "DELETE FROM fleet_agents WHERE agent_id = %s AND tenant_id = %s" in sql
 
     @patch("agent_bom.api.snowflake_store._sf_connect")
     def test_list_all(self, mock_connect):
@@ -408,7 +519,7 @@ class TestSnowflakeFleetStore:
     def test_list_summary(self, mock_connect):
         cur = _mock_cursor(
             fetchall_val=[
-                ("a1", "agent-a", "discovered", 0.8, "2025-01-01T00:00:00Z"),
+                ("a1", "agent-canonical-1", "agent-a", "discovered", 0.8, "2025-01-01T00:00:00Z"),
             ]
         )
         conn = _mock_connection(cursor=cur)
@@ -417,7 +528,33 @@ class TestSnowflakeFleetStore:
         result = store.list_summary()
         assert len(result) == 1
         assert result[0]["agent_id"] == "a1"
+        assert result[0]["canonical_id"] == "agent-canonical-1"
         assert result[0]["trust_score"] == 0.8
+
+    @patch("agent_bom.api.snowflake_store._sf_connect")
+    def test_list_by_tenant(self, mock_connect):
+        agent = self._make_agent()
+        cur = _mock_cursor(fetchall_val=[(agent.model_dump_json(),)])
+        conn = _mock_connection(cursor=cur)
+        mock_connect.return_value = conn
+        store = self._make_store()
+        result = store.list_by_tenant("tenant-alpha")
+        assert len(result) == 1
+        assert result[0].tenant_id == "tenant-alpha"
+        sql = str(conn.cursor().execute.call_args_list[-1])
+        assert "WHERE tenant_id = %s" in sql
+
+    @patch("agent_bom.api.snowflake_store._sf_connect")
+    def test_list_tenants(self, mock_connect):
+        cur = _mock_cursor(fetchall_val=[("tenant-alpha", 2), ("tenant-beta", 1)])
+        conn = _mock_connection(cursor=cur)
+        mock_connect.return_value = conn
+        store = self._make_store()
+        result = store.list_tenants()
+        assert result == [
+            {"tenant_id": "tenant-alpha", "agent_count": 2},
+            {"tenant_id": "tenant-beta", "agent_count": 1},
+        ]
 
     @patch("agent_bom.api.snowflake_store._sf_connect")
     def test_update_state_found(self, mock_connect):
@@ -428,7 +565,7 @@ class TestSnowflakeFleetStore:
         conn = _mock_connection(cursor=cur)
         mock_connect.return_value = conn
         store = self._make_store()
-        assert store.update_state("a1", FleetLifecycleState.APPROVED) is True
+        assert store.update_state("a1", FleetLifecycleState.APPROVED, tenant_id="tenant-alpha") is True
 
     @patch("agent_bom.api.snowflake_store._sf_connect")
     def test_update_state_not_found(self, mock_connect):
@@ -438,7 +575,7 @@ class TestSnowflakeFleetStore:
         conn = _mock_connection(cursor=cur)
         mock_connect.return_value = conn
         store = self._make_store()
-        assert store.update_state("missing", FleetLifecycleState.APPROVED) is False
+        assert store.update_state("missing", FleetLifecycleState.APPROVED, tenant_id="tenant-alpha") is False
 
 
 # ─── SnowflakePolicyStore ────────────────────────────────────────────────────
@@ -459,6 +596,7 @@ class TestSnowflakePolicyStore:
             policy_id=policy_id,
             name=name,
             updated_at=datetime.now(timezone.utc).isoformat(),
+            tenant_id="tenant-alpha",
         )
 
     def _make_audit_entry(self, entry_id="e1"):
@@ -474,6 +612,7 @@ class TestSnowflakePolicyStore:
             action_taken="blocked",
             reason="matched rule",
             timestamp=datetime.now(timezone.utc).isoformat(),
+            tenant_id="tenant-alpha",
         )
 
     @patch("agent_bom.api.snowflake_store._sf_connect")
@@ -526,6 +665,17 @@ class TestSnowflakePolicyStore:
         assert store.delete_policy("p1") is True
 
     @patch("agent_bom.api.snowflake_store._sf_connect")
+    def test_delete_policy_is_tenant_scoped(self, mock_connect):
+        policy = self._make_policy()
+        cur = _mock_cursor(fetchone_val=(policy.model_dump_json(),), rowcount=1)
+        conn = _mock_connection(cursor=cur)
+        mock_connect.return_value = conn
+        store = self._make_store()
+        assert store.delete_policy("p1", tenant_id="default") is True
+        delete_call = str(conn.cursor().execute.call_args_list[-1])
+        assert "DELETE FROM gateway_policies WHERE policy_id = %s AND tenant_id = %s" in delete_call
+
+    @patch("agent_bom.api.snowflake_store._sf_connect")
     def test_list_policies(self, mock_connect):
         p1 = self._make_policy("p1", "a-policy")
         p2 = self._make_policy("p2", "b-policy")
@@ -535,6 +685,15 @@ class TestSnowflakePolicyStore:
         store = self._make_store()
         result = store.list_policies()
         assert len(result) == 2
+
+    @patch("agent_bom.api.snowflake_store._sf_connect")
+    def test_list_policies_tenant_filter_is_pushed_into_sql(self, mock_connect):
+        conn = _mock_connection()
+        mock_connect.return_value = conn
+        store = self._make_store()
+        store.list_policies(tenant_id="tenant-alpha")
+        sql_calls = [str(c) for c in conn.cursor().execute.call_args_list if "gateway_policies" in str(c) and "SELECT" in str(c)]
+        assert any("tenant_id = %s" in call for call in sql_calls)
 
     @patch("agent_bom.api.snowflake_store._sf_connect")
     def test_get_policies_for_agent_filters(self, mock_connect):
@@ -594,11 +753,202 @@ class TestSnowflakePolicyStore:
         conn = _mock_connection()
         mock_connect.return_value = conn
         store = self._make_store()
-        store.list_audit_entries(policy_id="p1", agent_name="test-agent", limit=50)
+        store.list_audit_entries(policy_id="p1", agent_name="test-agent", tenant_id="tenant-alpha", limit=50)
         calls = conn.cursor().execute.call_args_list
         # Check that the SQL includes both filter clauses
         sql_calls = [str(c) for c in calls if "policy_audit_log" in str(c) and "SELECT" in str(c)]
         assert len(sql_calls) > 0
+        assert any("tenant_id = %s" in call for call in sql_calls)
+
+
+# ─── SnowflakeScheduleStore ──────────────────────────────────────────────────
+
+
+class TestSnowflakeScheduleStore:
+    @patch("agent_bom.api.snowflake_store._sf_connect")
+    def _make_store(self, mock_connect):
+        mock_connect.return_value = _mock_connection()
+        from agent_bom.api.snowflake_store import SnowflakeScheduleStore
+
+        return SnowflakeScheduleStore(SF_PARAMS)
+
+    def _make_schedule(self, schedule_id="sched-1", tenant_id="default", enabled=True, next_run="2025-01-01T00:00:00Z"):
+        from agent_bom.api.schedule_store import ScanSchedule
+
+        return ScanSchedule(
+            schedule_id=schedule_id,
+            name="nightly-scan",
+            cron_expression="0 */6 * * *",
+            scan_config={"images": ["nginx:latest"]},
+            enabled=enabled,
+            next_run=next_run,
+            created_at="2025-01-01T00:00:00Z",
+            updated_at="2025-01-01T00:00:00Z",
+            tenant_id=tenant_id,
+        )
+
+    @patch("agent_bom.api.snowflake_store._sf_connect")
+    def test_init_creates_table(self, mock_connect):
+        conn = _mock_connection()
+        mock_connect.return_value = conn
+        from agent_bom.api.snowflake_store import SnowflakeScheduleStore
+
+        SnowflakeScheduleStore(SF_PARAMS)
+        create_call = conn.cursor().execute.call_args_list[0]
+        assert "CREATE TABLE IF NOT EXISTS scan_schedules" in create_call[0][0]
+
+    @patch("agent_bom.api.snowflake_store._sf_connect")
+    def test_put(self, mock_connect):
+        conn = _mock_connection()
+        mock_connect.return_value = conn
+        store = self._make_store()
+        store.put(self._make_schedule())
+        calls = conn.cursor().execute.call_args_list
+        merge_call = [c for c in calls if "MERGE INTO scan_schedules" in str(c)]
+        assert len(merge_call) > 0
+
+    @patch("agent_bom.api.snowflake_store._sf_connect")
+    def test_get_found(self, mock_connect):
+        schedule = self._make_schedule()
+        cur = _mock_cursor(fetchone_val=(schedule.model_dump_json(),))
+        conn = _mock_connection(cursor=cur)
+        mock_connect.return_value = conn
+        store = self._make_store()
+        result = store.get("sched-1", tenant_id="default")
+        assert result is not None
+        assert result.schedule_id == "sched-1"
+        sql = str(conn.cursor().execute.call_args_list[-1])
+        assert "WHERE schedule_id = %s AND tenant_id = %s" in sql
+
+    @patch("agent_bom.api.snowflake_store._sf_connect")
+    def test_list_all_tenant_filtered(self, mock_connect):
+        s1 = self._make_schedule("sched-1", tenant_id="tenant-a")
+        s2 = self._make_schedule("sched-2", tenant_id="tenant-a")
+        cur = _mock_cursor(fetchall_val=[(s1.model_dump_json(),), (s2.model_dump_json(),)])
+        conn = _mock_connection(cursor=cur)
+        mock_connect.return_value = conn
+        store = self._make_store()
+        result = store.list_all(tenant_id="tenant-a")
+        assert len(result) == 2
+        assert all(item.tenant_id == "tenant-a" for item in result)
+
+    @patch("agent_bom.api.snowflake_store._sf_connect")
+    def test_list_due(self, mock_connect):
+        schedule = self._make_schedule("sched-due", enabled=True, next_run="2025-01-01T00:00:00Z")
+        cur = _mock_cursor(fetchall_val=[(schedule.model_dump_json(),)])
+        conn = _mock_connection(cursor=cur)
+        mock_connect.return_value = conn
+        store = self._make_store()
+        result = store.list_due("2025-06-01T00:00:00Z")
+        assert len(result) == 1
+        assert result[0].schedule_id == "sched-due"
+
+    @patch("agent_bom.api.snowflake_store._sf_connect")
+    def test_delete_found(self, mock_connect):
+        cur = _mock_cursor(rowcount=1)
+        conn = _mock_connection(cursor=cur)
+        mock_connect.return_value = conn
+        store = self._make_store()
+        assert store.delete("sched-1", tenant_id="default") is True
+        sql = str(conn.cursor().execute.call_args_list[-1])
+        assert "DELETE FROM scan_schedules WHERE schedule_id = %s AND tenant_id = %s" in sql
+
+
+# ─── SnowflakeExceptionStore ─────────────────────────────────────────────────
+
+
+class TestSnowflakeExceptionStore:
+    @patch("agent_bom.api.snowflake_store._sf_connect")
+    def _make_store(self, mock_connect):
+        mock_connect.return_value = _mock_connection()
+        from agent_bom.api.snowflake_store import SnowflakeExceptionStore
+
+        return SnowflakeExceptionStore(SF_PARAMS)
+
+    def _make_exception(self, exception_id="exc-1", tenant_id="default", status="pending"):
+        from agent_bom.api.exception_store import ExceptionStatus, VulnException
+
+        return VulnException(
+            exception_id=exception_id,
+            vuln_id="CVE-2026-0001",
+            package_name="express",
+            server_name="filesystem",
+            reason="accepted temporary risk",
+            requested_by="alice@example.com",
+            approved_by="bob@example.com" if status != "pending" else "",
+            status=ExceptionStatus(status),
+            created_at="2026-01-01T00:00:00Z",
+            expires_at="2099-06-01T00:00:00Z",
+            tenant_id=tenant_id,
+        )
+
+    @patch("agent_bom.api.snowflake_store._sf_connect")
+    def test_init_creates_table(self, mock_connect):
+        conn = _mock_connection()
+        mock_connect.return_value = conn
+        from agent_bom.api.snowflake_store import SnowflakeExceptionStore
+
+        SnowflakeExceptionStore(SF_PARAMS)
+        create_call = conn.cursor().execute.call_args_list[0]
+        assert "CREATE TABLE IF NOT EXISTS exceptions" in create_call[0][0]
+
+    @patch("agent_bom.api.snowflake_store._sf_connect")
+    def test_put(self, mock_connect):
+        conn = _mock_connection()
+        mock_connect.return_value = conn
+        store = self._make_store()
+        store.put(self._make_exception())
+        calls = conn.cursor().execute.call_args_list
+        merge_call = [c for c in calls if "MERGE INTO exceptions" in str(c)]
+        assert len(merge_call) > 0
+
+    @patch("agent_bom.api.snowflake_store._sf_connect")
+    def test_get_found(self, mock_connect):
+        exc = self._make_exception()
+        cur = _mock_cursor(fetchone_val=(json.dumps(exc.to_dict()),))
+        conn = _mock_connection(cursor=cur)
+        mock_connect.return_value = conn
+        store = self._make_store()
+        result = store.get("exc-1", tenant_id="default")
+        assert result is not None
+        assert result.exception_id == "exc-1"
+        assert result.tenant_id == "default"
+        sql = str(conn.cursor().execute.call_args_list[-1])
+        assert "WHERE exception_id = %s AND tenant_id = %s" in sql
+
+    @patch("agent_bom.api.snowflake_store._sf_connect")
+    def test_list_all_tenant_filtered(self, mock_connect):
+        exc = self._make_exception("exc-1", tenant_id="tenant-a", status="approved")
+        cur = _mock_cursor(fetchall_val=[(json.dumps(exc.to_dict()),)])
+        conn = _mock_connection(cursor=cur)
+        mock_connect.return_value = conn
+        store = self._make_store()
+        result = store.list_all(status="approved", tenant_id="tenant-a")
+        assert len(result) == 1
+        assert result[0].tenant_id == "tenant-a"
+        assert result[0].status.value == "approved"
+
+    @patch("agent_bom.api.snowflake_store._sf_connect")
+    def test_find_matching_uses_approved_and_active(self, mock_connect):
+        approved = self._make_exception("exc-approved", tenant_id="tenant-a", status="approved")
+        active = self._make_exception("exc-active", tenant_id="tenant-a", status="active")
+        cur = _mock_cursor(fetchall_val=[(json.dumps(approved.to_dict()),), (json.dumps(active.to_dict()),)])
+        conn = _mock_connection(cursor=cur)
+        mock_connect.return_value = conn
+        store = self._make_store()
+        result = store.find_matching("CVE-2026-0001", "express", "filesystem", tenant_id="tenant-a")
+        assert result is not None
+        assert result.exception_id in {"exc-approved", "exc-active"}
+
+    @patch("agent_bom.api.snowflake_store._sf_connect")
+    def test_delete_found(self, mock_connect):
+        cur = _mock_cursor(rowcount=1)
+        conn = _mock_connection(cursor=cur)
+        mock_connect.return_value = conn
+        store = self._make_store()
+        assert store.delete("exc-1", tenant_id="default") is True
+        sql = str(conn.cursor().execute.call_args_list[-1])
+        assert "DELETE FROM exceptions WHERE exception_id = %s AND tenant_id = %s" in sql
 
 
 # ─── Server lifespan auto-detection ──────────────────────────────────────────
@@ -612,6 +962,7 @@ class TestServerLifespanAutoDetect:
         monkeypatch.setenv("SNOWFLAKE_USER", "test_user")
         monkeypatch.setenv("SNOWFLAKE_PRIVATE_KEY_PATH", "/keys/rsa.p8")
         monkeypatch.setenv("AGENT_BOM_DB", "/tmp/should_not_use.db")
+        monkeypatch.setenv("AGENT_BOM_POSTGRES_URL", "postgresql://should-not-use.example/agent_bom")
         monkeypatch.delenv("SNOWFLAKE_PASSWORD", raising=False)
 
         mock_sf_connect.return_value = _mock_connection()
@@ -623,6 +974,10 @@ class TestServerLifespanAutoDetect:
         st._store = None
         st._fleet_store = None
         st._policy_store = None
+        st._source_store = None
+        st._credential_ref_store = None
+        st._schedule_store = None
+        st._exception_store = None
 
         import asyncio
 
@@ -633,16 +988,24 @@ class TestServerLifespanAutoDetect:
         asyncio.run(_run())
 
         from agent_bom.api.snowflake_store import (
+            SnowflakeExceptionStore,
             SnowflakeFleetStore,
             SnowflakeJobStore,
             SnowflakePolicyStore,
+            SnowflakeScheduleStore,
         )
 
         assert isinstance(st._store, SnowflakeJobStore)
         assert isinstance(st._fleet_store, SnowflakeFleetStore)
         assert isinstance(st._policy_store, SnowflakePolicyStore)
+        assert isinstance(st._schedule_store, SnowflakeScheduleStore)
+        assert isinstance(st._exception_store, SnowflakeExceptionStore)
 
         # Cleanup
         st._store = None
         st._fleet_store = None
         st._policy_store = None
+        st._source_store = None
+        st._credential_ref_store = None
+        st._schedule_store = None
+        st._exception_store = None

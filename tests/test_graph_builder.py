@@ -1,0 +1,1657 @@
+"""Tests for build_unified_graph_from_report() — full inventory graph."""
+
+from __future__ import annotations
+
+from agent_bom.graph import EntityType, NodeDimensions, RelationshipType, UnifiedGraph, UnifiedNode
+from agent_bom.graph.builder import _resolve_cloud_resource_node_id, build_unified_graph_from_report
+from agent_bom.graph.rollup import rollup_view
+
+
+def _minimal_report():
+    """Minimal AIBOMReport JSON with agents, packages, vulns."""
+    return {
+        "scan_id": "test-full-001",
+        "agents": [
+            {
+                "name": "claude-desktop",
+                "type": "claude-desktop",
+                "status": "configured",
+                "config_path": "/home/user/.config/claude/config.json",
+                "mcp_servers": [
+                    {
+                        "name": "mcp-fs",
+                        "command": "npx",
+                        "transport": "stdio",
+                        "surface": "mcp-server",
+                        "packages": [
+                            {
+                                "name": "express",
+                                "version": "4.18.0",
+                                "ecosystem": "npm",
+                                "is_direct": True,
+                                "vulnerabilities": [
+                                    {
+                                        "id": "CVE-2024-1234",
+                                        "severity": "high",
+                                        "cvss_score": 7.5,
+                                        "is_kev": False,
+                                        "fixed_version": "4.19.0",
+                                    }
+                                ],
+                            },
+                            {
+                                "name": "lodash",
+                                "version": "4.17.21",
+                                "ecosystem": "npm",
+                                "is_direct": False,
+                                "vulnerabilities": [],
+                            },
+                        ],
+                        "tools": [
+                            {"name": "read_file", "description": "Read a file from disk"},
+                            {"name": "write_file", "description": "Write a file to disk"},
+                        ],
+                        "credential_env_vars": ["GITHUB_TOKEN", "OPENAI_API_KEY"],
+                        "env": {},
+                    }
+                ],
+            },
+            {
+                "name": "cursor",
+                "type": "cursor",
+                "status": "configured",
+                "mcp_servers": [
+                    {
+                        "name": "mcp-fs",
+                        "command": "npx",
+                        "transport": "stdio",
+                        "surface": "mcp-server",
+                        "packages": [],
+                        "tools": [],
+                        "credential_env_vars": ["GITHUB_TOKEN"],
+                        "env": {},
+                    }
+                ],
+            },
+        ],
+        "blast_radius": [
+            {
+                "vulnerability_id": "CVE-2024-1234",
+                "severity": "high",
+                "package_name": "express",
+                "package_version": "4.18.0",
+                "ecosystem": "npm",
+                "risk_score": 7.5,
+                "cvss_score": 7.5,
+                "is_kev": False,
+                "affected_agents": ["claude-desktop"],
+                "affected_servers": ["mcp-fs"],
+                "owasp_tags": ["OWASP-A06"],
+                "atlas_tags": [],
+                "attack_tags": ["MITRE-T1059"],
+            }
+        ],
+    }
+
+
+class TestBuildUnifiedGraphFromReport:
+    def test_all_entity_types_present(self):
+        report = _minimal_report()
+        g = build_unified_graph_from_report(report)
+
+        types = {n.entity_type for n in g.nodes.values()}
+        assert EntityType.AGENT in types
+        assert EntityType.SERVER in types
+        assert EntityType.PACKAGE in types
+        assert EntityType.TOOL in types
+        assert EntityType.CREDENTIAL in types
+        assert EntityType.VULNERABILITY in types
+
+    def test_agent_nodes(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        agents = g.nodes_by_type(EntityType.AGENT)
+        assert len(agents) == 2
+        names = {a.label for a in agents}
+        assert names == {"claude-desktop", "cursor"}
+
+    def test_agent_environment_lands_on_dimensions_and_stack(self):
+        report = _minimal_report()
+        report["agents"][0]["environment"] = "production"
+        g = build_unified_graph_from_report(report)
+        agent = next(n for n in g.nodes.values() if n.label == "claude-desktop")
+        assert agent.dimensions.environment == "production"
+        assert agent.attributes["environment"] == "production"
+        server = next(n for n in g.nodes.values() if n.entity_type == EntityType.SERVER and n.attributes.get("agent") == "claude-desktop")
+        assert server.dimensions.environment == "production"
+        assert server.attributes["environment"] == "production"
+        package = next(n for n in g.nodes.values() if n.entity_type == EntityType.PACKAGE and "express" in n.label)
+        assert package.dimensions.environment == "production"
+        assert package.attributes["environment"] == "production"
+
+    def test_cloud_inventory_bucket_owns_and_contains_with_env_tag(self):
+        report = _minimal_report()
+        report["cloud_inventory"] = {
+            "provider": "aws",
+            "status": "ok",
+            "account_id": "123456789012",
+            "region": "us-east-1",
+            "buckets": [
+                {
+                    "name": "prod-artifacts",
+                    "publicly_accessible": False,
+                    "tags": {"Environment": "production"},
+                }
+            ],
+        }
+        g = build_unified_graph_from_report(report)
+        account_id = "account:aws:123456789012"
+        bucket_id = "cloud_resource:aws:s3:bucket:prod-artifacts"
+        assert bucket_id in g.nodes
+        assert g.nodes[bucket_id].dimensions.environment == "production"
+        assert g.nodes[bucket_id].attributes["environment"] == "production"
+        assert any(e.source == account_id and e.target == bucket_id and e.relationship == RelationshipType.OWNS for e in g.edges)
+        assert any(e.source == account_id and e.target == bucket_id and e.relationship == RelationshipType.CONTAINS for e in g.edges)
+
+    def test_fleet_source_id_disambiguates_same_named_agents(self):
+        report = {
+            "scan_id": "fleet-endpoints",
+            "agents": [
+                {
+                    "name": "claude-desktop",
+                    "type": "claude-desktop",
+                    "source_id": "device-a",
+                    "stable_id": "legacy-agent-stable-id",
+                    "enrollment_name": "eng-laptop-a",
+                    "owner": "alice",
+                    "mcp_servers": [
+                        {
+                            "name": "team-chat-server",
+                            "transport": "stdio",
+                            "packages": [{"name": "axios", "version": "1.4.0", "ecosystem": "npm"}],
+                            "tools": [{"name": "send_message", "description": "Send a message"}],
+                            "credential_env_vars": ["SLACK_TOKEN"],
+                        }
+                    ],
+                },
+                {
+                    "name": "claude-desktop",
+                    "type": "claude-desktop",
+                    "source_id": "device-b",
+                    "stable_id": "legacy-agent-stable-id",
+                    "enrollment_name": "eng-laptop-b",
+                    "owner": "bob",
+                    "mcp_servers": [
+                        {
+                            "name": "team-chat-server",
+                            "transport": "stdio",
+                            "packages": [{"name": "axios", "version": "1.4.0", "ecosystem": "npm"}],
+                            "tools": [{"name": "send_message", "description": "Send a message"}],
+                            "credential_env_vars": ["SLACK_TOKEN"],
+                        }
+                    ],
+                },
+            ],
+        }
+
+        g = build_unified_graph_from_report(report)
+
+        assert "agent:device-a:claude-desktop" in g.nodes
+        assert "agent:device-b:claude-desktop" in g.nodes
+        assert g.nodes["agent:device-a:claude-desktop"].canonical_id != g.nodes["agent:device-b:claude-desktop"].canonical_id
+        assert g.nodes["agent:device-a:claude-desktop"].attributes["source_id"] == "device-a"
+        assert g.nodes["agent:device-b:claude-desktop"].attributes["owner"] == "bob"
+        assert g.has_edge("agent:device-a:claude-desktop", "server:device-a:claude-desktop:team-chat-server")
+        assert g.has_edge("agent:device-b:claude-desktop", "server:device-b:claude-desktop:team-chat-server")
+        assert g.has_edge("server:device-a:claude-desktop:team-chat-server", "pkg:npm:axios@1.4.0")
+        assert g.has_edge("server:device-b:claude-desktop:team-chat-server", "pkg:npm:axios@1.4.0")
+
+    def test_agent_source_id_colons_do_not_collide_with_graph_id_segments(self):
+        report = {
+            "agents": [
+                {
+                    "name": "claude-desktop",
+                    "source_id": "device:prod",
+                    "mcp_servers": [],
+                },
+            ],
+        }
+
+        g = build_unified_graph_from_report(report)
+
+        assert "agent:device%3Aprod:claude-desktop" in g.nodes
+        assert "agent:device:prod:claude-desktop" not in g.nodes
+        assert g.nodes["agent:device%3Aprod:claude-desktop"].attributes["source_id"] == "device:prod"
+        assert g.nodes["agent:device%3Aprod:claude-desktop"].attributes["source_ids"]["source_id"] == "device:prod"
+
+    def test_provider_nodes_and_hosts_edges(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        providers = g.nodes_by_type(EntityType.PROVIDER)
+        assert len(providers) == 1
+        assert providers[0].label == "local"
+
+    def test_server_launch_attributes_are_redacted(self):
+        token = "ghp_" + "A" * 36
+        report = _minimal_report()
+        server = report["agents"][0]["mcp_servers"][0]
+        server["url"] = f"https://user:pass@example.com/sse?token={token}"
+        server["command"] = f"npx {token}"
+        server["security_warnings"] = [f"token {token}"]
+        server["security_intelligence"] = [
+            {
+                "entry_id": "intel",
+                "matched_value": f"server --token {token}",
+                "references": ["javascript:alert(1)", "https://example.com/advisory#frag"],
+            }
+        ]
+
+        g = build_unified_graph_from_report(report)
+        node = next(n for n in g.nodes_by_type(EntityType.SERVER) if n.label == "mcp-fs")
+
+        assert token not in str(node.attributes)
+        assert node.attributes["url"] == "https://example.com/sse"
+        assert node.attributes["security_warnings"] == ["token <redacted>"]
+        assert node.attributes["security_intelligence"][0]["references"] == ["https://example.com/advisory"]
+        assert g.has_edge("provider:local", "agent:claude-desktop")
+
+    def test_cloud_origin_metadata_becomes_lineage_nodes(self):
+        report = _minimal_report()
+        report["agents"][0]["source"] = "gcp-cloud-run"
+        report["agents"][0]["metadata"] = {
+            "cloud_origin": {
+                "provider": "gcp",
+                "service": "cloud-run",
+                "resource_type": "service",
+                "resource_id": "projects/acme/locations/us-central1/services/support-agent",
+                "resource_name": "support-agent",
+                "location": "us-central1",
+                "scope": {"project_id": "acme"},
+            },
+            "cloud_principal": {
+                "provider": "gcp",
+                "service": "cloud-run",
+                "resource_type": "service",
+                "principal_type": "service-account",
+                "principal_id": "support-agent@acme.iam.gserviceaccount.com",
+                "source_field": "template.service_account",
+            },
+            "cloud_state": {
+                "provider": "gcp",
+                "service": "cloud-run",
+                "resource_type": "service",
+                "lifecycle_state": "ready",
+            },
+        }
+
+        g = build_unified_graph_from_report(report)
+
+        resource_id = "cloud_resource:gcp:cloud-run:service:projects/acme/locations/us-central1/services/support-agent"
+        principal_id = "service_account:gcp:support-agent@acme.iam.gserviceaccount.com"
+        account_id = "account:gcp:acme"
+        resource = g.nodes.get(resource_id)
+        principal = g.nodes.get(principal_id)
+        account = g.nodes.get(account_id)
+
+        assert resource is not None
+        assert resource.entity_type == EntityType.CLOUD_RESOURCE
+        assert resource.label == "support-agent"
+        assert resource.attributes["cloud_origin"]["scope"]["project_id"] == "acme"
+        assert resource.attributes["cloud_state"]["lifecycle_state"] == "ready"
+        assert resource.dimensions.cloud_provider == "gcp"
+        assert principal is not None
+        assert principal.entity_type == EntityType.SERVICE_ACCOUNT
+        assert principal.attributes["principal_type"] == "service-account"
+        assert account is not None
+        assert account.entity_type == EntityType.ACCOUNT
+        assert account.attributes["scope_key"] == "project_id"
+        assert g.has_edge("provider:gcp", resource_id)
+        assert g.has_edge("provider:gcp", account_id)
+        assert g.has_edge(account_id, resource_id)
+        assert g.has_edge(resource_id, "agent:claude-desktop")
+        assert g.has_edge(principal_id, resource_id)
+        assert any(e.source == principal_id and e.target == account_id and e.relationship == RelationshipType.MEMBER_OF for e in g.edges)
+        assert any(e.source == principal_id and e.target == resource_id and e.relationship == RelationshipType.CAN_ACCESS for e in g.edges)
+        # Direct principal → agent edge (audit P0 #1): single-hop reach so
+        # "which principals can touch this agent?" doesn't have to traverse
+        # the cloud_resource intermediate.
+        assert g.has_edge(principal_id, "agent:claude-desktop")
+        principal_to_agent = next(
+            (
+                e
+                for e in g.edges
+                if e.source == principal_id and e.target == "agent:claude-desktop" and e.relationship == RelationshipType.MANAGES
+            ),
+            None,
+        )
+        assert principal_to_agent is not None
+        # The `via` evidence preserves the lineage so consumers can tell the
+        # principal-to-agent relationship is mediated by a cloud_resource
+        # rather than direct ownership.
+        assert principal_to_agent.evidence.get("via") == resource_id
+
+    def test_cloud_principal_role_policy_metadata_becomes_identity_graph(self):
+        report = _minimal_report()
+        report["agents"][0]["source"] = "aws-bedrock"
+        report["agents"][0]["metadata"] = {
+            "cloud_origin": {
+                "provider": "aws",
+                "service": "bedrock",
+                "resource_type": "agent",
+                "resource_id": "arn:aws:bedrock:us-east-1:123456789012:agent/agent-abc",
+                "resource_name": "support-agent",
+                "location": "us-east-1",
+                "scope": {
+                    "org_id": "o-example",
+                    "account_id": "123456789012",
+                },
+            },
+            "cloud_principal": {
+                "provider": "aws",
+                "principal_type": "role",
+                "principal_id": "arn:aws:iam::123456789012:role/AgentRuntimeRole",
+                "principal_name": "AgentRuntimeRole",
+                "policies": [
+                    {
+                        "policy_id": "arn:aws:iam::123456789012:policy/AgentRuntimePolicy",
+                        "policy_name": "AgentRuntimePolicy",
+                    }
+                ],
+                "trust_principals": [
+                    {
+                        "principal_type": "service-principal",
+                        "principal_id": "bedrock.amazonaws.com",
+                        "principal_name": "bedrock.amazonaws.com",
+                        "relationship": "trusts",
+                    },
+                    {
+                        "principal_type": "account",
+                        "principal_id": "210987654321",
+                        "principal_name": "210987654321",
+                        "relationship": "cross_account_trust",
+                    },
+                ],
+                "source_field": "agentResourceRoleArn",
+            },
+        }
+
+        g = build_unified_graph_from_report(report)
+
+        org_id = "org:aws:o-example"
+        account_id = "account:aws:123456789012"
+        role_id = "role:aws:arn:aws:iam::123456789012:role/AgentRuntimeRole"
+        policy_id = "policy:aws:arn:aws:iam::123456789012:policy/AgentRuntimePolicy"
+        service_principal_id = "service_principal:aws:bedrock.amazonaws.com"
+        external_account_id = "account:aws:210987654321"
+        resource_id = "cloud_resource:aws:bedrock:agent:arn:aws:bedrock:us-east-1:123456789012:agent/agent-abc"
+
+        assert g.nodes[org_id].entity_type == EntityType.ORG
+        assert g.nodes[account_id].entity_type == EntityType.ACCOUNT
+        assert g.nodes[role_id].entity_type == EntityType.ROLE
+        assert g.nodes[policy_id].entity_type == EntityType.POLICY
+        assert g.nodes[service_principal_id].entity_type == EntityType.SERVICE_PRINCIPAL
+        assert g.nodes[external_account_id].entity_type == EntityType.ACCOUNT
+        assert g.nodes[role_id].attributes["principal_type"] == "role"
+        assert any(e.source == account_id and e.target == org_id and e.relationship == RelationshipType.PART_OF for e in g.edges)
+        assert any(e.source == account_id and e.target == resource_id and e.relationship == RelationshipType.HOSTS for e in g.edges)
+        assert any(e.source == account_id and e.target == resource_id and e.relationship == RelationshipType.CONTAINS for e in g.edges)
+        assert any(e.source == role_id and e.target == account_id and e.relationship == RelationshipType.MEMBER_OF for e in g.edges)
+        assert any(e.source == role_id and e.target == resource_id and e.relationship == RelationshipType.CAN_ACCESS for e in g.edges)
+        assert any(e.source == role_id and e.target == policy_id and e.relationship == RelationshipType.ATTACHED for e in g.edges)
+        assert any(e.source == role_id and e.target == service_principal_id and e.relationship == RelationshipType.TRUSTS for e in g.edges)
+        assert any(
+            e.source == role_id and e.target == external_account_id and e.relationship == RelationshipType.CROSS_ACCOUNT_TRUST
+            for e in g.edges
+        )
+
+    def test_cloud_resource_rolls_up_under_account_contains_tree(self):
+        report = _minimal_report()
+        report["agents"][0]["source"] = "aws-bedrock"
+        report["agents"][0]["metadata"] = {
+            "cloud_origin": {
+                "provider": "aws",
+                "service": "bedrock",
+                "resource_type": "agent",
+                "resource_id": "arn:aws:bedrock:us-east-1:123456789012:agent/agent-abc",
+                "resource_name": "support-agent",
+                "location": "us-east-1",
+                "scope": {
+                    "account_id": "123456789012",
+                },
+            },
+        }
+
+        g = build_unified_graph_from_report(report)
+
+        account_id = "account:aws:123456789012"
+        resource_id = "cloud_resource:aws:bedrock:agent:arn:aws:bedrock:us-east-1:123456789012:agent/agent-abc"
+        view = rollup_view(g)
+        account = next(item for item in view["top_level"] if item["id"] == account_id)
+        assert account["has_children"] is True
+        assert account["direct_child_count"] == 1
+        assert account["aggregate"]["by_type"]["cloud_resource"] == 1
+        assert resource_id not in {item["id"] for item in view["top_level"]}
+
+    def test_no_principal_agent_edge_when_principal_metadata_absent(self):
+        # If cloud_origin is present but cloud_principal is missing, only
+        # the resource-side lineage is created — no service_account node,
+        # and definitely no orphan principal → agent edge.
+        report = _minimal_report()
+        report["agents"][0]["source"] = "gcp-cloud-run"
+        report["agents"][0]["metadata"] = {
+            "cloud_origin": {
+                "provider": "gcp",
+                "service": "cloud-run",
+                "resource_type": "service",
+                "resource_id": "no-principal",
+                "resource_name": "no-principal",
+            },
+        }
+        g = build_unified_graph_from_report(report)
+        sa_nodes = [n for n in g.nodes_by_type(EntityType.SERVICE_ACCOUNT)]
+        assert sa_nodes == []
+        principal_to_agent = [e for e in g.edges if e.source.startswith("service_account:") and e.target == "agent:claude-desktop"]
+        assert principal_to_agent == []
+
+    def test_gpu_container_metadata_promotes_to_cloud_resource(self):
+        # gpu_infra_to_agents (src/agent_bom/cloud/gpu_infra.py) attaches a
+        # cloud_origin envelope so the existing promoter creates a
+        # cloud_resource:gpu:... lineage node for each container. This test
+        # asserts the contract end-to-end via the report-shaped dict, which
+        # is what the unified-graph builder consumes.
+        report = _minimal_report()
+        report["agents"][0]["source"] = "gpu_infra"
+        report["agents"][0]["metadata"] = {
+            "cloud_origin": {
+                "provider": "gpu",
+                "service": "container_runtime",
+                "resource_type": "nvidia",
+                "resource_id": "ctr-abc123",
+                "resource_name": "training-worker",
+                "scope": {
+                    "image": "nvcr.io/nvidia/pytorch:23.10-py3",
+                    "gpu_requested": True,
+                    "cuda_version": "12.2",
+                    "cudnn_version": "8.9",
+                },
+            },
+        }
+
+        g = build_unified_graph_from_report(report)
+
+        resource_id = "cloud_resource:gpu:container_runtime:nvidia:ctr-abc123"
+        resource = g.nodes.get(resource_id)
+        assert resource is not None
+        assert resource.entity_type == EntityType.CLOUD_RESOURCE
+        assert resource.label == "training-worker"
+        assert resource.attributes["cloud_origin"]["scope"]["cuda_version"] == "12.2"
+        assert resource.dimensions.cloud_provider == "gpu"
+        assert g.has_edge("provider:gpu", resource_id)
+        assert g.has_edge(resource_id, "agent:claude-desktop")
+
+    def test_k8s_gpu_cluster_promotes_with_aggregated_scope(self):
+        # The aggregated k8s-gpu-cluster agent rolls multiple GPU nodes into
+        # a single cloud_resource so dashboards see one cluster, not one node
+        # per row. Per-node facts live in the scope envelope.
+        report = _minimal_report()
+        report["agents"][0]["source"] = "gpu_infra"
+        report["agents"][0]["metadata"] = {
+            "cloud_origin": {
+                "provider": "gpu",
+                "service": "kubernetes",
+                "resource_type": "nvidia",
+                "resource_id": "k8s-gpu-cluster",
+                "resource_name": "k8s-gpu-cluster",
+                "scope": {
+                    "node_count": 4,
+                    "gpu_capacity_total": 32,
+                    "vendors": ["nvidia"],
+                },
+            },
+        }
+
+        g = build_unified_graph_from_report(report)
+
+        resource_id = "cloud_resource:gpu:kubernetes:nvidia:k8s-gpu-cluster"
+        resource = g.nodes.get(resource_id)
+        assert resource is not None
+        assert resource.attributes["cloud_origin"]["scope"]["node_count"] == 4
+        assert resource.attributes["cloud_origin"]["scope"]["gpu_capacity_total"] == 32
+        assert g.has_edge(resource_id, "agent:claude-desktop")
+
+    def test_server_nodes(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        servers = g.nodes_by_type(EntityType.SERVER)
+        assert len(servers) == 2  # one per agent
+
+    def test_package_nodes(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        packages = g.nodes_by_type(EntityType.PACKAGE)
+        assert len(packages) == 2  # express + lodash
+        labels = {p.label for p in packages}
+        assert "express@4.18.0" in labels
+        assert "lodash@4.17.21" in labels
+
+    def test_tool_nodes(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        tools = g.nodes_by_type(EntityType.TOOL)
+        assert len(tools) == 2
+        names = {t.label for t in tools}
+        assert "read_file" in names
+        assert "write_file" in names
+
+    def test_tool_nodes_include_capability_facets(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        read_tool = g.nodes["tool:server:claude-desktop:mcp-fs:read_file"]
+        write_tool = g.nodes["tool:server:claude-desktop:mcp-fs:write_file"]
+
+        assert "read" in read_tool.attributes["capabilities"]
+        assert "write" in write_tool.attributes["capabilities"]
+        assert read_tool.attributes["capability_source"] == "classified"
+
+    def test_credential_nodes(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        creds = g.nodes_by_type(EntityType.CREDENTIAL)
+        labels = {c.label for c in creds}
+        assert "GITHUB_TOKEN" in labels
+        assert "OPENAI_API_KEY" in labels
+
+    def test_same_env_var_name_does_not_merge_credential_slots(self):
+        report = _minimal_report()
+
+        g = build_unified_graph_from_report(report)
+
+        github_creds = {node.id for node in g.nodes_by_type(EntityType.CREDENTIAL) if node.label == "GITHUB_TOKEN"}
+        assert github_creds == {
+            "cred:server:claude-desktop:mcp-fs:GITHUB_TOKEN",
+            "cred:server:cursor:mcp-fs:GITHUB_TOKEN",
+        }
+        assert not any(edge.relationship == RelationshipType.SHARES_CRED for edge in g.edges)
+
+    def test_credential_to_tool_reaches_edges(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        github_cred_id = "cred:server:claude-desktop:mcp-fs:GITHUB_TOKEN"
+        read_tool_id = "tool:server:claude-desktop:mcp-fs:read_file"
+        write_tool_id = "tool:server:claude-desktop:mcp-fs:write_file"
+
+        assert g.has_edge(github_cred_id, read_tool_id)
+        assert g.has_edge(github_cred_id, write_tool_id)
+        edge = next(
+            edge
+            for edge in g.edges
+            if edge.source == github_cred_id and edge.target == write_tool_id and edge.relationship == RelationshipType.REACHES_TOOL
+        )
+        assert edge.evidence["server"] == "server:claude-desktop:mcp-fs"
+        assert edge.evidence["credential_env_var"] == "GITHUB_TOKEN"
+        assert edge.evidence["mapping_method"] == "server_scope_conservative"
+        assert edge.evidence["confidence"] == "medium"
+
+    def test_credential_to_tool_edges_stay_server_scoped(self):
+        report = _minimal_report()
+        report["agents"][1]["mcp_servers"][0]["tools"] = [{"name": "delete_repo", "description": "Delete a repo"}]
+
+        g = build_unified_graph_from_report(report)
+
+        cursor_cred_id = "cred:server:cursor:mcp-fs:GITHUB_TOKEN"
+        claude_cred_id = "cred:server:claude-desktop:mcp-fs:OPENAI_API_KEY"
+        assert g.has_edge(cursor_cred_id, "tool:server:cursor:mcp-fs:delete_repo")
+        assert not any(
+            edge.source == claude_cred_id
+            and edge.target == "tool:server:cursor:mcp-fs:delete_repo"
+            and edge.relationship == RelationshipType.REACHES_TOOL
+            for edge in g.edges
+        )
+
+    def test_vulnerability_nodes(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        vulns = g.nodes_by_type(EntityType.VULNERABILITY)
+        assert len(vulns) == 1
+        assert vulns[0].label == "CVE-2024-1234"
+        assert vulns[0].severity == "high"
+        assert vulns[0].category_uid == 2
+        assert vulns[0].class_uid == 2001
+
+    def test_package_to_vuln_edge(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        pkg_id = "pkg:npm:express@4.18.0"
+        vuln_id = "vuln:CVE-2024-1234"
+        assert g.has_edge(pkg_id, vuln_id)
+
+    def test_vulnerability_to_tool_exploitable_via_edges(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        vuln_id = "vuln:CVE-2024-1234"
+        read_tool_id = "tool:server:claude-desktop:mcp-fs:read_file"
+        write_tool_id = "tool:server:claude-desktop:mcp-fs:write_file"
+
+        assert g.has_edge(vuln_id, read_tool_id)
+        assert g.has_edge(vuln_id, write_tool_id)
+        edge = next(
+            edge
+            for edge in g.edges
+            if edge.source == vuln_id and edge.target == write_tool_id and edge.relationship == RelationshipType.EXPLOITABLE_VIA
+        )
+        assert edge.evidence["mapping_method"] == "server_scope_conservative"
+        assert edge.evidence["confidence"] == "medium"
+        assert edge.evidence["package_node"] == "pkg:npm:express@4.18.0"
+        assert "write" in edge.evidence["capabilities"]
+
+    def test_exploitable_via_does_not_cross_same_named_servers(self):
+        report = _minimal_report()
+        report["agents"][1]["mcp_servers"][0]["tools"] = [{"name": "delete_repo", "description": "Delete a repository"}]
+
+        g = build_unified_graph_from_report(report)
+
+        assert g.has_edge("vuln:CVE-2024-1234", "tool:server:claude-desktop:mcp-fs:read_file")
+        assert not g.has_edge("vuln:CVE-2024-1234", "tool:server:cursor:mcp-fs:delete_repo")
+
+    def test_unknown_package_version_does_not_emit_exploitable_via(self):
+        report = _minimal_report()
+        package = report["agents"][0]["mcp_servers"][0]["packages"][0]
+        package["version"] = "unknown"
+        report["blast_radius"][0]["package_version"] = "unknown"
+
+        g = build_unified_graph_from_report(report)
+
+        assert g.has_edge("pkg:npm:express@unknown", "vuln:CVE-2024-1234")
+        exploit_edges = [edge for edge in g.edges if edge.relationship == RelationshipType.EXPLOITABLE_VIA]
+        assert exploit_edges == []
+
+    def test_server_to_package_edge(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        assert g.has_edge("server:claude-desktop:mcp-fs", "pkg:npm:express@4.18.0")
+
+    def test_package_edges_include_discovery_provenance(self):
+        report = _minimal_report()
+        report["agents"][0]["mcp_servers"][0]["packages"][0]["purl"] = "pkg:npm/express@4.18.0"
+        report["agents"][0]["mcp_servers"][0]["packages"][0]["occurrences"] = [
+            {
+                "layer_index": 2,
+                "layer_id": "sha256:abc",
+                "package_path": "app/package-lock.json",
+                "source_file": "package-lock.json",
+                "line": 42,
+                "parser": "npm-lock",
+            }
+        ]
+        report["agents"][0]["mcp_servers"][0]["packages"][0]["occurrence_count"] = 1
+        g = build_unified_graph_from_report(report)
+
+        edge = next(e for e in g.edges if e.source == "server:claude-desktop:mcp-fs" and e.target == "pkg:npm:express@4.18.0")
+        assert edge.evidence["source"] == "mcp-scan"
+        assert edge.evidence["purl"] == "pkg:npm/express@4.18.0"
+        assert edge.evidence["version_provenance"]["resolved_version"] == "4.18.0"
+        assert edge.evidence["version_provenance"]["version_source"] == "unknown"
+        assert edge.evidence["occurrences"][0]["package_path"] == "app/package-lock.json"
+        assert edge.evidence["occurrences"][0]["line"] == 42
+
+        node = g.nodes["pkg:npm:express@4.18.0"]
+        assert node.attributes["version_provenance"]["resolved_version"] == "4.18.0"
+
+    def test_package_node_id_uses_canonical_identity(self):
+        report = _minimal_report()
+        report["agents"][0]["mcp_servers"][0]["packages"][0]["name"] = "torch_audio"
+        report["agents"][0]["mcp_servers"][0]["packages"][0]["ecosystem"] = "PyPI"
+        report["agents"][0]["mcp_servers"][0]["packages"][0]["version"] = "1.0.0"
+        report["agents"][0]["mcp_servers"][0]["packages"][0]["purl"] = "pkg:pypi/torch.audio@1.0.0"
+        report["blast_radius"][0]["package_name"] = "torch-audio"
+        report["blast_radius"][0]["package_version"] = "1.0.0"
+        report["blast_radius"][0]["ecosystem"] = "pypi"
+
+        g = build_unified_graph_from_report(report)
+
+        assert "pkg:pypi:torch-audio@1.0.0" in g.nodes
+        assert g.nodes["pkg:pypi:torch-audio@1.0.0"].to_dict()["canonical_id"]
+        assert g.has_edge("pkg:pypi:torch-audio@1.0.0", "vuln:CVE-2024-1234")
+
+    def test_graph_nodes_and_edges_emit_canonical_ids_without_replacing_readable_ids(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        agent = g.nodes["agent:claude-desktop"]
+        edge = next(e for e in g.edges if e.source == "agent:claude-desktop" and e.target == "server:claude-desktop:mcp-fs")
+
+        assert agent.to_dict()["id"] == "agent:claude-desktop"
+        assert agent.to_dict()["canonical_id"] == agent.canonical_id
+        assert edge.to_dict()["id"] == "uses:agent:claude-desktop:server:claude-desktop:mcp-fs"
+        assert edge.to_dict()["canonical_id"] == edge.canonical_id
+
+    def test_agent_to_server_edge(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        assert g.has_edge("agent:claude-desktop", "server:claude-desktop:mcp-fs")
+
+    def test_shared_server_edge(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        # claude-desktop and cursor both use mcp-fs
+        assert g.has_edge("agent:claude-desktop", "agent:cursor") or g.has_edge("agent:cursor", "agent:claude-desktop")
+
+    def test_blast_radius_does_not_cross_product_same_named_servers(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        vuln_id = "vuln:CVE-2024-1234"
+        assert g.has_edge("server:claude-desktop:mcp-fs", vuln_id)
+        assert not g.has_edge("server:cursor:mcp-fs", vuln_id)
+
+    def test_blast_radius_accepts_object_shaped_affected_servers(self):
+        report = _minimal_report()
+        report["blast_radius"][0]["affected_servers"] = [{"name": "mcp-fs"}]
+        g = build_unified_graph_from_report(report)
+        assert g.has_edge("server:claude-desktop:mcp-fs", "vuln:CVE-2024-1234")
+
+    def test_same_env_var_name_does_not_create_shared_credential_edge(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        assert not any(e.relationship == RelationshipType.SHARES_CRED for e in g.edges)
+
+    def test_compliance_tags_on_vuln(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        vuln = g.nodes.get("vuln:CVE-2024-1234")
+        assert vuln is not None
+        assert "OWASP-A06" in vuln.compliance_tags
+        assert "MITRE-T1059" in vuln.compliance_tags
+
+    def test_attack_path_traversal(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        # agent → server → package → vuln should be traversable
+        path = g.shortest_path("agent:claude-desktop", "vuln:CVE-2024-1234")
+        assert path is not None
+        assert path[0] == "agent:claude-desktop"
+        assert path[-1] == "vuln:CVE-2024-1234"
+
+    def test_credential_not_in_ocsf_events(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        events = g.to_ocsf_events()
+        # Only vuln should be in OCSF events, not credentials
+        assert len(events) == 1
+        assert events[0]["message"] == "vulnerability:CVE-2024-1234"
+
+    def test_dimensions_populated(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        pkg = g.nodes.get("pkg:npm:express@4.18.0")
+        assert pkg is not None
+        assert pkg.dimensions.ecosystem == "npm"
+
+        agent = g.nodes.get("agent:claude-desktop")
+        assert agent is not None
+        assert agent.dimensions.agent_type == "claude-desktop"
+
+    def test_scan_id_propagated(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        assert g.scan_id == "test-full-001"
+
+    def test_stats_complete(self):
+        g = build_unified_graph_from_report(_minimal_report())
+        s = g.stats()
+        assert s["total_nodes"] >= 9  # 2 agents + 2 servers + 2 pkgs + 2 tools + 2 creds + 1 vuln
+        assert s["total_edges"] >= 8
+        assert "agent" in s["node_types"]
+        assert "package" in s["node_types"]
+        assert "vulnerability" in s["node_types"]
+
+
+class TestCISMisconfigNodes:
+    def test_cis_failures_become_misconfig_nodes(self):
+        report = _minimal_report()
+        report["cis_benchmark"] = {
+            "checks": [
+                {
+                    "check_id": "1.1",
+                    "title": "Ensure MFA is enabled",
+                    "status": "FAIL",
+                    "severity": "high",
+                    "resource_ids": ["bucket/prod-secrets"],
+                },
+                {"check_id": "1.2", "title": "Ensure logging", "status": "PASS", "severity": "medium"},
+            ]
+        }
+        g = build_unified_graph_from_report(report)
+        misconfigs = g.nodes_by_type(EntityType.MISCONFIGURATION)
+        assert len(misconfigs) == 1
+        assert "MFA" in misconfigs[0].label
+        assert misconfigs[0].severity == "high"
+        assert misconfigs[0].category_uid == 2
+        assert misconfigs[0].class_uid == 2003
+        resources = g.nodes_by_type(EntityType.CLOUD_RESOURCE)
+        assert len(resources) == 1
+        assert resources[0].label == "bucket/prod-secrets"
+        assert resources[0].attributes["cloud_provider"] == "aws"
+        assert g.has_edge("misconfig:cis_benchmark:1.1", "cloud_resource:aws:bucket/prod-secrets")
+        assert not g.get_node("cloud_resource:generic:bucket/prod-secrets")
+
+    def test_cis_failures_anchor_account_scope_to_provider(self):
+        report = _minimal_report()
+        report["cis_benchmark"] = {
+            "account_id": "123456789012",
+            "checks": [
+                {
+                    "check_id": "1.3",
+                    "title": "Ensure account contact is current",
+                    "status": "FAIL",
+                    "severity": "medium",
+                }
+            ],
+        }
+        g = build_unified_graph_from_report(report)
+
+        assert g.has_edge("misconfig:cis_benchmark:1.3", "account:aws:123456789012")
+        account = g.get_node("account:aws:123456789012")
+        assert account is not None
+        assert account.attributes["cloud_provider"] == "aws"
+
+    def test_cis_and_inventory_share_one_canonical_cloud_resource(self):
+        """A finding, hierarchy, and CNAPP overlay must address the same asset."""
+        report = _minimal_report()
+        report["cloud_inventory"] = {
+            "provider": "aws",
+            "status": "ok",
+            "account_id": "123456789012",
+            "region": "us-east-1",
+            "buckets": [
+                {
+                    "name": "prod-secrets",
+                    "arn": "arn:aws:s3:::prod-secrets",
+                    "publicly_accessible": True,
+                }
+            ],
+        }
+        report["cis_benchmark"] = {
+            "provider": "aws",
+            "account_id": "123456789012",
+            "checks": [
+                {
+                    "check_id": "2.1",
+                    "title": "Block public bucket access",
+                    "status": "FAIL",
+                    "severity": "high",
+                    "resource_ids": ["bucket/prod-secrets"],
+                }
+            ],
+        }
+
+        graph = build_unified_graph_from_report(report)
+        canonical_id = "cloud_resource:aws:s3:bucket:prod-secrets"
+        thin_id = "cloud_resource:aws:bucket/prod-secrets"
+
+        assert canonical_id in graph.nodes
+        assert thin_id not in graph.nodes
+        assert graph.has_edge("misconfig:cis_benchmark:2.1", canonical_id)
+        assert graph.has_edge("account:aws:123456789012", canonical_id)
+        assert f"data_store:{canonical_id}" in graph.nodes
+
+    def test_cloud_resource_alias_resolution_fails_closed_on_ambiguous_names(self):
+        graph = UnifiedGraph()
+        for resource_type in ("bucket", "database"):
+            graph.add_node(
+                UnifiedNode(
+                    id=f"cloud_resource:aws:{resource_type}:prod",
+                    entity_type=EntityType.CLOUD_RESOURCE,
+                    label=f"{resource_type}: prod",
+                    attributes={
+                        "cloud_provider": "aws",
+                        "resource_id": f"arn:aws:{resource_type}:::prod",
+                        "resource_name": "prod",
+                        "resource_type": resource_type,
+                    },
+                    dimensions=NodeDimensions(cloud_provider="aws"),
+                )
+            )
+
+        assert _resolve_cloud_resource_node_id(graph, "aws", "prod") is None
+        assert _resolve_cloud_resource_node_id(graph, "aws", "bucket/prod") == "cloud_resource:aws:bucket:prod"
+
+
+class TestSASTNodes:
+    def test_sast_findings_become_misconfig_nodes(self):
+        report = _minimal_report()
+        report["sast"] = {
+            "findings": [
+                {
+                    "rule_id": "CWE-79",
+                    "message": "XSS in template",
+                    "severity": "high",
+                    "file_path": "app.py",
+                    "start_line": 42,
+                    "end_line": 42,
+                    "cwe_ids": ["CWE-79"],
+                    "owasp_ids": ["A03:2021"],
+                    "rule_url": "https://semgrep.dev/r/cwe-79",
+                },
+            ]
+        }
+        g = build_unified_graph_from_report(report)
+        misconfigs = g.nodes_by_type(EntityType.MISCONFIGURATION)
+        assert len(misconfigs) == 1
+        assert "XSS" in misconfigs[0].label
+        assert misconfigs[0].attributes["file_path"] == "app.py"
+        assert misconfigs[0].attributes["start_line"] == 42
+        assert "CWE-79" in misconfigs[0].compliance_tags
+        assert "A03:2021" in misconfigs[0].compliance_tags
+
+
+class TestIaCNodes:
+    def test_iac_findings_become_misconfig_nodes_and_target_anchors(self):
+        report = _minimal_report()
+        report["iac_findings"] = {
+            "findings": [
+                {
+                    "rule_id": "K8S-007",
+                    "title": "Secrets in plain env values",
+                    "message": "Container sets a plaintext secret in env.",
+                    "severity": "high",
+                    "file_path": "deploy/k8s/api.yaml",
+                    "line_number": 27,
+                    "category": "kubernetes",
+                    "compliance": ["CIS-5.4.1"],
+                    "attack_techniques": ["T1552.001"],
+                    "remediation": "Use Secret refs instead of plaintext values.",
+                }
+            ]
+        }
+
+        g = build_unified_graph_from_report(report)
+
+        misconfigs = g.nodes_by_type(EntityType.MISCONFIGURATION)
+        assert len(misconfigs) == 1
+        assert misconfigs[0].label == "Secrets in plain env values"
+        assert misconfigs[0].attributes["file_path"] == "deploy/k8s/api.yaml"
+        assert misconfigs[0].attributes["category"] == "kubernetes"
+        assert misconfigs[0].attributes["remediation"] == "Use Secret refs instead of plaintext values."
+        assert "CIS-5.4.1" in misconfigs[0].compliance_tags
+        assert "T1552.001" in misconfigs[0].compliance_tags
+
+        anchors = g.nodes_by_type(EntityType.CLOUD_RESOURCE)
+        assert any(anchor.label == "deploy/k8s/api.yaml" for anchor in anchors)
+        anchor = next(anchor for anchor in anchors if anchor.label == "deploy/k8s/api.yaml")
+        assert anchor.attributes["target_type"] == "iac_file"
+        assert g.has_edge("misconfig:iac:K8S-007:deploy/k8s/api.yaml:27", "iac_target:kubernetes:deploy/k8s/api.yaml")
+
+
+class TestSkillAuditNodes:
+    def test_skill_audit_findings_become_misconfig_nodes_and_attach_to_inventory(self):
+        report = _minimal_report()
+        report["agents"][1]["mcp_servers"][0]["name"] = "mcp-git"
+        report["skill_audit"] = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "category": "shell_access",
+                    "title": "Shell access in skill config",
+                    "detail": "Skill enables shell execution.",
+                    "source_file": "/home/user/.config/claude/config.json",
+                },
+                {
+                    "severity": "medium",
+                    "category": "unknown_package",
+                    "title": "Unknown skill package",
+                    "detail": "Package express was referenced by a skill.",
+                    "package": "express",
+                    "source_file": "/skills/demo.md",
+                },
+                {
+                    "severity": "medium",
+                    "category": "unverified_server",
+                    "title": "Unverified MCP server",
+                    "detail": "Server mcp-fs is not verified.",
+                    "server": "mcp-fs",
+                    "source_file": "/skills/demo.md",
+                },
+            ]
+        }
+
+        g = build_unified_graph_from_report(report)
+
+        misconfigs = g.nodes_by_type(EntityType.MISCONFIGURATION)
+        labels = {node.label for node in misconfigs}
+        assert "Shell access in skill config" in labels
+        assert "Unknown skill package" in labels
+        assert "Unverified MCP server" in labels
+
+        shell_node = g.nodes.get("misconfig:skill_audit:shell_access:1")
+        pkg_node = g.nodes.get("misconfig:skill_audit:unknown_package:2")
+        server_node = g.nodes.get("misconfig:skill_audit:unverified_server:3")
+        assert shell_node is not None
+        assert pkg_node is not None
+        assert server_node is not None
+        assert shell_node.data_sources == ["skill-audit"]
+        assert "skill_audit:shell_access" in shell_node.compliance_tags
+
+        assert g.has_edge("misconfig:skill_audit:shell_access:1", "agent:claude-desktop")
+        assert g.has_edge("misconfig:skill_audit:unknown_package:2", "pkg:npm:express@4.18.0")
+        assert g.has_edge("misconfig:skill_audit:unverified_server:3", "server:claude-desktop:mcp-fs")
+        assert not g.has_edge("misconfig:skill_audit:unverified_server:3", "server:cursor:mcp-git")
+
+
+class TestAgenticIdentityGraphProjection:
+    def test_audit_projection_enters_unified_graph(self):
+        report = _minimal_report()
+        report["audit_events"] = [
+            {
+                "event_id": "evt-1",
+                "details": {
+                    "agentic_identity_graph": {
+                        "schema_version": "agentic_identity_graph.v1",
+                        "source": "proxy_tool_call",
+                        "nodes": [
+                            {
+                                "id": "agent:agent_id:agent:caller:agent-alpha",
+                                "entity_type": "agent",
+                                "label": "agent-alpha",
+                                "source_ref": {
+                                    "type": "agent",
+                                    "id": "agent-alpha",
+                                    "role": "caller",
+                                    "source_field": "agent_id",
+                                },
+                            },
+                            {
+                                "id": "tool_call:proxy_tool_call_evt-1",
+                                "entity_type": "tool_call",
+                                "label": "Tool call",
+                                "attributes": {"source": "proxy_tool_call", "event_id": "evt-1"},
+                            },
+                            {
+                                "id": "tool:tool:tool:invoked_tool:query_database",
+                                "entity_type": "tool",
+                                "label": "query_database",
+                                "source_ref": {
+                                    "type": "tool",
+                                    "id": "query_database",
+                                    "role": "invoked_tool",
+                                    "source_field": "tool",
+                                },
+                            },
+                            {
+                                "id": "credential_ref:credential_ref:credential_ref:credential_reference:redacted",
+                                "entity_type": "credential_ref",
+                                "label": "<reference>",
+                                "source_ref": {
+                                    "type": "credential_ref",
+                                    "id": "***REDACTED***",
+                                    "role": "credential_reference",
+                                    "source_field": "credential_ref",
+                                },
+                            },
+                            {
+                                "id": "resource:resource_id:resource:referenced_input:warehouse-prod",
+                                "entity_type": "resource",
+                                "label": "warehouse-prod",
+                                "source_ref": {
+                                    "type": "resource",
+                                    "id": "warehouse-prod",
+                                    "role": "referenced_input",
+                                    "source_field": "resource_id",
+                                },
+                            },
+                        ],
+                        "edges": [
+                            {
+                                "source": "agent:agent_id:agent:caller:agent-alpha",
+                                "target": "tool_call:proxy_tool_call_evt-1",
+                                "relationship": "invoked",
+                                "evidence": {"source": "proxy_tool_call", "event_id": "evt-1"},
+                            },
+                            {
+                                "source": "tool_call:proxy_tool_call_evt-1",
+                                "target": "tool:tool:tool:invoked_tool:query_database",
+                                "relationship": "called",
+                                "evidence": {"source": "proxy_tool_call", "event_id": "evt-1"},
+                            },
+                            {
+                                "source": "tool_call:proxy_tool_call_evt-1",
+                                "target": "credential_ref:credential_ref:credential_ref:credential_reference:redacted",
+                                "relationship": "used_credential",
+                                "evidence": {"source": "proxy_tool_call", "event_id": "evt-1"},
+                            },
+                            {
+                                "source": "tool_call:proxy_tool_call_evt-1",
+                                "target": "resource:resource_id:resource:referenced_input:warehouse-prod",
+                                "relationship": "accessed",
+                                "evidence": {"source": "proxy_tool_call", "event_id": "evt-1"},
+                            },
+                        ],
+                    }
+                },
+            }
+        ]
+
+        g = build_unified_graph_from_report(report, tenant_id="tenant-alpha")
+
+        assert "tool_call:proxy_tool_call_evt-1" in g.nodes
+        assert "credential_ref:credential_ref:credential_ref:credential_reference:redacted" in g.nodes
+        assert "resource:resource_id:resource:referenced_input:warehouse-prod" in g.nodes
+        assert g.nodes["tool_call:proxy_tool_call_evt-1"].entity_type == EntityType.TOOL_CALL
+        assert g.nodes["tool_call:proxy_tool_call_evt-1"].attributes["agentic_identity_graph_schema"] == "agentic_identity_graph.v1"
+        assert g.nodes["tool_call:proxy_tool_call_evt-1"].dimensions.surface == "runtime"
+        assert g.has_edge("agent:agent_id:agent:caller:agent-alpha", "tool_call:proxy_tool_call_evt-1")
+        assert g.has_edge("tool_call:proxy_tool_call_evt-1", "tool:tool:tool:invoked_tool:query_database")
+        assert g.has_edge(
+            "tool_call:proxy_tool_call_evt-1",
+            "credential_ref:credential_ref:credential_ref:credential_reference:redacted",
+        )
+        assert g.has_edge("tool_call:proxy_tool_call_evt-1", "resource:resource_id:resource:referenced_input:warehouse-prod")
+        accessed = next(
+            edge
+            for edge in g.edges
+            if edge.source == "tool_call:proxy_tool_call_evt-1"
+            and edge.target == "resource:resource_id:resource:referenced_input:warehouse-prod"
+        )
+        assert accessed.relationship == RelationshipType.ACCESSED
+        assert accessed.evidence["data_source"] == "runtime-identity"
+        assert accessed.evidence["tenant_id"] == "tenant-alpha"
+
+    def test_projection_unknown_nodes_and_edges_are_ignored(self):
+        report = _minimal_report()
+        report["agentic_identity_graph"] = {
+            "schema_version": "agentic_identity_graph.v1",
+            "source": "proxy_tool_call",
+            "nodes": [
+                {"id": "tool_call:known", "entity_type": "tool_call", "label": "known"},
+                {"id": "mystery:1", "entity_type": "mystery", "label": "skip"},
+            ],
+            "edges": [
+                {"source": "tool_call:known", "target": "mystery:1", "relationship": "called"},
+                {"source": "tool_call:known", "target": "tool_call:known", "relationship": "mystery"},
+            ],
+        }
+
+        g = build_unified_graph_from_report(report)
+
+        assert "tool_call:known" in g.nodes
+        assert "mystery:1" not in g.nodes
+        assert not any(edge.source == "tool_call:known" and edge.target == "mystery:1" for edge in g.edges)
+
+
+class TestModelProvenance:
+    def test_model_nodes_created(self):
+        report = _minimal_report()
+        report["model_provenance"] = [
+            {"model_name": "gpt-4", "framework": "openai", "source": "api", "verified": True},
+        ]
+        g = build_unified_graph_from_report(report)
+        models = g.nodes_by_type(EntityType.MODEL)
+        assert len(models) == 1
+        assert models[0].label == "gpt-4"
+
+    def test_provenance_and_framework_model_ref_resolve_to_one_node(self):
+        # A provenance model and a framework model_ref naming the same model
+        # must collapse to ONE node carrying both the provenance attributes
+        # and the serves_model edge (no double-counting).
+        report = _minimal_report()
+        report["model_provenance"] = [
+            {
+                "model_name": "gpt-4o",
+                "framework": "openai",
+                "source": "api",
+                "hash": "sha256:abc",
+                "verified": True,
+            },
+        ]
+        report["ai_inventory"] = {
+            "framework_agents": [
+                {
+                    "stable_id": "framework-agent:chain",
+                    "name": "chain",
+                    "framework": "LangChain",
+                    "file_path": "app.py",
+                    "line_number": 1,
+                    "confidence": "high",
+                    "capabilities": [],
+                    "model_refs": ["gpt-4o"],
+                    "credential_refs": [],
+                    "dynamic_edges": False,
+                    "topology_edges": [],
+                }
+            ],
+        }
+
+        g = build_unified_graph_from_report(report)
+
+        models = g.nodes_by_type(EntityType.MODEL)
+        assert len(models) == 1
+        node = models[0]
+        # Provenance attributes are merged onto the same node.
+        assert node.attributes.get("verified") is True
+        assert node.attributes.get("hash") == "sha256:abc"
+        # Framework model_ref attribute lands on the same node.
+        assert node.attributes.get("model_ref") == "gpt-4o"
+        # serves_model edges point at that single node.
+        serves = [e for e in g.edges if e.relationship == RelationshipType.SERVES_MODEL and e.target == node.id]
+        assert serves
+        assert serves[0].source == "framework-agent:chain"
+
+    def test_provenance_normalizes_provider_prefix(self):
+        # Provider-prefixed refs collapse onto the same node id.
+        report = _minimal_report()
+        report["model_provenance"] = [
+            {"model_name": "gpt-4o", "source": "api", "verified": True},
+        ]
+        report["ai_inventory"] = {"unique_models": ["openai/gpt-4o"]}
+        g = build_unified_graph_from_report(report)
+        assert len(g.nodes_by_type(EntityType.MODEL)) == 1
+
+    def test_observability_framework_observes_detected_agents(self):
+        # An observability framework import co-occurring with detected agents
+        # emits framework -> agent observes edges (advertised relationship is
+        # actually produced).
+        report = _minimal_report()
+        report["ai_inventory"] = {
+            "components": [
+                {
+                    "type": "observability",
+                    "name": "Langfuse",
+                    "package": "langfuse",
+                    "ecosystem": "pypi",
+                    "language": "python",
+                    "file": "app.py",
+                    "line": 1,
+                    "is_shadow": False,
+                },
+            ],
+        }
+
+        g = build_unified_graph_from_report(report)
+
+        observes = [e for e in g.edges if e.relationship == RelationshipType.OBSERVES]
+        assert observes
+        for edge in observes:
+            assert g.nodes[edge.source].entity_type == EntityType.FRAMEWORK
+            assert g.nodes[edge.source].attributes.get("framework_kind") == "observability"
+            assert g.nodes[edge.target].entity_type == EntityType.AGENT
+
+    def test_dataset_and_container_nodes_created(self):
+        report = _minimal_report()
+        report["model_provenance"] = [
+            {"model_name": "gpt-4", "framework": "openai", "source": "api", "verified": True},
+        ]
+        report["dataset_cards"] = {
+            "datasets": [
+                {
+                    "name": "hf/acme-support",
+                    "license": "apache-2.0",
+                    "source_file": "datasets/support/README.md",
+                    "compliance_tags": {"nist": ["NIST-AI-RMF-MAP-1.1"]},
+                }
+            ]
+        }
+        report["serving_configs"] = [
+            {
+                "name": "support-api",
+                "framework": "mlflow",
+                "container_image": "ghcr.io/acme/support-api:1.2.3",
+                "model_uri": "models:/gpt-4/Production",
+                "endpoint_url": "https://support.example/api",
+            }
+        ]
+        report["toxic_combinations"] = [{"name": "rce_chain", "vulnerability_ids": ["CVE-2024-1234"], "risk_score": 9.5}]
+
+        g = build_unified_graph_from_report(report)
+
+        datasets = g.nodes_by_type(EntityType.DATASET)
+        containers = g.nodes_by_type(EntityType.CONTAINER)
+        assert len(datasets) == 1
+        assert datasets[0].label == "hf/acme-support"
+        assert "NIST-AI-RMF-MAP-1.1" in datasets[0].compliance_tags
+        assert len(containers) == 1
+        assert containers[0].attributes["container_image"] == "ghcr.io/acme/support-api:1.2.3"
+        assert g.has_edge("container:ghcr.io/acme/support-api:1.2.3", "model:gpt-4")
+        assert "toxic:rce_chain" in g.nodes
+        assert g.has_edge("vuln:CVE-2024-1234", "toxic:rce_chain")
+
+    def test_toxic_combo_title_component_shape_projects_to_graph(self):
+        report = _minimal_report()
+        report["toxic_combinations"] = [
+            {
+                "pattern": "credential_blast",
+                "severity": "critical",
+                "title": "Credential Blast: CVE-2024-1234 exposes GITHUB_TOKEN",
+                "description": "Critical package vulnerability exposes an agent credential.",
+                "components": [
+                    {"type": "cve", "id": "CVE-2024-1234", "label": "high severity"},
+                    {"type": "credential", "id": "GITHUB_TOKEN", "label": "GITHUB_TOKEN"},
+                ],
+                "risk_score": 9.5,
+                "remediation": "Upgrade express and rotate GITHUB_TOKEN.",
+            }
+        ]
+
+        g = build_unified_graph_from_report(report)
+
+        toxic_nodes = [node for node in g.nodes.values() if node.id.startswith("toxic:")]
+        assert len(toxic_nodes) == 1
+        toxic = toxic_nodes[0]
+        assert toxic.label == "Credential Blast: CVE-2024-1234 exposes GITHUB_TOKEN"
+        assert toxic.severity == "critical"
+        assert toxic.attributes["pattern"] == "credential_blast"
+        assert toxic.attributes["vulnerability_ids"] == ["CVE-2024-1234"]
+        assert toxic.attributes["remediation"] == "Upgrade express and rotate GITHUB_TOKEN."
+        trigger_edges = [
+            edge
+            for edge in g.edges
+            if edge.source == "vuln:CVE-2024-1234" and edge.target == toxic.id and edge.relationship == RelationshipType.TRIGGERS
+        ]
+        assert len(trigger_edges) == 1
+        assert trigger_edges[0].evidence["pattern"] == "credential_blast"
+        assert trigger_edges[0].evidence["remediation"] == "Upgrade express and rotate GITHUB_TOKEN."
+
+
+class TestFrameworkTopology:
+    def test_framework_agents_and_static_topology_edges_enter_graph(self):
+        report = _minimal_report()
+        report["ai_inventory"] = {
+            "framework_agents": [
+                {
+                    "stable_id": "framework-agent:crew",
+                    "name": "crew",
+                    "framework": "crewai",
+                    "file_path": "crew.py",
+                    "line_number": 5,
+                    "confidence": "high",
+                    "capabilities": [],
+                    "model_refs": [],
+                    "credential_refs": [],
+                    "dynamic_edges": False,
+                    "topology_edges": [
+                        {
+                            "source_id": "framework-agent:crew",
+                            "source_name": "crew",
+                            "target_id": "framework-agent:researcher",
+                            "target_name": "Researcher",
+                            "relationship": "delegated_to",
+                            "framework": "crewai",
+                            "file_path": "crew.py",
+                            "line_number": 5,
+                            "confidence": "high",
+                            "evidence": "Crew(agents=[...])",
+                        }
+                    ],
+                },
+                {
+                    "stable_id": "framework-agent:researcher",
+                    "name": "Researcher",
+                    "framework": "crewai",
+                    "file_path": "crew.py",
+                    "line_number": 3,
+                    "confidence": "high",
+                    "capabilities": [],
+                    "model_refs": [],
+                    "credential_refs": [],
+                    "dynamic_edges": False,
+                    "topology_edges": [],
+                },
+            ]
+        }
+
+        g = build_unified_graph_from_report(report)
+
+        assert g.nodes["framework-agent:crew"].attributes["framework"] == "crewai"
+        assert g.nodes["framework-agent:researcher"].attributes["agent_type"] == "framework-agent"
+        assert g.has_edge("framework-agent:crew", "framework-agent:researcher")
+        edge = next(edge for edge in g.edges if edge.source == "framework-agent:crew" and edge.target == "framework-agent:researcher")
+        assert edge.relationship == RelationshipType.DELEGATED_TO
+        assert edge.evidence["source"] == "source-ast"
+
+        fw_nodes = [n for n in g.nodes.values() if n.entity_type == EntityType.FRAMEWORK]
+        assert len(fw_nodes) == 1
+        assert fw_nodes[0].label == "crewai"
+        assert any(e.relationship == RelationshipType.USES_FRAMEWORK and e.source == "framework-agent:crew" for e in g.edges)
+
+    def test_ai_stack_framework_and_model_components_enter_graph(self):
+        report = _minimal_report()
+        report["ai_inventory"] = {
+            "unique_models": ["gpt-4o"],
+            "components": [
+                {
+                    "type": "agent_framework",
+                    "name": "LangChain",
+                    "package": "langchain",
+                    "ecosystem": "pypi",
+                    "language": "python",
+                    "file": "app.py",
+                    "line": 1,
+                    "is_shadow": False,
+                },
+                {
+                    "type": "observability",
+                    "name": "Langfuse",
+                    "package": "langfuse",
+                    "ecosystem": "pypi",
+                    "language": "python",
+                    "file": "app.py",
+                    "line": 2,
+                    "is_shadow": False,
+                },
+                {
+                    "type": "model_reference",
+                    "name": "gpt-4o-mini",
+                    "package": "",
+                    "ecosystem": "",
+                    "language": "python",
+                    "file": "app.py",
+                    "line": 3,
+                    "is_shadow": False,
+                },
+            ],
+            "framework_agents": [
+                {
+                    "stable_id": "framework-agent:chain",
+                    "name": "chain",
+                    "framework": "LangGraph",
+                    "file_path": "graph.py",
+                    "line_number": 10,
+                    "confidence": "high",
+                    "capabilities": [],
+                    "model_refs": ["claude-3-5-sonnet"],
+                    "credential_refs": [],
+                    "dynamic_edges": False,
+                    "topology_edges": [],
+                }
+            ],
+        }
+
+        g = build_unified_graph_from_report(report)
+
+        frameworks = {n.label.lower(): n for n in g.nodes.values() if n.entity_type == EntityType.FRAMEWORK}
+        assert "langchain" in frameworks
+        assert "langfuse" in frameworks
+        assert "langgraph" in frameworks
+        assert frameworks["langfuse"].attributes.get("framework_kind") == "observability"
+
+        models = {n.label for n in g.nodes.values() if n.entity_type == EntityType.MODEL}
+        assert "gpt-4o" in models
+        assert "gpt-4o-mini" in models
+        assert "claude-3-5-sonnet" in models
+
+        assert any(e.relationship == RelationshipType.USES_FRAMEWORK and e.source == "framework-agent:chain" for e in g.edges)
+        assert any(e.relationship == RelationshipType.SERVES_MODEL and e.source == "framework-agent:chain" for e in g.edges)
+        assert any(e.relationship == RelationshipType.DEPENDS_ON and g.nodes[e.source].entity_type == EntityType.FRAMEWORK for e in g.edges)
+
+
+class TestCrossEnvironmentCorrelation:
+    """Cross-environment correlation lands on the unified graph as edges."""
+
+    def _report_with_local_and_bedrock(self, *, local_account: str, local_region: str, local_model: str | None) -> dict:
+        env: dict[str, str] = {"AWS_ACCOUNT_ID": local_account, "AWS_REGION": local_region}
+        if local_model is not None:
+            env["BEDROCK_MODEL_ID"] = local_model
+        return {
+            "scan_id": "test-cross-env",
+            "agents": [
+                {
+                    "name": "cursor-dev",
+                    "type": "cursor",
+                    "agent_type": "cursor",
+                    "status": "configured",
+                    "config_path": "/home/dev/.cursor/mcp.json",
+                    "version": "0.42.0",
+                    "metadata": {},
+                    "mcp_servers": [
+                        {
+                            "name": "bedrock-mcp",
+                            "command": "python",
+                            "transport": "stdio",
+                            "surface": "mcp-server",
+                            "env": env,
+                            "packages": [],
+                            "tools": [],
+                            "credential_env_vars": [],
+                        }
+                    ],
+                },
+                {
+                    "name": "bedrock:prod-agent",
+                    "type": "custom",
+                    "agent_type": "custom",
+                    "source": "aws-bedrock",
+                    "status": "configured",
+                    "config_path": "arn:aws:bedrock:us-east-1:111122223333:agent/AGENTID01",
+                    "version": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                    "metadata": {
+                        "cloud_origin": {
+                            "provider": "aws",
+                            "service": "bedrock",
+                            "resource_type": "agent",
+                            "resource_id": "arn:aws:bedrock:us-east-1:111122223333:agent/AGENTID01",
+                            "resource_name": "prod-agent",
+                            "location": "us-east-1",
+                            "scope": {"account_id": "111122223333"},
+                        }
+                    },
+                    "mcp_servers": [],
+                },
+            ],
+        }
+
+    def test_full_triplet_emits_correlates_with_edge(self):
+        report = self._report_with_local_and_bedrock(
+            local_account="111122223333",
+            local_region="us-east-1",
+            local_model="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        )
+
+        g = build_unified_graph_from_report(report)
+
+        edge = next(
+            (edge for edge in g.edges if edge.source == "agent:cursor-dev" and edge.target == "agent:bedrock:prod-agent"),
+            None,
+        )
+        assert edge is not None
+        assert edge.relationship == RelationshipType.CORRELATES_WITH
+        assert edge.evidence["confidence"] == "high"
+        assert set(edge.evidence["matched_signals"]) == {"account_id", "region", "model_id"}
+
+    def test_partial_match_emits_possibly_correlates_with_edge(self):
+        report = self._report_with_local_and_bedrock(
+            local_account="999988887777",
+            local_region="eu-west-1",
+            local_model="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        )
+
+        g = build_unified_graph_from_report(report)
+
+        edge = next(
+            (edge for edge in g.edges if edge.source == "agent:cursor-dev" and edge.target == "agent:bedrock:prod-agent"),
+            None,
+        )
+        assert edge is not None
+        assert edge.relationship == RelationshipType.POSSIBLY_CORRELATES_WITH
+        assert edge.evidence["confidence"] == "low"
+        assert edge.evidence["matched_signals"] == ["model_id"]
+
+    def test_sdk_presence_alone_does_not_emit_edge(self):
+        report = self._report_with_local_and_bedrock(
+            local_account="111122223333",
+            local_region="us-east-1",
+            local_model=None,
+        )
+        # Strip account too — leave only AWS_PROFILE-style noise.
+        report["agents"][0]["mcp_servers"][0]["env"] = {"AWS_PROFILE": "dev"}
+
+        g = build_unified_graph_from_report(report)
+
+        cross_edges = [
+            edge for edge in g.edges if edge.relationship in (RelationshipType.CORRELATES_WITH, RelationshipType.POSSIBLY_CORRELATES_WITH)
+        ]
+        assert cross_edges == []
+
+    def test_correlates_with_edge_is_bidirectional_so_reverse_lookup_finds_it(self):
+        # Cross-env correlation reads the same in both directions ("local
+        # X corresponds to cloud Y"). The edge must therefore be
+        # traversable both ways. Without `direction="bidirectional"`,
+        # `g.adjacency[cloud_id]` does not contain the local agent and
+        # the reverse lookup "for this cloud agent, which local talks to
+        # it?" silently returns nothing. Locks the directionality fix in
+        # place so a future caller can't regress it.
+        report = self._report_with_local_and_bedrock(
+            local_account="111122223333",
+            local_region="us-east-1",
+            local_model="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        )
+
+        g = build_unified_graph_from_report(report)
+
+        edge = next(
+            (edge for edge in g.edges if edge.relationship == RelationshipType.CORRELATES_WITH),
+            None,
+        )
+        assert edge is not None
+        assert edge.is_bidirectional, "cross-env correlates_with edge must be bidirectional"
+        # Forward adjacency from the cloud agent must include the local
+        # agent as a neighbour. Without `direction='bidirectional'` the
+        # edge is only stored under the local agent's adjacency, and the
+        # reverse-direction lookup ("for this cloud agent, which local
+        # talks to it?") silently returns nothing.
+        cloud_neighbor_targets = {nbr.target for nbr in g.adjacency.get("agent:bedrock:prod-agent", [])}
+        assert "agent:cursor-dev" in cloud_neighbor_targets, (
+            "reverse lookup from cloud agent failed — bidirectional flag isn't being honored"
+        )
+
+
+class TestEdgeEvidenceMerge:
+    """Audit-5: re-adding the same (source, target, relationship) edge
+    must merge the new evidence keys into the kept edge instead of
+    silently dropping them. The graph builder hits this whenever the
+    package-path edge is added before the blast-radius edge for the
+    same package; without the merge, cvss / epss / kev / attack-tag
+    evidence on the second-arriving edge was lost."""
+
+    def test_second_add_merges_evidence_keys(self):
+        from agent_bom.graph.container import UnifiedGraph
+        from agent_bom.graph.edge import UnifiedEdge
+        from agent_bom.graph.types import RelationshipType
+
+        g = UnifiedGraph(scan_id="merge", tenant_id="t1")
+        g.add_edge(
+            UnifiedEdge(
+                source="server:s",
+                target="pkg:p",
+                relationship=RelationshipType.DEPENDS_ON,
+                evidence={"data_source": "package-path", "is_direct": True},
+            )
+        )
+        g.add_edge(
+            UnifiedEdge(
+                source="server:s",
+                target="pkg:p",
+                relationship=RelationshipType.DEPENDS_ON,
+                evidence={"cvss": 7.5, "epss": 0.42, "kev": True, "is_direct": False},
+            )
+        )
+
+        kept = next(e for e in g.edges if e.source == "server:s" and e.target == "pkg:p")
+        # Second-add evidence keys land on the kept edge.
+        assert kept.evidence.get("cvss") == 7.5
+        assert kept.evidence.get("epss") == 0.42
+        assert kept.evidence.get("kev") is True
+        # Original keys preserved (not overwritten by truthy defaults).
+        assert kept.evidence.get("data_source") == "package-path"
+        # Conflict on existing key: kept side wins (no overwrite).
+        assert kept.evidence.get("is_direct") is True
+
+
+def test_attack_path_analysis_failure_is_recorded_without_exception_text(monkeypatch):
+    import agent_bom.graph.attack_path_fusion as fusion
+
+    def fail(_graph):
+        raise RuntimeError("secret-bearing analyzer detail")
+
+    monkeypatch.setattr(fusion, "apply_attack_path_fusion", fail)
+
+    g = build_unified_graph_from_report({"agents": []}, scan_id="failed-analysis", tenant_id="tenant-a")
+
+    status = g.analysis_status["attack_path_fusion"].to_dict()
+    assert status["status"] == "failed"
+    assert status["reason_codes"] == ["analysis_error"]
+    assert "secret-bearing" not in str(status)

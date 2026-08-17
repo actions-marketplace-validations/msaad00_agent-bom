@@ -8,6 +8,48 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+
+def test_audit_details_redact_nested_secrets_and_urls():
+    from agent_bom.api.audit_log import sanitize_audit_details
+
+    github_token = "ghp_" + "abcdefghijklmnopqrstuvwxyz" + "123456"
+    api_key = "sk-" + "live-" + "abcdefghijklmnopqrstuvwxyz"
+    details = sanitize_audit_details(
+        {
+            "url": f"https://user:pass@siem.example/ingest?token={github_token}",
+            "token": api_key,
+            "nested": {"path": "/Users/alice/prod-secrets/openai-key.env"},
+        }
+    )
+
+    encoded = str(details)
+    assert "user:pass" not in encoded
+    assert "token=" not in encoded
+    assert "sk-live" not in encoded
+    assert "/Users/alice" not in encoded
+    assert "prod-secrets" not in encoded
+    assert details["url"] == "https://siem.example/ingest"
+    assert details["token"] == "***REDACTED***"
+
+
+def test_audit_password_is_redacted_before_hmac_signing():
+    """Sensitive fields never enter the authenticated, persisted audit payload."""
+    from agent_bom.api.audit_log import InMemoryAuditLog, get_audit_log, log_action, set_audit_log
+
+    original = get_audit_log()
+    audit = InMemoryAuditLog()
+    set_audit_log(audit)
+    try:
+        log_action("connection_test", password="database-password", tenant_id="tenant-alpha")
+        entry = audit.list_entries(tenant_id="tenant-alpha")[0]
+
+        assert "database-password" not in str(entry.details)
+        assert "password" not in entry.details
+        assert entry.verify()
+    finally:
+        set_audit_log(original)
+
+
 # ── Content-Length validation ────────────────────────────────────────────────
 
 
@@ -104,6 +146,15 @@ def test_ai_cache_put_bounded():
         ai_enrich._cache.clear()
 
 
+def test_ai_response_text_ignores_missing_provider_content():
+    """AI providers may return None content for filtered or empty completions."""
+    from agent_bom import ai_enrich
+
+    assert ai_enrich._response_text(None) == ""
+    assert ai_enrich._response_text({"content": "not-a-string"}) == ""
+    assert ai_enrich._response_text("  actionable summary  ") == "actionable summary"
+
+
 # ── Proxy metrics bounds ─────────────────────────────────────────────────────
 
 
@@ -147,8 +198,9 @@ def test_sqlite_schedule_store_has_index():
     with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
         SQLiteScheduleStore(tmp.name)
         conn = sqlite3.connect(tmp.name)
-        indexes = [r[1] for r in conn.execute("PRAGMA index_list('schedules')").fetchall()]
-        assert "idx_sched_due" in indexes
+        indexes = [r[1] for r in conn.execute("PRAGMA index_list('scan_schedules')").fetchall()]
+        assert "idx_scan_sched_due" in indexes
+        assert "idx_scan_sched_tenant_due" in indexes
         conn.close()
 
 
@@ -243,7 +295,8 @@ def test_read_alerts_from_log_with_valid_data():
         result = _read_alerts_from_log(Path(f.name))
 
     assert len(result) == 2
-    assert result[0]["message"] == "test alert"
+    assert result[0]["type"] == "runtime_alert"
+    assert "message" not in result[0]
 
 
 # ── ThreadPoolExecutor sizing ────────────────────────────────────────────────

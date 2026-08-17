@@ -90,7 +90,7 @@ def load_report(path: str | None, mode: str | None) -> dict:
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 
 st.sidebar.title("agent-bom")
-st.sidebar.caption("AI Supply Chain Security")
+st.sidebar.caption("Open security scanner for AI infrastructure")
 
 source = st.sidebar.radio(
     "Data source",
@@ -654,13 +654,13 @@ with tabs[6]:
         "Output",
     ]
     descriptions = {
-        "Discovery": "Auto-detect 22 MCP client configs (Claude Desktop, Cursor, VS Code, etc.)",
+        "Discovery": "Auto-detect 30 MCP client configs (Claude Desktop, Cursor, VS Code, etc.)",
         "Parsing": "Extract servers, packages, credentials, tools from config JSON/YAML",
         "Resolution": "Resolve versions via npm/PyPI registries, deps.dev, lock files",
         "Enrichment": "Add licenses, EPSS scores, KEV status, NVD data, scorecards",
         "Scanning": "Match packages against OSV, NVD, GitHub Advisories for CVEs",
         "Blast Radius": "Map CVE → package → server → credentials → tools → agents",
-        "Compliance": "Tag findings against 13 frameworks (OWASP, ATLAS, NIST, EU AI Act, ...)",
+        "Compliance": "Tag findings against 14 frameworks (OWASP, ATLAS, NIST, EU AI Act, ...)",
         "Output": "JSON, CycloneDX SBOM, SPDX SBOM, HTML, SARIF, Prometheus, Badge",
     }
 
@@ -761,4 +761,4 @@ with tabs[6]:
 # ─── Footer ───────────────────────────────────────────────────────────────────
 
 st.divider()
-st.caption("agent-bom Dashboard | AI Supply Chain Security | github.com/msaad00/agent-bom")
+st.caption("agent-bom Dashboard | github.com/msaad00/agent-bom")

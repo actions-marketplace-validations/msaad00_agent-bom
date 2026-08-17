@@ -6,12 +6,13 @@ import json
 import sqlite3
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from agent_bom.db.schema import init_db
-from agent_bom.db.sync import GHSA_ECOSYSTEMS, sync_ghsa
+from agent_bom.db.sync import GHSA_ECOSYSTEMS, _ingest_ghsa_advisory, _normalize_ghsa_db_ecosystem, sync_ghsa
+from agent_bom.package_utils import normalize_package_name
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -51,33 +52,23 @@ def _make_advisory(
     }
 
 
-def _mock_urlopen(pages: list[list[dict]]):
-    """Return a context-manager mock that yields pages in sequence."""
+def _mock_fetch_json(pages: list[list[dict]]):
+    """Return a side_effect for fetch_json that returns pages in sequence."""
     call_count = [0]
 
-    def side_effect(req, timeout=30):
+    def side_effect(url: str, *, timeout: int = 30, headers: dict | None = None):
         idx = call_count[0]
         call_count[0] += 1
-        if idx >= len(pages):
-            payload = []
-        else:
-            payload = pages[idx]
-        cm = MagicMock()
-        cm.__enter__ = MagicMock(return_value=cm)
-        cm.__exit__ = MagicMock(return_value=False)
-        cm.read = MagicMock(return_value=json.dumps(payload).encode())
-        return cm
+        return pages[idx] if idx < len(pages) else []
 
     return side_effect
 
 
-def _mock_urlopen_by_ecosystem(eco_pages: dict[str, list[list[dict]]]):
-    """Return a mock that dispatches pages based on ecosystem= in the URL."""
+def _mock_fetch_json_by_ecosystem(eco_pages: dict[str, list[list[dict]]]):
+    """Return a side_effect for fetch_json that dispatches by ecosystem= in URL."""
     eco_counters: dict[str, int] = {}
 
-    def side_effect(req, timeout=30):
-        url = req.full_url if hasattr(req, "full_url") else str(req)
-        # Extract ecosystem from URL query string
+    def side_effect(url: str, *, timeout: int = 30, headers: dict | None = None):
         eco = None
         for param in url.split("?", 1)[-1].split("&"):
             if param.startswith("ecosystem="):
@@ -90,13 +81,7 @@ def _mock_urlopen_by_ecosystem(eco_pages: dict[str, list[list[dict]]]):
         eco_counters[eco] += 1
 
         pages = eco_pages.get(eco, [])
-        payload = pages[idx] if idx < len(pages) else []
-
-        cm = MagicMock()
-        cm.__enter__ = MagicMock(return_value=cm)
-        cm.__exit__ = MagicMock(return_value=False)
-        cm.read = MagicMock(return_value=json.dumps(payload).encode())
-        return cm
+        return pages[idx] if idx < len(pages) else []
 
     return side_effect
 
@@ -111,7 +96,7 @@ def test_sync_ghsa_ingests_advisory() -> None:
     conn = _make_conn()
     advisory = _make_advisory(pkg_name="torch")
 
-    with patch("urllib.request.urlopen", side_effect=_mock_urlopen([[advisory], []])):
+    with patch("agent_bom.http_client.fetch_json", side_effect=_mock_fetch_json([[advisory], []])):
         count = sync_ghsa(conn, url="https://api.github.com/advisories", max_entries=10, ecosystems=["pip"])
 
     assert count == 1
@@ -137,7 +122,7 @@ def test_sync_ghsa_ingests_non_ai_packages() -> None:
         ecosystem="pip",
     )
 
-    with patch("urllib.request.urlopen", side_effect=_mock_urlopen([[advisory], []])):
+    with patch("agent_bom.http_client.fetch_json", side_effect=_mock_fetch_json([[advisory], []])):
         count = sync_ghsa(conn, url="https://api.github.com/advisories", max_entries=10, ecosystems=["pip"])
 
     assert count == 1
@@ -156,7 +141,7 @@ def test_sync_ghsa_ingests_npm_advisory() -> None:
         ecosystem="npm",
     )
 
-    with patch("urllib.request.urlopen", side_effect=_mock_urlopen([[advisory], []])):
+    with patch("agent_bom.http_client.fetch_json", side_effect=_mock_fetch_json([[advisory], []])):
         count = sync_ghsa(conn, url="https://api.github.com/advisories", max_entries=10, ecosystems=["npm"])
 
     assert count == 1
@@ -176,12 +161,12 @@ def test_sync_ghsa_deduplicates_by_id() -> None:
 
     pages = [[advisory], []]
 
-    with patch("urllib.request.urlopen", side_effect=_mock_urlopen(pages)):
+    with patch("agent_bom.http_client.fetch_json", side_effect=_mock_fetch_json(pages)):
         count1 = sync_ghsa(conn, url="https://api.github.com/advisories", max_entries=10, ecosystems=["pip"])
 
     # Second sync — reset the side_effect mock
     pages2 = [[advisory], []]
-    with patch("urllib.request.urlopen", side_effect=_mock_urlopen(pages2)):
+    with patch("agent_bom.http_client.fetch_json", side_effect=_mock_fetch_json(pages2)):
         count2 = sync_ghsa(conn, url="https://api.github.com/advisories", max_entries=10, ecosystems=["pip"])
 
     assert count1 == 1
@@ -207,7 +192,7 @@ def test_sync_ghsa_handles_missing_cve_id() -> None:
         pkg_name="langchain",
     )
 
-    with patch("urllib.request.urlopen", side_effect=_mock_urlopen([[advisory], []])):
+    with patch("agent_bom.http_client.fetch_json", side_effect=_mock_fetch_json([[advisory], []])):
         count = sync_ghsa(conn, url="https://api.github.com/advisories", max_entries=10, ecosystems=["pip"])
 
     assert count == 1
@@ -241,7 +226,7 @@ def test_sync_ghsa_multiple_ecosystems() -> None:
         "npm": [[npm_advisory], []],
     }
 
-    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_by_ecosystem(eco_pages)):
+    with patch("agent_bom.http_client.fetch_json", side_effect=_mock_fetch_json_by_ecosystem(eco_pages)):
         count = sync_ghsa(
             conn,
             url="https://api.github.com/advisories",
@@ -259,7 +244,7 @@ def test_sync_ghsa_ecosystem_filtering() -> None:
     advisory = _make_advisory(pkg_name="torch")
 
     # Only pass pip ecosystem — should only make requests for pip
-    with patch("urllib.request.urlopen", side_effect=_mock_urlopen([[advisory], []])) as mock_open:
+    with patch("agent_bom.http_client.fetch_json", side_effect=_mock_fetch_json([[advisory], []])) as mock_open:
         sync_ghsa(conn, url="https://api.github.com/advisories", max_entries=10, ecosystems=["pip"])
 
     # All requests should contain ecosystem=pip
@@ -272,7 +257,7 @@ def test_sync_ghsa_ecosystem_filtering() -> None:
 def test_sync_ghsa_default_ecosystems() -> None:
     """When no ecosystems are specified, all GHSA_ECOSYSTEMS are used."""
     # Verify minimum required ecosystems are present (no hardcoded count)
-    required = {"pip", "npm", "go", "maven", "nuget", "rubygems", "cargo"}
+    required = {"pip", "npm", "go", "maven", "nuget", "rubygems", "rust", "composer", "swift", "pub", "erlang", "actions"}
     assert required.issubset(set(GHSA_ECOSYSTEMS)), f"Missing: {required - set(GHSA_ECOSYSTEMS)}"
     assert len(GHSA_ECOSYSTEMS) >= len(required), "GHSA_ECOSYSTEMS shrunk below minimum"
     # No duplicates
@@ -285,7 +270,7 @@ def test_sync_ghsa_pagination() -> None:
     page1 = [_make_advisory(ghsa_id=f"GHSA-p1-{i:04d}-aaaa", cve_id=f"CVE-2024-{1000 + i}", pkg_name="torch") for i in range(3)]
     page2 = [_make_advisory(ghsa_id=f"GHSA-p2-{i:04d}-bbbb", cve_id=f"CVE-2024-{2000 + i}", pkg_name="numpy") for i in range(2)]
 
-    with patch("urllib.request.urlopen", side_effect=_mock_urlopen([page1, page2, []])):
+    with patch("agent_bom.http_client.fetch_json", side_effect=_mock_fetch_json([page1, page2, []])):
         count = sync_ghsa(conn, url="https://api.github.com/advisories", max_entries=100, ecosystems=["pip"])
 
     assert count == 5
@@ -296,7 +281,87 @@ def test_sync_ghsa_respects_max_entries() -> None:
     conn = _make_conn()
     advisories = [_make_advisory(ghsa_id=f"GHSA-max-{i:04d}-aaaa", cve_id=f"CVE-2024-{3000 + i}", pkg_name="torch") for i in range(10)]
 
-    with patch("urllib.request.urlopen", side_effect=_mock_urlopen([advisories])):
+    with patch("agent_bom.http_client.fetch_json", side_effect=_mock_fetch_json([advisories])):
         count = sync_ghsa(conn, url="https://api.github.com/advisories", max_entries=3, ecosystems=["pip"])
 
     assert count == 3
+    meta = conn.execute("SELECT metadata_json FROM sync_meta WHERE source='ghsa'").fetchone()
+    assert meta is not None
+    details = json.loads(meta["metadata_json"])
+    assert details["cap_hit"] is True
+    assert details["coverage"] == "truncated"
+    assert details["max_entries"] == 3
+    assert details["ecosystem_counts"] == {"pip": 3}
+
+
+def test_sync_ghsa_records_partial_on_fetch_failure() -> None:
+    """A fetch_json error mid-sync must mark the sync partial, not abandon silently.
+
+    Regression: an exception on any page logged an error and broke out, leaving
+    sync_meta indistinguishable from a clean run. The metadata must record
+    sync_failed / coverage=partial so the incompleteness is visible.
+    """
+    conn = _make_conn()
+
+    def boom(url: str, *, timeout: int = 30, headers: dict | None = None):
+        raise ConnectionError("network down")
+
+    with patch("agent_bom.http_client.fetch_json", side_effect=boom):
+        count = sync_ghsa(conn, url="https://api.github.com/advisories", max_entries=10, ecosystems=["pip"])
+
+    assert count == 0
+    meta = conn.execute("SELECT metadata_json FROM sync_meta WHERE source='ghsa'").fetchone()
+    assert meta is not None
+    details = json.loads(meta["metadata_json"])
+    assert details["sync_failed"] is True
+    assert details["coverage"] == "partial"
+
+
+def test_ghsa_api_ecosystems_normalize_to_scanner_db_keys() -> None:
+    assert _normalize_ghsa_db_ecosystem("pip") == "pypi"
+    assert _normalize_ghsa_db_ecosystem("composer") == "packagist"
+    assert _normalize_ghsa_db_ecosystem("rust") == "crates.io"
+    assert _normalize_ghsa_db_ecosystem("erlang") == "hex"
+    assert _normalize_ghsa_db_ecosystem("swift") == "swifturl"
+
+
+def test_ghsa_ingest_stores_affected_rows_under_scanner_keys() -> None:
+    conn = _make_conn()
+    advisory = {
+        "ghsa_id": "GHSA-test-1234",
+        "cve_id": "CVE-2026-12345",
+        "summary": "Example GHSA",
+        "severity": "high",
+        "published_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:00:00Z",
+        "vulnerabilities": [
+            {
+                "package": {"ecosystem": "pip", "name": "Requests"},
+                "vulnerable_version_range": ">= 2.0.0, < 2.32.0",
+                "first_patched_version": "2.32.0",
+            },
+            {
+                "package": {"ecosystem": "rust", "name": "serde"},
+                "vulnerable_version_range": "< 1.0.200",
+                "first_patched_version": "1.0.200",
+            },
+            {
+                "package": {"ecosystem": "composer", "name": "vendor/pkg"},
+                "vulnerable_version_range": "< 3.0.0",
+                "first_patched_version": "3.0.0",
+            },
+        ],
+        "cwes": [{"cwe_id": "CWE-79"}],
+    }
+
+    assert _ingest_ghsa_advisory(conn, advisory, normalize_package_name) is True
+
+    rows = conn.execute(
+        "SELECT ecosystem, package_name, introduced, fixed FROM affected WHERE vuln_id = ? ORDER BY ecosystem, package_name",
+        ("CVE-2026-12345",),
+    ).fetchall()
+    assert [(row["ecosystem"], row["package_name"], row["introduced"], row["fixed"]) for row in rows] == [
+        ("crates.io", "serde", "", "1.0.200"),
+        ("packagist", "vendor/pkg", "", "3.0.0"),
+        ("pypi", "requests", "2.0.0", "2.32.0"),
+    ]

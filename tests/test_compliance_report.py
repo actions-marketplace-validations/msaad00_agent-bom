@@ -1,0 +1,702 @@
+"""Tests for GET /v1/compliance/{framework}/report — signed evidence bundle.
+
+Locks the auditor-facing contract:
+
+- response carries ``X-Agent-Bom-Compliance-Report-Signature`` matching
+  the HMAC-SHA256 of the canonical JSON body
+- bundle pairs every framework control with the matching blast-radius
+  evidence drawn from the tenant's completed scans
+- audit events are filtered to the requested time window and the authed
+  tenant — never cross-tenant leakage
+- ``compliance.report_exported`` is appended to the audit log with the
+  exporter's actor + tenant + scope so re-issued bundles leave a trail
+- jsonl format streams one control per line for SIEM / security-lake
+- unknown framework, malformed timestamps, and inverted ranges all 4xx
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import json
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+from fastapi import HTTPException
+from fastapi.responses import JSONResponse
+from starlette.testclient import TestClient
+
+from agent_bom.api.audit_log import (
+    AuditEntry,
+    InMemoryAuditLog,
+    get_audit_log,
+    set_audit_log,
+)
+from agent_bom.api.models import JobStatus, ScanJob, ScanRequest
+from agent_bom.api.routes import compliance as compliance_routes
+from agent_bom.api.server import app
+from agent_bom.api.store import InMemoryJobStore
+from agent_bom.api.stores import _get_store, set_analytics_store, set_job_store
+from tests.auth_helpers import disable_trusted_proxy_env, enable_trusted_proxy_env, proxy_headers
+
+
+def setup_module() -> None:
+    enable_trusted_proxy_env()
+
+
+def teardown_module() -> None:
+    disable_trusted_proxy_env()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _request(tenant_id: str, actor: str = "ci-bot") -> SimpleNamespace:
+    state = SimpleNamespace(tenant_id=tenant_id, api_key_name=actor)
+    return SimpleNamespace(state=state)
+
+
+def _seed_jobs_with_findings(tenant_id: str = "tenant-alpha") -> list[ScanJob]:
+    """Build two completed scans with blast-radius entries tagged for OWASP LLM and SOC 2."""
+    job_a = ScanJob(
+        job_id="scan-a",
+        tenant_id=tenant_id,
+        status=JobStatus.DONE,
+        created_at=_now_iso(),
+        completed_at=_now_iso(),
+        request=ScanRequest(),
+    )
+    job_a.result = {
+        "scan_id": "scan-a",
+        "scanner_version": "0.90.0-test",
+        "policy_decisions": [{"decision": "blocked", "policy": "runtime.tool.write"}],
+        "provenance": {"source": "test-seed", "scanner": "agent-bom"},
+        "blast_radius": [
+            {
+                "vulnerability_id": "CVE-2024-0001",
+                "package": "axios@1.4.0",
+                "severity": "high",
+                "fixed_version": "1.7.4",
+                "owasp_tags": ["LLM01"],
+                "soc2_tags": ["CC6.1"],
+                "affected_agents": ["claude-desktop"],
+            },
+            {
+                "vulnerability_id": "CVE-2024-0002",
+                "package": "certifi@2022.12.7",
+                "severity": "critical",
+                "fixed_version": "2024.7.4",
+                "owasp_tags": ["LLM02"],
+                "affected_agents": ["claude-desktop"],
+            },
+        ],
+    }
+    return [job_a]
+
+
+def _seed_job_with_cis(tenant_id: str = "tenant-alpha") -> ScanJob:
+    job = ScanJob(
+        job_id="scan-cis",
+        tenant_id=tenant_id,
+        status=JobStatus.DONE,
+        created_at=_now_iso(),
+        completed_at=_now_iso(),
+        request=ScanRequest(),
+    )
+    job.result = {
+        "scan_id": "scan-cis",
+        "cis_benchmark": {
+            "checks": [
+                {
+                    "check_id": "1.5",
+                    "title": "Ensure MFA is enabled for the root user",
+                    "status": "fail",
+                    "severity": "high",
+                    "cis_section": "1 - Identity and Access Management",
+                    "evidence": "Root user MFA is not enabled.",
+                    "resource_ids": ["root"],
+                    "remediation": {
+                        "fix_cli": "",
+                        "fix_console": "AWS Console -> IAM",
+                        "effort": "medium",
+                        "priority": 1,
+                        "guardrails": ["identity"],
+                        "requires_human_review": True,
+                    },
+                }
+            ]
+        },
+        "azure_cis_benchmark": {
+            "checks": [
+                {
+                    "check_id": "2.1",
+                    "title": "Storage account secure transfer required",
+                    "status": "pass",
+                    "severity": "medium",
+                    "remediation": {"priority": 3},
+                }
+            ]
+        },
+    }
+    return job
+
+
+def _setup_audit_log() -> InMemoryAuditLog:
+    audit = InMemoryAuditLog()
+    audit.append(
+        AuditEntry(
+            entry_id="e1",
+            timestamp=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+            action="auth.key_rotated",
+            actor="ci-bot",
+            resource="key/abc",
+            details={"tenant_id": "tenant-alpha"},
+        )
+    )
+    audit.append(
+        AuditEntry(
+            entry_id="e2",
+            timestamp=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+            action="scan.started",
+            actor="ci-bot",
+            resource="scan/scan-a",
+            details={"tenant_id": "tenant-other"},  # cross-tenant — must NOT appear in tenant-alpha bundle
+        )
+    )
+    set_audit_log(audit)
+    return audit
+
+
+def test_list_cis_checks_filters_scan_job_fallback():
+    store = InMemoryJobStore()
+    set_job_store(store)
+    store.put(_seed_job_with_cis())
+
+    class _NoAnalytics:
+        def query_cis_benchmark_checks(self, **_kwargs):
+            return []
+
+    set_analytics_store(_NoAnalytics())
+    body = asyncio.run(
+        compliance_routes.list_cis_benchmark_checks(
+            _request("tenant-alpha"),
+            cloud="aws",
+            status="fail",
+            priority=1,
+        )
+    )
+    assert body["source"] == "scan_jobs"
+    assert body["count"] == 1
+    assert body["checks"][0]["check_id"] == "1.5"
+    assert body["checks"][0]["remediation"]["priority"] == 1
+
+
+def _seed_cis_scan(job_id: str, completed_at: str, status: str, tenant_id: str = "tenant-alpha") -> ScanJob:
+    """A completed scan carrying a single AWS CIS check 1.5 with a given status/time."""
+    job = ScanJob(
+        job_id=job_id,
+        tenant_id=tenant_id,
+        status=JobStatus.DONE,
+        created_at=completed_at,
+        completed_at=completed_at,
+        request=ScanRequest(),
+    )
+    job.result = {
+        "scan_id": job_id,
+        "cis_benchmark": {
+            "checks": [
+                {
+                    "check_id": "1.5",
+                    "title": "Ensure MFA is enabled for the root user",
+                    "status": status,
+                    "severity": "high",
+                    "cis_section": "1 - Identity and Access Management",
+                    "evidence": f"status={status}",
+                    "resource_ids": ["root"],
+                    "remediation": {"priority": 1},
+                }
+            ]
+        },
+    }
+    return job
+
+
+def test_list_cis_checks_fallback_dedupes_repeat_scans_to_latest():
+    """Two scans of the same cloud must not stack duplicate check_id rows.
+
+    The insert-only CIS table keys rows by scan_id, so N scans of one cloud
+    would otherwise surface the same (cloud, check_id) N times. The in-memory
+    fallback must collapse to the latest measurement, mirroring the columnar
+    store's DISTINCT ON dedup.
+    """
+    store = InMemoryJobStore()
+    set_job_store(store)
+    store.put(_seed_cis_scan("scan-old", "2026-01-01T00:00:00Z", status="fail"))
+    store.put(_seed_cis_scan("scan-new", "2026-02-01T00:00:00Z", status="pass"))
+
+    class _NoAnalytics:
+        def query_cis_benchmark_checks(self, **_kwargs):
+            return []
+
+    set_analytics_store(_NoAnalytics())
+    body = asyncio.run(compliance_routes.list_cis_benchmark_checks(_request("tenant-alpha"), cloud="aws"))
+    assert body["source"] == "scan_jobs"
+    aws_15 = [row for row in body["checks"] if row["check_id"] == "1.5"]
+    assert len(aws_15) == 1  # one logical check, not one-per-scan
+    assert aws_15[0]["status"] == "pass"  # latest scan wins
+    assert body["count"] == 1
+
+
+def test_list_cis_checks_prefers_columnar_store():
+    class _ColumnarStore(InMemoryJobStore):
+        def query_cis_benchmark_checks(self, tenant_id: str, **kwargs):
+            assert tenant_id == "tenant-alpha"
+            assert kwargs["cloud"] == "aws"
+            return [
+                {
+                    "scan_id": "scan-cis",
+                    "tenant_id": tenant_id,
+                    "cloud": "aws",
+                    "check_id": "1.5",
+                    "title": "Root MFA",
+                    "status": "fail",
+                    "severity": "high",
+                    "remediation": '{"priority": 1}',
+                }
+            ]
+
+    set_job_store(_ColumnarStore())
+    body = asyncio.run(compliance_routes.list_cis_benchmark_checks(_request("tenant-alpha"), cloud="aws"))
+    assert body["source"] == "columnar"
+    assert body["checks"][0]["remediation"] == {
+        "priority": 1,
+        "fix_cli": None,
+        "effort": "manual",
+        "requires_human_review": True,
+    }
+
+
+def _patched_get_compliance_returns(payload: dict):
+    return patch.object(compliance_routes, "get_compliance", return_value=payload)
+
+
+def _export_with_real_producer(framework: str = "owasp-llm", *, format: str = "json"):
+    """Call export_compliance_report against seeded real jobs — no get_compliance mock.
+
+    The only patch is ``_tenant_jobs`` (the store accessor, which is test
+    plumbing) so the real ``_build_controls`` / ``_evidence_for_control``
+    pipeline runs end-to-end. This is the regression guard for the
+    control-dict shape drift that the mock-heavy tests originally missed.
+    """
+    jobs = _seed_jobs_with_findings()
+    req = _request("tenant-alpha")
+    with patch.object(compliance_routes, "_tenant_jobs", return_value=jobs):
+        return asyncio.run(compliance_routes.export_compliance_report(req, framework, format=format))
+
+
+# ─── Happy-path JSON ─────────────────────────────────────────────────────────
+
+
+def test_report_json_signature_matches_canonical_body() -> None:
+    audit = _setup_audit_log()
+    jobs = _seed_jobs_with_findings()
+
+    full_payload = {
+        "owasp_llm_top10": [
+            {"control_id": "LLM01", "name": "Prompt Injection", "status": "fail", "tags": ["LLM01"]},
+            {"control_id": "LLM02", "name": "Insecure Output Handling", "status": "warning", "tags": ["LLM02"]},
+            {"control_id": "LLM03", "name": "Training Data Poisoning", "status": "pass", "tags": ["LLM03"]},
+        ]
+    }
+    req = _request("tenant-alpha")
+
+    with patch.object(compliance_routes, "_tenant_jobs", return_value=jobs):
+        with _patched_get_compliance_returns(full_payload):
+            resp = asyncio.run(compliance_routes.export_compliance_report(req, "owasp-llm"))
+
+    assert isinstance(resp, JSONResponse)
+    body = json.loads(resp.body)
+    assert body["framework_key"] == "owasp_llm_top10"
+    assert body["framework_label"] == "OWASP LLM Top 10"
+    assert body["tenant_id"] == "tenant-alpha"
+    assert body["scope"]["control_count"] == 3
+    # One finding maps to many controls, so mapping ROWS and distinct FINDINGS
+    # are reported under separate names rather than one ambiguous finding_count.
+    assert body["scope"]["evidence_row_count"] == 2
+    assert body["scope"]["distinct_finding_count"] == 2
+
+    # Pass/warning/fail summary
+    assert body["summary"]["fail"] == 1
+    assert body["summary"]["warning"] == 1
+    assert body["summary"]["pass"] == 0
+    assert body["summary"]["incomplete"] == 1
+
+    # Evidence wired to the right control
+    by_id = {c["control_id"]: c for c in body["controls"]}
+    assert by_id["LLM01"]["finding_count"] == 1
+    assert by_id["LLM01"]["status"] == "fail"
+    assert by_id["LLM01"]["evidence_state"] == "complete"
+    assert by_id["LLM01"]["evidence"][0]["vulnerability_id"] == "CVE-2024-0001"
+    assert by_id["LLM03"]["finding_count"] == 0
+    assert by_id["LLM03"]["status"] == "incomplete"
+    assert by_id["LLM03"]["evidence_state"] == "missing_control_evidence"
+
+    # HMAC signature header matches canonical body. The bundle now EMBEDS its
+    # signature so a saved file verifies off-line, and a signature cannot cover
+    # itself — the canonical form is the body with `signature` removed.
+    sig = resp.headers["X-Agent-Bom-Compliance-Report-Signature"]
+    assert body["signature"] == sig, "the saved document must carry the signature, not just the header"
+    canonical = json.dumps({k: v for k, v in body.items() if k != "signature"}, sort_keys=True).encode()
+    from agent_bom.api.audit_log import _HMAC_KEY  # noqa: PLC0415
+
+    expected = hmac.new(_HMAC_KEY, canonical, hashlib.sha256).hexdigest()
+    assert sig == expected
+
+    # Content-Disposition + filename
+    assert resp.headers["Content-Disposition"].endswith('agent-bom-compliance-owasp-llm-top10.json"')
+
+    # compliance.report_exported emitted with full scope
+    log_entries = list(audit._entries)  # type: ignore[attr-defined]
+    exported_entries = [e for e in log_entries if e.action == "compliance.report_exported"]
+    assert len(exported_entries) == 1
+    exported = exported_entries[0]
+    assert (exported.details or {}).get("tenant_id") == "tenant-alpha"
+    assert exported.actor == "ci-bot"
+    # Nonce from the body is recorded in the audit trail for forensic correlation
+    assert (exported.details or {}).get("nonce") == body["nonce"]
+    assert (exported.details or {}).get("expires_at") == body["expires_at"]
+
+
+def test_real_compliance_export_wires_control_tags_and_non_empty_evidence() -> None:
+    """Exercise the real producer path instead of patching in synthetic tags."""
+    _setup_audit_log()
+    jobs = _seed_jobs_with_findings()
+    req = _request("tenant-alpha")
+
+    with patch.object(compliance_routes, "_tenant_jobs", return_value=jobs):
+        posture = asyncio.run(compliance_routes.get_compliance(req))
+        resp = asyncio.run(compliance_routes.export_compliance_report(req, "owasp-llm"))
+
+    controls = posture["owasp_llm_top10"]
+    llm01 = next(c for c in controls if c["control_id"] == "LLM01")
+    assert llm01["tags"] == ["LLM01"]
+
+    body = json.loads(resp.body)
+    exported = {c["control_id"]: c for c in body["controls"]}
+    assert exported["LLM01"]["finding_count"] == 1
+    assert exported["LLM01"]["evidence"][0]["control_tag"] == "LLM01"
+    assert exported["LLM01"]["evidence"][0]["vulnerability_id"] == "CVE-2024-0001"
+    assert exported["LLM01"]["evidence"][0]["scanner_version"] == "0.90.0-test"
+    assert exported["LLM01"]["evidence"][0]["scan_started_at"]
+    assert exported["LLM01"]["evidence"][0]["scan_completed_at"]
+    assert exported["LLM01"]["evidence"][0]["policy_decisions"] == [{"decision": "blocked", "policy": "runtime.tool.write"}]
+    assert exported["LLM01"]["evidence"][0]["provenance"] == {"source": "test-seed", "scanner": "agent-bom"}
+
+
+def test_compliance_report_route_exports_real_evidence_end_to_end() -> None:
+    """Exercise the real FastAPI route with real auth, store, and audit wiring."""
+    original_store = _get_store()
+    original_audit_log = get_audit_log()
+    audit = _setup_audit_log()
+    store = InMemoryJobStore()
+    set_job_store(store)
+    try:
+        for job in _seed_jobs_with_findings():
+            store.put(job)
+
+        client = TestClient(app)
+        resp = client.get(
+            "/v1/compliance/owasp-llm/report",
+            headers=proxy_headers(tenant="tenant-alpha"),
+        )
+        assert resp.status_code == 200
+
+        body = resp.json()
+        assert body["tenant_id"] == "tenant-alpha"
+        assert body["scope"]["distinct_finding_count"] == 2
+        llm01 = next(control for control in body["controls"] if control["control_id"] == "LLM01")
+        assert llm01["finding_count"] == 1
+        assert llm01["evidence"]
+        assert llm01["evidence"][0]["control_tag"] == "LLM01"
+        assert llm01["evidence"][0]["scan_id"] == "scan-a"
+        assert llm01["evidence"][0]["scanner_version"] == "0.90.0-test"
+        assert llm01["evidence"][0]["vulnerability_id"] == "CVE-2024-0001"
+        assert {entry["details"]["tenant_id"] for entry in body["audit_events"]} == {"tenant-alpha"}
+
+        log_entries = list(audit._entries)  # type: ignore[attr-defined]
+        assert any(entry.action == "compliance.report_exported" for entry in log_entries)
+    finally:
+        set_job_store(original_store)
+        set_audit_log(original_audit_log)
+
+
+def test_report_with_no_completed_scans_marks_controls_not_evaluated() -> None:
+    _setup_audit_log()
+    req = _request("tenant-alpha")
+    payload = {
+        "owasp_llm_top10": [
+            {"control_id": "LLM01", "name": "Prompt Injection", "status": "pass", "tags": ["LLM01"]},
+        ]
+    }
+
+    with patch.object(compliance_routes, "_tenant_jobs", return_value=[]):
+        with _patched_get_compliance_returns(payload):
+            resp = asyncio.run(compliance_routes.export_compliance_report(req, "owasp-llm"))
+
+    body = json.loads(resp.body)
+    assert body["scope"]["completed_scan_count"] == 0
+    assert body["summary"]["pass"] == 0
+    assert body["summary"]["not_evaluated"] == 1
+    assert body["summary"]["score"] == 0.0
+    control = body["controls"][0]
+    assert control["source_status"] == "pass"
+    assert control["status"] == "not_evaluated"
+    assert control["evidence_state"] == "missing_scan"
+    assert control["evidence"] == []
+
+
+def test_report_with_missing_control_evidence_is_incomplete_not_pass() -> None:
+    _setup_audit_log()
+    req = _request("tenant-alpha")
+    payload = {
+        "owasp_llm_top10": [
+            {"control_id": "LLM99", "name": "Unmapped Control", "status": "pass", "tags": ["LLM99"]},
+        ]
+    }
+
+    with patch.object(compliance_routes, "_tenant_jobs", return_value=_seed_jobs_with_findings()):
+        with _patched_get_compliance_returns(payload):
+            resp = asyncio.run(compliance_routes.export_compliance_report(req, "owasp-llm"))
+
+    body = json.loads(resp.body)
+    assert body["scope"]["completed_scan_count"] == 1
+    assert body["summary"]["pass"] == 0
+    assert body["summary"]["incomplete"] == 1
+    assert body["summary"]["score"] == 0.0
+    control = body["controls"][0]
+    assert control["source_status"] == "pass"
+    assert control["status"] == "incomplete"
+    assert control["evidence_state"] == "missing_control_evidence"
+    assert control["finding_count"] == 0
+
+
+# ─── Replay-protection envelope ──────────────────────────────────────────────
+
+
+def test_bundle_carries_nonce_and_expiry_in_signed_envelope() -> None:
+    """nonce + expires_at must be inside the body and thus inside the signature."""
+    _setup_audit_log()
+    resp = _export_with_real_producer("owasp-llm")
+    body = json.loads(resp.body)
+    # 128-bit hex nonce
+    assert isinstance(body["nonce"], str)
+    assert len(body["nonce"]) == 32
+    assert all(c in "0123456789abcdef" for c in body["nonce"])
+    # expires_at is in the future
+    expires = datetime.fromisoformat(body["expires_at"])
+    assert expires > datetime.now(timezone.utc)
+    # Signature covers the envelope — tampering with nonce breaks it
+    tampered = dict(body)
+    tampered["nonce"] = "00" * 16
+    tampered_canonical = json.dumps(tampered, sort_keys=True).encode()
+    from agent_bom.api.audit_log import _HMAC_KEY  # noqa: PLC0415
+
+    tampered_sig = hmac.new(_HMAC_KEY, tampered_canonical, hashlib.sha256).hexdigest()
+    assert resp.headers["X-Agent-Bom-Compliance-Report-Signature"] != tampered_sig
+
+
+def test_every_export_gets_a_fresh_nonce() -> None:
+    """Two consecutive exports for the same tenant must have different nonces."""
+    _setup_audit_log()
+    a = _export_with_real_producer("owasp-llm")
+    b = _export_with_real_producer("owasp-llm")
+    nonce_a = json.loads(a.body)["nonce"]
+    nonce_b = json.loads(b.body)["nonce"]
+    assert nonce_a != nonce_b
+
+
+def test_threat_model_block_documents_guarantees() -> None:
+    """The bundle must carry a threat_model block so auditors see the guarantees inline."""
+    _setup_audit_log()
+    resp = _export_with_real_producer("owasp-llm")
+    body = json.loads(resp.body)
+    tm = body["threat_model"]
+    # Every documented guarantee has a block
+    for key in ("integrity", "confidentiality", "replay", "non_repudiation"):
+        assert key in tm, f"threat_model must document {key}"
+        assert len(tm[key]) > 40
+
+
+# ─── Tenant isolation ─────────────────────────────────────────────────────────
+
+
+def test_report_audit_events_are_tenant_filtered() -> None:
+    audit = _setup_audit_log()  # has one tenant-alpha and one tenant-other entry
+    audit.append(
+        AuditEntry(
+            entry_id="e3",
+            timestamp=(datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(),
+            action="scan.completed",
+            actor="system",
+            resource="scan/scan-a",
+            details={},  # missing tenant_id must NOT leak into default tenant exports
+        )
+    )
+    resp = _export_with_real_producer("owasp-llm")
+    body = json.loads(resp.body)
+    # Cross-tenant audit entry must not leak into the bundle
+    tenants = {e["details"].get("tenant_id") for e in body["audit_events"]}
+    assert tenants == {"tenant-alpha"}
+    assert all(e["details"].get("tenant_id") != "tenant-other" for e in body["audit_events"])
+    assert len(body["audit_events"]) == 1
+    assert body["audit_log_integrity"]["checked"] == 1
+
+
+def test_report_fetches_audit_entries_with_tenant_scope(monkeypatch) -> None:
+    _setup_audit_log()
+    jobs = _seed_jobs_with_findings()
+    req = _request("tenant-alpha")
+
+    class RecordingAuditStore(InMemoryAuditLog):
+        def __init__(self) -> None:
+            super().__init__()
+            self.captured_tenant_id: str | None = None
+
+        def list_entries(self, *args, tenant_id: str | None = None, **kwargs):  # type: ignore[override]
+            self.captured_tenant_id = tenant_id
+            return super().list_entries(*args, tenant_id=tenant_id, **kwargs)
+
+    store = RecordingAuditStore()
+    store.append(
+        AuditEntry(
+            entry_id="e1",
+            timestamp=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+            action="auth.key_rotated",
+            actor="ci-bot",
+            resource="key/abc",
+            details={"tenant_id": "tenant-alpha"},
+        )
+    )
+    monkeypatch.setattr("agent_bom.api.audit_log.get_audit_log", lambda: store)
+
+    with patch.object(compliance_routes, "_tenant_jobs", return_value=jobs):
+        asyncio.run(compliance_routes.export_compliance_report(req, "owasp-llm"))
+
+    assert store.captured_tenant_id == "tenant-alpha"
+
+
+# ─── Format = jsonl ──────────────────────────────────────────────────────────
+
+
+def test_report_jsonl_streams_one_record_per_line() -> None:
+    _setup_audit_log()
+    jobs = _seed_jobs_with_findings()
+    full_payload = {
+        "soc2": [
+            {"control_id": "CC6.1", "name": "Logical Access", "status": "fail", "tags": ["CC6.1"]},
+        ]
+    }
+    req = _request("tenant-alpha")
+
+    with patch.object(compliance_routes, "_tenant_jobs", return_value=jobs):
+        with _patched_get_compliance_returns(full_payload):
+            resp = asyncio.run(compliance_routes.export_compliance_report(req, "soc2", format="jsonl"))
+
+    # jsonl path is a StreamingResponse — drain the async iterator into bytes.
+    from starlette.responses import StreamingResponse
+
+    assert isinstance(resp, StreamingResponse)
+    chunks: list[bytes] = []
+    for chunk in asyncio.run(_drain_stream(resp)):
+        chunks.append(chunk)
+    raw = b"".join(chunks).decode()
+    lines = [ln for ln in raw.split("\n") if ln]
+    # First line is meta; followed by one control line; followed by the audit entry
+    assert json.loads(lines[0])["meta"]["framework_key"] == "soc2"
+    assert json.loads(lines[1])["control"]["control_id"] == "CC6.1"
+    # The signature covers the canonical JSON body (minus the `signature` field)
+    # for BOTH renderings, so a consumer reassembles meta + control + audit
+    # records and verifies without reproducing the stream's byte layout. It used
+    # to sign the exact streamed bytes, which no saved-file consumer could
+    # reproduce reliably.
+    sig = resp.headers["X-Agent-Bom-Compliance-Report-Signature"]
+    records = [json.loads(ln) for ln in lines]
+    meta = next(r["meta"] for r in records if "meta" in r)
+    assert meta["signature"] == sig, "the streamed meta record must carry the signature"
+    reassembled = {
+        **{k: v for k, v in meta.items() if k != "signature"},
+        "controls": [r["control"] for r in records if "control" in r],
+        "audit_events": [r["audit"] for r in records if "audit" in r],
+    }
+    from agent_bom.api.audit_log import _HMAC_KEY  # noqa: PLC0415
+
+    expected = hmac.new(_HMAC_KEY, json.dumps(reassembled, sort_keys=True).encode(), hashlib.sha256).hexdigest()
+    assert sig == expected
+
+
+async def _drain_stream(resp) -> list[bytes]:
+    """Drain a StreamingResponse into a list of bytes chunks for assertions."""
+    collected: list[bytes] = []
+    async for chunk in resp.body_iterator:
+        collected.append(chunk if isinstance(chunk, bytes) else chunk.encode())
+    return collected
+
+
+# ─── Bad input ────────────────────────────────────────────────────────────────
+
+
+def test_unknown_framework_returns_400() -> None:
+    _setup_audit_log()
+    req = _request("tenant-alpha")
+    with patch.object(compliance_routes, "_tenant_jobs", return_value=[]):
+        with _patched_get_compliance_returns({}):
+            with pytest.raises(HTTPException) as exc:
+                asyncio.run(compliance_routes.export_compliance_report(req, "made-up-framework"))
+    assert exc.value.status_code == 400
+    assert "Unknown framework" in exc.value.detail
+
+
+def test_invalid_format_returns_400() -> None:
+    _setup_audit_log()
+    req = _request("tenant-alpha")
+    with patch.object(compliance_routes, "_tenant_jobs", return_value=[]):
+        with _patched_get_compliance_returns({}):
+            with pytest.raises(HTTPException) as exc:
+                asyncio.run(compliance_routes.export_compliance_report(req, "fedramp", format="csv"))
+    assert exc.value.status_code == 400
+    assert "format must be" in exc.value.detail
+
+
+def test_malformed_since_returns_400() -> None:
+    _setup_audit_log()
+    req = _request("tenant-alpha")
+    with patch.object(compliance_routes, "_tenant_jobs", return_value=[]):
+        with _patched_get_compliance_returns({}):
+            with pytest.raises(HTTPException) as exc:
+                asyncio.run(compliance_routes.export_compliance_report(req, "fedramp", since="not-a-date"))
+    assert exc.value.status_code == 400
+    assert "Invalid timestamp" in exc.value.detail
+
+
+def test_since_after_until_returns_400() -> None:
+    _setup_audit_log()
+    req = _request("tenant-alpha")
+    later = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    earlier = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    with patch.object(compliance_routes, "_tenant_jobs", return_value=[]):
+        with _patched_get_compliance_returns({}):
+            with pytest.raises(HTTPException) as exc:
+                asyncio.run(
+                    compliance_routes.export_compliance_report(
+                        req,
+                        "fedramp",
+                        since=later,
+                        until=earlier,
+                    )
+                )
+    assert exc.value.status_code == 400
+    assert "since must be earlier" in exc.value.detail

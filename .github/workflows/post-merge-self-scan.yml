@@ -20,14 +20,16 @@ permissions:
   contents: read
 
 jobs:
-  self-sast-scan:
-    name: Self SAST scan
+  self-dep-scan:
+    name: Self dependency scan
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       security-events: write  # required: SARIF upload to GitHub Security tab
+      issues: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup-python
         with:
@@ -41,33 +43,119 @@ jobs:
         run: |
           set +e
           mkdir -p sarif
-          uv run agent-bom scan --self-scan --format sarif -o sarif/self-dep.sarif --quiet
+          uv run agent-bom scan --self-scan --format sarif -o sarif/self-dep.sarif \
+            --fail-on-severity high --exclude-unfixable --quiet
           echo "dep_exit=$?" >> "$GITHUB_OUTPUT"
 
-      - name: Run SAST scan on source code (--code)
-        id: sast_scan
+      - name: Build self-scan summary
+        if: always()
+        id: dep_summary
         run: |
-          set +e
-          uv run agent-bom scan \
-            --code src/agent_bom \
-            --format sarif \
-            -o sarif/self-sast.sarif \
-            --quiet
-          echo "sast_exit=$?" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path("sarif/self-dep.sarif")
+          total = critical = high = medium = low = 0
+          if path.exists():
+              data = json.loads(path.read_text())
+              for run in data.get("runs", []):
+                  for result in run.get("results", []):
+                      total += 1
+                      level = str(result.get("level", "")).lower()
+                      props = result.get("properties", {}) or {}
+                      sev = str(props.get("security-severity", "")).lower()
+                      if level == "error" or sev.startswith("9"):
+                          critical += 1
+                      elif level == "warning" or sev.startswith(("7", "8")):
+                          high += 1
+                      elif level == "note" or sev.startswith(("4", "5", "6")):
+                          medium += 1
+                      else:
+                          low += 1
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"total={total}\n")
+              fh.write(f"critical={critical}\n")
+              fh.write(f"high={high}\n")
+              fh.write(f"medium={medium}\n")
+              fh.write(f"low={low}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write("## Dependency Self-Scan Summary\n")
+              fh.write(f"- Total findings: {total}\n")
+              fh.write(f"- Critical: {critical}\n")
+              fh.write(f"- High: {high}\n")
+              fh.write(f"- Medium: {medium}\n")
+              fh.write(f"- Low: {low}\n")
+          PY
+
+      - name: Print dep scan summary from SARIF (all severities, for logs)
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("sarif/self-dep.sarif")
+          if not path.exists():
+              print("No dependency SARIF was produced.")
+              raise SystemExit(0)
+
+          data = json.loads(path.read_text())
+          findings = []
+          for run in data.get("runs", []):
+              for result in run.get("results", []):
+                  props = result.get("properties", {}) or {}
+                  findings.append(
+                      {
+                          "rule": result.get("ruleId", "unknown"),
+                          "level": result.get("level", "unknown"),
+                          "severity": props.get("security-severity", "unknown"),
+                          "message": (result.get("message") or {}).get("text", ""),
+                      }
+                  )
+
+          print(f"Dependency SARIF findings: {len(findings)}")
+          for item in findings[:20]:
+              message = item["message"].replace("\n", " ")[:160]
+              print(
+                  f"- {item['rule']} level={item['level']} "
+                  f"security-severity={item['severity']} {message}"
+              )
+          if len(findings) > 20:
+              print(f"... {len(findings) - 20} additional findings omitted from log")
+          PY
+
+      - name: Align dep scan SARIF category
+        if: always() && hashFiles('sarif/self-dep.sarif') != ''
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          # agent-bom's SARIF formatter pre-sets runs[].automationDetails.id to
+          # "agent-bom/<scan_id>". github/codeql-action/upload-sarif only injects
+          # its `category` input when automationDetails is absent, so the pre-set
+          # id wins and GitHub derives the category from it (the part before the
+          # final "/", i.e. "agent-bom") instead of the intended
+          # "agent-bom-self-dep". Drop it so the upload `category` below applies.
+          path = Path("sarif/self-dep.sarif")
+          data = json.loads(path.read_text())
+          for run in data.get("runs", []):
+              run.pop("automationDetails", None)
+          path.write_text(json.dumps(data, indent=2) + "\n")
+          PY
+
+      - name: Filter first-party informational skill findings
+        if: always() && hashFiles('sarif/self-dep.sarif') != ''
+        run: uv run python scripts/filter_first_party_skill_sarif.py sarif/self-dep.sarif
 
       - name: Upload dep scan SARIF
         if: always() && hashFiles('sarif/self-dep.sarif') != ''
-        uses: github/codeql-action/upload-sarif@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
+        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
         with:
           sarif_file: sarif/self-dep.sarif
           category: agent-bom-self-dep
-
-      - name: Upload SAST SARIF
-        if: always() && hashFiles('sarif/self-sast.sarif') != ''
-        uses: github/codeql-action/upload-sarif@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
-        with:
-          sarif_file: sarif/self-sast.sarif
-          category: agent-bom-self-sast
 
       - name: Fail on critical (optional, only when explicitly requested)
         if: inputs.fail_on_critical == true
@@ -77,13 +165,101 @@ jobs:
             exit 1
           fi
 
+      - name: Open or close dependency vulnerability issue
+        if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEP_EXIT: ${{ steps.dep_scan.outputs.dep_exit }}
+          TOTAL: ${{ steps.dep_summary.outputs.total }}
+          CRITICAL: ${{ steps.dep_summary.outputs.critical }}
+          HIGH: ${{ steps.dep_summary.outputs.high }}
+          MEDIUM: ${{ steps.dep_summary.outputs.medium }}
+          LOW: ${{ steps.dep_summary.outputs.low }}
+        run: |
+          set -euo pipefail
+          TITLE="dependency-vulnerability: self-scan found HIGH/CRITICAL findings on main"
+          gh label create dependency-vulnerability --color D73A4A --description "Automated dependency vulnerability findings" >/dev/null 2>&1 || true
+          gh label create security-preventive --color 0E8A16 --description "Preventive daily security automation findings" >/dev/null 2>&1 || true
+          gh label create automated --color 5319E7 --description "Opened or updated automatically by CI" >/dev/null 2>&1 || true
+
+          EXISTING=$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')
+
+          if [ "$DEP_EXIT" != "0" ]; then
+            BODY=$(cat <<EOF
+          ## Automated Dependency Vulnerability Alert
+
+          Daily self-scan found fixable HIGH/CRITICAL findings in agent-bom dependencies.
+
+          | Severity | Count |
+          |---|---:|
+          | Critical | $CRITICAL |
+          | High | $HIGH |
+          | Medium | $MEDIUM |
+          | Low | $LOW |
+          | Total | $TOTAL |
+
+          Source: \`.github/workflows/post-merge-self-scan.yml\`
+          Trigger: \`${{ github.event_name }}\`
+
+          This issue is auto-managed. It should be updated or closed by the next clean preventive run.
+          EOF
+          )
+
+            if [ -n "$EXISTING" ]; then
+              gh issue comment "$EXISTING" --body "$BODY"
+            else
+              gh issue create --title "$TITLE" --label "dependency-vulnerability,security-preventive,automated" --body "$BODY"
+            fi
+          elif [ -n "$EXISTING" ]; then
+            gh issue close "$EXISTING" --comment "Daily self-scan is clean again; closing the automated dependency vulnerability alert."
+          fi
+
+  self-sast-scan:
+    name: Self SAST scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write  # required: SARIF upload to GitHub Security tab
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-python
+        with:
+          python-version: "3.11"
+
+      - name: Install agent-bom (from source)
+        run: uv sync --extra dev
+
+      - name: Run bounded source code analysis
+        id: sast_scan
+        timeout-minutes: 15
+        run: |
+          set +e
+          mkdir -p sarif
+          uv run agent-bom code src/agent_bom --format json -o sarif/self-sast.json --quiet
+          scan_exit=$?
+          if [ "$scan_exit" -eq 0 ]; then
+            uv run python scripts/code_scan_json_to_sarif.py sarif/self-sast.json sarif/self-sast.sarif
+          fi
+          echo "sast_exit=$scan_exit" >> "$GITHUB_OUTPUT"
+          exit "$scan_exit"
+
+      - name: Upload SAST SARIF
+        if: always() && hashFiles('sarif/self-sast.sarif') != ''
+        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
+        with:
+          sarif_file: sarif/self-sast.sarif
+          category: agent-bom-self-sast
+
   generate-sbom:
     name: Generate SBOM
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup-python
         with:
@@ -100,7 +276,7 @@ jobs:
           echo "SBOM generated (exit $?)"
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-${{ github.sha }}
           path: sbom/agent-bom.cdx.json

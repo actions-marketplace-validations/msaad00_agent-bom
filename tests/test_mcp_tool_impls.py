@@ -7,6 +7,7 @@ mcp_tools/specialized.py which were at <25% coverage.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,6 +23,9 @@ def _trunc(s: str) -> str:
 
 def _trunc_async(s: str) -> str:
     return s
+
+
+_AUTHENTICATED_OPERATOR = "agent-bom-operator"
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +54,9 @@ def test_registry_lookup_not_found():
         _get_registry_data=lambda: {"servers": {}},
     )
     data = json.loads(result)
-    assert data["found"] is False
+    # Stable envelope from #1960.
+    assert data["error"]["code"] == "AGENTBOM_MCP_NOT_FOUND_RESOURCE"
+    assert data["error"]["category"] == "not_found"
 
 
 def test_registry_lookup_found_by_name():
@@ -131,6 +137,52 @@ def test_registry_lookup_registry_error():
     assert "error" in data
 
 
+def test_registry_lookup_is_deterministic_across_registry_order():
+    """A substring query that matches several servers must return the same
+    entry regardless of dict-insertion order, so agents can cache the result."""
+    from agent_bom.mcp_tools.registry import registry_lookup_impl
+
+    def _entry(key: str) -> dict:
+        return {
+            "name": key,
+            "package": f"@scope/server-{key}",
+            "ecosystem": "npm",
+            "latest_version": "1.0.0",
+            "risk_level": "low",
+            "risk_justification": "",
+            "verified": True,
+            "tools": [],
+            "credential_env_vars": [],
+            "known_cves": [],
+            "category": "tools",
+            "license": "MIT",
+            "source_url": "",
+        }
+
+    # Both "server-alpha" and "server-beta" packages contain "server" — the
+    # query matches both, so iteration order would otherwise decide the winner.
+    names = ["beta", "gamma", "alpha"]
+    forward = {n: _entry(n) for n in names}
+    reordered = {n: _entry(n) for n in reversed(names)}
+
+    def _lookup(registry: dict) -> dict:
+        return json.loads(
+            registry_lookup_impl(
+                server_name="server",
+                package_name=None,
+                _get_registry_data=lambda: {"servers": registry},
+            )
+        )
+
+    first = _lookup(forward)
+    second = _lookup(reordered)
+    third = _lookup(forward)
+
+    assert first == second == third
+    # sorted() makes "alpha" the stable winner regardless of input order.
+    assert first["id"] == "alpha"
+
+
 @pytest.mark.asyncio
 async def test_marketplace_check_empty_package():
     from agent_bom.mcp_tools.registry import marketplace_check_impl
@@ -197,7 +249,10 @@ async def test_blast_radius_cve_not_found():
         _truncate_response=_trunc,
     )
     data = json.loads(result)
-    assert data["found"] is False
+    # Stable envelope from #1960.
+    assert data["error"]["code"] == "AGENTBOM_MCP_NOT_FOUND_RESOURCE"
+    assert data["error"]["category"] == "not_found"
+    assert data["error"]["details"]["cve_id"] == "CVE-2024-9999"
 
 
 @pytest.mark.asyncio
@@ -456,6 +511,99 @@ async def test_compliance_impl_no_agents():
     data = json.loads(result)
     # No agents → should still return compliance breakdown (empty findings)
     assert "overall_status" in data or "error" in data
+
+
+def _nist_blast_radius():
+    from agent_bom.models import (
+        Agent,
+        AgentType,
+        BlastRadius,
+        Package,
+        Severity,
+        Vulnerability,
+    )
+
+    vuln = Vulnerability(id="CVE-2025-9000", summary="x", severity=Severity.HIGH, fixed_version=None)
+    pkg = Package(name="flask", version="1.0.0", ecosystem="pypi", vulnerabilities=[vuln])
+    agent = Agent(name="claude", agent_type=AgentType.CUSTOM, config_path="/tmp")
+    br = BlastRadius(
+        vulnerability=vuln,
+        package=pkg,
+        affected_servers=[],
+        affected_agents=[agent],
+        exposed_credentials=[],
+        exposed_tools=[],
+        risk_score=7.0,
+    )
+    br.nist_800_53_tags = ["SI-10"]
+    return agent, br
+
+
+@pytest.mark.asyncio
+async def test_compliance_impl_surfaces_nist_catalog_line():
+    """The MCP compliance tool surfaces the catalog-backed NIST 800-53 line
+    (vendor-asserted), consistent with the /v1/compliance API, and scored
+    INDEPENDENTLY — it must not move overall_score."""
+    from agent_bom.mcp_tools.compliance import compliance_impl
+
+    agent, br = _nist_blast_radius()
+
+    async def _pipeline(_config=None, _image=None):
+        return [agent], [br], [], []
+
+    result = await compliance_impl(config_path=None, image=None, _run_scan_pipeline=_pipeline, _truncate_response=_trunc)
+    data = json.loads(result)
+    catalog = data["nist_800_53_catalog"]
+    assert catalog["framework_key"] == "nist_800_53_catalog"
+    assert catalog["vendor_asserted"] is True
+    assert catalog["status"] == "fail"
+    assert any(c["control_id"] == "SI-10" and c["status"] == "fail" for c in catalog["controls"])
+    # Independent: the AI-framework overall_score is not dragged by the catalog line.
+    assert "nist_800_53_catalog" not in data.get("owasp_llm_top10", [])
+
+
+@pytest.mark.asyncio
+async def test_compliance_impl_never_passes_controls_it_did_not_evaluate():
+    """A scanned estate with zero findings is not a 100% compliant estate.
+
+    The MCP tool is the primary agent-facing compliance surface, and it scored
+    every catalogue control with no mapped finding as ``pass`` — so a clean scan
+    returned ``overall_score 100.0 / overall_status "pass"`` over 99 controls,
+    including all 65 MITRE ATLAS techniques. Absence of a CVE is not evidence a
+    control is implemented; it is ``not_evaluated``, exactly as /v1/compliance
+    has reported it since #4562.
+    """
+    from agent_bom.mcp_tools.compliance import compliance_impl
+    from agent_bom.models import Agent, AgentType
+
+    agent = Agent(name="claude", agent_type=AgentType.CUSTOM, config_path="/tmp")
+
+    async def _pipeline(_config=None, _image=None):
+        return [agent], [], [], ["local"]
+
+    result = await compliance_impl(config_path=None, image=None, _run_scan_pipeline=_pipeline, _truncate_response=_trunc)
+    data = json.loads(result)
+
+    assert data["overall_status"] == "no_data", "a clean scan read as a compliant estate"
+    assert data["overall_score"] == 0.0, "no_data still carried a score"
+    assert data["evaluated_controls"] == 0
+    assert data["not_evaluated_controls"] == data["total_controls"]
+    for line in ("owasp_llm_top10", "mitre_atlas", "nist_ai_rmf", "owasp_mcp_top10"):
+        statuses = {c["status"] for c in data[line]}
+        assert statuses == {"not_evaluated"}, f"{line} asserted a status it never evaluated: {statuses}"
+
+
+@pytest.mark.asyncio
+async def test_compliance_impl_nist_catalog_no_data_without_agents():
+    from agent_bom.mcp_tools.compliance import compliance_impl
+
+    async def _pipeline(_config=None, _image=None):
+        return [], [], [], []
+
+    result = await compliance_impl(config_path=None, image=None, _run_scan_pipeline=_pipeline, _truncate_response=_trunc)
+    catalog = json.loads(result)["nist_800_53_catalog"]
+    assert catalog["status"] == "no_data"
+    assert catalog["summary"]["evaluated"] == 0
 
 
 @pytest.mark.asyncio
@@ -840,6 +988,379 @@ def test_inventory_impl_exception():
     assert "error" in data
 
 
+def test_tool_risk_assessment_impl_success():
+    from agent_bom.mcp_introspect import IntrospectionReport, ServerIntrospection
+    from agent_bom.mcp_tools.runtime import tool_risk_assessment_impl
+
+    server = MagicMock()
+    server.name = "filesystem"
+    server.command = "npx"
+    server.transport.value = "stdio"
+    agent = MagicMock()
+    agent.mcp_servers = [server]
+
+    intro = ServerIntrospection(
+        server_name="filesystem",
+        success=True,
+        capability_risk_score=7.2,
+        capability_risk_level="high",
+        tool_risk_profiles=[{"tool_name": "write_file", "risk_score": 8.0, "risk_level": "high"}],
+    )
+    report = IntrospectionReport(results=[intro])
+
+    with (
+        patch("agent_bom.discovery.discover_all", return_value=[agent]),
+        patch("agent_bom.mcp_introspect.introspect_servers_sync", return_value=report),
+    ):
+        result = tool_risk_assessment_impl(config_path=None, timeout=5.0, _truncate_response=_trunc)
+    data = json.loads(result)
+    assert data["summary"]["total_servers"] == 1
+    assert data["servers"][0]["capability_risk_level"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_runtime_production_index_impl_empty_state():
+    import agent_bom.api.routes.proxy as proxy_mod
+    from agent_bom.mcp_tools.runtime import runtime_production_index_impl
+
+    proxy_mod._proxy_alerts.clear()
+    proxy_mod._proxy_alerts_total = 0
+    proxy_mod._proxy_metrics = None
+    proxy_mod._proxy_metrics_by_tenant.clear()
+
+    result = await runtime_production_index_impl(tenant_id="default", _truncate_response=_trunc)
+    data = json.loads(result)
+    assert data["schema_version"] == "runtime.production_index.v1"
+    assert data["status"] == "no_runtime_activity"
+    assert data["authorization_trace"]["retention"] == "metadata_only"
+    assert data["retention_posture"]["event_classes"]["production_index"] == "metadata_only"
+
+
+@pytest.mark.asyncio
+async def test_runtime_blueprints_impl_lists_and_filters():
+    from agent_bom.mcp_tools.runtime import runtime_blueprints_impl
+
+    all_result = await runtime_blueprints_impl(blueprint_id="", tenant_id="default", _truncate_response=_trunc)
+    all_data = json.loads(all_result)
+    assert all_data["schema_version"] == "runtime.blueprints.v1"
+    assert {blueprint["blueprint_id"] for blueprint in all_data["blueprints"]} >= {"developer", "admin"}
+
+    one_result = await runtime_blueprints_impl(blueprint_id="developer", tenant_id="default", _truncate_response=_trunc)
+    one_data = json.loads(one_result)
+    assert one_data["blueprint"]["blueprint_id"] == "developer"
+
+
+@pytest.mark.asyncio
+async def test_runtime_blueprint_drift_impl_reports_drift(monkeypatch):
+    import agent_bom.api.routes.proxy as proxy_mod
+    from agent_bom.api.server import push_proxy_metrics
+    from agent_bom.mcp_tools.runtime import runtime_blueprint_drift_impl
+
+    proxy_mod._proxy_alerts.clear()
+    proxy_mod._proxy_metrics = None
+    proxy_mod._proxy_metrics_by_tenant.clear()
+    monkeypatch.delenv("AGENT_BOM_LOG", raising=False)
+    push_proxy_metrics(
+        {
+            "type": "proxy_summary",
+            "tenant_id": "default",
+            "total_tool_calls": 1,
+            "calls_by_tool": {"prod.deploy_service": 1},
+        }
+    )
+
+    result = await runtime_blueprint_drift_impl(blueprint_id="developer", tenant_id="default", _truncate_response=_trunc)
+    data = json.loads(result)
+    assert data["schema_version"] == "runtime.blueprint_drift.v1"
+    assert data["status"] == "drift_detected"
+    assert data["violations"][0]["type"] == "restricted_tool_category"
+
+    proxy_mod._proxy_alerts.clear()
+    proxy_mod._proxy_metrics = None
+    proxy_mod._proxy_metrics_by_tenant.clear()
+
+
+@pytest.mark.asyncio
+async def test_proxy_gateway_and_shield_status_impls_empty_state():
+    from agent_bom.mcp_tools.runtime import gateway_status_impl, proxy_status_impl, shield_status_impl
+
+    proxy_result = await proxy_status_impl(tenant_id="default", _truncate_response=_trunc)
+    proxy_data = json.loads(proxy_result)
+    assert proxy_data["status"] == "no_proxy_session"
+
+    gateway_result = await gateway_status_impl(tenant_id="default", _truncate_response=_trunc)
+    gateway_data = json.loads(gateway_result)
+    assert "policy_runtime" in gateway_data
+    assert "firewall_runtime" in gateway_data
+
+    shield_result = await shield_status_impl(session_id="default", _truncate_response=_trunc)
+    shield_data = json.loads(shield_result)
+    assert shield_data["active"] is False
+
+
+@pytest.mark.asyncio
+async def test_mcp_runtime_tools_use_server_bound_tenant(monkeypatch):
+    from agent_bom.mcp_tools.runtime import proxy_status_impl
+
+    captured: dict[str, str] = {}
+
+    async def _fake_proxy_status(request):
+        captured["tenant_id"] = request.state.tenant_id
+        return {"tenant_id": request.state.tenant_id, "status": "ok"}
+
+    monkeypatch.setenv("AGENT_BOM_MCP_TENANT_ID", "tenant-server")
+    monkeypatch.setattr("agent_bom.api.routes.proxy.proxy_status", _fake_proxy_status)
+
+    result = await proxy_status_impl(tenant_id="tenant-attacker", _truncate_response=_trunc)
+    data = json.loads(result)
+
+    assert captured["tenant_id"] == "tenant-server"
+    assert data["tenant_id"] == "tenant-server"
+
+
+@pytest.mark.asyncio
+async def test_shield_routes_isolate_same_session_id_by_tenant():
+    from agent_bom.api.routes import proxy as proxy_routes
+
+    proxy_routes._shield_engines.clear()
+    request_a = SimpleNamespace(state=SimpleNamespace(tenant_id="tenant-a"))
+    request_b = SimpleNamespace(state=SimpleNamespace(tenant_id="tenant-b"))
+
+    try:
+        started = await proxy_routes.shield_start(request_a, session_id="shared-session", correlation_window=1.0)
+        assert started["status"] == "started"
+        assert started["tenant_id"] == "tenant-a"
+
+        status_a = await proxy_routes.shield_status(request_a, session_id="shared-session")
+        status_b = await proxy_routes.shield_status(request_b, session_id="shared-session")
+
+        assert status_a["active"] is True
+        assert status_a["tenant_id"] == "tenant-a"
+        assert status_b["active"] is False
+        assert status_b["tenant_id"] == "tenant-b"
+    finally:
+        proxy_routes._shield_engines.clear()
+
+
+@pytest.mark.asyncio
+async def test_shield_write_tools_require_admin_and_audit_reason():
+    from agent_bom.api.audit_log import InMemoryAuditLog, set_audit_log
+    from agent_bom.api.routes import proxy as proxy_routes
+    from agent_bom.mcp_tools.runtime import shield_start_impl, shield_unblock_impl
+
+    store = InMemoryAuditLog()
+    set_audit_log(store)
+    os_environ_patch = pytest.MonkeyPatch()
+    os_environ_patch.setenv("AGENT_BOM_MCP_TENANT_ID", "tenant-alpha")
+    proxy_routes._shield_engines.clear()
+
+    try:
+        blocked = json.loads(
+            await shield_start_impl(
+                session_id="incident-1",
+                operator_role="viewer",
+                reason="start incident shield",
+                tenant_id="tenant-alpha",
+                _truncate_response=_trunc,
+            )
+        )
+        assert blocked["status"] == "blocked"
+        assert blocked["required_role"] == "admin"
+
+        missing_reason = json.loads(
+            await shield_start_impl(
+                session_id="incident-1",
+                operator_role="admin",
+                operator_scopes="shield:write",
+                reason="short",
+                tenant_id="tenant-alpha",
+                _truncate_response=_trunc,
+            )
+        )
+        assert missing_reason["status"] == "blocked"
+        assert "audit reason" in missing_reason["error"]
+
+        missing_scope = json.loads(
+            await shield_start_impl(
+                session_id="incident-1",
+                operator_role="admin",
+                operator_scopes="scan:write",
+                reason="incident response validation",
+                tenant_id="tenant-alpha",
+                _truncate_response=_trunc,
+            )
+        )
+        assert missing_scope["status"] == "blocked"
+        assert missing_scope["required_scope"] == "shield:write"
+
+        missing_actor = json.loads(
+            await shield_start_impl(
+                session_id="incident-1",
+                operator_role="admin",
+                operator_scopes="shield:write",
+                reason="incident response validation",
+                tenant_id="tenant-alpha",
+                _truncate_response=_trunc,
+            )
+        )
+        assert missing_actor["status"] == "blocked"
+        assert "authenticated operator actor" in missing_actor["error"]
+
+        started = json.loads(
+            await shield_start_impl(
+                session_id="incident-1",
+                operator_role="admin",
+                operator_scopes="shield:write",
+                reason="incident response validation",
+                tenant_id="tenant-alpha",
+                _truncate_response=_trunc,
+                _authenticated_actor=_AUTHENTICATED_OPERATOR,
+            )
+        )
+        assert started["status"] == "started"
+        assert started["mcp_write_policy"]["required_role"] == "admin"
+        assert started["mcp_write_policy"]["required_scope"] == "shield:write"
+        assert started["mcp_write_policy"]["audit_logged"] is True
+        assert started["mcp_write_policy"]["actor"] == _AUTHENTICATED_OPERATOR
+
+        unblocked = json.loads(
+            await shield_unblock_impl(
+                session_id="incident-1",
+                operator_role="admin",
+                operator_scopes="shield:write",
+                reason="incident response validation",
+                tenant_id="tenant-alpha",
+                _truncate_response=_trunc,
+                _authenticated_actor=_AUTHENTICATED_OPERATOR,
+            )
+        )
+        assert unblocked["status"] in {"not_blocked", "unblocked"}
+
+        entries = store.list_entries(tenant_id="tenant-alpha", limit=10)
+        assert [entry.action for entry in entries] == ["shield_unblock", "shield_start"]
+
+        proxy_routes._shield_engines.clear()
+    finally:
+        os_environ_patch.undo()
+        proxy_routes._shield_engines.clear()
+
+
+@pytest.mark.asyncio
+async def test_shield_break_glass_tool_uses_admin_role_context():
+    from agent_bom.api.audit_log import InMemoryAuditLog, set_audit_log
+    from agent_bom.api.routes import proxy as proxy_routes
+    from agent_bom.mcp_tools.runtime import shield_break_glass_impl, shield_start_impl
+
+    store = InMemoryAuditLog()
+    set_audit_log(store)
+    os_environ_patch = pytest.MonkeyPatch()
+    os_environ_patch.setenv("AGENT_BOM_MCP_TENANT_ID", "tenant-alpha")
+    proxy_routes._shield_engines.clear()
+
+    try:
+        await shield_start_impl(
+            session_id="incident-2",
+            operator_role="admin",
+            operator_scopes="shield:write",
+            reason="incident response validation",
+            tenant_id="tenant-alpha",
+            _truncate_response=_trunc,
+            _authenticated_actor=_AUTHENTICATED_OPERATOR,
+        )
+        result = json.loads(
+            await shield_break_glass_impl(
+                session_id="incident-2",
+                operator_role="admin",
+                operator_scopes="shield:write",
+                reason="emergency operator override",
+                tenant_id="tenant-alpha",
+                _truncate_response=_trunc,
+                _authenticated_actor=_AUTHENTICATED_OPERATOR,
+            )
+        )
+        assert result["status"] == "break_glass_activated"
+        assert result["mcp_write_policy"]["actor"] == _AUTHENTICATED_OPERATOR
+        assert result["mcp_write_policy"]["actor_role"] == "admin"
+
+        entries = store.list_entries(tenant_id="tenant-alpha", limit=10)
+        assert [entry.action for entry in entries][:2] == ["break_glass", "shield_start"]
+
+        proxy_routes._shield_engines.clear()
+    finally:
+        os_environ_patch.undo()
+        proxy_routes._shield_engines.clear()
+
+
+@pytest.mark.asyncio
+async def test_proxy_alerts_impl_filters_metadata_only_alerts():
+    import agent_bom.api.routes.proxy as proxy_mod
+    from agent_bom.api.routes.proxy import push_proxy_alert
+    from agent_bom.mcp_tools.runtime import proxy_alerts_impl
+
+    proxy_mod._proxy_alerts.clear()
+    push_proxy_alert(
+        {
+            "tenant_id": "default",
+            "severity": "critical",
+            "detector": "credential_leak",
+            "message": "blocked secret",
+            "raw_arguments": {"token": "sk-test"},
+        }
+    )
+
+    result = await proxy_alerts_impl(
+        tenant_id="default",
+        severity="critical",
+        detector="credential_leak",
+        limit=10,
+        _truncate_response=_trunc,
+    )
+    data = json.loads(result)
+    assert data["count"] == 1
+    assert data["alerts"][0]["detector"] == "credential_leak"
+    assert "raw_arguments" not in data["alerts"][0]
+
+    proxy_mod._proxy_alerts.clear()
+
+
+@pytest.mark.asyncio
+async def test_audit_query_and_integrity_impls_are_tenant_scoped(monkeypatch):
+    from agent_bom.api.audit_log import AuditEntry, InMemoryAuditLog, set_audit_log
+    from agent_bom.mcp_tools.runtime import audit_integrity_impl, audit_query_impl
+
+    monkeypatch.setenv("AGENT_BOM_MCP_TENANT_ID", "tenant-alpha")
+    store = InMemoryAuditLog()
+    store.append(AuditEntry(action="scan", actor="alice", resource="job/alpha", details={"tenant_id": "tenant-alpha"}))
+    store.append(AuditEntry(action="scan", actor="bob", resource="job/beta", details={"tenant_id": "tenant-beta"}))
+    set_audit_log(store)
+
+    query_result = await audit_query_impl(tenant_id="tenant-alpha", action="scan", limit=10, _truncate_response=_trunc)
+    query_data = json.loads(query_result)
+    assert query_data["total"] == 1
+    assert query_data["entries"][0]["resource"] == "job/alpha"
+
+    integrity_result = await audit_integrity_impl(tenant_id="tenant-alpha", include_runtime=False, _truncate_response=_trunc)
+    integrity_data = json.loads(integrity_result)
+    assert integrity_data["checked"] == 1
+    assert integrity_data["chains"][0]["tenant_scoped"] is True
+
+
+def test_firewall_check_impl_is_read_only_default_allow():
+    from agent_bom.mcp_tools.runtime import firewall_check_impl
+
+    result = firewall_check_impl(
+        source_agent="developer-agent",
+        target_agent="ticketing-agent",
+        source_roles="developer",
+        target_roles="support",
+        _truncate_response=_trunc,
+    )
+    data = json.loads(result)
+    assert data["decision"] == "allow"
+    assert data["effective_decision"] == "allow"
+    assert data["recorded"] is False
+
+
 # ---------------------------------------------------------------------------
 # cli/__init__.py — cli_main error path
 # ---------------------------------------------------------------------------
@@ -1006,7 +1527,7 @@ async def test_license_compliance_scan_with_policy():
 
 
 # ---------------------------------------------------------------------------
-# mcp_tools/runtime.py — verify_impl, skill_trust_impl
+# mcp_tools/runtime.py — verify_impl, skill_scan_impl, skill_verify_impl, skill_trust_impl
 # ---------------------------------------------------------------------------
 
 
@@ -1046,6 +1567,42 @@ def test_skill_trust_impl_file_not_found():
     assert "error" in data
 
 
+def test_skill_scan_impl_success(tmp_path):
+    from agent_bom.mcp_tools.runtime import skill_scan_impl
+
+    skill_file = tmp_path / "CLAUDE.md"
+    skill_file.write_text("# System\nUse npx @modelcontextprotocol/server-filesystem\n")
+
+    result = skill_scan_impl(
+        path=str(tmp_path),
+        _safe_path=lambda p: tmp_path,
+        _truncate_response=_trunc,
+    )
+    data = json.loads(result)
+    assert data["summary"]["files_scanned"] == 1
+    trust = data["files"][0]["trust"]
+    assert trust["verdict"] == "benign"
+    assert trust["content_verdict"] == "benign"
+    assert trust["provenance_verdict"] == "unverified"
+    assert trust["overall_recommendation"] == "review"
+
+
+def test_skill_verify_impl_success(tmp_path):
+    from agent_bom.mcp_tools.runtime import skill_verify_impl
+
+    skill_file = tmp_path / "CLAUDE.md"
+    skill_file.write_text("# System\nStay safe.\n")
+
+    result = skill_verify_impl(
+        path=str(tmp_path),
+        _safe_path=lambda p: tmp_path,
+        _truncate_response=_trunc,
+    )
+    data = json.loads(result)
+    assert len(data["files"]) == 1
+    assert data["files"][0]["status"] == "unsigned"
+
+
 def test_skill_trust_impl_safe_path_error():
     from agent_bom.mcp_tools.runtime import skill_trust_impl
 
@@ -1083,6 +1640,32 @@ async def test_policy_check_impl_success():
         )
     data = json.loads(result)
     assert "passed" in data or "error" not in data
+
+
+@pytest.mark.asyncio
+async def test_policy_check_impl_surfaces_fail_action_matches():
+    from agent_bom.mcp_tools.compliance import policy_check_impl
+    from agent_bom.models import BlastRadius, Package, Severity, Vulnerability
+
+    br = BlastRadius(
+        vulnerability=Vulnerability(id="CVE-2026-0001", severity=Severity.HIGH, summary="bad"),
+        package=Package(name="axios", version="1.4.0", ecosystem="npm"),
+        affected_servers=[],
+        affected_agents=[],
+        exposed_credentials=[],
+        exposed_tools=[],
+    )
+    policy = {"rules": [{"id": "fail-high", "severity_gte": "high", "action": "fail"}]}
+
+    result = await policy_check_impl(
+        policy_json=json.dumps(policy),
+        _run_scan_pipeline=AsyncMock(return_value=([], [br], [], [])),
+        _truncate_response=_trunc,
+    )
+
+    data = json.loads(result)
+    assert data["passed"] is False
+    assert data["failures"][0]["rule_id"] == "fail-high"
 
 
 @pytest.mark.asyncio
@@ -1151,28 +1734,18 @@ def test_skill_trust_impl_success(tmp_path):
     skill_file = tmp_path / "CLAUDE.md"
     skill_file.write_text("# System\nYou are a helpful assistant.")
 
-    mock_scan = MagicMock()
-    mock_audit = MagicMock()
-    mock_trust = MagicMock()
-    mock_trust.to_dict.return_value = {"trust_level": "high", "risk_score": 0.1}
-    mock_provenance = MagicMock()
-    mock_provenance.verified = False
-    mock_provenance.has_sigstore_bundle = False
-    mock_provenance.sha256 = "abc123"
-
-    with (
-        patch("agent_bom.parsers.skill_audit.audit_skill_result", return_value=mock_audit),
-        patch("agent_bom.parsers.skills.parse_skill_file", return_value=mock_scan),
-        patch("agent_bom.parsers.trust_assessment.assess_trust", return_value=mock_trust),
-        patch("agent_bom.integrity.verify_instruction_file", return_value=mock_provenance),
-    ):
-        result = skill_trust_impl(
-            skill_path=str(skill_file),
-            _safe_path=lambda p: skill_file,
-            _truncate_response=_trunc,
-        )
+    result = skill_trust_impl(
+        skill_path=str(skill_file),
+        _safe_path=lambda p: skill_file,
+        _truncate_response=_trunc,
+    )
     data = json.loads(result)
-    assert "trust_level" in data
+    assert "verdict" in data
+    assert "categories" in data
+    assert data["verdict"] == "benign"
+    assert data["content_verdict"] == "benign"
+    assert data["provenance_verdict"] == "unverified"
+    assert data["overall_recommendation"] == "review"
     assert data["provenance"]["status"] == "unsigned"
 
 

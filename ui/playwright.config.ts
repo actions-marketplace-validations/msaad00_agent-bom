@@ -1,0 +1,39 @@
+import { defineConfig, devices } from "@playwright/test";
+
+const PORT = Number(process.env.PLAYWRIGHT_PORT ?? "3001");
+const baseURL = `http://127.0.0.1:${PORT}`;
+const serverCommand =
+  `if test -f .next/standalone/server.js; ` +
+  `then mkdir -p .next/standalone/.next && rm -rf .next/standalone/.next/static .next/standalone/public && ` +
+  `cp -R .next/static .next/standalone/.next/static && ` +
+  `if test -d public; then cp -R public .next/standalone/public; fi && ` +
+  `cd .next/standalone && HOSTNAME=127.0.0.1 PORT=${PORT} node server.js; ` +
+  `else npm run dev -- --hostname 127.0.0.1 --port ${PORT}; fi`;
+
+export default defineConfig({
+  testDir: "./e2e",
+  timeout: 30_000,
+  expect: {
+    timeout: 10_000,
+  },
+  use: {
+    baseURL,
+    trace: "on-first-retry",
+  },
+  webServer: {
+    command: serverCommand,
+    url: baseURL,
+    reuseExistingServer: !process.env.CI,
+    timeout: 120_000,
+    env: {
+      NEXT_PUBLIC_API_URL: "",
+      NEXT_TELEMETRY_DISABLED: "1",
+    },
+  },
+  projects: [
+    {
+      name: "chromium",
+      use: { ...devices["Desktop Chrome"] },
+    },
+  ],
+});

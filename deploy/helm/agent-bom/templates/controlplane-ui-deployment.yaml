@@ -1,0 +1,91 @@
+{{- if and .Values.controlPlane.enabled .Values.controlPlane.ui.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "agent-bom.name" . }}-ui
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agent-bom.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ui
+spec:
+  replicas: {{ .Values.controlPlane.ui.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "agent-bom.name" . }}
+      app.kubernetes.io/component: ui
+  template:
+    metadata:
+      labels:
+        {{- include "agent-bom.labels" . | nindent 8 }}
+        app.kubernetes.io/component: ui
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      {{- $priorityClassName := include "agent-bom.controlPlanePriorityClassName" . }}
+      {{- if $priorityClassName }}
+      priorityClassName: {{ $priorityClassName }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- include "agent-bom.controlPlaneTopologySpreadConstraints" (dict "Values" .Values "component" "ui" "Chart" .Chart "Release" .Release) | nindent 6 }}
+      {{- include "agent-bom.controlPlaneAffinity" (dict "Values" .Values "component" "ui" "Chart" .Chart "Release" .Release) | nindent 6 }}
+      initContainers:
+        - name: seed-public
+          image: "{{ .Values.uiImage.repository }}:{{ .Values.uiImage.tag }}"
+          imagePullPolicy: {{ .Values.uiImage.pullPolicy }}
+          # Prefer -R over -a: restricted securityContext cannot utime on emptyDir
+          # ("cp: preserving times ... Operation not permitted") and exits 1.
+          command: ["sh", "-c", "cp -R /app/public/. /seed/"]
+          securityContext:
+            {{- toYaml (default .Values.securityContext .Values.controlPlane.ui.securityContext) | nindent 12 }}
+          volumeMounts:
+            - name: ui-public
+              mountPath: /seed
+      containers:
+        - name: ui
+          image: "{{ .Values.uiImage.repository }}:{{ .Values.uiImage.tag }}"
+          imagePullPolicy: {{ .Values.uiImage.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.controlPlane.ui.port }}
+              name: http
+              protocol: TCP
+          {{- with .Values.controlPlane.ui.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.controlPlane.ui.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml (default .Values.securityContext .Values.controlPlane.ui.securityContext) | nindent 12 }}
+          volumeMounts:
+            - name: ui-public
+              mountPath: /app/public
+          resources:
+            {{- toYaml .Values.controlPlane.ui.resources | nindent 12 }}
+          livenessProbe:
+            {{- toYaml .Values.controlPlane.ui.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.controlPlane.ui.readinessProbe | nindent 12 }}
+          startupProbe:
+            {{- toYaml .Values.controlPlane.ui.startupProbe | nindent 12 }}
+      volumes:
+        - name: ui-public
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

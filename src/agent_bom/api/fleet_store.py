@@ -6,13 +6,18 @@ Follows the same pattern as ``store.py`` (Protocol + InMemory + SQLite).
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
-from datetime import datetime, timezone
 from enum import Enum
-from typing import Protocol
+from typing import Any, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from agent_bom.api.storage_schema import ensure_sqlite_schema_version
+from agent_bom.canonical_ids import canonical_agent_id
+from agent_bom.platform_invariants import normalize_tenant_id, normalize_timestamp, now_utc_iso
+from agent_bom.security import sanitize_text
 
 # ─── Models ──────────────────────────────────────────────────────────────────
 
@@ -29,15 +34,20 @@ class FleetAgent(BaseModel):
     """A managed agent in the fleet registry."""
 
     agent_id: str
+    canonical_id: str = ""
     name: str
     agent_type: str
     config_path: str = ""
+    source_id: str = ""
+    device_fingerprint: str = ""
+    enrollment_name: str = ""
+    mdm_provider: str = ""
     lifecycle_state: FleetLifecycleState = FleetLifecycleState.DISCOVERED
     owner: str | None = None
     environment: str | None = None
-    tags: list[str] = []
+    tags: list[str] = Field(default_factory=list)
     trust_score: float = 0.0
-    trust_factors: dict = {}
+    trust_factors: dict[str, Any] = Field(default_factory=dict)
     server_count: int = 0
     package_count: int = 0
     credential_count: int = 0
@@ -49,6 +59,221 @@ class FleetAgent(BaseModel):
     updated_at: str = ""
     notes: str = ""
 
+    @field_validator("tenant_id", mode="before")
+    @classmethod
+    def _normalize_tenant_id(cls, value: str | None) -> str:
+        normalized: str = normalize_tenant_id(value)
+        return normalized
+
+    @field_validator("last_discovery", "last_scan", "created_at", "updated_at", mode="before")
+    @classmethod
+    def _normalize_timestamps(cls, value: str | None) -> str | None:
+        normalized: str | None = normalize_timestamp(value)
+        return normalized
+
+    @model_validator(mode="after")
+    def _apply_defaults(self) -> FleetAgent:
+        if not self.created_at:
+            self.created_at = now_utc_iso()
+        if not self.updated_at:
+            self.updated_at = self.created_at
+        if not self.canonical_id:
+            self.canonical_id = canonical_agent_id(
+                self.agent_type,
+                self.name,
+                source_id=self.source_id,
+                device_fingerprint=self.device_fingerprint,
+            )
+        return self
+
+
+class FleetEndpoint(BaseModel):
+    """Privacy-safe latest workstation inventory for one enrolled endpoint."""
+
+    endpoint_id: str = Field(min_length=1, max_length=200)
+    tenant_id: str = "default"
+    platform: dict[str, str] = Field(default_factory=dict)
+    counts: dict[str, int | None] = Field(default_factory=dict)
+    collector_status: dict[str, str] = Field(default_factory=dict)
+    collector_messages: dict[str, str] = Field(default_factory=dict)
+    privacy: dict[str, bool] = Field(default_factory=dict)
+    completeness: str = "partial"
+    last_scan_id: str = ""
+    observed_at: str = ""
+    updated_at: str = ""
+
+    @field_validator("tenant_id", mode="before")
+    @classmethod
+    def _normalize_endpoint_tenant_id(cls, value: str | None) -> str:
+        return normalize_tenant_id(value)
+
+    @field_validator("observed_at", "updated_at", mode="before")
+    @classmethod
+    def _normalize_endpoint_timestamps(cls, value: str | None) -> str:
+        return normalize_timestamp(value) or ""
+
+    @model_validator(mode="after")
+    def _apply_endpoint_defaults(self) -> FleetEndpoint:
+        if not self.updated_at:
+            self.updated_at = now_utc_iso()
+        if not self.observed_at:
+            self.observed_at = self.updated_at
+        return self
+
+
+_ENDPOINT_COLLECTORS = ("applications", "processes", "services", "listeners", "containers", "images")
+_ENDPOINT_COLLECTOR_STATUSES = frozenset({"complete", "partial", "unsupported", "unavailable", "permission_denied", "skipped"})
+
+
+def endpoint_summary_from_inventory(
+    *,
+    endpoint_id: str,
+    tenant_id: str,
+    inventory: dict[str, Any],
+    scan_id: str = "",
+    observed_at: str = "",
+) -> FleetEndpoint:
+    """Reduce raw endpoint inventory to bounded, non-identifying fleet evidence."""
+
+    collector_rows = inventory.get("collectors") if isinstance(inventory, dict) else []
+    if not isinstance(collector_rows, list):
+        collector_rows = []
+    collector_by_name: dict[str, dict[str, Any]] = {}
+    for row in (collector_rows or [])[:100]:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "")
+        if name in _ENDPOINT_COLLECTORS and name not in collector_by_name:
+            collector_by_name[name] = row
+    statuses: dict[str, str] = {}
+    counts: dict[str, int | None] = {}
+    messages: dict[str, str] = {}
+    for name in _ENDPOINT_COLLECTORS:
+        row = collector_by_name.get(name)
+        if row is None:
+            continue
+        status = str(row.get("status") or "unavailable")
+        statuses[name] = status if status in _ENDPOINT_COLLECTOR_STATUSES else "unavailable"
+        raw_count = row.get("item_count")
+        counts[name] = max(0, min(raw_count, 2_147_483_647)) if type(raw_count) is int else None
+        if row.get("message"):
+            messages[name] = sanitize_text(str(row.get("message") or ""), max_len=300)
+    requested = [status for status in statuses.values() if status != "skipped"]
+    completeness = "complete" if requested and all(status == "complete" for status in requested) else "partial"
+    platform_raw = inventory.get("platform") if isinstance(inventory, dict) else {}
+    privacy_raw = inventory.get("privacy") if isinstance(inventory, dict) else {}
+    if not isinstance(platform_raw, dict):
+        platform_raw = {}
+    if not isinstance(privacy_raw, dict):
+        privacy_raw = {}
+    return FleetEndpoint(
+        endpoint_id=endpoint_id,
+        tenant_id=tenant_id,
+        platform={key: sanitize_text(str((platform_raw or {}).get(key) or ""), max_len=100) for key in ("system", "release", "machine")},
+        counts=counts,
+        collector_status=statuses,
+        collector_messages=messages,
+        privacy={
+            key: (privacy_raw or {}).get(key, False) is True
+            for key in (
+                "process_arguments_collected",
+                "environment_values_collected",
+                "browser_history_collected",
+                "arbitrary_home_directory_scan",
+                "network_remote_addresses_collected",
+            )
+        },
+        completeness=completeness,
+        last_scan_id=scan_id,
+        observed_at=observed_at,
+    )
+
+
+def endpoint_inventory_evidence(endpoint: FleetEndpoint) -> dict[str, Any]:
+    """Return the bounded endpoint payload safe for job and graph persistence."""
+
+    return {
+        "schema_version": "1",
+        "platform": dict(endpoint.platform),
+        "privacy": dict(endpoint.privacy),
+        "collectors": [
+            {
+                "name": name,
+                "status": endpoint.collector_status[name],
+                "item_count": endpoint.counts.get(name),
+                "message": endpoint.collector_messages.get(name, ""),
+            }
+            for name in _ENDPOINT_COLLECTORS
+            if name in endpoint.collector_status
+        ],
+    }
+
+
+def fleet_agent_natural_key(agent_type: str, name: str, config_path: str) -> tuple[str, str, str]:
+    """Compatibility key for upgrading scanner-owned fleet rows in place."""
+    return (
+        (agent_type or "").strip().lower(),
+        (name or "").strip().lower(),
+        (config_path or "").strip().lower(),
+    )
+
+
+def match_discovered_fleet_agent(
+    existing_agents: list[FleetAgent],
+    *,
+    canonical_id: str,
+    agent_type: str,
+    name: str,
+    config_path: str,
+    previous_canonical_ids: list[str] | None = None,
+    claimed_agent_ids: set[str] | None = None,
+) -> FleetAgent | None:
+    """Match a discovery row across canonical-ID schema upgrades.
+
+    Natural identity is checked before legacy aliases because v1 aliases may
+    intentionally collide. A legacy alias is accepted only when exactly one
+    unclaimed persisted row carries it.
+    """
+    claimed = claimed_agent_ids if claimed_agent_ids is not None else set()
+    available = [agent for agent in existing_agents if agent.agent_id not in claimed]
+    current = [agent for agent in available if agent.canonical_id == canonical_id]
+    if len(current) == 1:
+        return current[0]
+
+    natural_key = fleet_agent_natural_key(agent_type, name, config_path)
+    natural = [agent for agent in available if fleet_agent_natural_key(agent.agent_type, agent.name, agent.config_path) == natural_key]
+    if len(natural) == 1:
+        return natural[0]
+
+    aliases = set(previous_canonical_ids or [])
+    legacy = [agent for agent in available if agent.canonical_id in aliases]
+    return legacy[0] if len(legacy) == 1 else None
+
+
+def _fleet_agent_identifiers(agent: Any) -> tuple[str, ...]:
+    """The names a relay caller may legitimately be known by, case-folded."""
+    return tuple((getattr(agent, field_name, "") or "").strip().lower() for field_name in ("name", "agent_id", "canonical_id"))
+
+
+def find_fleet_agent(store: Any, tenant_id: str, identifier: str) -> Any | None:
+    """Resolve one relay caller to its fleet row without paging the roster.
+
+    Quarantine is enforced in the relay's hot path, so this must cost a bounded
+    indexed read rather than materializing every agent in the tenant. A store
+    that predates ``find_by_identifier`` keeps working through the roster scan.
+    """
+    finder = getattr(store, "find_by_identifier", None)
+    if finder is not None:
+        agent: Any | None = finder(tenant_id, identifier)
+        return agent
+    key = (identifier or "").strip().lower()
+    if not key:
+        return None
+    for candidate in store.list_by_tenant(tenant_id):
+        if key in _fleet_agent_identifiers(candidate):
+            return candidate
+    return None
+
 
 # ─── Protocol ────────────────────────────────────────────────────────────────
 
@@ -57,34 +282,81 @@ class FleetStore(Protocol):
     """Protocol for fleet agent persistence."""
 
     def put(self, agent: FleetAgent) -> None: ...
-    def get(self, agent_id: str) -> FleetAgent | None: ...
+    def get(self, agent_id: str, *, tenant_id: str) -> FleetAgent | None: ...
+    def get_by_canonical_id(self, canonical_id: str, tenant_id: str | None = None) -> FleetAgent | None: ...
     def get_by_name(self, name: str) -> FleetAgent | None: ...
-    def delete(self, agent_id: str) -> bool: ...
+    def delete(self, agent_id: str, *, tenant_id: str) -> bool: ...
     def list_all(self) -> list[FleetAgent]: ...
-    def list_summary(self) -> list[dict]: ...
+    def list_summary(self) -> list[dict[str, Any]]: ...
     def list_by_tenant(self, tenant_id: str) -> list[FleetAgent]: ...
-    def list_tenants(self) -> list[dict]: ...
-    def update_state(self, agent_id: str, state: FleetLifecycleState) -> bool: ...
+    def find_by_identifier(self, tenant_id: str, identifier: str) -> FleetAgent | None: ...
+    def query_by_tenant(
+        self,
+        tenant_id: str,
+        *,
+        state: str | None = None,
+        environment: str | None = None,
+        min_trust: float | None = None,
+        search: str | None = None,
+        include_quarantined: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[FleetAgent], int]: ...
+    def list_tenants(self) -> list[dict[str, Any]]: ...
+    # ``agent_id`` is unique only WITHIN a tenant, so the tenant is a required
+    # keyword: an unscoped state change is a cross-tenant write.
+    def update_state(self, agent_id: str, state: FleetLifecycleState, *, tenant_id: str) -> bool: ...
     def batch_put(self, agents: list[FleetAgent]) -> int: ...
+    def put_endpoint(self, endpoint: FleetEndpoint) -> None: ...
+    def get_endpoint(self, endpoint_id: str, *, tenant_id: str) -> FleetEndpoint | None: ...
+    def delete_endpoint(self, endpoint_id: str, *, tenant_id: str) -> bool: ...
+    def query_endpoints(
+        self,
+        tenant_id: str,
+        *,
+        search: str | None = None,
+        completeness: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[FleetEndpoint], int]: ...
 
 
 # ─── In-Memory ───────────────────────────────────────────────────────────────
 
 
 class InMemoryFleetStore:
-    """Dict-based in-memory fleet store. Thread-safe via lock."""
+    """Dict-based in-memory fleet store. Thread-safe via lock.
+
+    Keyed by ``(tenant_id, agent_id)``: ``canonical_agent_id`` is derived from
+    agent content with no tenant component, so keying on ``agent_id`` alone let
+    the second tenant to register a stock agent silently replace the first
+    tenant's row.
+    """
 
     def __init__(self) -> None:
-        self._agents: dict[str, FleetAgent] = {}
+        self._agents: dict[tuple[str, str], FleetAgent] = {}
+        self._endpoints: dict[tuple[str, str], FleetEndpoint] = {}
         self._lock = threading.Lock()
 
     def put(self, agent: FleetAgent) -> None:
+        normalized = FleetAgent.model_validate(agent.model_dump())
         with self._lock:
-            self._agents[agent.agent_id] = agent
+            self._agents[(normalized.tenant_id, normalized.agent_id)] = normalized
 
-    def get(self, agent_id: str) -> FleetAgent | None:
+    def get(self, agent_id: str, *, tenant_id: str) -> FleetAgent | None:
         with self._lock:
-            return self._agents.get(agent_id)
+            return self._agents.get((normalize_tenant_id(tenant_id), agent_id))
+
+    def get_by_canonical_id(self, canonical_id: str, tenant_id: str | None = None) -> FleetAgent | None:
+        wanted = normalize_tenant_id(tenant_id) if tenant_id is not None else None
+        with self._lock:
+            for agent in self._agents.values():
+                if agent.canonical_id != canonical_id:
+                    continue
+                if wanted is not None and agent.tenant_id != wanted:
+                    continue
+                return agent
+            return None
 
     def get_by_name(self, name: str) -> FleetAgent | None:
         with self._lock:
@@ -93,22 +365,20 @@ class InMemoryFleetStore:
                     return a
             return None
 
-    def delete(self, agent_id: str) -> bool:
+    def delete(self, agent_id: str, *, tenant_id: str) -> bool:
         with self._lock:
-            if agent_id in self._agents:
-                del self._agents[agent_id]
-                return True
-            return False
+            return self._agents.pop((normalize_tenant_id(tenant_id), agent_id), None) is not None
 
     def list_all(self) -> list[FleetAgent]:
         with self._lock:
             return list(self._agents.values())
 
-    def list_summary(self) -> list[dict]:
+    def list_summary(self) -> list[dict[str, Any]]:
         with self._lock:
             return [
                 {
                     "agent_id": a.agent_id,
+                    "canonical_id": a.canonical_id,
                     "name": a.name,
                     "lifecycle_state": a.lifecycle_state,
                     "trust_score": a.trust_score,
@@ -121,31 +391,165 @@ class InMemoryFleetStore:
         with self._lock:
             return [a for a in self._agents.values() if a.tenant_id == tenant_id]
 
-    def list_tenants(self) -> list[dict]:
+    def find_by_identifier(self, tenant_id: str, identifier: str) -> FleetAgent | None:
+        key = (identifier or "").strip().lower()
+        if not key:
+            return None
+        with self._lock:
+            for agent in self._agents.values():
+                if agent.tenant_id != tenant_id:
+                    continue
+                if key in _fleet_agent_identifiers(agent):
+                    return agent
+            return None
+
+    def query_by_tenant(
+        self,
+        tenant_id: str,
+        *,
+        state: str | None = None,
+        environment: str | None = None,
+        min_trust: float | None = None,
+        search: str | None = None,
+        include_quarantined: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[FleetAgent], int]:
+        agents = self.list_by_tenant(tenant_id)
+        if not include_quarantined and state is None:
+            agents = [a for a in agents if a.lifecycle_state.value not in ("quarantined", "decommissioned")]
+        if state:
+            agents = [a for a in agents if a.lifecycle_state.value == state]
+        if environment:
+            agents = [a for a in agents if a.environment == environment]
+        if min_trust is not None:
+            agents = [a for a in agents if (a.trust_score or 0.0) >= min_trust]
+        if search:
+            needle = search.lower()
+            agents = [
+                a
+                for a in agents
+                if needle in a.name.lower()
+                or needle in (a.owner or "").lower()
+                or needle in (a.environment or "").lower()
+                or any(needle in tag.lower() for tag in a.tags)
+            ]
+        agents = sorted(agents, key=lambda a: (a.name.lower(), a.agent_id))
+        total = len(agents)
+        return agents[offset : offset + limit], total
+
+    def list_tenants(self) -> list[dict[str, Any]]:
         with self._lock:
             counts: dict[str, int] = {}
             for a in self._agents.values():
                 counts[a.tenant_id] = counts.get(a.tenant_id, 0) + 1
             return [{"tenant_id": tid, "agent_count": cnt} for tid, cnt in sorted(counts.items())]
 
-    def update_state(self, agent_id: str, state: FleetLifecycleState) -> bool:
+    def update_state(self, agent_id: str, state: FleetLifecycleState, *, tenant_id: str) -> bool:
         with self._lock:
-            agent = self._agents.get(agent_id)
+            agent = self._agents.get((normalize_tenant_id(tenant_id), agent_id))
             if agent is None:
                 return False
             agent.lifecycle_state = state
-            agent.updated_at = datetime.now(timezone.utc).isoformat()
+            agent.updated_at = now_utc_iso()
             return True
 
     def batch_put(self, agents: list[FleetAgent]) -> int:
         """Upsert multiple agents at once."""
         with self._lock:
             for agent in agents:
-                self._agents[agent.agent_id] = agent
+                normalized = FleetAgent.model_validate(agent.model_dump())
+                self._agents[(normalized.tenant_id, normalized.agent_id)] = normalized
             return len(agents)
+
+    def put_endpoint(self, endpoint: FleetEndpoint) -> None:
+        normalized = FleetEndpoint.model_validate(endpoint.model_dump())
+        with self._lock:
+            self._endpoints[(normalized.tenant_id, normalized.endpoint_id)] = normalized
+
+    def get_endpoint(self, endpoint_id: str, *, tenant_id: str) -> FleetEndpoint | None:
+        with self._lock:
+            return self._endpoints.get((normalize_tenant_id(tenant_id), endpoint_id))
+
+    def delete_endpoint(self, endpoint_id: str, *, tenant_id: str) -> bool:
+        with self._lock:
+            return self._endpoints.pop((normalize_tenant_id(tenant_id), endpoint_id), None) is not None
+
+    def query_endpoints(
+        self,
+        tenant_id: str,
+        *,
+        search: str | None = None,
+        completeness: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[FleetEndpoint], int]:
+        normalized_tenant = normalize_tenant_id(tenant_id)
+        with self._lock:
+            endpoints = [endpoint for (tid, _), endpoint in self._endpoints.items() if tid == normalized_tenant]
+        if search:
+            needle = search.casefold()
+            endpoints = [
+                endpoint
+                for endpoint in endpoints
+                if needle in endpoint.endpoint_id.casefold() or any(needle in value.casefold() for value in endpoint.platform.values())
+            ]
+        if completeness:
+            endpoints = [endpoint for endpoint in endpoints if endpoint.completeness == completeness]
+        endpoints.sort(key=lambda endpoint: (endpoint.updated_at, endpoint.endpoint_id), reverse=True)
+        total = len(endpoints)
+        return endpoints[offset : offset + limit], total
 
 
 # ─── SQLite ──────────────────────────────────────────────────────────────────
+
+_FLEET_MIGRATION_TABLE = "fleet_agents_tenant_key_migration"
+
+# Keyed by (tenant_id, agent_id): agent IDs are derived from agent content with
+# no tenant component (``canonical_ids.canonical_agent_id``), so a bare
+# ``agent_id`` key let one tenant's INSERT OR REPLACE silently delete another
+# tenant's row. Mirrors the Postgres and Snowflake fleet_agents keys.
+_CREATE_FLEET_AGENTS_SQL = """
+    CREATE TABLE IF NOT EXISTS {table} (
+        agent_id TEXT NOT NULL,
+        canonical_id TEXT NOT NULL DEFAULT '',
+        name TEXT NOT NULL,
+        lifecycle_state TEXT NOT NULL,
+        trust_score REAL DEFAULT 0.0,
+        updated_at TEXT NOT NULL,
+        device_fingerprint TEXT NOT NULL DEFAULT '',
+        tenant_id TEXT NOT NULL DEFAULT 'default',
+        data TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, agent_id)
+    )
+"""
+
+_FLEET_COLUMNS = "agent_id, canonical_id, name, lifecycle_state, trust_score, updated_at, device_fingerprint, tenant_id, data"
+
+_CREATE_FLEET_ENDPOINTS_SQL = """
+    CREATE TABLE IF NOT EXISTS fleet_endpoints (
+        tenant_id TEXT NOT NULL,
+        endpoint_id TEXT NOT NULL,
+        completeness TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        data TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, endpoint_id)
+    )
+"""
+
+
+def _fleet_row(agent: FleetAgent) -> tuple[Any, ...]:
+    return (
+        agent.agent_id,
+        agent.canonical_id,
+        agent.name,
+        agent.lifecycle_state.value,
+        agent.trust_score,
+        agent.updated_at,
+        agent.device_fingerprint,
+        agent.tenant_id,
+        agent.model_dump_json(),
+    )
 
 
 class SQLiteFleetStore:
@@ -158,59 +562,153 @@ class SQLiteFleetStore:
         self._db_path = db_path
         self._local = threading.local()
         self._init_db()
+        if os.path.exists(self._db_path):
+            os.chmod(self._db_path, 0o600)
 
     @property
     def _conn(self) -> sqlite3.Connection:
         if not hasattr(self._local, "conn") or self._local.conn is None:
             self._local.conn = sqlite3.connect(self._db_path, check_same_thread=False)
             self._local.conn.execute("PRAGMA journal_mode=WAL")
-        return self._local.conn
+        conn: sqlite3.Connection = self._local.conn
+        return conn
 
     def _init_db(self) -> None:
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS fleet_agents (
-                agent_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                lifecycle_state TEXT NOT NULL,
-                trust_score REAL DEFAULT 0.0,
-                updated_at TEXT NOT NULL,
-                data TEXT NOT NULL
-            )
-        """)
+        ensure_sqlite_schema_version(self._conn, "fleet")
+        self._conn.execute(_CREATE_FLEET_AGENTS_SQL.format(table="fleet_agents"))
+        self._conn.execute(_CREATE_FLEET_ENDPOINTS_SQL)
+        if "canonical_id" not in _table_columns(self._conn, "fleet_agents"):
+            self._conn.execute("ALTER TABLE fleet_agents ADD COLUMN canonical_id TEXT NOT NULL DEFAULT ''")
+        if "device_fingerprint" not in _table_columns(self._conn, "fleet_agents"):
+            self._conn.execute("ALTER TABLE fleet_agents ADD COLUMN device_fingerprint TEXT NOT NULL DEFAULT ''")
+        self._backfill_canonical_ids()
+        self._backfill_device_fingerprints()
+        self._migrate_to_tenant_scoped_key()
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_fleet_name ON fleet_agents(name)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_fleet_canonical_id ON fleet_agents(canonical_id)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_fleet_tenant_canonical_id ON fleet_agents(tenant_id, canonical_id)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_fleet_device_fingerprint ON fleet_agents(device_fingerprint)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_fleet_state ON fleet_agents(lifecycle_state)")
-        self._conn.commit()
-
-    def put(self, agent: FleetAgent) -> None:
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_fleet_state_trust_name ON fleet_agents(lifecycle_state, trust_score DESC, name)")
+        # Case-insensitive single-agent resolution for the gateway relay. The
+        # match has always been case-insensitive; these keep it that way without
+        # reading the roster on every call.
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_fleet_name_lower ON fleet_agents(lower(name))")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_fleet_agent_id_lower ON fleet_agents(lower(agent_id))")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_fleet_canonical_id_lower ON fleet_agents(lower(canonical_id))")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_fleet_tenant_name ON fleet_agents(tenant_id, name)")
         self._conn.execute(
-            """INSERT OR REPLACE INTO fleet_agents
-               (agent_id, name, lifecycle_state, trust_score, updated_at, data)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                agent.agent_id,
-                agent.name,
-                agent.lifecycle_state.value,
-                agent.trust_score,
-                agent.updated_at,
-                agent.model_dump_json(),
-            ),
+            "CREATE INDEX IF NOT EXISTS idx_fleet_endpoints_tenant_updated ON fleet_endpoints(tenant_id, updated_at DESC, endpoint_id)"
         )
         self._conn.commit()
 
-    def get(self, agent_id: str) -> FleetAgent | None:
-        row = self._conn.execute("SELECT data FROM fleet_agents WHERE agent_id = ?", (agent_id,)).fetchone()
+    def _migrate_to_tenant_scoped_key(self) -> None:
+        """Rebuild ``fleet_agents`` onto ``PRIMARY KEY (tenant_id, agent_id)``.
+
+        The shipped table was keyed ``agent_id`` alone with no tenant column, so
+        ``INSERT OR REPLACE`` let the second tenant to register a stock agent
+        silently delete the first tenant's row. SQLite cannot re-key a table in
+        place, so this copies into the new shape and swaps.
+
+        Pre-existing rows keep the tenant recorded in their own ``data``
+        payload; rows written before ``tenant_id`` existed at all belong to
+        ``default``, the documented system tenant such a deployment ran as.
+        Nothing is dropped: the old key permits at most one row per
+        ``agent_id``, so the new wider key can never collide.
+        """
+        if _primary_key_columns(self._conn, "fleet_agents") == ["tenant_id", "agent_id"]:
+            return
+
+        legacy_columns = _table_columns(self._conn, "fleet_agents")
+        # A previous interrupted run may have left the scratch table behind.
+        self._conn.execute(f"DROP TABLE IF EXISTS {_FLEET_MIGRATION_TABLE}")
+        self._conn.execute(_CREATE_FLEET_AGENTS_SQL.format(table=_FLEET_MIGRATION_TABLE))
+        tenant_expr = (
+            "COALESCE(NULLIF(TRIM(tenant_id), ''), 'default')"
+            if "tenant_id" in legacy_columns
+            else "COALESCE(NULLIF(TRIM(json_extract(data, '$.tenant_id')), ''), 'default')"
+        )
+        self._conn.execute(
+            f"INSERT INTO {_FLEET_MIGRATION_TABLE} "  # nosec B608 - table and expression are static
+            "(tenant_id, agent_id, canonical_id, name, lifecycle_state, trust_score, updated_at, device_fingerprint, data) "
+            f"SELECT {tenant_expr}, agent_id, canonical_id, name, lifecycle_state, trust_score, updated_at, device_fingerprint, data "
+            "FROM fleet_agents"
+        )
+        self._conn.execute("DROP TABLE fleet_agents")
+        self._conn.execute(f"ALTER TABLE {_FLEET_MIGRATION_TABLE} RENAME TO fleet_agents")
+        self._conn.commit()
+
+    def _backfill_canonical_ids(self) -> None:
+        rows = self._conn.execute("SELECT agent_id, data FROM fleet_agents WHERE canonical_id = ''").fetchall()
+        for agent_id, raw in rows:
+            agent = FleetAgent.model_validate_json(raw)
+            self._conn.execute(
+                "UPDATE fleet_agents SET canonical_id = ?, data = ? WHERE agent_id = ?",
+                (agent.canonical_id, agent.model_dump_json(), agent_id),
+            )
+
+    def _backfill_device_fingerprints(self) -> None:
+        """Mirror the persisted ``device_fingerprint`` into its dedicated column.
+
+        Idempotent and cheap: only rows whose column is empty *and* whose stored
+        JSON actually carries a fingerprint are touched, so evidence-less agents
+        (the common case) keep a null/empty column and are never re-processed.
+        """
+        rows = self._conn.execute(
+            "SELECT agent_id, data FROM fleet_agents "
+            "WHERE COALESCE(device_fingerprint, '') = '' "
+            "AND COALESCE(json_extract(data, '$.device_fingerprint'), '') != ''"
+        ).fetchall()
+        for agent_id, raw in rows:
+            agent = FleetAgent.model_validate_json(raw)
+            self._conn.execute(
+                "UPDATE fleet_agents SET device_fingerprint = ? WHERE agent_id = ?",
+                (agent.device_fingerprint, agent_id),
+            )
+
+    def put(self, agent: FleetAgent) -> None:
+        normalized = FleetAgent.model_validate(agent.model_dump())
+        self._conn.execute(
+            f"INSERT OR REPLACE INTO fleet_agents ({_FLEET_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",  # nosec B608 - static column list
+            _fleet_row(normalized),
+        )
+        self._conn.commit()
+
+    def get(self, agent_id: str, *, tenant_id: str) -> FleetAgent | None:
+        row = self._conn.execute(
+            "SELECT data FROM fleet_agents WHERE agent_id = ? AND tenant_id = ?",
+            (agent_id, normalize_tenant_id(tenant_id)),
+        ).fetchone()
         if row is None:
             return None
-        return FleetAgent.model_validate_json(row[0])
+        agent: FleetAgent = FleetAgent.model_validate_json(row[0])
+        return agent
+
+    def get_by_canonical_id(self, canonical_id: str, tenant_id: str | None = None) -> FleetAgent | None:
+        if tenant_id is None:
+            row = self._conn.execute("SELECT data FROM fleet_agents WHERE canonical_id = ?", (canonical_id,)).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT data FROM fleet_agents WHERE canonical_id = ? AND tenant_id = ?",
+                (canonical_id, normalize_tenant_id(tenant_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        agent: FleetAgent = FleetAgent.model_validate_json(row[0])
+        return agent
 
     def get_by_name(self, name: str) -> FleetAgent | None:
         row = self._conn.execute("SELECT data FROM fleet_agents WHERE name = ?", (name,)).fetchone()
         if row is None:
             return None
-        return FleetAgent.model_validate_json(row[0])
+        agent: FleetAgent = FleetAgent.model_validate_json(row[0])
+        return agent
 
-    def delete(self, agent_id: str) -> bool:
-        cursor = self._conn.execute("DELETE FROM fleet_agents WHERE agent_id = ?", (agent_id,))
+    def delete(self, agent_id: str, *, tenant_id: str) -> bool:
+        cursor = self._conn.execute(
+            "DELETE FROM fleet_agents WHERE agent_id = ? AND tenant_id = ?",
+            (agent_id, normalize_tenant_id(tenant_id)),
+        )
         self._conn.commit()
         return cursor.rowcount > 0
 
@@ -218,44 +716,97 @@ class SQLiteFleetStore:
         rows = self._conn.execute("SELECT data FROM fleet_agents ORDER BY name").fetchall()
         return [FleetAgent.model_validate_json(r[0]) for r in rows]
 
-    def list_summary(self) -> list[dict]:
+    def list_summary(self) -> list[dict[str, Any]]:
         rows = self._conn.execute(
-            "SELECT agent_id, name, lifecycle_state, trust_score, updated_at FROM fleet_agents ORDER BY name"
+            "SELECT agent_id, canonical_id, name, lifecycle_state, trust_score, updated_at FROM fleet_agents ORDER BY name"
         ).fetchall()
         return [
             {
                 "agent_id": r[0],
-                "name": r[1],
-                "lifecycle_state": r[2],
-                "trust_score": r[3],
-                "updated_at": r[4],
+                "canonical_id": r[1],
+                "name": r[2],
+                "lifecycle_state": r[3],
+                "trust_score": r[4],
+                "updated_at": r[5],
             }
             for r in rows
         ]
 
     def list_by_tenant(self, tenant_id: str) -> list[FleetAgent]:
         rows = self._conn.execute(
-            "SELECT data FROM fleet_agents WHERE json_extract(data, '$.tenant_id') = ? ORDER BY name",
-            (tenant_id,),
+            "SELECT data FROM fleet_agents WHERE tenant_id = ? ORDER BY name",
+            (normalize_tenant_id(tenant_id),),
         ).fetchall()
         return [FleetAgent.model_validate_json(r[0]) for r in rows]
 
-    def list_tenants(self) -> list[dict]:
-        rows = self._conn.execute(
-            """SELECT COALESCE(json_extract(data, '$.tenant_id'), 'default') as tid,
-                      COUNT(*) as cnt
-               FROM fleet_agents
-               GROUP BY tid ORDER BY tid"""
-        ).fetchall()
+    def find_by_identifier(self, tenant_id: str, identifier: str) -> FleetAgent | None:
+        key = (identifier or "").strip().lower()
+        if not key:
+            return None
+        for column in ("name", "agent_id", "canonical_id"):
+            row = self._conn.execute(
+                # nosec B608 - ``column`` comes from the fixed literal tuple in
+                # the loop above; the values are bound.
+                f"SELECT data FROM fleet_agents WHERE lower({column}) = ? AND tenant_id = ? LIMIT 1",  # nosec B608
+                (key, tenant_id),
+            ).fetchone()
+            if row is not None:
+                agent: FleetAgent = FleetAgent.model_validate_json(row[0])
+                return agent
+        return None
+
+    def query_by_tenant(
+        self,
+        tenant_id: str,
+        *,
+        state: str | None = None,
+        environment: str | None = None,
+        min_trust: float | None = None,
+        search: str | None = None,
+        include_quarantined: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[FleetAgent], int]:
+        agents = self.list_by_tenant(tenant_id)
+        if not include_quarantined and state is None:
+            agents = [a for a in agents if a.lifecycle_state.value not in ("quarantined", "decommissioned")]
+        if state:
+            agents = [a for a in agents if a.lifecycle_state.value == state]
+        if environment:
+            agents = [a for a in agents if a.environment == environment]
+        if min_trust is not None:
+            agents = [a for a in agents if (a.trust_score or 0.0) >= min_trust]
+        if search:
+            needle = search.lower()
+            agents = [
+                a
+                for a in agents
+                if needle in a.name.lower()
+                or needle in (a.owner or "").lower()
+                or needle in (a.environment or "").lower()
+                or any(needle in tag.lower() for tag in a.tags)
+            ]
+        agents = sorted(agents, key=lambda a: (a.name.lower(), a.agent_id))
+        total = len(agents)
+        return agents[offset : offset + limit], total
+
+    def list_tenants(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute("SELECT tenant_id, COUNT(*) FROM fleet_agents GROUP BY tenant_id ORDER BY tenant_id").fetchall()
         return [{"tenant_id": r[0], "agent_count": r[1]} for r in rows]
 
-    def update_state(self, agent_id: str, state: FleetLifecycleState) -> bool:
-        now = datetime.now(timezone.utc).isoformat()
-        agent = self.get(agent_id)
-        if agent is None:
+    def update_state(self, agent_id: str, state: FleetLifecycleState, *, tenant_id: str) -> bool:
+        # agent_id is unique only WITHIN a tenant, so the predicate must carry
+        # the tenant: an unscoped UPDATE would quarantine every tenant's copy of
+        # a shared stock agent ID in one statement.
+        row = self._conn.execute(
+            "SELECT data FROM fleet_agents WHERE agent_id = ? AND tenant_id = ?",
+            (agent_id, normalize_tenant_id(tenant_id)),
+        ).fetchone()
+        if row is None:
             return False
+        agent = FleetAgent.model_validate_json(row[0])
         agent.lifecycle_state = state
-        agent.updated_at = now
+        agent.updated_at = now_utc_iso()
         self.put(agent)
         return True
 
@@ -264,20 +815,75 @@ class SQLiteFleetStore:
         if not agents:
             return 0
         self._conn.executemany(
-            """INSERT OR REPLACE INTO fleet_agents
-               (agent_id, name, lifecycle_state, trust_score, updated_at, data)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            [
-                (
-                    a.agent_id,
-                    a.name,
-                    a.lifecycle_state.value,
-                    a.trust_score,
-                    a.updated_at,
-                    a.model_dump_json(),
-                )
-                for a in agents
-            ],
+            f"INSERT OR REPLACE INTO fleet_agents ({_FLEET_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",  # nosec B608 - static column list
+            [_fleet_row(FleetAgent.model_validate(agent.model_dump())) for agent in agents],
         )
         self._conn.commit()
         return len(agents)
+
+    def put_endpoint(self, endpoint: FleetEndpoint) -> None:
+        normalized = FleetEndpoint.model_validate(endpoint.model_dump())
+        self._conn.execute(
+            "INSERT OR REPLACE INTO fleet_endpoints (tenant_id, endpoint_id, completeness, updated_at, data) VALUES (?, ?, ?, ?, ?)",
+            (
+                normalized.tenant_id,
+                normalized.endpoint_id,
+                normalized.completeness,
+                normalized.updated_at,
+                normalized.model_dump_json(),
+            ),
+        )
+        self._conn.commit()
+
+    def get_endpoint(self, endpoint_id: str, *, tenant_id: str) -> FleetEndpoint | None:
+        row = self._conn.execute(
+            "SELECT data FROM fleet_endpoints WHERE tenant_id = ? AND endpoint_id = ?",
+            (normalize_tenant_id(tenant_id), endpoint_id),
+        ).fetchone()
+        return FleetEndpoint.model_validate_json(row[0]) if row else None
+
+    def delete_endpoint(self, endpoint_id: str, *, tenant_id: str) -> bool:
+        cursor = self._conn.execute(
+            "DELETE FROM fleet_endpoints WHERE tenant_id = ? AND endpoint_id = ?",
+            (normalize_tenant_id(tenant_id), endpoint_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def query_endpoints(
+        self,
+        tenant_id: str,
+        *,
+        search: str | None = None,
+        completeness: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[FleetEndpoint], int]:
+        clauses = ["tenant_id = ?"]
+        params: list[Any] = [normalize_tenant_id(tenant_id)]
+        if completeness:
+            clauses.append("completeness = ?")
+            params.append(completeness)
+        if search:
+            clauses.append("(lower(endpoint_id) LIKE ? OR lower(data) LIKE ?)")
+            needle = f"%{search.casefold()}%"
+            params.extend((needle, needle))
+        where = " AND ".join(clauses)
+        total = int(
+            self._conn.execute(f"SELECT COUNT(*) FROM fleet_endpoints WHERE {where}", params).fetchone()[0]  # nosec B608
+        )
+        rows = self._conn.execute(
+            f"SELECT data FROM fleet_endpoints WHERE {where} ORDER BY updated_at DESC, endpoint_id LIMIT ? OFFSET ?",  # nosec B608
+            [*params, limit, offset],
+        ).fetchall()
+        return [FleetEndpoint.model_validate_json(row[0]) for row in rows], total
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}  # nosec B608 - table is static
+
+
+def _primary_key_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    """Return the table's primary-key columns in key order."""
+    rows = [row for row in conn.execute(f"PRAGMA table_info({table})").fetchall() if row[5]]  # nosec B608 - table is static
+    return [str(row[1]) for row in sorted(rows, key=lambda row: row[5])]

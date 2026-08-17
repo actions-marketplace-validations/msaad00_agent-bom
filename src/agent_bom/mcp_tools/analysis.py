@@ -5,7 +5,16 @@ from __future__ import annotations
 import json
 import logging
 
-from agent_bom.security import sanitize_error
+from agent_bom.graph.completeness import graph_completeness
+from agent_bom.mcp_errors import (
+    CODE_INTERNAL_UNEXPECTED,
+    CODE_NOT_FOUND_AGENTS,
+    CODE_NOT_FOUND_RESOURCE,
+    CODE_UNSUPPORTED_QUERY_TYPE,
+    CODE_VALIDATION_INVALID_ARGUMENT,
+    CODE_VALIDATION_INVALID_VULN_ID,
+    mcp_error_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,20 +31,17 @@ async def blast_radius_impl(
         validated_cve = _validate_cve_id(cve_id)
     except ValueError as exc:
         logger.exception("MCP tool error")
-        return json.dumps({"error": sanitize_error(exc)})
+        return mcp_error_json(CODE_VALIDATION_INVALID_VULN_ID, exc, details={"argument": "cve_id"})
 
     try:
         _agents, blast_radii, _warnings, _srcs = await _run_scan_pipeline()
 
         matches = [br for br in blast_radii if br.vulnerability.id.upper() == validated_cve.upper()]
         if not matches:
-            return json.dumps(
-                {
-                    "found": False,
-                    "error": "CVE not found",
-                    "cve_id": cve_id,
-                    "suggestion": "Run scan first",
-                }
+            return mcp_error_json(
+                CODE_NOT_FOUND_RESOURCE,
+                "CVE not found in current scan results",
+                details={"cve_id": cve_id, "suggestion": "Run a fresh scan via the scan tool first."},
             )
 
         results = []
@@ -59,7 +65,7 @@ async def blast_radius_impl(
         return _truncate_response(json.dumps({"cve_id": cve_id, "found": True, "blast_radii": results}, indent=2, default=str))
     except Exception as exc:
         logger.exception("MCP tool error")
-        return json.dumps({"error": sanitize_error(exc)})
+        return mcp_error_json(CODE_INTERNAL_UNEXPECTED, exc)
 
 
 async def context_graph_impl(
@@ -75,8 +81,8 @@ async def context_graph_impl(
         from agent_bom.context_graph import (
             NodeKind,
             build_context_graph,
+            collect_lateral_paths,
             compute_interaction_risks,
-            find_lateral_paths,
             to_serializable,
         )
         from agent_bom.models import AIBOMReport
@@ -84,7 +90,7 @@ async def context_graph_impl(
 
         agents, blast_radii, _warnings, scan_sources = await _run_scan_pipeline(config_path)
         if not agents:
-            return json.dumps({"error": "No agents found"})
+            return mcp_error_json(CODE_NOT_FOUND_AGENTS, "No agents discovered in the current scan scope.")
 
         report = AIBOMReport(agents=agents, blast_radii=blast_radii, scan_sources=scan_sources)
         report_json = to_json(report)
@@ -94,22 +100,28 @@ async def context_graph_impl(
         )
 
         paths: list = []
+        paths_truncated = False
         depth = max(1, min(max_depth, 6))
         if source_agent:
             node_id = f"agent:{source_agent}"
             if node_id in graph.nodes:
-                paths = find_lateral_paths(graph, node_id, max_depth=depth)
+                paths, paths_truncated = collect_lateral_paths(graph, [node_id], max_depth=depth)
         else:
-            for nid, node in graph.nodes.items():
-                if node.kind == NodeKind.AGENT:
-                    paths.extend(find_lateral_paths(graph, nid, max_depth=depth))
+            source_ids = (nid for nid in sorted(graph.nodes.keys()) if graph.nodes[nid].kind == NodeKind.AGENT)
+            paths, paths_truncated = collect_lateral_paths(graph, source_ids, max_depth=depth)
 
         risks = compute_interaction_risks(graph)
         result = to_serializable(graph, paths, risks)
+        result["stats"]["lateral_paths_truncated"] = paths_truncated
+        result["completeness"] = graph_completeness(
+            returned=len(paths),
+            sampled=paths_truncated,
+            reason=("multi-source path budget reached; request a source_agent for exhaustive local traversal" if paths_truncated else ""),
+        )
         return _truncate_response(json.dumps(result, indent=2, default=str))
     except Exception as exc:
         logger.exception("MCP tool error")
-        return json.dumps({"error": sanitize_error(exc)})
+        return mcp_error_json(CODE_INTERNAL_UNEXPECTED, exc)
 
 
 async def analytics_query_impl(
@@ -126,15 +138,30 @@ async def analytics_query_impl(
         from agent_bom.api.stores import _get_analytics_store
 
         store = _get_analytics_store()
-        valid_types = {"vuln_trends", "top_cves", "posture_history", "event_summary"}
+        valid_types = {
+            "vuln_trends",
+            "top_cves",
+            "posture_history",
+            "event_summary",
+            "fleet_riskiest",
+            "compliance_heatmap",
+        }
         if query_type not in valid_types:
-            return json.dumps({"error": f"Invalid query_type. Use one of: {', '.join(sorted(valid_types))}"})
+            return mcp_error_json(
+                CODE_UNSUPPORTED_QUERY_TYPE,
+                f"Invalid query_type. Use one of: {', '.join(sorted(valid_types))}",
+                details={"argument": "query_type", "value": query_type, "allowed": sorted(valid_types)},
+            )
 
         # Validate agent name to prevent SQL injection via ClickHouse
         import re as _re
 
         if agent and not _re.fullmatch(r"[a-zA-Z0-9._\-/ ]{1,200}", agent):
-            return json.dumps({"error": "Invalid agent name. Use only alphanumeric, dot, dash, underscore, slash, space (max 200 chars)."})
+            return mcp_error_json(
+                CODE_VALIDATION_INVALID_ARGUMENT,
+                "Invalid agent name. Use only alphanumeric, dot, dash, underscore, slash, space (max 200 chars).",
+                details={"argument": "agent"},
+            )
 
         if query_type == "vuln_trends":
             data = store.query_vuln_trends(days=days, agent=agent)
@@ -142,10 +169,14 @@ async def analytics_query_impl(
             data = store.query_top_cves(limit=limit)
         elif query_type == "posture_history":
             data = store.query_posture_history(agent=agent, days=days)
+        elif query_type == "fleet_riskiest":
+            data = store.query_top_riskiest_agents(limit=limit)
+        elif query_type == "compliance_heatmap":
+            data = store.query_compliance_heatmap(days=days)
         else:
             data = store.query_event_summary(hours=hours)
 
         return _truncate_response(json.dumps({"query_type": query_type, "results": data, "count": len(data)}, indent=2, default=str))
     except Exception as exc:
         logger.exception("MCP tool error")
-        return json.dumps({"error": sanitize_error(exc)})
+        return mcp_error_json(CODE_INTERNAL_UNEXPECTED, exc)

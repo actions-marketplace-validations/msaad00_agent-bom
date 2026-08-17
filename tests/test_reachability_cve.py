@@ -1,0 +1,787 @@
+"""Tests for the function-level reachability-to-CVE join.
+
+Pins the contract that:
+
+1. Affected symbols are extracted from OSV/GHSA ``ecosystem_specific.imports``
+   and from the ``Vulnerability.affected_symbols`` field.
+2. A vulnerable package whose affected symbol IS reached from an entrypoint
+   classifies as ``function_reachable``.
+3. A reached package whose affected symbol is NOT reached, or an advisory
+   with no symbol data, classifies as ``package_reachable`` — never an
+   over-claimed function reach.
+4. A package present but not reached classifies as ``unreachable``.
+5. The thin ``apply_symbol_reachability_to_blast_radii`` hook stamps the
+   signal onto Python and npm BlastRadius rows and leaves unsupported
+   ecosystems untouched.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from agent_bom.ast.js_ts import npm_package_from_module as _npm_package_from_module
+from agent_bom.ast_analyzer import analyze_project
+from agent_bom.ast_models import ASTAnalysisResult, DependencySymbolReach
+from agent_bom.graph.blast_reach import apply_symbol_reachability_to_blast_radii
+from agent_bom.models import BlastRadius, Package, Severity, Vulnerability
+from agent_bom.reachability_cve import (
+    FUNCTION_REACHABLE,
+    PACKAGE_REACHABLE,
+    UNREACHABLE,
+    SymbolReachIndex,
+    advisory_affected_symbols_by_path,
+    classify_reachability,
+    extract_advisory_identifiers,
+    extract_affected_symbols,
+)
+
+
+def _reach(package: str, module: str, symbol: str) -> DependencySymbolReach:
+    return DependencySymbolReach(
+        entrypoint="tool_entry",
+        package=package,
+        module=module,
+        symbol=symbol,
+        file_path="agent.py",
+        line_number=5,
+        call_path=["tool_entry", f"{module}.{symbol}"],
+    )
+
+
+def _osv_with_symbols(symbols: list[str], *, path: str = "jinja2.sandbox") -> dict:
+    return {
+        "id": "CVE-2099-1234",
+        "affected": [
+            {
+                "package": {"ecosystem": "PyPI", "name": "jinja2"},
+                "ecosystem_specific": {"imports": [{"path": path, "symbols": symbols}]},
+            }
+        ],
+    }
+
+
+# ── extraction ────────────────────────────────────────────────────────────
+
+
+def test_extract_symbols_from_osv_imports() -> None:
+    tokens = extract_affected_symbols(_osv_with_symbols(["SandboxedEnvironment"]))
+    assert "SandboxedEnvironment" in tokens
+
+
+def test_extract_symbols_from_vulnerability_field() -> None:
+    vuln = Vulnerability(id="CVE-2099-1", summary="x", severity=Severity.HIGH, affected_symbols=["dangerous_load"])
+    assert "dangerous_load" in extract_affected_symbols(vuln)
+
+
+def test_extract_returns_empty_without_symbol_data() -> None:
+    advisory = {"id": "CVE-2099-2", "affected": [{"package": {"ecosystem": "PyPI", "name": "jinja2"}}]}
+    assert extract_affected_symbols(advisory) == set()
+    assert extract_affected_symbols(None) == set()
+
+
+def test_extract_symbols_from_ghsa_vulnerable_functions() -> None:
+    """The advisory's token set is exactly what the advisory named.
+
+    It must NOT be widened to the bare ``axios`` head: the advisory named the
+    method ``axios.get``, and indexing the head here made any use of ``axios``
+    satisfy it — an over-claimed ``function_reachable``.
+    """
+    advisory = {
+        "id": "GHSA-xxxx-yyyy-zzzz",
+        "database_specific": {"vulnerable_functions": ["axios.get", "request"]},
+    }
+    tokens = extract_affected_symbols(advisory)
+    assert tokens == {"axios.get", "request"}
+
+
+def test_extract_symbols_from_ghsa_rest_top_level_vulnerable_functions() -> None:
+    advisory = {
+        "ghsa_id": "GHSA-xxxx-yyyy-zzzz",
+        "vulnerable_functions": ["express.static", "send"],
+    }
+    tokens = extract_affected_symbols(advisory)
+    assert tokens == {"express.static", "send"}
+
+
+def test_extract_symbols_from_vulnerability_affected_symbols_field() -> None:
+    vuln = Vulnerability(
+        id="CVE-2099-55",
+        summary="x",
+        severity=Severity.HIGH,
+        affected_symbols=["axios.get", "request"],
+    )
+    assert "axios.get" in extract_affected_symbols(vuln)
+    assert "get" not in extract_affected_symbols(vuln) or "axios" in extract_affected_symbols(vuln)
+
+
+def test_extract_advisory_identifiers_from_vulnerability_model() -> None:
+    vuln = Vulnerability(
+        id="CVE-2099-42",
+        summary="x",
+        severity=Severity.HIGH,
+        cwe_ids=["CWE-79"],
+        aliases=["GHSA-abcd-efgh-ijkl"],
+    )
+    ids = extract_advisory_identifiers(vuln)
+    assert ids.cve_ids == ("CVE-2099-42",)
+    assert ids.cwe_ids == ("CWE-79",)
+
+
+def test_extract_advisory_identifiers_from_osv_cpe() -> None:
+    advisory = {
+        "id": "CVE-2099-99",
+        "aliases": ["CVE-2099-99"],
+        "database_specific": {"cwe_ids": ["CWE-502"]},
+        "affected": [{"package": {"ecosystem": "PyPI", "name": "pickle", "cpe": "cpe:2.3:a:python:pickle:*:*:*:*:*:*:*:*"}}],
+    }
+    ids = extract_advisory_identifiers(advisory)
+    assert ids.cve_ids == ("CVE-2099-99",)
+    assert ids.cwe_ids == ("CWE-502",)
+    assert ids.cpe_ids == ("cpe:2.3:a:python:pickle:*:*:*:*:*:*:*:*",)
+
+
+def test_extract_ignores_malformed_blocks() -> None:
+    advisory = {"affected": ["not-a-dict", {"ecosystem_specific": {"imports": "nope"}}]}
+    assert extract_affected_symbols(advisory) == set()
+
+
+# ── classification ────────────────────────────────────────────────────────
+
+
+def test_function_reachable_when_affected_symbol_is_reached() -> None:
+    index = SymbolReachIndex.from_reaches([_reach("jinja2", "jinja2.sandbox", "SandboxedEnvironment")])
+    signal = classify_reachability(package="jinja2", advisory=_osv_with_symbols(["SandboxedEnvironment"]), index=index)
+    assert signal.state == FUNCTION_REACHABLE
+    assert signal.matched_symbols == ("SandboxedEnvironment",)
+    assert signal.function_reachable is True
+
+
+def test_function_reachable_matches_method_on_reached_class() -> None:
+    # Reached symbol is the method ``SandboxedEnvironment.from_string``; the
+    # advisory names the type. The leading-component token must still match.
+    index = SymbolReachIndex.from_reaches([_reach("jinja2", "jinja2.sandbox", "SandboxedEnvironment.from_string")])
+    signal = classify_reachability(package="jinja2", advisory=_osv_with_symbols(["SandboxedEnvironment"]), index=index)
+    assert signal.state == FUNCTION_REACHABLE
+
+
+def test_package_reachable_when_affected_symbol_not_reached() -> None:
+    # The reached symbol is a different, benign function in the same package.
+    index = SymbolReachIndex.from_reaches([_reach("jinja2", "jinja2", "escape")])
+    signal = classify_reachability(package="jinja2", advisory=_osv_with_symbols(["SandboxedEnvironment"]), index=index)
+    assert signal.state == PACKAGE_REACHABLE
+    assert signal.matched_symbols == ()
+
+
+def test_package_reachable_when_advisory_has_no_symbols() -> None:
+    index = SymbolReachIndex.from_reaches([_reach("jinja2", "jinja2", "escape")])
+    advisory = {"id": "CVE-2099-3", "affected": [{"package": {"ecosystem": "PyPI", "name": "jinja2"}}]}
+    signal = classify_reachability(package="jinja2", advisory=advisory, index=index)
+    assert signal.state == PACKAGE_REACHABLE
+    assert "no symbol data" in signal.reason
+
+
+def test_unreachable_when_package_not_reached() -> None:
+    index = SymbolReachIndex.from_reaches([_reach("requests", "requests", "get")])
+    signal = classify_reachability(package="jinja2", advisory=_osv_with_symbols(["SandboxedEnvironment"]), index=index)
+    assert signal.state == UNREACHABLE
+
+
+def test_graph_reach_fallback_yields_package_reachable() -> None:
+    # No symbol-level reach captured for the package, but the graph layer says
+    # it is in the reachable dependency closure → package_reachable, not
+    # unreachable.
+    empty_index = SymbolReachIndex.from_reaches([])
+    signal = classify_reachability(
+        package="jinja2",
+        advisory=_osv_with_symbols(["SandboxedEnvironment"]),
+        index=empty_index,
+        package_reachable=True,
+    )
+    assert signal.state == PACKAGE_REACHABLE
+
+
+def test_package_name_normalization_matches() -> None:
+    index = SymbolReachIndex.from_reaches([_reach("Jinja2", "jinja2.sandbox", "SandboxedEnvironment")])
+    signal = classify_reachability(package="jinja2", advisory=_osv_with_symbols(["SandboxedEnvironment"]), index=index)
+    assert signal.state == FUNCTION_REACHABLE
+
+
+def test_ecosystem_keys_do_not_cross_match() -> None:
+    npm_reach = DependencySymbolReach(
+        entrypoint="fetch_url",
+        package="lodash",
+        module="lodash",
+        symbol="get",
+        file_path="server.ts",
+        line_number=3,
+        call_path=["fetch_url", "lodash.get"],
+        ecosystem="npm",
+    )
+    index = SymbolReachIndex.from_reaches([npm_reach])
+    signal = classify_reachability(
+        package="lodash",
+        advisory={"id": "CVE-2099-8", "affected": [{"package": {"ecosystem": "npm", "name": "lodash"}}]},
+        index=index,
+        ecosystem="pypi",
+    )
+    assert signal.state == UNREACHABLE
+
+
+def test_npm_function_reachable_when_affected_symbol_is_reached() -> None:
+    npm_reach = DependencySymbolReach(
+        entrypoint="fetch_url",
+        package="axios",
+        module="axios",
+        symbol="get",
+        file_path="server.ts",
+        line_number=3,
+        call_path=["fetch_url", "axios.get"],
+        ecosystem="npm",
+    )
+    index = SymbolReachIndex.from_reaches([npm_reach])
+    advisory = {
+        "id": "CVE-2099-9",
+        "affected": [
+            {
+                "package": {"ecosystem": "npm", "name": "axios"},
+                "ecosystem_specific": {"imports": [{"path": "axios", "symbols": ["get"]}]},
+            }
+        ],
+    }
+    signal = classify_reachability(package="axios", advisory=advisory, index=index, ecosystem="npm")
+    assert signal.state == FUNCTION_REACHABLE
+    assert signal.matched_symbols == ("get",)
+
+
+# ── end-to-end through the real AST call graph ────────────────────────────
+
+
+def test_function_reachable_from_real_ast_analysis(tmp_path: Path) -> None:
+    (tmp_path / "agent.py").write_text("import requests\n\n@tool\ndef fetch(url):\n    return requests.get(url)\n")
+    result = analyze_project(tmp_path)
+    index = SymbolReachIndex.from_ast_result(result)
+
+    # Advisory flags requests.get — which the entrypoint reaches.
+    advisory = {
+        "id": "CVE-2099-9999",
+        "affected": [
+            {
+                "package": {"ecosystem": "PyPI", "name": "requests"},
+                "ecosystem_specific": {"imports": [{"path": "requests", "symbols": ["get"]}]},
+            }
+        ],
+    }
+    signal = classify_reachability(package="requests", advisory=advisory, index=index)
+    assert signal.state == FUNCTION_REACHABLE
+    assert signal.matched_symbols == ("get",)
+
+    # A different symbol of the same reached package is not function-reachable.
+    other = {
+        "id": "CVE-2099-0000",
+        "affected": [
+            {
+                "package": {"ecosystem": "PyPI", "name": "requests"},
+                "ecosystem_specific": {"imports": [{"path": "requests", "symbols": ["post"]}]},
+            }
+        ],
+    }
+    assert classify_reachability(package="requests", advisory=other, index=index).state == PACKAGE_REACHABLE
+
+
+# ── Go module ⇄ import-path join ──────────────────────────────────────────
+#
+# The Go AST records ``reach.package`` as the full *import path*
+# (``github.com/aws/aws-sdk-go/service/s3/s3crypto``) while an SCA finding —
+# and the OSV advisory ``affected[].package.name`` — is the *module*
+# (``github.com/aws/aws-sdk-go``). The two must join or Go symbol reach, the
+# richest advisory-symbol source, is inert.
+
+
+def _go_reach(import_path: str, symbol: str) -> DependencySymbolReach:
+    return DependencySymbolReach(
+        entrypoint="decrypt",
+        package=import_path,
+        module=import_path,
+        symbol=symbol,
+        file_path="main.go",
+        line_number=9,
+        call_path=["decrypt", f"{import_path}.{symbol}"],
+        ecosystem="go",
+    )
+
+
+def _go_osv(import_path: str, symbols: list[str], module: str = "github.com/aws/aws-sdk-go") -> dict:
+    return {
+        "id": "GO-2022-0646",
+        "affected": [
+            {
+                "package": {"ecosystem": "Go", "name": module},
+                "ecosystem_specific": {"imports": [{"path": import_path, "symbols": symbols}]},
+            }
+        ],
+    }
+
+
+def test_go_module_finding_reaches_subpackage_import_symbol() -> None:
+    # Finding is the module; the reached import path is a sub-package of it.
+    index = SymbolReachIndex.from_reaches([_go_reach("github.com/aws/aws-sdk-go/service/s3/s3crypto", "NewDecryptionClient")])
+    signal = classify_reachability(
+        package="github.com/aws/aws-sdk-go",
+        advisory=_go_osv("github.com/aws/aws-sdk-go/service/s3/s3crypto", ["NewDecryptionClient", "NewEncryptionClient"]),
+        index=index,
+        ecosystem="go",
+    )
+    assert signal.state == FUNCTION_REACHABLE
+    assert signal.matched_symbols == ("NewDecryptionClient",)
+    assert signal.call_path  # closest sub-package call path is surfaced
+
+
+def test_go_module_package_reachable_when_affected_symbol_not_called() -> None:
+    # A benign symbol of a sub-package is reached; the advisory flags another.
+    index = SymbolReachIndex.from_reaches([_go_reach("github.com/aws/aws-sdk-go/service/s3", "ListBuckets")])
+    signal = classify_reachability(
+        package="github.com/aws/aws-sdk-go",
+        advisory=_go_osv("github.com/aws/aws-sdk-go/service/s3/s3crypto", ["NewDecryptionClient"]),
+        index=index,
+        ecosystem="go",
+    )
+    assert signal.state == PACKAGE_REACHABLE
+    assert signal.matched_symbols == ()
+
+
+def test_go_module_prefix_respects_module_boundary() -> None:
+    # A different module that merely shares a string prefix must not match:
+    # ``…/aws-sdk-goodies`` is not a sub-package of ``…/aws-sdk-go``.
+    index = SymbolReachIndex.from_reaches([_go_reach("github.com/aws/aws-sdk-goodies/crypto", "NewDecryptionClient")])
+    signal = classify_reachability(
+        package="github.com/aws/aws-sdk-go",
+        advisory=_go_osv("github.com/aws/aws-sdk-go/service/s3/s3crypto", ["NewDecryptionClient"]),
+        index=index,
+        ecosystem="go",
+    )
+    assert signal.state == UNREACHABLE
+
+
+def test_go_function_reachable_from_real_ast_analysis(tmp_path: Path) -> None:
+    (tmp_path / "main.go").write_text(
+        "package main\n\n"
+        "import (\n"
+        '\t"github.com/aws/aws-sdk-go/service/s3/s3crypto"\n'
+        '\t"github.com/mark3labs/mcp-go/server"\n'
+        ")\n\n"
+        "func handleTool(args map[string]any) (any, error) {\n"
+        "\tclient := s3crypto.NewDecryptionClient(nil)\n"
+        "\treturn client, nil\n"
+        "}\n\n"
+        "func main() {\n"
+        '\ts := server.NewMCPServer("demo", "1.0.0")\n'
+        '\ts.AddTool("decrypt", handleTool)\n'
+        "}\n"
+    )
+    result = analyze_project(tmp_path)
+    index = SymbolReachIndex.from_ast_result(result)
+    signal = classify_reachability(
+        package="github.com/aws/aws-sdk-go",
+        advisory=_go_osv("github.com/aws/aws-sdk-go/service/s3/s3crypto", ["NewDecryptionClient"]),
+        index=index,
+        ecosystem="go",
+    )
+    assert signal.state == FUNCTION_REACHABLE
+    assert signal.matched_symbols == ("NewDecryptionClient",)
+
+
+def test_go_cross_subpackage_symbol_collision_is_not_function_reachable() -> None:
+    # Regression: an affected symbol lives in ``service/s3/s3crypto`` but the
+    # project only reaches an identically-named symbol in an UNRELATED
+    # sub-package (``service/dynamodb``). Common Go names (New/Client/Do/Get)
+    # collide across a big module, so a whole-module symbol union over-claims
+    # ``function_reachable``. The advisory's own sub-package must be honoured.
+    index = SymbolReachIndex.from_reaches([_go_reach("github.com/aws/aws-sdk-go/service/dynamodb", "Client.Do")])
+    signal = classify_reachability(
+        package="github.com/aws/aws-sdk-go",
+        advisory=_go_osv("github.com/aws/aws-sdk-go/service/s3/s3crypto", ["Client.Do"]),
+        index=index,
+        ecosystem="go",
+    )
+    assert signal.state == PACKAGE_REACHABLE
+    assert signal.matched_symbols == ()
+
+
+def test_go_cross_subpackage_collision_via_model_by_path() -> None:
+    # Same collision, but exercised the way the real pipeline sees it: the
+    # advisory arrives as a ``Vulnerability`` model whose sub-package grouping
+    # is carried on ``affected_symbols_by_path`` (populated at scan time).
+    index = SymbolReachIndex.from_reaches([_go_reach("github.com/aws/aws-sdk-go/service/dynamodb", "Client.Do")])
+    vuln = Vulnerability(
+        id="GO-2022-0646",
+        summary="x",
+        severity=Severity.HIGH,
+        affected_symbols=["Client.Do"],
+        affected_symbols_by_path={"github.com/aws/aws-sdk-go/service/s3/s3crypto": ["Client.Do"]},
+    )
+    signal = classify_reachability(
+        package="github.com/aws/aws-sdk-go",
+        advisory=vuln,
+        index=index,
+        ecosystem="go",
+    )
+    assert signal.state == PACKAGE_REACHABLE
+
+
+def test_advisory_affected_symbols_by_path_groups_go_imports() -> None:
+    by_path = advisory_affected_symbols_by_path(_go_osv("github.com/aws/aws-sdk-go/service/s3/s3crypto", ["NewDecryptionClient"]))
+    assert by_path == {"github.com/aws/aws-sdk-go/service/s3/s3crypto": ["NewDecryptionClient"]}
+
+
+def test_wiring_stamps_go_row_with_realistic_subpackage_import() -> None:
+    br = _python_br(["NewDecryptionClient"], pkg_name="github.com/aws/aws-sdk-go")
+    br.package.ecosystem = "go"
+    go_reach = _go_reach("github.com/aws/aws-sdk-go/service/s3/s3crypto", "NewDecryptionClient")
+    stamped = apply_symbol_reachability_to_blast_radii([br], ASTAnalysisResult(dependency_symbol_reach=[go_reach]))
+    assert stamped == 1
+    assert br.symbol_reachability == FUNCTION_REACHABLE
+    assert br.reachable_affected_symbols == ["NewDecryptionClient"]
+
+
+# ── thin wiring hook ──────────────────────────────────────────────────────
+
+
+def _python_br(symbols: list[str], pkg_name: str = "requests") -> BlastRadius:
+    vuln = Vulnerability(id="CVE-2099-7", summary="x", severity=Severity.HIGH, affected_symbols=symbols)
+    pkg = Package(name=pkg_name, version="2.0.0", ecosystem="pypi")
+    return BlastRadius(
+        vulnerability=vuln,
+        package=pkg,
+        affected_servers=[],
+        affected_agents=[],
+        exposed_credentials=[],
+        exposed_tools=[],
+    )
+
+
+def _ast_result_with_get() -> ASTAnalysisResult:
+    return ASTAnalysisResult(dependency_symbol_reach=[_reach("requests", "requests", "get")])
+
+
+def test_wiring_stamps_function_reachable_on_python_row() -> None:
+    br = _python_br(["get"])
+    stamped = apply_symbol_reachability_to_blast_radii([br], _ast_result_with_get())
+    assert stamped == 1
+    assert br.symbol_reachability == FUNCTION_REACHABLE
+    assert br.reachable_affected_symbols == ["get"]
+
+
+def test_wiring_stamps_function_reachable_from_built_vulnerability_model() -> None:
+    from agent_bom.scanners import build_vulnerabilities
+
+    pkg = Package(name="axios", version="1.6.0", ecosystem="npm")
+    vulns = build_vulnerabilities(
+        [
+            {
+                "id": "GHSA-xxxx-yyyy-zzzz",
+                "aliases": ["CVE-2099-1234"],
+                "summary": "axios SSRF",
+                "database_specific": {"vulnerable_functions": ["get"]},
+            }
+        ],
+        pkg,
+    )
+    assert vulns[0].affected_symbols
+    br = BlastRadius(
+        vulnerability=vulns[0],
+        package=pkg,
+        affected_servers=[],
+        affected_agents=[],
+        exposed_credentials=[],
+        exposed_tools=[],
+    )
+    npm_reach = DependencySymbolReach(
+        entrypoint="fetch_url",
+        package="axios",
+        module="axios",
+        symbol="get",
+        file_path="server.ts",
+        line_number=3,
+        call_path=["fetch_url", "axios.get"],
+        ecosystem="npm",
+    )
+    stamped = apply_symbol_reachability_to_blast_radii([br], ASTAnalysisResult(dependency_symbol_reach=[npm_reach]))
+    assert stamped == 1
+    assert br.symbol_reachability == FUNCTION_REACHABLE
+
+
+def test_wiring_stamps_unreachable_when_symbol_absent() -> None:
+    br = _python_br(["get"], pkg_name="leftpad")
+    stamped = apply_symbol_reachability_to_blast_radii([br], _ast_result_with_get())
+    assert stamped == 1
+    assert br.symbol_reachability == UNREACHABLE
+
+
+def test_wiring_skips_unsupported_ecosystem_rows() -> None:
+    br = _python_br(["get"])
+    br.package.ecosystem = "hex"
+    stamped = apply_symbol_reachability_to_blast_radii([br], _ast_result_with_get())
+    assert stamped == 0
+    assert br.symbol_reachability is None
+
+
+def test_wiring_stamps_maven_row() -> None:
+    br = _python_br(["newCall"], pkg_name="com.squareup.okhttp3:okhttp")
+    br.package.ecosystem = "maven"
+    maven_reach = DependencySymbolReach(
+        entrypoint="fetch_url",
+        package="com.squareup.okhttp3:okhttp",
+        module="com.squareup.okhttp3:okhttp",
+        symbol="newCall",
+        file_path="Server.java",
+        line_number=8,
+        call_path=["fetch_url", "fetchUrl", "com.squareup.okhttp3:okhttp.newCall"],
+        ecosystem="maven",
+    )
+    stamped = apply_symbol_reachability_to_blast_radii([br], ASTAnalysisResult(dependency_symbol_reach=[maven_reach]))
+    assert stamped == 1
+    assert br.symbol_reachability == FUNCTION_REACHABLE
+    assert br.reachable_affected_symbols == ["newCall"]
+
+
+def test_wiring_stamps_nuget_row() -> None:
+    br = _python_br(["ExecuteAsync"], pkg_name="RestSharp")
+    br.package.ecosystem = "nuget"
+    nuget_reach = DependencySymbolReach(
+        entrypoint="fetch_url",
+        package="RestSharp",
+        module="RestSharp",
+        symbol="ExecuteAsync",
+        file_path="Server.cs",
+        line_number=10,
+        call_path=["fetch_url", "FetchUrl", "RestSharp.ExecuteAsync"],
+        ecosystem="nuget",
+    )
+    stamped = apply_symbol_reachability_to_blast_radii([br], ASTAnalysisResult(dependency_symbol_reach=[nuget_reach]))
+    assert stamped == 1
+    assert br.symbol_reachability == FUNCTION_REACHABLE
+    assert br.reachable_affected_symbols == ["ExecuteAsync"]
+
+
+def test_wiring_stamps_cargo_row() -> None:
+    br = _python_br(["get"], pkg_name="reqwest")
+    br.package.ecosystem = "cargo"
+    cargo_reach = DependencySymbolReach(
+        entrypoint="fetch_url",
+        package="reqwest",
+        module="reqwest",
+        symbol="get",
+        file_path="server.rs",
+        line_number=6,
+        call_path=["fetch_url", "fetch_url", "reqwest::get"],
+        ecosystem="cargo",
+    )
+    stamped = apply_symbol_reachability_to_blast_radii([br], ASTAnalysisResult(dependency_symbol_reach=[cargo_reach]))
+    assert stamped == 1
+    assert br.symbol_reachability == FUNCTION_REACHABLE
+    assert br.reachable_affected_symbols == ["get"]
+
+
+def test_wiring_stamps_rubygems_row() -> None:
+    br = _python_br(["get"], pkg_name="faraday")
+    br.package.ecosystem = "rubygems"
+    ruby_reach = DependencySymbolReach(
+        entrypoint="fetch_url",
+        package="faraday",
+        module="faraday",
+        symbol="get",
+        file_path="server.rb",
+        line_number=9,
+        call_path=["fetch_url", "fetch_url", "faraday.get"],
+        ecosystem="rubygems",
+    )
+    stamped = apply_symbol_reachability_to_blast_radii([br], ASTAnalysisResult(dependency_symbol_reach=[ruby_reach]))
+    assert stamped == 1
+    assert br.symbol_reachability == FUNCTION_REACHABLE
+    assert br.reachable_affected_symbols == ["get"]
+
+
+def test_wiring_stamps_composer_row() -> None:
+    br = _python_br(["get"], pkg_name="guzzlehttp/guzzle")
+    br.package.ecosystem = "composer"
+    composer_reach = DependencySymbolReach(
+        entrypoint="fetch_url",
+        package="guzzlehttp/guzzle",
+        module="guzzlehttp/guzzle",
+        symbol="get",
+        file_path="Server.php",
+        line_number=12,
+        call_path=["fetch_url", "fetchUrl", "guzzlehttp/guzzle.get"],
+        ecosystem="composer",
+    )
+    stamped = apply_symbol_reachability_to_blast_radii(
+        [br],
+        ASTAnalysisResult(dependency_symbol_reach=[composer_reach]),
+    )
+    assert stamped == 1
+    assert br.symbol_reachability == FUNCTION_REACHABLE
+    assert br.reachable_affected_symbols == ["get"]
+
+
+def test_wiring_stamps_swift_row() -> None:
+    br = _python_br(["request"], pkg_name="alamofire")
+    br.package.ecosystem = "swift"
+    swift_reach = DependencySymbolReach(
+        entrypoint="fetch_url",
+        package="alamofire",
+        module="alamofire",
+        symbol="request",
+        file_path="Server.swift",
+        line_number=8,
+        call_path=["fetch_url", "fetchUrl", "alamofire.request"],
+        ecosystem="swift",
+    )
+    stamped = apply_symbol_reachability_to_blast_radii(
+        [br],
+        ASTAnalysisResult(dependency_symbol_reach=[swift_reach]),
+    )
+    assert stamped == 1
+    assert br.symbol_reachability == FUNCTION_REACHABLE
+    assert br.reachable_affected_symbols == ["request"]
+
+
+def test_wiring_stamps_npm_row() -> None:
+    br = _python_br(["get"], pkg_name="axios")
+    br.package.ecosystem = "npm"
+    npm_reach = DependencySymbolReach(
+        entrypoint="fetch_url",
+        package="axios",
+        module="axios",
+        symbol="get",
+        file_path="server.ts",
+        line_number=3,
+        call_path=["fetch_url", "axios.get"],
+        ecosystem="npm",
+    )
+    stamped = apply_symbol_reachability_to_blast_radii([br], ASTAnalysisResult(dependency_symbol_reach=[npm_reach]))
+    assert stamped == 1
+    assert br.symbol_reachability == FUNCTION_REACHABLE
+    assert br.reachable_affected_symbols == ["get"]
+
+
+def test_wiring_stamps_go_row() -> None:
+    br = _python_br(["Get"], pkg_name="net/http")
+    br.package.ecosystem = "go"
+    go_reach = DependencySymbolReach(
+        entrypoint="fetch_url",
+        package="net/http",
+        module="net/http",
+        symbol="Get",
+        file_path="server.go",
+        line_number=8,
+        call_path=["fetch_url", "fetchURL", "net/http.Get"],
+        ecosystem="go",
+    )
+    stamped = apply_symbol_reachability_to_blast_radii([br], ASTAnalysisResult(dependency_symbol_reach=[go_reach]))
+    assert stamped == 1
+    assert br.symbol_reachability == FUNCTION_REACHABLE
+    assert br.reachable_affected_symbols == ["Get"]
+
+
+def test_wiring_no_op_without_symbol_reach_evidence() -> None:
+    # AST ran but captured no symbol reach → no basis to mark anything
+    # unreachable, so the hook leaves every row untouched.
+    br = _python_br(["get"])
+    stamped = apply_symbol_reachability_to_blast_radii([br], ASTAnalysisResult())
+    assert stamped == 0
+    assert br.symbol_reachability is None
+
+
+def test_wiring_is_best_effort_no_op(monkeypatch) -> None:
+    br = _python_br(["get"])
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("synthetic failure")
+
+    monkeypatch.setattr("agent_bom.reachability_cve.SymbolReachIndex.from_ast_result", explode)
+    assert apply_symbol_reachability_to_blast_radii([br], _ast_result_with_get()) == 0
+    assert br.symbol_reachability is None
+
+
+def test_npm_package_from_module() -> None:
+    assert _npm_package_from_module("axios") == "axios"
+    assert _npm_package_from_module("@scope/pkg/subpath") == "@scope/pkg"
+    assert _npm_package_from_module("./relative") is None
+    assert _npm_package_from_module("node:fs") is None
+
+
+# ---------------------------------------------------------------------------
+# Head-token expansion must be ASYMMETRIC
+#
+# The module docstring promises "we *cannot prove* function reachability, so we
+# never claim it". Expanding the leading dotted component on BOTH sides broke
+# that promise: an advisory naming ``Environment.from_string`` was satisfied by
+# any use of the bare ``Environment`` class. The head token may only be added on
+# the REACHED side (a reached ``Environment.from_string`` does satisfy an
+# advisory naming ``Environment``), never on the advisory side.
+# ---------------------------------------------------------------------------
+
+
+def test_bare_class_token_does_not_satisfy_a_method_level_advisory() -> None:
+    """Constructing ``Environment`` is not proof that ``from_string`` is reached."""
+    index = SymbolReachIndex.from_reaches([_reach("jinja2", "jinja2", "Environment")])
+    signal = classify_reachability(
+        package="jinja2",
+        advisory=_osv_with_symbols(["Environment.from_string"], path="jinja2"),
+        index=index,
+    )
+    assert signal.state == PACKAGE_REACHABLE
+    assert signal.matched_symbols == ()
+    assert "no affected symbol is reached" in signal.reason
+
+
+def test_reached_method_still_satisfies_a_class_level_advisory() -> None:
+    """The other direction must keep working — no new false negatives."""
+    index = SymbolReachIndex.from_reaches([_reach("jinja2", "jinja2", "Environment.from_string")])
+    signal = classify_reachability(
+        package="jinja2",
+        advisory=_osv_with_symbols(["Environment"], path="jinja2"),
+        index=index,
+    )
+    assert signal.state == FUNCTION_REACHABLE
+    assert "Environment" in signal.matched_symbols
+
+
+def test_exact_symbol_match_still_classifies_function_reachable() -> None:
+    index = SymbolReachIndex.from_reaches([_reach("jinja2", "jinja2", "Environment.from_string")])
+    signal = classify_reachability(
+        package="jinja2",
+        advisory=_osv_with_symbols(["Environment.from_string"], path="jinja2"),
+        index=index,
+    )
+    assert signal.state == FUNCTION_REACHABLE
+
+
+def test_sibling_method_does_not_satisfy_a_method_level_advisory() -> None:
+    """Calling ``Environment.get_template`` is not reaching ``from_string``."""
+    index = SymbolReachIndex.from_reaches([_reach("jinja2", "jinja2", "Environment.get_template")])
+    signal = classify_reachability(
+        package="jinja2",
+        advisory=_osv_with_symbols(["Environment.from_string"], path="jinja2"),
+        index=index,
+    )
+    assert signal.state == PACKAGE_REACHABLE
+
+
+def test_dynamic_dispatch_is_never_upgraded_to_function_reachable(tmp_path: Path) -> None:
+    """``getattr(env, name)()`` carries no symbol proof — package level at most."""
+    (tmp_path / "app.py").write_text(
+        "from jinja2 import Environment\n"
+        "\n"
+        "def tool_dynamic(name, meth):\n"
+        '    """A tool."""\n'
+        "    env = Environment()\n"
+        "    return getattr(env, meth)(name)\n"
+    )
+    index = SymbolReachIndex.from_ast_result(analyze_project(tmp_path))
+    signal = classify_reachability(
+        package="jinja2",
+        advisory=_osv_with_symbols(["Environment.from_string"], path="jinja2"),
+        index=index,
+    )
+    assert signal.state != FUNCTION_REACHABLE

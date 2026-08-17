@@ -9,14 +9,17 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
+
+from agent_bom.api.tenancy import require_request_tenant_id
 
 router = APIRouter()
 _logger = logging.getLogger(__name__)
 
 
-@router.get("/v1/assets", tags=["assets"])
+@router.get("/assets", tags=["assets"])
 async def list_assets(
+    request: Request,
     status: str | None = None,
     severity: str | None = None,
     limit: int = 500,
@@ -31,11 +34,10 @@ async def list_assets(
     try:
         from agent_bom.asset_tracker import AssetTracker
 
-        tracker = AssetTracker()
-        assets = tracker.list_assets(status=status, severity=severity, limit=limit)
-        stats = tracker.stats()
-        mttr = tracker.mttr_days()
-        tracker.close()
+        with AssetTracker(tenant_id=require_request_tenant_id(request)) as tracker:
+            assets = tracker.list_assets(status=status, severity=severity, limit=limit)
+            stats = tracker.stats()
+            mttr = tracker.mttr_days()
         return {
             "assets": assets,
             "count": len(assets),
@@ -53,16 +55,15 @@ async def list_assets(
         }
 
 
-@router.get("/v1/assets/stats", tags=["assets"])
-async def get_asset_stats() -> dict:
+@router.get("/assets/stats", tags=["assets"])
+async def get_asset_stats(request: Request) -> dict:
     """Return aggregate asset tracking statistics including MTTR."""
     try:
         from agent_bom.asset_tracker import AssetTracker
 
-        tracker = AssetTracker()
-        stats = tracker.stats()
-        mttr = tracker.mttr_days()
-        tracker.close()
+        with AssetTracker(tenant_id=require_request_tenant_id(request)) as tracker:
+            stats = tracker.stats()
+            mttr = tracker.mttr_days()
         return {"stats": stats, "mttr_days": mttr}
     except Exception:
         _logger.exception("Failed to get asset stats")

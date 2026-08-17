@@ -12,10 +12,14 @@ from agent_bom.security import (
     _is_obfuscated_credential,
     _shannon_entropy,
     create_safe_subprocess_env,
+    require_recognized_launcher,
+    sanitize_command_args,
     sanitize_env_vars,
     sanitize_error,
+    sanitize_log_label,
+    sanitize_path_label,
+    sanitize_url,
     validate_arguments,
-    validate_command,
     validate_environment,
     validate_file_size,
     validate_image_ref,
@@ -26,23 +30,52 @@ from agent_bom.security import (
     validate_url,
 )
 
+
+def test_sanitize_log_label_strips_ansi_and_line_controls():
+    cleaned = sanitize_log_label("srv\x1b[31m-red\x1b[0m\r\nnext\tline")
+    assert cleaned == "srv-red next line"
+    assert "\x1b" not in cleaned
+    assert "\n" not in cleaned
+    assert "\r" not in cleaned
+    assert "\t" not in cleaned
+
+
+def test_sanitize_log_label_bounds_length():
+    assert sanitize_log_label("x" * 20, max_len=7) == "x" * 7
+
+
 # ---------------------------------------------------------------------------
-# validate_command
+# require_recognized_launcher — launch-hygiene check, NOT a sandbox
 # ---------------------------------------------------------------------------
 
 
-def test_validate_command_allowed():
-    validate_command("npx")
-    validate_command("python3")
+def test_require_recognized_launcher_accepts_known_launchers():
+    require_recognized_launcher("npx")
+    require_recognized_launcher("python3")
 
 
-def test_validate_command_rejected():
+def test_require_recognized_launcher_rejects_unknown_binary():
     with pytest.raises(SecurityError):
-        validate_command("rm")
+        require_recognized_launcher("rm")
+
+
+def test_require_recognized_launcher_error_points_at_real_isolation():
+    """The rejection message must not present the launcher list as a sandbox.
+
+    The list is a misconfiguration guard; actual isolation is the container
+    sandbox (``agent_bom.proxy_sandbox``, ``--isolate``). The error text must
+    say so, so operators are never led to believe passing this check confers
+    isolation.
+    """
+    with pytest.raises(SecurityError) as excinfo:
+        require_recognized_launcher("bash")
+    message = str(excinfo.value)
+    assert "not a sandbox" in message
+    assert "--isolate" in message
 
 
 # ---------------------------------------------------------------------------
-# validate_arguments
+# validate_arguments — config-hygiene metacharacter check, not an exec control
 # ---------------------------------------------------------------------------
 
 
@@ -173,6 +206,60 @@ def test_sanitize_env_vars_safe():
     assert result["LANG"] == "en_US.UTF-8"
 
 
+def test_sanitize_command_args_redacts_secret_values_and_urls():
+    github_token = "ghp_" + "A" * 36
+    result = sanitize_command_args(
+        [
+            "server",
+            "--api-key",
+            "sk-live-secret",
+            github_token,
+            "session=" + github_token,
+            "callback=https://user:pass@example.com/path?token=secret",
+        ]
+    )
+
+    assert result == [
+        "server",
+        "--api-key",
+        "<redacted>",
+        "<redacted>",
+        "session=<redacted>",
+        "callback=https://example.com/path",
+    ]
+
+
+def test_sanitize_url_strips_credentials_query_and_fragment():
+    assert sanitize_url("https://user:pass@example.com/path?token=secret#frag") == "https://example.com/path"
+
+
+def test_redact_secret_url_drops_path_and_query():
+    from agent_bom.security import redact_secret_url
+
+    secret = "https://hooks.slack.com/services/T000/B111/XXXXSECRETXXXX?x=1#frag"
+    out = redact_secret_url(secret)
+    # The secret path/query/fragment must be gone; host retained; fingerprint appended.
+    assert "XXXXSECRETXXXX" not in out
+    assert "services" not in out
+    assert "x=1" not in out
+    assert out.startswith("https://hooks.slack.com/")
+    assert "#" in out
+    # Stable fingerprint for correlation.
+    assert redact_secret_url(secret) == out
+
+
+def test_redact_secret_url_handles_empty_and_malformed():
+    from agent_bom.security import redact_secret_url
+
+    assert redact_secret_url("") == "<none>"
+    assert redact_secret_url(None) == "<none>"
+    assert redact_secret_url("not-a-url").startswith("<redacted-url>#")
+
+
+def test_sanitize_path_label_is_idempotent_for_existing_safe_labels():
+    assert sanitize_path_label("<path:mcp.json>") == "<path:mcp.json>"
+
+
 # ---------------------------------------------------------------------------
 # validate_file_size
 # ---------------------------------------------------------------------------
@@ -230,6 +317,19 @@ def test_validate_url_http():
         validate_url("http://example.com/api")
 
 
+def test_validate_url_private_egress_override_allows_http_localhost(monkeypatch):
+    monkeypatch.setenv("AGENT_BOM_ALLOW_PRIVATE_EGRESS_URLS", "true")
+
+    validate_url("http://localhost/api")
+
+
+def test_validate_url_private_egress_override_rejects_public_http(monkeypatch):
+    monkeypatch.setenv("AGENT_BOM_ALLOW_PRIVATE_EGRESS_URLS", "true")
+
+    with pytest.raises(SecurityError, match="HTTP URLs are only allowed"):
+        validate_url("http://93.184.216.34/api")
+
+
 def test_validate_url_metadata():
     with pytest.raises(SecurityError, match="metadata"):
         validate_url("https://169.254.169.254/latest/meta-data/")
@@ -238,6 +338,11 @@ def test_validate_url_metadata():
 def test_validate_url_private_ip():
     with pytest.raises(SecurityError, match="private"):
         validate_url("https://10.0.0.1/api")
+
+
+def test_validate_url_rejects_ipv6_link_local():
+    with pytest.raises(SecurityError, match="private"):
+        validate_url("https://[fe80::1]/api")
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +428,102 @@ def test_sanitize_error_string():
     assert "error message" in result
 
 
+def test_sanitize_sensitive_payload_redacts_nested_runtime_values():
+    from agent_bom.security import sanitize_sensitive_payload
+
+    github_token = "ghp_" + "abcdefghijklmnopqrstuvwxyz" + "123456"
+    api_key = "sk-" + "live-" + "abcdefghijklmnopqrstuvwxyz"
+    slack_token = "xoxb-" + "1234567890-" + "abcdefghijklmnop"
+    payload = {
+        "url": f"https://alice:secret@example.com/callback?token={github_token}",
+        "body": {"api_key": api_key},
+        "path": "/Users/alice/prod-secrets/openai-key.env",
+        "items": [slack_token],
+    }
+
+    result = sanitize_sensitive_payload(payload)
+    encoded = str(result)
+    assert "alice:secret" not in encoded
+    assert "token=" not in encoded
+    assert "sk-live" not in encoded
+    assert "xoxb-" not in encoded
+    assert "/Users/alice" not in encoded
+    assert "prod-secrets" not in encoded
+    assert "<path:" in encoded
+
+
+def test_sanitize_sensitive_payload_preserves_safe_shape():
+    from agent_bom.security import sanitize_sensitive_payload
+
+    result = sanitize_sensitive_payload({"package": "express", "version": "4.18.2", "count": 2})
+
+    assert result == {"package": "express", "version": "4.18.2", "count": 2}
+
+
+def test_sanitize_sensitive_payload_preserves_structured_graph_edge_ids():
+    from agent_bom.security import sanitize_sensitive_payload
+
+    edge_id = "pkg:pypi:pyyaml@5.3->vulnerable_to->finding:CVE-2020-14343"
+    result = sanitize_sensitive_payload({"id": edge_id, "source": "pkg:pypi:pyyaml@5.3", "target": "finding:CVE-2020-14343"})
+
+    assert result == {"id": edge_id, "source": "pkg:pypi:pyyaml@5.3", "target": "finding:CVE-2020-14343"}
+
+
+def test_sanitize_sensitive_payload_still_redacts_credentials_in_id_fields():
+    from agent_bom.security import sanitize_sensitive_payload
+
+    synthetic_credential = "sk_" + "live_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+    result = sanitize_sensitive_payload({"id": synthetic_credential})
+
+    assert result == {"id": "***REDACTED***"}
+
+
+def test_sanitize_sensitive_payload_redacts_unknown_secret_inside_structured_edge_id():
+    from agent_bom.security import sanitize_sensitive_payload
+
+    opaque_value = "q7V9mK2xR8pL4nT6wY1cF3hJ5sD0aB2eG8uN9zQ6XkI="
+    edge_id = f"asset:{opaque_value}->can_access->finding:CVE-2020-14343"
+
+    assert sanitize_sensitive_payload({"id": edge_id}) == {"id": "***REDACTED***"}
+
+
+def test_sanitize_sensitive_payload_preserves_deep_inventory_metadata():
+    from agent_bom.security import sanitize_sensitive_payload
+
+    payload = {
+        "inventory_snapshot": {
+            "agents": [
+                {
+                    "mcp_servers": [
+                        {
+                            "packages": [
+                                {
+                                    "name": "agent-bom",
+                                    "version": "0.89.2",
+                                    "ecosystem": "pypi",
+                                    "discovery_provenance": {
+                                        "version_provenance": {
+                                            "evidence": [{"package_path": "<path:mcp.json>"}],
+                                        },
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+    }
+
+    result = sanitize_sensitive_payload(payload)
+
+    package = result["inventory_snapshot"]["agents"][0]["mcp_servers"][0]["packages"][0]
+    assert package["name"] == "agent-bom"
+    assert package["version"] == "0.89.2"
+    assert package["ecosystem"] == "pypi"
+    assert package["discovery_provenance"]["version_provenance"]["evidence"] == [{"package_path": "<path:mcp.json>"}]
+
+
 # ---------------------------------------------------------------------------
 # create_safe_subprocess_env
 # ---------------------------------------------------------------------------
@@ -333,3 +534,109 @@ def test_create_safe_subprocess_env():
     assert "LD_PRELOAD" not in env
     assert "DYLD_INSERT_LIBRARIES" not in env
     assert "PATH" in env
+
+
+# ---------------------------------------------------------------------------
+# mask_email — email is sensitive PII
+# ---------------------------------------------------------------------------
+
+
+def test_mask_email_basic():
+    from agent_bom.security import mask_email
+
+    assert mask_email("alice@example.com") == "a***@e***.com"
+
+
+def test_mask_email_within_text():
+    from agent_bom.security import mask_email
+
+    masked = mask_email("contact bob@acme.io for the report")
+    assert "bob@acme.io" not in masked
+    assert "b***@a***.io" in masked
+
+
+def test_mask_email_multiple_in_one_string():
+    from agent_bom.security import mask_email
+
+    masked = mask_email("a@x.com, b@y.org")
+    assert "a@x.com" not in masked
+    assert "b@y.org" not in masked
+
+
+def test_mask_email_leaves_non_email_untouched():
+    from agent_bom.security import mask_email
+
+    # Scoped npm package names contain "@" but are not emails.
+    assert mask_email("@scope/pkg") == "@scope/pkg"
+    assert mask_email("v4.18.2") == "v4.18.2"
+    assert mask_email("not an email @ all") == "not an email @ all"
+
+
+def test_sanitize_text_masks_email():
+    from agent_bom.security import sanitize_text
+
+    out = sanitize_text("notify owner alice@corp.com on failure")
+    assert "alice@corp.com" not in out
+    assert "a***@c***.com" in out
+
+
+# `-----BEGIN OPENSSH PRIVATE KEY-----` is what `ssh-keygen` has emitted by
+# default since OpenSSH 7.8, so it is the *common* case, not an exotic one. The
+# value pattern list covered only the PKCS#1/SEC1 labels, so a key held under a
+# variable name the key-based check does not recognise reached the report
+# verbatim. Redaction is driven by the value's shape here, so this uses a
+# deliberately unremarkable variable name.
+@pytest.mark.parametrize(
+    "label",
+    [
+        "RSA PRIVATE KEY",
+        "EC PRIVATE KEY",
+        "DSA PRIVATE KEY",
+        "PRIVATE KEY",
+        "OPENSSH PRIVATE KEY",
+        "ENCRYPTED PRIVATE KEY",
+        "PGP PRIVATE KEY BLOCK",
+    ],
+)
+def test_sanitize_env_vars_redacts_every_private_key_label(label: str) -> None:
+    from agent_bom.security import sanitize_env_vars
+
+    body = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW"
+    pem = f"-----BEGIN {label}-----\n{body}\n-----END {label}-----"
+
+    redacted = sanitize_env_vars({"DEPLOY_MATERIAL": pem})["DEPLOY_MATERIAL"]
+
+    assert body not in redacted, f"{label} key body survived redaction"
+    assert redacted != pem
+
+
+# The precision half of the pair above: widening the label match must not start
+# eating public material. A redactor that masks certificates is one people turn
+# off, and the value is not a secret to begin with.
+@pytest.mark.parametrize(
+    "label",
+    ["CERTIFICATE", "CERTIFICATE REQUEST", "PUBLIC KEY", "RSA PUBLIC KEY"],
+)
+def test_sanitize_env_vars_leaves_public_pem_material_intact(label: str) -> None:
+    from agent_bom.security import sanitize_env_vars
+
+    body = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1234567890"
+    pem = f"-----BEGIN {label}-----\n{body}\n-----END {label}-----"
+
+    assert sanitize_env_vars({"DEPLOY_MATERIAL": pem})["DEPLOY_MATERIAL"] == pem
+
+
+def test_sanitize_sensitive_payload_masks_email_keys():
+    from agent_bom.security import sanitize_sensitive_payload
+
+    result = sanitize_sensitive_payload(
+        {
+            "user_email": "carol@example.com",
+            "email": "dave@example.org",
+            "package": "express",
+        }
+    )
+    assert "carol@example.com" not in str(result)
+    assert "dave@example.org" not in str(result)
+    assert result["package"] == "express"
+    assert result["user_email"] == "c***@e***.com"

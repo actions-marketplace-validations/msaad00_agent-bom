@@ -1,0 +1,404 @@
+"""Standalone ``agent-bom remediate`` command.
+
+Runs the scan pipeline, builds a prioritized remediation plan, and outputs
+it in console, JSON, or Markdown format.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import click
+
+from agent_bom import __version__
+from agent_bom.cli._common import _make_console, _sync_runtime_consoles, logger
+from agent_bom.cli._scan_runner import ScanConfig, run_default_scan
+from agent_bom.remediation_apply import RemediationApplyError, apply_remediation_plan
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_PRIORITY_RANK = {"P1": 1, "P2": 2, "P3": 3, "P4": 4}
+
+
+def _compute_blast_radius_score(blast_radii, package_name: str) -> float:
+    """Compute max risk_score across blast radii matching the given package."""
+    scores = [br.risk_score for br in blast_radii if br.package.name == package_name]
+    return max(scores) if scores else 0.0
+
+
+def _group_by_server(plan_items: list[dict], blast_radii) -> dict[str, list[dict]]:
+    """Re-group plan items by MCP server name instead of package."""
+    server_groups: dict[str, list[dict]] = {}
+    for item in plan_items:
+        # Find which servers are affected via blast radii
+        servers_for_pkg: set[str] = set()
+        for br in blast_radii:
+            if br.package.name == item["package"]:
+                for srv in br.affected_servers:
+                    servers_for_pkg.add(srv.name)
+        if not servers_for_pkg:
+            servers_for_pkg = {"unknown"}
+        for srv_name in sorted(servers_for_pkg):
+            server_groups.setdefault(srv_name, []).append(item)
+    return server_groups
+
+
+def _render_markdown(plan_items: list[dict], blast_radii) -> str:
+    """Render a PR-ready Markdown remediation report."""
+    lines: list[str] = []
+    lines.append("# Remediation Plan")
+    lines.append("")
+    lines.append(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    lines.append(f"agent-bom {__version__}")
+    lines.append("")
+
+    fixable = [p for p in plan_items if p.get("fix")]
+    unfixable = [p for p in plan_items if not p.get("fix")]
+
+    if fixable:
+        lines.append(f"## Fixable ({len(fixable)} upgrade(s))")
+        lines.append("")
+        lines.append("| # | Priority | Package | Current | Fix | Vulns | Blast Radius Score |")
+        lines.append("|---|----------|---------|---------|-----|-------|--------------------|")
+        for i, item in enumerate(fixable, 1):
+            br_score = item.get("blast_radius_score", 0.0)
+            n_vulns = len(item.get("vulns", []))
+            lines.append(
+                f"| {i} | {item['priority']} | {item['package']} | {item['current']} | {item['fix']} | {n_vulns} | {br_score:.1f} |"
+            )
+        lines.append("")
+
+        for i, item in enumerate(fixable, 1):
+            lines.append(f"### {i}. {item['package']} {item['current']} -> {item['fix']}")
+            lines.append("")
+            lines.append(f"- **Priority**: {item['priority']}")
+            if item.get("ranking_rationale"):
+                lines.append(f"- **Why first**: {item['ranking_rationale']}")
+            lines.append(f"- **Ecosystem**: {item['ecosystem']}")
+            lines.append(f"- **Vulnerabilities**: {', '.join(item['vulns'][:5])}")
+            if item.get("agents"):
+                lines.append(f"- **Affected agents**: {', '.join(item['agents'][:5])}")
+            if item.get("command"):
+                lines.append(f"- **Fix command**: `{item['command']}`")
+            if item.get("verify_command"):
+                lines.append(f"- **Verify command**: `{item['verify_command']}`")
+            if item.get("references"):
+                lines.append("- **Advisories**:")
+                for ref in item["references"][:5]:
+                    lines.append(f"  - {ref}")
+            lines.append("")
+
+    if unfixable:
+        lines.append(f"## No Fix Available ({len(unfixable)} package(s))")
+        lines.append("")
+        for item in unfixable:
+            lines.append(f"- **{item['package']}@{item['current']}** -- {', '.join(item['vulns'][:3])}")
+            if item.get("agents"):
+                lines.append(f"  - Agents: {', '.join(item['agents'][:3])}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _plan_to_json(plan_items: list[dict]) -> dict:
+    """Build JSON-serialisable output following the json_fmt.py pattern."""
+    from agent_bom.models import Severity
+
+    items_out = []
+    for item in plan_items:
+        sev = item.get("max_severity", Severity.NONE)
+        sev_str = sev.name.lower() if hasattr(sev, "name") else str(sev)
+        items_out.append(
+            {
+                "package": item["package"],
+                "ecosystem": item["ecosystem"],
+                "current_version": item["current"],
+                "fixed_version": item.get("fix"),
+                "priority": item["priority"],
+                "ranking_score": item.get("ranking_score", item.get("impact", 0)),
+                "ranking_reasons": item.get("ranking_reasons", []),
+                "ranking_rationale": item.get("ranking_rationale", ""),
+                "action": item.get("action", ""),
+                "command": item.get("command"),
+                "verify_command": item.get("verify_command"),
+                "max_severity": sev_str,
+                "blast_radius_score": item.get("blast_radius_score", 0.0),
+                "impact": item.get("impact", 0),
+                "vulnerabilities": item.get("vulns", []),
+                "affected_agents": item.get("agents", []),
+                "exposed_credentials": item.get("creds", []),
+                "exposed_tools": item.get("tools", []),
+                "references": item.get("references", []),
+                "has_kev": item.get("has_kev", False),
+                "ai_risk": item.get("ai_risk", False),
+                "compliance_tags": {
+                    "owasp": item.get("owasp", []),
+                    "atlas": item.get("atlas", []),
+                    "nist": item.get("nist", []),
+                    "owasp_mcp": item.get("owasp_mcp", []),
+                    "owasp_agentic": item.get("owasp_agentic", []),
+                    "eu_ai_act": item.get("eu_ai_act", []),
+                    "nist_csf": item.get("nist_csf", []),
+                    "iso_27001": item.get("iso_27001", []),
+                    "soc2": item.get("soc2", []),
+                    "cis": item.get("cis", []),
+                },
+            }
+        )
+
+    return {
+        "version": __version__,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "remediation_plan": items_out,
+        "summary": {
+            "total_items": len(items_out),
+            "fixable": sum(1 for i in items_out if i["fixed_version"]),
+            "unfixable": sum(1 for i in items_out if not i["fixed_version"]),
+            "p1_count": sum(1 for i in items_out if i["priority"] == "P1"),
+            "p2_count": sum(1 for i in items_out if i["priority"] == "P2"),
+            "p3_count": sum(1 for i in items_out if i["priority"] == "P3"),
+            "p4_count": sum(1 for i in items_out if i["priority"] == "P4"),
+        },
+    }
+
+
+def _print_apply_outcome(output_console, outcome) -> None:
+    """Render guarded apply results for console output."""
+    output_console.print()
+    output_console.print("[bold green]Remediation apply result[/bold green]")
+    if outcome.apply_result.applied:
+        for fix in outcome.apply_result.applied:
+            output_console.print(f"  [green]applied[/green] {fix.package} {fix.current_version} -> {fix.fixed_version}")
+    if outcome.apply_result.skipped:
+        for fix in outcome.apply_result.skipped:
+            output_console.print(f"  [yellow]skipped[/yellow] {fix.package} ({fix.ecosystem})")
+    if outcome.changed_files:
+        output_console.print("  changed files: " + ", ".join(outcome.changed_files))
+    if outcome.validation_commands:
+        commands = [" ".join(cmd) for cmd in outcome.validation_commands]
+        output_console.print("  validation: " + "; ".join(commands))
+    if outcome.branch_name:
+        output_console.print(f"  branch: {outcome.branch_name}")
+    if outcome.pr_url:
+        output_console.print(f"  draft PR: {outcome.pr_url}")
+    if outcome.audit_log_path:
+        output_console.print(f"  audit: {outcome.audit_log_path}")
+    output_console.print()
+
+
+# ---------------------------------------------------------------------------
+# Click command
+# ---------------------------------------------------------------------------
+
+
+@click.command("remediate")
+@click.option("--demo", is_flag=True, help="Scan a curated demo environment with known-vulnerable packages.")
+@click.option("--offline", is_flag=True, help="Use local vulnerability DB only (no network calls).")
+@click.option("-p", "--project", type=click.Path(exists=True), default=None, help="Project directory to scan.")
+@click.option("--server-group", is_flag=True, default=False, help="Group output by MCP server instead of by package.")
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["console", "json", "markdown"], case_sensitive=False),
+    default="console",
+    help="Output format.",
+)
+@click.option("-o", "--output", "output_path", type=click.Path(), default=None, help="Write output to a file.")
+@click.option(
+    "--priority",
+    "min_priority",
+    type=click.Choice(["P1", "P2", "P3", "P4"], case_sensitive=False),
+    default=None,
+    help="Filter to show only items at this priority or higher.",
+)
+@click.option("--fixable-only", is_flag=True, default=False, help="Hide items without a fix version.")
+@click.option("--quiet", "-q", is_flag=True, default=False, help="Suppress scan chatter and file-write status messages.")
+@click.option("--apply", "apply_changes", is_flag=True, default=False, help="Apply fixable package dependency remediations.")
+@click.option("--open-pr", is_flag=True, default=False, help="Create a draft GitHub PR after applying fixes.")
+@click.option("-y", "--yes", is_flag=True, default=False, help="Confirm remediation writes without prompting.")
+@click.option("--no-backup", is_flag=True, default=False, help="Do not create .agent-bom-backup files for local applies.")
+@click.option("--skip-verify", is_flag=True, default=False, help="Skip dependency file validation after applying fixes.")
+@click.option("--branch-name", default=None, help="Branch name to use with --open-pr.")
+@click.option("--pr-title", default=None, help="Draft PR title to use with --open-pr.")
+@click.option("--audit-log", default=None, type=click.Path(), help="Write remediation apply audit JSONL to this path.")
+def remediate_cmd(
+    demo: bool,
+    offline: bool,
+    project: Optional[str],
+    server_group: bool,
+    output_format: str,
+    output_path: Optional[str],
+    min_priority: Optional[str],
+    fixable_only: bool,
+    quiet: bool,
+    apply_changes: bool,
+    open_pr: bool,
+    yes: bool,
+    no_backup: bool,
+    skip_verify: bool,
+    branch_name: Optional[str],
+    pr_title: Optional[str],
+    audit_log: Optional[str],
+) -> None:
+    """Generate a prioritized remediation plan for discovered vulnerabilities.
+
+    \b
+    Runs a scan, then builds a remediation plan ordered by priority and blast-radius impact.
+    Each item includes fix commands, verification steps, and compliance tags.
+
+    \b
+    Examples:
+      agent-bom remediate --demo                      demo remediation plan
+      agent-bom remediate -p . -f json -o plan.json   JSON plan for current project
+      agent-bom remediate --fixable-only --priority P2 show P1+P2 fixable items only
+      agent-bom remediate --server-group               group by MCP server
+      agent-bom remediate -p . --apply                 apply package fixes after review
+      agent-bom remediate -p . --apply --open-pr       apply fixes and open a draft PR
+    """
+    import agent_bom.output as output_mod
+
+    runtime_console = _make_console(quiet=quiet or (output_format != "console"), output_format=output_format)
+    output_console = _make_console()
+    _sync_runtime_consoles(runtime_console)
+    output_mod.console = output_console
+
+    if open_pr and not apply_changes:
+        raise click.ClickException("--open-pr requires --apply")
+
+    # Run the scan pipeline
+    try:
+        result = run_default_scan(
+            ScanConfig(project=project, demo=demo, offline=offline),
+            con=runtime_console,
+        )
+        blast_radii, report = result.blast_radii, result.report
+    except SystemExit:
+        raise
+    except Exception as exc:
+        logger.error("Scan failed: %s", exc)
+        raise SystemExit(1)
+
+    if not blast_radii:
+        if output_format == "json":
+            empty_plan = _plan_to_json([])
+            _out_str = json.dumps(empty_plan, indent=2)
+            if output_path:
+                Path(output_path).write_text(_out_str)
+            else:
+                click.echo(_out_str)
+            return
+        output_console.print("\n[green]No vulnerabilities found — no remediation needed.[/green]\n")
+        return
+
+    # Build the plan
+    plan = output_mod.build_remediation_plan(blast_radii)
+
+    # Enrich with blast_radius_score
+    for item in plan:
+        item["blast_radius_score"] = _compute_blast_radius_score(blast_radii, item["package"])
+
+    # Apply filters
+    if min_priority:
+        threshold = _PRIORITY_RANK.get(min_priority.upper(), 4)
+        plan = [item for item in plan if _PRIORITY_RANK.get(item["priority"], 4) <= threshold]
+
+    if fixable_only:
+        plan = [item for item in plan if item.get("fix")]
+
+    if not plan:
+        if output_format == "json":
+            empty_plan = _plan_to_json([])
+            _out_str = json.dumps(empty_plan, indent=2)
+            if output_path:
+                Path(output_path).write_text(_out_str)
+            else:
+                click.echo(_out_str)
+            return
+        output_console.print("\n[dim]No remediation items match the current filters.[/dim]\n")
+        return
+
+    apply_outcome = None
+    if apply_changes:
+        fixable_count = sum(1 for item in plan if item.get("fix"))
+        if fixable_count == 0:
+            output_console.print("\n[dim]No fixable package remediation items to apply.[/dim]\n")
+            return
+        if not yes and not click.confirm(
+            f"Apply {fixable_count} package remediation update(s) to dependency files?",
+            default=False,
+        ):
+            output_console.print("[yellow]Remediation apply cancelled.[/yellow]")
+            return
+        try:
+            apply_outcome = apply_remediation_plan(
+                plan,
+                project_dir=project or ".",
+                open_pr=open_pr,
+                backup=not no_backup,
+                verify=not skip_verify,
+                branch_name=branch_name,
+                pr_title=pr_title,
+                audit_log_path=audit_log,
+            )
+        except RemediationApplyError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    # Render output
+    if output_format == "console":
+        if server_group:
+            groups = _group_by_server(plan, blast_radii)
+            from rich.rule import Rule
+
+            output_console.print()
+            output_console.print(Rule("Remediation Plan (grouped by MCP server)", style="green"))
+            output_console.print()
+            for srv_name, items in groups.items():
+                output_console.print(f"\n  [bold cyan]{srv_name}[/bold cyan]")
+                for item in items:
+                    fix_str = f"[green]{item['fix']}[/green]" if item.get("fix") else "[dim]no fix[/dim]"
+                    kev = " [red][KEV][/red]" if item.get("has_kev") else ""
+                    output_console.print(
+                        f"    [{item['priority']}] {item['package']} "
+                        f"[dim]{item['current']}[/dim] -> {fix_str}{kev}"
+                        f"  ({len(item.get('vulns', []))} vuln(s))"
+                    )
+            output_console.print()
+        else:
+            # Use the existing print_remediation_plan for default console view
+            assert report is not None  # guaranteed after successful scan
+            output_mod.print_remediation_plan(report)
+
+    elif output_format == "json":
+        if server_group:
+            groups = _group_by_server(plan, blast_radii)
+            json_out = _plan_to_json(plan)
+            json_out["server_groups"] = {srv: [item["package"] for item in items] for srv, items in groups.items()}
+        else:
+            json_out = _plan_to_json(plan)
+        if apply_outcome is not None:
+            json_out["apply_result"] = apply_outcome.to_json()
+        _out_str = json.dumps(json_out, indent=2)
+        if output_path:
+            Path(output_path).write_text(_out_str)
+            if not quiet:
+                output_console.print(f"[green]Remediation plan written[/green] -> {output_path}")
+        else:
+            click.echo(_out_str)
+
+    elif output_format == "markdown":
+        md = _render_markdown(plan, blast_radii)
+        if output_path:
+            Path(output_path).write_text(md)
+            if not quiet:
+                output_console.print(f"[green]Remediation report written[/green] -> {output_path}")
+        else:
+            click.echo(md)
+
+    if output_format == "console" and apply_outcome is not None:
+        _print_apply_outcome(output_console, apply_outcome)

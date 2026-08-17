@@ -1,0 +1,35 @@
+# Scanner exception input.
+# Human-reviewed exception metadata lives in security/image-exceptions.yaml.
+# Keep this file aligned with the structured registry until the workflows read the
+# YAML registry directly.
+
+# CVE-2026-27459: pyOpenSSL DTLS cookie callback buffer overflow (HIGH)
+# Affects: pyopenssl@25.x. Fixed in: pyopenssl>=26.0.0
+# Blocked by: snowflake-connector-python requires pyopenssl<26.0.0
+# Revisit: when snowflake-connector-python releases support for pyopenssl>=26.0.0
+CVE-2026-27459
+
+# Debian ncurses base-image issue inherited from python:3.12.13-slim.
+# Docker Scout surfaced CVE-2025-69720 against debian/ncurses 6.5+20250216-2;
+# Debian's security tracker currently exposes the ncurses issue on this base
+# lineage as CVE-2025-6141, with no patched trixie/bookworm package available
+# as of 2026-03-24. Revisit on every base digest refresh and remove as soon as
+# Debian publishes a fixed ncurses package in the supported suite.
+CVE-2025-69720
+CVE-2025-6141
+
+# Alpine busybox inherited from python:3.14.3-alpine3.23.
+# Docker Scout surfaced CVE-2025-60876 against alpine/busybox 1.37.0-r30.
+# No fixed Alpine package is available for the pinned image lineage as of
+# 2026-04-25. Runtime uses agent-bom as a non-root entrypoint and does not
+# expose busybox wget as an application feature.
+# Structured exception: security/image-exceptions.yaml#alpine-busybox-no-fix-2026-04
+CVE-2025-60876
+
+# pip inherited from the pinned Python base image.
+# Docker Scout surfaced CVE-2026-3219 against pip 26.0.1 in the runtime image.
+# Runtime does not use pip for untrusted package installation after image build;
+# build-time dependency installation is hash-pinned. Revisit when the Python
+# base image ships a fixed pip package or pip can be removed from runtime.
+# Structured exception: security/image-exceptions.yaml#base-python-pip-no-fix-2026-04
+CVE-2026-3219

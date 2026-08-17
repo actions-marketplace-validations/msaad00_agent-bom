@@ -1,0 +1,81 @@
+# Example upstreams config for `agent-bom gateway serve`.
+#
+# This file is OPERATOR-AUTHORED — the gateway has no way to auto-discover
+# the MCP servers your team uses; you list them here once, then laptops
+# point at https://agent-bom-gateway.example.com/mcp/{server-name} for every
+# MCP. The `name` field is the routing key (used in the URL); the `url` is
+# where the gateway actually forwards the request. One URL template for the
+# whole org, no per-laptop proxy install.
+#
+# Operator-authored entries may target private/VPC/cluster addresses. The
+# gateway still resolves and validates every new socket at connect time and
+# always rejects cloud metadata, link-local, reserved, and multicast targets.
+# Auto-discovered entries are public-only until an operator overlays the same
+# name here, which is the approval boundary for private-network egress.
+#
+# ── How to use ───────────────────────────────────────────────────────────────
+# 1. Copy this file, replace the example upstreams with YOUR MCPs.
+# 2. Put any bearer tokens into Kubernetes Secrets (NOT in this file — bearer
+#    tokens are pulled from env vars at runtime via `token_env`).
+# 3. Point Helm at your customised file:
+#
+#      helm upgrade agent-bom deploy/helm/agent-bom \
+#        --reuse-values \
+#        --set gateway.enabled=true \
+#        --set-file gateway.upstreamsYaml=./my-upstreams.yaml
+#
+# 4. Configure the token env vars via `gateway.envFrom` in values.yaml
+#    pointing at a Secret that exposes them. The gateway pod reads them
+#    at startup — rotate by updating the Secret + `kubectl rollout restart`.
+#
+# ── Supported auth modes ─────────────────────────────────────────────────────
+#   auth: none            — no credential injection (use for in-cluster MCPs)
+#   auth: bearer          — gateway reads `token_env` and sets Authorization
+#                           header on every upstream request
+#   auth: oauth2_client_credentials — gateway fetches and caches the token
+#
+# ── Supported upstream transport ─────────────────────────────────────────────
+#   transport: streamable-http  — JSON-RPC over HTTP POST. This is the only
+#                                 upstream relay transport the gateway supports.
+#   Legacy SSE `/sse` upstream endpoints are intentionally rejected; use the
+#   upstream server's streamable-http `/mcp` endpoint, or run a per-MCP proxy
+#   for SSE.
+#
+# Replace the three examples below with your real MCP inventory.
+
+upstreams:
+  # EXAMPLE 1 — A SaaS MCP (e.g. a Jira MCP published by Atlassian or a
+  # vendor) behind an internal ingress. The gateway injects the bearer
+  # token from a Secret; the laptop never holds it.
+  - name: jira
+    url: https://mcp.jira.example.com/mcp
+    transport: streamable-http
+    auth: bearer
+    token_env: JIRA_MCP_TOKEN
+
+  # EXAMPLE 2 — A Snowflake-hosted MCP (e.g. a data-query MCP running as
+  # a Snowflake container service or Cortex function). Uses OAuth2
+  # client-credentials so the gateway fetches + rotates tokens against
+  # Snowflake's IdP automatically.
+  - name: snowflake
+    url: https://snowflake.example.internal/mcp/cortex
+    transport: streamable-http
+    auth: oauth2_client_credentials
+    oauth_token_url: https://snowflake.example.internal/oauth/token
+    oauth_client_id_env: SNOWFLAKE_OAUTH_CLIENT_ID
+    oauth_client_secret_env: SNOWFLAKE_OAUTH_CLIENT_SECRET
+    scopes: ["mcp.read", "mcp.write"]
+
+  # EXAMPLE 3 — A remote GitHub MCP server behind an internal ingress.
+  - name: github
+    url: https://mcp.github.example.com/mcp
+    transport: streamable-http
+    auth: bearer
+    token_env: GITHUB_MCP_TOKEN
+
+  # EXAMPLE 4 — An in-cluster MCP workload in a sibling namespace. No
+  # external auth needed — the gateway is the authed front door and
+  # Kubernetes NetworkPolicy restricts direct access.
+  - name: filesystem-review-env
+    url: http://review-fs.agent-bom-workloads.svc.cluster.local:8100
+    auth: none

@@ -2,6 +2,16 @@
 
 > Run CIS AWS Foundations v3.0 checks, map controls to compliance frameworks, track posture over time, and remediate findings — using agent-bom as the assessment engine.
 
+```yaml
+capabilities:
+  read_findings: true
+  read_inventory: true
+  read_audit_log: false
+  write_findings: false
+  outbound_http: true
+  shell_exec: true
+```
+
 ## Architecture
 
 ```
@@ -130,7 +140,7 @@ cis_benchmark(provider="aws", region="us-east-1")
 
 - name: Upload to GitHub Security
   if: always()
-  uses: github/codeql-action/upload-sarif@v3
+  uses: github/codeql-action/upload-sarif@v4
   with:
     sarif_file: cis-results.sarif
 ```
@@ -143,7 +153,8 @@ cis_benchmark(provider="aws", region="us-east-1")
   FINDING: Root account has access keys
   ──────────────────────────────────────
   WHY:     Root keys = unlimited blast radius. Compromised root = full account takeover.
-  FIX:     aws iam delete-access-key --user-name root --access-key-id AKIA...
+  FIX:     Prefer AWS Organizations root access management for member accounts. Otherwise, use an approved
+           break-glass root session, delete the key under IAM > Security credentials, and sign out immediately.
   VERIFY:  agent-bom scan --aws --aws-cis-benchmark | grep "root_access_keys"
 ```
 

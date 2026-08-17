@@ -32,6 +32,7 @@ import subprocess
 from pathlib import Path
 
 from agent_bom.models import Package
+from agent_bom.package_utils import parse_debian_source_name
 from agent_bom.sbom import parse_cyclonedx
 from agent_bom.security import validate_path
 
@@ -40,6 +41,26 @@ logger = logging.getLogger(__name__)
 
 class FilesystemScanError(Exception):
     """Raised when a filesystem path cannot be scanned."""
+
+
+def read_os_release_metadata(root: Path) -> tuple[str | None, str | None]:
+    """Read distro ``ID`` and ``VERSION_ID`` from ``etc/os-release``."""
+    os_release = root / "etc" / "os-release"
+    if not os_release.exists():
+        return None, None
+
+    distro_name: str | None = None
+    distro_version: str | None = None
+    try:
+        for line in os_release.read_text(errors="replace").splitlines():
+            if line.startswith("ID="):
+                distro_name = line.split("=", 1)[1].strip().strip('"').strip("'").lower() or None
+            elif line.startswith("VERSION_ID="):
+                distro_version = line.split("=", 1)[1].strip().strip('"').strip("'") or None
+    except OSError:
+        return None, None
+
+    return distro_name, distro_version
 
 
 def detect_linux_distro(root: Path) -> str:
@@ -55,20 +76,8 @@ def detect_linux_distro(root: Path) -> str:
     Returns:
         Lowercase distro identifier string.
     """
-    os_release = root / "etc" / "os-release"
-    if not os_release.exists():
-        return "linux"
-
-    try:
-        for line in os_release.read_text(errors="replace").splitlines():
-            if line.startswith("ID="):
-                # ID may be quoted: ID="rocky" or ID=alpine
-                value = line.split("=", 1)[1].strip().strip('"').strip("'")
-                return value.lower() if value else "linux"
-    except OSError:
-        pass
-
-    return "linux"
+    distro_name, _distro_version = read_os_release_metadata(root)
+    return distro_name or "linux"
 
 
 # ── Syft-based scanning ───────────────────────────────────────────────────────
@@ -110,9 +119,13 @@ def scan_filesystem(path: str, timeout: int = 600) -> tuple[list[Package], str]:
         except Exception:
             logger.debug("Native tar parsing failed, trying Syft fallback")
 
-        # Syft fallback for tar archives
-        if shutil.which("syft"):
-            return _scan_archive(validated, timeout), "syft-tar"
+        # Syft fallback for tar archives. Resolve once to an absolute path
+        # and pass it through so the subprocess does not re-resolve against
+        # PATH and pick a different binary between the check and the exec
+        # (audit-4 P2 TOCTOU).
+        syft_path = shutil.which("syft")
+        if syft_path:
+            return _scan_archive(validated, timeout, syft_executable=syft_path), "syft-tar"
         raise FilesystemScanError(
             "Could not parse tar archive natively and syft not found on PATH. "
             "Install syft from https://github.com/anchore/syft for fallback support."
@@ -137,16 +150,22 @@ def _scan_directory(dir_path: Path, timeout: int = 600) -> list[Package]:
     return _run_syft(f"dir:{dir_path}", timeout)
 
 
-def _scan_archive(tar_path: Path, timeout: int = 600) -> list[Package]:
+def _scan_archive(tar_path: Path, timeout: int = 600, *, syft_executable: str = "syft") -> list[Package]:
     """Run ``syft /path/to/archive.tar -o cyclonedx-json``."""
-    return _run_syft(str(tar_path), timeout)
+    return _run_syft(str(tar_path), timeout, syft_executable=syft_executable)
 
 
-def _run_syft(source: str, timeout: int) -> list[Package]:
-    """Execute syft and parse CycloneDX output."""
+def _run_syft(source: str, timeout: int, *, syft_executable: str = "syft") -> list[Package]:
+    """Execute syft and parse CycloneDX output.
+
+    ``syft_executable`` defaults to the bare name for backwards compatibility
+    with internal callers; production callers pass the absolute path resolved
+    via ``shutil.which("syft")`` to avoid a PATH-substitution race between
+    the resolve and the exec (audit-4 P2).
+    """
     try:
         result = subprocess.run(
-            ["syft", source, "-o", "cyclonedx-json", "--quiet"],
+            [syft_executable, source, "-o", "cyclonedx-json", "--quiet"],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -197,6 +216,7 @@ def parse_dpkg_status(status_file: Path) -> list[Package]:
                 if "install ok installed" in status:
                     name = current["Package"]
                     version = current["Version"]
+                    source_package = parse_debian_source_name(current.get("Source", ""))
                     # Strip epoch prefix (e.g. "1:2.3.4" → "2.3.4")
                     version = re.sub(r"^\d+:", "", version)
                     packages.append(
@@ -205,6 +225,7 @@ def parse_dpkg_status(status_file: Path) -> list[Package]:
                             version=version,
                             ecosystem="deb",
                             purl=f"pkg:deb/debian/{name}@{version}",
+                            source_package=source_package,
                             is_direct=True,
                         )
                     )
@@ -239,12 +260,14 @@ def parse_apk_installed(installed_file: Path) -> list[Package]:
             if current.get("P") and current.get("V"):
                 name = current["P"]
                 version = current["V"]
+                source_package = current.get("o") or current.get("O")
                 packages.append(
                     Package(
                         name=name,
                         version=version,
                         ecosystem="apk",
                         purl=f"pkg:apk/alpine/{name}@{version}",
+                        source_package=source_package,
                         is_direct=True,
                     )
                 )
@@ -258,12 +281,14 @@ def parse_apk_installed(installed_file: Path) -> list[Package]:
     if current.get("P") and current.get("V"):
         name = current["P"]
         version = current["V"]
+        source_package = current.get("o") or current.get("O")
         packages.append(
             Package(
                 name=name,
                 version=version,
                 ecosystem="apk",
                 purl=f"pkg:apk/alpine/{name}@{version}",
+                source_package=source_package,
                 is_direct=True,
             )
         )
@@ -288,45 +313,50 @@ def _parse_rpm_sqlite(db_path: Path) -> list[Package]:
     """
     import sqlite3
 
+    from agent_bom.oci_parser import _parse_rpm_header_blob
+
     if not db_path.exists():
         return []
 
+    # RHEL 9+ stores `Packages(hnum INTEGER PRIMARY KEY, blob BLOB)` — one binary
+    # RPM header per row. This used to select `name, version, release, epoch,
+    # arch`, columns that exist in no rpmdb; the query raised, the except
+    # swallowed it, and every RHEL/UBI/Fedora/Amazon filesystem scanned clean.
+    #
+    # `oci_parser._parse_rpm_header_blob` already decodes this format correctly
+    # (#4684 fixed the same defect there). Reusing it means one decoder, so the
+    # two paths cannot disagree about the same bytes again.
     packages: list[Package] = []
     try:
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
-            cur = con.execute("SELECT name, version, release, epoch, arch FROM Packages")
-            rows = cur.fetchall()
+            rows = con.execute("SELECT blob FROM Packages").fetchall()
         finally:
             con.close()
     except Exception as exc:  # noqa: BLE001
         logger.debug("RPM SQLite parse failed for %s: %s", db_path, exc)
         return []
 
-    for row in rows:
-        name, version, release, epoch, arch = row
-        if not name or not version:
+    seen: set[tuple[str, str]] = set()
+    for (blob,) in rows:
+        if not isinstance(blob, bytes):
             continue
-
-        # Build version string: epoch:version-release (omit epoch when 0)
-        epoch_str = str(epoch).strip() if epoch is not None else "0"
-        ver_release = f"{version}-{release}" if release else version
-        if epoch_str and epoch_str != "0":
-            full_version = f"{epoch_str}:{ver_release}"
-        else:
-            full_version = ver_release
-
-        # PURL: pkg:rpm/rhel/name@epoch:version-release?arch=x86_64
-        purl = f"pkg:rpm/rhel/{name}@{full_version}"
-        if arch:
-            purl += f"?arch={arch}"
-
+        parsed = _parse_rpm_header_blob(blob)
+        if not parsed:
+            continue
+        name, full_version = parsed
+        # A signing key in the rpmdb, not installed software.
+        if name == "gpg-pubkey":
+            continue
+        if (name, full_version) in seen:
+            continue
+        seen.add((name, full_version))
         packages.append(
             Package(
                 name=name,
                 version=full_version,
                 ecosystem="rpm",
-                purl=purl,
+                purl=f"pkg:rpm/rhel/{name}@{full_version}",
                 is_direct=True,
             )
         )
@@ -493,6 +523,7 @@ def scan_disk_path_native(root: Path) -> list[Package]:
         Deduplicated list of :class:`~agent_bom.models.Package` objects.
     """
     packages: list[Package] = []
+    distro_name, distro_version = read_os_release_metadata(root)
 
     # APT / Debian
     dpkg_status = root / "var" / "lib" / "dpkg" / "status"
@@ -561,6 +592,9 @@ def scan_disk_path_native(root: Path) -> list[Package]:
     seen: set[tuple[str, str, str]] = set()
     unique: list[Package] = []
     for pkg in packages:
+        if pkg.ecosystem in {"deb", "apk", "rpm"}:
+            pkg.distro_name = pkg.distro_name or distro_name
+            pkg.distro_version = pkg.distro_version or distro_version
         key = (pkg.name, pkg.version, pkg.ecosystem)
         if key not in seen:
             seen.add(key)

@@ -13,7 +13,7 @@
   <rect width="960" height="420" rx="12" fill="#ffffff" stroke="#e4e4e7" stroke-width="1"/>
 
   <text x="480" y="28" text-anchor="middle" class="title">Scan pipeline</text>
-  <text x="480" y="44" text-anchor="middle" class="subtitle">5 stages, left to right. No secrets leave your machine — only package names + versions are sent to public APIs.</text>
+  <text x="480" y="44" text-anchor="middle" class="subtitle">5 operator stages over 6 tracked steps: discover, extract, scan, enrich, analyze, output. Source code and credential values stay local.</text>
 
   <!-- ═══ STEP 1: DISCOVER ═══ -->
   <rect x="20" y="64" width="160" height="304" rx="10" fill="#fafafa" stroke="#e4e4e7" stroke-width="1"/>
@@ -23,7 +23,7 @@
   <text x="56" y="84" class="step-name">DISCOVER</text>
 
   <text x="36" y="114" class="item-label" fill="#2563eb">MCP configs</text>
-  <text x="140" y="114" text-anchor="end" class="step-desc">22 clients</text>
+  <text x="140" y="114" text-anchor="end" class="step-desc">29 clients</text>
   <rect x="30" y="120" width="140" height="1" fill="#e4e4e7"/>
 
   <text x="36" y="138" class="item-label" fill="#2563eb">Cloud</text>
@@ -31,7 +31,7 @@
   <rect x="30" y="144" width="140" height="1" fill="#e4e4e7"/>
 
   <text x="36" y="162" class="item-label" fill="#2563eb">Containers</text>
-  <text x="140" y="162" text-anchor="end" class="step-desc">Grype + Syft</text>
+  <text x="140" y="162" text-anchor="end" class="step-desc">native OCI parser</text>
   <rect x="30" y="168" width="140" height="1" fill="#e4e4e7"/>
 
   <text x="36" y="186" class="item-label" fill="#2563eb">Packages</text>
@@ -98,7 +98,7 @@
   <rect x="226" y="216" width="140" height="1" fill="#e4e4e7"/>
 
   <text x="232" y="234" class="item-label" fill="#d97706">MCP Registry</text>
-  <text x="366" y="234" text-anchor="end" class="step-desc">427+ servers</text>
+  <text x="366" y="234" text-anchor="end" class="step-desc">1081 servers</text>
   <rect x="226" y="240" width="140" height="1" fill="#e4e4e7"/>
 
   <text x="232" y="254" class="step-desc">Queries run in parallel</text>
@@ -120,7 +120,7 @@
   <rect x="422" y="120" width="140" height="1" fill="#e4e4e7"/>
 
   <text x="428" y="138" class="item-label" fill="#e11d48">Compliance</text>
-  <text x="562" y="138" text-anchor="end" class="step-desc">13 frameworks</text>
+  <text x="562" y="138" text-anchor="end" class="step-desc">15 + AISVS</text>
   <rect x="422" y="144" width="140" height="1" fill="#e4e4e7"/>
 
   <text x="428" y="162" class="item-label" fill="#e11d48">Policy engine</text>
@@ -206,5 +206,5 @@
 
   <!-- ═══ BOTTOM BAR ═══ -->
   <rect x="20" y="380" width="920" height="28" rx="8" fill="#fafafa" stroke="#e4e4e7" stroke-width="1"/>
-  <text x="480" y="399" text-anchor="middle" font-size="9" font-weight="600" fill="#a1a1aa" letter-spacing="0.06em" font-family="system-ui, sans-serif">READ-ONLY GUARANTEE · never writes configs · never runs servers · never stores secrets · --dry-run previews everything · Sigstore signed</text>
+  <text x="480" y="399" text-anchor="middle" font-size="9" font-weight="600" fill="#a1a1aa" letter-spacing="0.06em" font-family="system-ui, sans-serif">READ-ONLY SCAN · no target writes · no secret values · --dry-run previews everything · offline-capable with local DB</text>
 </svg>

@@ -5,6 +5,11 @@ on:
     workflows: ["Release"]
     types: [completed]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to the official MCP Registry. Leave false to validate server.json only."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -13,12 +18,13 @@ jobs:
   publish:
     name: Publish to Official MCP Registry
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       id-token: write  # Required for GitHub OIDC token exchange
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Validate server.json
         run: |
@@ -28,7 +34,6 @@ jobs:
             -H "Content-Type: application/json" \
             -d @integrations/mcp-registry/server.json)
           echo "Validation status: $HTTP_STATUS"
-          cat /tmp/validate-response.json
           if [ "$HTTP_STATUS" -ge 400 ]; then
             echo "::error::server.json validation failed (HTTP $HTTP_STATUS)"
             exit 1
@@ -39,32 +44,88 @@ jobs:
             exit 1
           fi
 
-      - name: Get GitHub OIDC token
-        id: oidc
+      - name: Decide publish mode
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_DISPATCH_PUBLISH: ${{ inputs.publish || false }}
+          RELEASE_PUBLISH_ENABLED: ${{ vars.MCP_REGISTRY_PUBLISH_ENABLED || 'false' }}
         run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$WORKFLOW_DISPATCH_PUBLISH" = "true" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Manual MCP Registry publish requested."
+          elif [ "$EVENT_NAME" = "workflow_run" ] && [ "$RELEASE_PUBLISH_ENABLED" = "true" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "MCP Registry publish enabled by repository variable."
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "MCP Registry publish not enabled; validation-only run."
+          fi
+
+      - name: Skip publish until official MCP Registry registration is enabled
+        if: steps.mode.outputs.publish != 'true'
+        run: |
+          echo "server.json validation passed."
+          echo "Skipping official MCP Registry publish because MCP_REGISTRY_PUBLISH_ENABLED is not true and manual publish was not requested."
+          echo "After the repository is registered with the official MCP Registry, set repository variable MCP_REGISTRY_PUBLISH_ENABLED=true or run this workflow manually with publish=true."
+
+      - name: Get GitHub OIDC token
+        shell: bash
+        id: oidc
+        if: steps.mode.outputs.publish == 'true'
+        run: |
+          if [ -z "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ] || [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            echo "::error::OIDC token request not available. Ensure id-token: write permission is granted."
+            exit 1
+          fi
           OIDC_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=mcp-registry" \
             | jq -r '.value')
+          if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
+            echo "::error::Failed to obtain OIDC token from GitHub"
+            exit 1
+          fi
           echo "::add-mask::$OIDC_TOKEN"
           echo "token=$OIDC_TOKEN" >> "$GITHUB_OUTPUT"
 
       - name: Exchange OIDC token for Registry JWT
         id: auth
+        if: steps.mode.outputs.publish == 'true'
         run: |
-          AUTH_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+          HTTP_STATUS=$(curl -s --connect-timeout 10 --max-time 30 \
+            -o /tmp/auth-response.json -w "%{http_code}" \
             -X POST "https://registry.modelcontextprotocol.io/v0.1/auth/github-oidc" \
             -H "Content-Type: application/json" \
             -d "{\"oidc_token\": \"${{ steps.oidc.outputs.token }}\"}")
-          JWT=$(echo "$AUTH_RESPONSE" | jq -r '.registry_token // .token // empty')
+          echo "MCP Registry auth status: HTTP $HTTP_STATUS"
+          if [ "$HTTP_STATUS" -ge 400 ]; then
+            ERROR=$(jq -r '.error // .message // "unknown"' /tmp/auth-response.json 2>/dev/null || echo "non-JSON response")
+            echo "::error::MCP Registry OIDC auth failed (HTTP $HTTP_STATUS): $ERROR"
+            echo "::error::If this is a new repo, you may need to register at https://registry.modelcontextprotocol.io"
+            exit 1
+          fi
+          JWT=$(jq -r '.registry_token // .token // empty' /tmp/auth-response.json)
           if [ -z "$JWT" ]; then
-            echo "::error::Failed to get Registry JWT: $AUTH_RESPONSE"
+            echo "::error::MCP Registry returned success but no JWT token in response"
             exit 1
           fi
           echo "::add-mask::$JWT"
           echo "jwt=$JWT" >> "$GITHUB_OUTPUT"
 
       - name: Publish to MCP Registry
+        if: steps.mode.outputs.publish == 'true'
         run: |
+          print_publish_error() {
+            if jq -e . >/dev/null 2>&1 </tmp/publish-response.json; then
+              echo "::group::MCP Registry publish error details"
+              jq -c '{error, message, detail, details, code, status}' /tmp/publish-response.json
+              echo "::endgroup::"
+            else
+              echo "::warning::MCP Registry returned a non-JSON error body"
+              head -c 1024 /tmp/publish-response.json || true
+            fi
+          }
+
           # Retry up to 3 times with exponential backoff
           for ATTEMPT in 1 2 3; do
             HTTP_STATUS=$(curl -s --connect-timeout 10 --max-time 30 \
@@ -74,17 +135,21 @@ jobs:
               -H "Authorization: Bearer ${{ steps.auth.outputs.jwt }}" \
               -d @integrations/mcp-registry/server.json)
             echo "MCP Registry attempt ${ATTEMPT}/3 — HTTP $HTTP_STATUS"
-            cat /tmp/publish-response.json
 
             if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 400 ]; then
               echo "Published to MCP Registry successfully"
               break
+            elif [ "$HTTP_STATUS" -eq 429 ] && [ "$ATTEMPT" -lt 3 ]; then
+              DELAY=$((ATTEMPT * 15))
+              echo "Rate limited — retrying in ${DELAY}s..."
+              sleep "$DELAY"
             elif [ "$HTTP_STATUS" -ge 500 ] && [ "$ATTEMPT" -lt 3 ]; then
               DELAY=$((ATTEMPT * 10))
               echo "Server error — retrying in ${DELAY}s..."
               sleep "$DELAY"
             else
-              echo "::error::MCP Registry publish failed (HTTP $HTTP_STATUS) — check response above"
+              echo "::error::MCP Registry publish failed (HTTP $HTTP_STATUS)"
+              print_publish_error
               exit 1
             fi
           done

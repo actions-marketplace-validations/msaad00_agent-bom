@@ -10,6 +10,7 @@ import pytest
 
 from agent_bom.models import Severity
 from agent_bom.sast import (
+    SASTExecutionStatus,
     SASTFinding,
     SASTResult,
     SASTScanError,
@@ -138,11 +139,12 @@ def test_parse_sarif_empty():
 
 
 def test_parse_sarif_no_location():
-    """Results without locations are skipped."""
+    """Results without locations remain available as external evidence."""
     sarif = {
+        "version": "2.1.0",
         "runs": [
             {
-                "tool": {"driver": {"rules": []}},
+                "tool": {"driver": {"name": "semgrep", "rules": []}},
                 "results": [
                     {
                         "ruleId": "test-rule",
@@ -152,10 +154,12 @@ def test_parse_sarif_no_location():
                     }
                 ],
             }
-        ]
+        ],
     }
     findings, _, _ = _parse_sarif_findings(sarif)
-    assert findings == []
+    assert len(findings) == 1
+    assert findings[0].file_path == "unknown"
+    assert findings[0].tool_name == "semgrep"
 
 
 # ── Severity mapping ───────────────────────────────────────────────────────
@@ -362,12 +366,110 @@ def test_scan_code_happy_path(monkeypatch, tmp_path):
     assert sast_result.files_scanned == 2
     assert sast_result.semgrep_version == "1.50.0"
     assert sast_result.config_used == "auto"
+    assert sast_result.to_dict()["execution_status"] == "findings"
+    assert sast_result.to_dict()["scanner_driver_id"] == "sast-semgrep"
 
     # Verify packages have correct ecosystem
     for pkg in packages:
         assert pkg.ecosystem == "sast"
         assert pkg.version == "0.0.0"
         assert len(pkg.vulnerabilities) > 0
+
+
+def test_scan_code_default_uses_local_rules_and_auto(monkeypatch, tmp_path):
+    """default config should prefer local rule bundles and still include Semgrep auto."""
+    monkeypatch.setattr("agent_bom.sast.shutil.which", lambda _: "/usr/bin/semgrep")
+    monkeypatch.setattr("agent_bom.sast._get_semgrep_version", lambda: "1.50.0")
+    # Pin Path.home() to a clean tmp directory so the dev's real ~/.semgrep
+    # config (if any) doesn't get auto-discovered and flip the assertion.
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr("agent_bom.sast.Path.home", lambda: fake_home)
+    rules_dir = tmp_path / ".agent-bom" / "sast-rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "custom.yaml").write_text("rules: []", encoding="utf-8")
+
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps(EMPTY_SARIF)
+    run_mock = MagicMock(return_value=mock_result)
+    monkeypatch.setattr("agent_bom.sast.subprocess.run", run_mock)
+
+    _, sast_result = scan_code(str(tmp_path), config="default")
+
+    cmd = run_mock.call_args.args[0]
+    assert "--config" in cmd
+    assert str(rules_dir.resolve()) in cmd
+    assert "auto" in cmd
+    assert sast_result.config_used == f"{rules_dir.resolve()},auto"
+
+
+def test_scan_code_default_uses_agent_bom_rules_directory(monkeypatch, tmp_path):
+    """default config should discover ~/.agent-bom/rules as a first-class custom-rule path."""
+    monkeypatch.setattr("agent_bom.sast.shutil.which", lambda _: "/usr/bin/semgrep")
+    monkeypatch.setattr("agent_bom.sast._get_semgrep_version", lambda: "1.50.0")
+    fake_home = tmp_path / "home"
+    rules_dir = fake_home / ".agent-bom" / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "custom.yaml").write_text("rules: []", encoding="utf-8")
+    monkeypatch.setattr("agent_bom.sast.Path.home", lambda: fake_home)
+
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps(EMPTY_SARIF)
+    run_mock = MagicMock(return_value=mock_result)
+    monkeypatch.setattr("agent_bom.sast.subprocess.run", run_mock)
+
+    _, sast_result = scan_code(str(tmp_path), config="default")
+
+    cmd = run_mock.call_args.args[0]
+    assert "--config" in cmd
+    assert str(rules_dir.resolve()) in cmd
+    assert "auto" in cmd
+    assert str(rules_dir.resolve()) in sast_result.config_used
+
+
+def test_scan_code_accepts_multiple_configs(monkeypatch, tmp_path):
+    """comma-separated configs should expand into multiple semgrep --config flags."""
+    monkeypatch.setattr("agent_bom.sast.shutil.which", lambda _: "/usr/bin/semgrep")
+    monkeypatch.setattr("agent_bom.sast._get_semgrep_version", lambda: "1.50.0")
+    custom_rule = tmp_path / "custom.yaml"
+    custom_rule.write_text("rules: []", encoding="utf-8")
+
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps(EMPTY_SARIF)
+    run_mock = MagicMock(return_value=mock_result)
+    monkeypatch.setattr("agent_bom.sast.subprocess.run", run_mock)
+
+    _, sast_result = scan_code(str(tmp_path), config=f"p/security-audit,{custom_rule.name}")
+
+    cmd = run_mock.call_args.args[0]
+    assert cmd.count("--config") == 2
+    assert "p/security-audit" in cmd
+    assert str(custom_rule.resolve()) in cmd
+    assert sast_result.config_used == f"p/security-audit,{custom_rule.resolve()}"
+
+
+def test_scan_code_accepts_rules_alias_path(monkeypatch, tmp_path):
+    """local custom rules passed explicitly should resolve through the same config path."""
+    monkeypatch.setattr("agent_bom.sast.shutil.which", lambda _: "/usr/bin/semgrep")
+    monkeypatch.setattr("agent_bom.sast._get_semgrep_version", lambda: "1.50.0")
+    rules_dir = tmp_path / ".agent-bom" / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "custom.yaml").write_text("rules: []", encoding="utf-8")
+
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = json.dumps(EMPTY_SARIF)
+    run_mock = MagicMock(return_value=mock_result)
+    monkeypatch.setattr("agent_bom.sast.subprocess.run", run_mock)
+
+    _, sast_result = scan_code(str(tmp_path), config=str(rules_dir))
+
+    cmd = run_mock.call_args.args[0]
+    assert str(rules_dir.resolve()) in cmd
+    assert sast_result.config_used == str(rules_dir.resolve())
 
 
 def test_scan_code_clean(monkeypatch, tmp_path):
@@ -384,6 +486,73 @@ def test_scan_code_clean(monkeypatch, tmp_path):
 
     assert packages == []
     assert sast_result.total_findings == 0
+    assert sast_result.to_dict()["execution_status"] == "clean"
+
+
+@pytest.mark.parametrize("config", ["auto", "p/security-audit", "local.yml,p/security-audit"])
+def test_scan_code_offline_rejects_network_backed_configs_without_running_semgrep(monkeypatch, tmp_path, config):
+    """Offline SAST must never pass registry-backed configs to Semgrep."""
+    monkeypatch.setattr("agent_bom.sast.shutil.which", lambda _: "/usr/bin/semgrep")
+    (tmp_path / "local.yml").write_text("rules: []", encoding="utf-8")
+    run_mock = MagicMock()
+    monkeypatch.setattr("agent_bom.sast.subprocess.run", run_mock)
+
+    with pytest.raises(SASTScanError) as exc_info:
+        scan_code(str(tmp_path), config=config, offline=True)
+
+    assert exc_info.value.execution_status is SASTExecutionStatus.SKIPPED
+    assert exc_info.value.reason_code == "offline_remote_config"
+    run_mock.assert_not_called()
+
+
+def test_scan_code_offline_default_uses_discovered_local_rules_only(monkeypatch, tmp_path):
+    """Offline default mode retains local rules while removing the auto fallback."""
+    monkeypatch.setattr("agent_bom.sast.shutil.which", lambda _: "/usr/bin/semgrep")
+    monkeypatch.setattr("agent_bom.sast._get_semgrep_version", lambda: "1.50.0")
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr("agent_bom.sast.Path.home", lambda: fake_home)
+    rules_dir = tmp_path / ".agent-bom" / "sast-rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "custom.yaml").write_text("rules: []", encoding="utf-8")
+
+    mock_result = MagicMock(returncode=0, stdout=json.dumps(EMPTY_SARIF))
+    run_mock = MagicMock(return_value=mock_result)
+    monkeypatch.setattr("agent_bom.sast.subprocess.run", run_mock)
+
+    _, sast_result = scan_code(str(tmp_path), config="default", offline=True)
+
+    cmd = run_mock.call_args.args[0]
+    assert str(rules_dir.resolve()) in cmd
+    assert "auto" not in cmd
+    assert sast_result.config_used == str(rules_dir.resolve())
+
+
+def test_scan_code_offline_default_without_local_rules_is_explicitly_skipped(monkeypatch, tmp_path):
+    monkeypatch.setattr("agent_bom.sast.shutil.which", lambda _: "/usr/bin/semgrep")
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr("agent_bom.sast.Path.home", lambda: fake_home)
+
+    with pytest.raises(SASTScanError) as exc_info:
+        scan_code(str(tmp_path), config="default", offline=True)
+
+    assert exc_info.value.execution_status is SASTExecutionStatus.SKIPPED
+    assert exc_info.value.reason_code == "offline_no_local_config"
+
+
+def test_scan_code_imports_sarif_without_semgrep(monkeypatch, tmp_path):
+    """Existing SARIF files import through the same result model without Semgrep."""
+    monkeypatch.setattr("agent_bom.sast.shutil.which", lambda _: None)
+    sarif_path = tmp_path / "results.sarif"
+    sarif_path.write_text(json.dumps(SAMPLE_SARIF), encoding="utf-8")
+
+    packages, sast_result = scan_code(str(sarif_path))
+
+    assert len(packages) == 2
+    assert sast_result.total_findings == 2
+    assert sast_result.config_used == "sarif-import"
+    assert sast_result.semgrep_version is None
 
 
 # ── CWE mapping ────────────────────────────────────────────────────────────
@@ -492,7 +661,8 @@ def test_cli_code_flag():
     from agent_bom.cli import scan as scan_cmd
 
     runner = CliRunner()
-    result = runner.invoke(scan_cmd, ["--help"])
+    result = runner.invoke(scan_cmd, ["--help-all"])
     assert "--code" in result.output
     assert "--sast-config" in result.output
+    assert "--rules" in result.output
     assert "SAST" in result.output or "Semgrep" in result.output

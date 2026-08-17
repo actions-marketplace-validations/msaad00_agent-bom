@@ -29,7 +29,7 @@ class TestRBAC:
     def test_admin_has_all_permissions(self):
         from agent_bom.rbac import Role, check_permission
 
-        for action in ["scan", "read", "fleet_write", "policy_write", "exception_approve", "config"]:
+        for action in ["scan", "read", "fleet_write", "policy_write", "policy.manage", "exception_approve", "config"]:
             assert check_permission(Role.ADMIN, action) is True
 
     def test_analyst_can_scan_and_read(self):
@@ -44,6 +44,7 @@ class TestRBAC:
 
         assert check_permission(Role.ANALYST, "fleet_write") is False
         assert check_permission(Role.ANALYST, "policy_write") is False
+        assert check_permission(Role.ANALYST, "policy.manage") is False
         assert check_permission(Role.ANALYST, "exception_approve") is False
 
     def test_viewer_read_only(self):
@@ -52,6 +53,7 @@ class TestRBAC:
         assert check_permission(Role.VIEWER, "read") is True
         assert check_permission(Role.VIEWER, "scan") is False
         assert check_permission(Role.VIEWER, "fleet_write") is False
+        assert check_permission(Role.VIEWER, "policy.manage") is False
         assert check_permission(Role.VIEWER, "config") is False
 
     def test_unknown_action_denied(self):
@@ -62,16 +64,18 @@ class TestRBAC:
     def test_resolve_role_from_api_key(self):
         from agent_bom.rbac import configure_api_keys, resolve_role
 
-        configure_api_keys({"key-abc": "analyst", "key-xyz": "admin"})
-        assert resolve_role(api_key="key-abc").value == "analyst"
-        assert resolve_role(api_key="key-xyz").value == "admin"
+        analyst_key = "key-abc-" + "a" * 32
+        admin_key = "key-xyz-" + "x" * 32
+        configure_api_keys({analyst_key: "analyst", admin_key: "admin"})
+        assert resolve_role(api_key=analyst_key).value == "analyst"
+        assert resolve_role(api_key=admin_key).value == "admin"
         configure_api_keys({})  # cleanup
 
-    def test_resolve_role_from_header(self):
+    def test_resolve_role_ignores_unauthenticated_header(self):
         from agent_bom.rbac import resolve_role
 
         assert resolve_role(role_header="viewer").value == "viewer"
-        assert resolve_role(role_header="ANALYST").value == "analyst"
+        assert resolve_role(role_header="ANALYST").value == "viewer"
 
     def test_resolve_role_default(self):
         from agent_bom.rbac import resolve_role
@@ -88,10 +92,12 @@ class TestRBAC:
     def test_load_api_keys_from_env(self):
         from agent_bom.rbac import configure_api_keys, load_api_keys_from_env, resolve_role
 
-        with patch.dict(os.environ, {"AGENT_BOM_API_KEYS": "k1:admin,k2:viewer"}):
+        admin_key = "k1-" + "a" * 32
+        viewer_key = "k2-" + "v" * 32
+        with patch.dict(os.environ, {"AGENT_BOM_API_KEYS": f"{admin_key}:admin,{viewer_key}:viewer"}):
             load_api_keys_from_env()
-            assert resolve_role(api_key="k1").value == "admin"
-            assert resolve_role(api_key="k2").value == "viewer"
+            assert resolve_role(api_key=admin_key).value == "admin"
+            assert resolve_role(api_key=viewer_key).value == "viewer"
         configure_api_keys({})  # cleanup
 
 
@@ -188,7 +194,32 @@ class TestAuditLog:
         log_action("scan", actor="admin", resource="job/test", packages=42)
         entries = store.list_entries()
         assert len(entries) == 1
-        assert entries[0].details == {"packages": 42}
+        assert entries[0].details == {"packages": 42, "tenant_id": "default"}
+
+    def test_log_action_bounds_detail_schema(self):
+        from agent_bom.api.audit_log import InMemoryAuditLog, log_action, set_audit_log
+
+        store = InMemoryAuditLog()
+        set_audit_log(store)
+        log_action(
+            "scan",
+            actor="admin",
+            resource="job/test",
+            **{
+                "tenant_id": "tenant-alpha",
+                "bad key\r\n": "x" * 3000,
+                "nested": {"items": list(range(100))},
+                "key_id": "k" * 3000,
+                "source_ids": [f"source-{i}" for i in range(100)],
+            },
+        )
+
+        details = store.list_entries()[0].details
+        assert "bad_key" not in details
+        assert "nested" not in details
+        assert len(details["key_id"]) == 2048
+        assert details["source_ids"][-1] == "[truncated]"
+        assert details["tenant_id"] == "tenant-alpha"
 
     def test_audit_bounded_size(self):
         from agent_bom.api.audit_log import AuditEntry, InMemoryAuditLog
@@ -417,6 +448,8 @@ class TestTrendAnalysis:
         assert len(history) == 3
         # Most recent first
         assert history[0].timestamp == "2026-03-05"
+        assert len(store.get_history(limit=10, tenant_id="default")) == 5
+        assert store.get_history(limit=10, tenant_id="tenant-beta") == []
 
     def test_sqlite_trend_store(self, tmp_path):
         from agent_bom.baseline import SQLiteTrendStore, TrendPoint
@@ -435,9 +468,28 @@ class TestTrendAnalysis:
                 posture_grade="B",
             )
         )
+        store.record(
+            TrendPoint(
+                timestamp="2026-03-02T00:00:00",
+                total_vulns=3,
+                critical=0,
+                high=1,
+                medium=1,
+                low=1,
+                posture_score=92.0,
+                posture_grade="A",
+                tenant_id="tenant-beta",
+            )
+        )
         history = store.get_history()
-        assert len(history) == 1
-        assert history[0].total_vulns == 10
+        assert len(history) == 2
+        assert [point.total_vulns for point in history] == [3, 10]
+        alpha = store.get_history(tenant_id="default")
+        beta = store.get_history(tenant_id="tenant-beta")
+        assert len(alpha) == 1
+        assert len(beta) == 1
+        assert alpha[0].total_vulns == 10
+        assert beta[0].total_vulns == 3
 
     def test_trend_point_to_dict(self):
         from agent_bom.baseline import TrendPoint
@@ -483,6 +535,29 @@ class TestTrendAnalysis:
 
 class TestSIEMConnectors:
     """Test SIEM integrations."""
+
+    @pytest.fixture(autouse=True)
+    def _governed_delivery_client(self, tmp_path):
+        from agent_bom.delivery import DeliveryClient, DeliveryStore, RetryPolicy, SendOutcome, set_delivery_client
+
+        def _sender(url, headers, body, timeout):
+            import httpx
+
+            try:
+                response = httpx.post(url, json=json.loads(body), headers=headers, timeout=timeout)
+                return SendOutcome(http_status=response.status_code)
+            except Exception:
+                return SendOutcome(http_status=None, error="transport failure")
+
+        set_delivery_client(
+            DeliveryClient(
+                DeliveryStore(tmp_path / "delivery.db"),
+                sender=_sender,
+                retry=RetryPolicy(max_attempts=1),
+            )
+        )
+        yield
+        set_delivery_client(None)
 
     def test_list_connectors(self):
         from agent_bom.siem import list_connectors

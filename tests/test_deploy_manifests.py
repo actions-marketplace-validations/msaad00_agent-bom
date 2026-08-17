@@ -2,16 +2,47 @@
 
 from __future__ import annotations
 
+import re
+import shutil
+import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 DEPLOY_DIR = Path(__file__).parent.parent / "deploy"
 K8S_DIR = DEPLOY_DIR / "k8s"
 HELM_DIR = DEPLOY_DIR / "helm" / "agent-bom"
+ENDPOINTS_DIR = DEPLOY_DIR / "endpoints"
+LOADTEST_DIR = DEPLOY_DIR / "loadtest"
+OPS_DIR = DEPLOY_DIR / "ops"
+REPO_ROOT = DEPLOY_DIR.parent
 
 
 # ─── K8s manifest validation ────────────────────────────────────────────────
+
+
+def test_runtime_images_probe_the_expected_running_process() -> None:
+    """A healthy image must prove its runtime entrypoint is still PID 1."""
+    expected = {
+        "Dockerfile.runtime": "agent-bom proxy",
+        "Dockerfile.mcp": "agent-bom mcp server",
+    }
+    for filename, process_signature in expected.items():
+        dockerfile = (DEPLOY_DIR / "docker" / filename).read_text()
+        assert "/proc/1/cmdline" in dockerfile
+        assert process_signature in dockerfile
+        healthcheck = dockerfile.split("HEALTHCHECK", 1)[1].split("ENTRYPOINT", 1)[0]
+        assert "agent-bom --version" not in healthcheck
+
+
+def test_airgap_profile_disables_cdn_backed_interactive_docs() -> None:
+    values = yaml.safe_load((HELM_DIR / "examples" / "airgap-vuln-db-values.yaml").read_text())
+    env = {entry["name"]: entry["value"] for entry in values["controlPlane"]["api"]["env"]}
+    assert env["AGENT_BOM_DISABLE_DOCS"] == "1"
+
+    deployment_docs = (REPO_ROOT / "docs" / "ENTERPRISE_DEPLOYMENT.md").read_text()
+    assert "docs/openapi/v1.yaml" in deployment_docs
 
 
 def test_k8s_yamls_are_valid():
@@ -88,11 +119,101 @@ def test_sidecar_has_prometheus_annotations():
     assert annotations["prometheus.io/port"] == "8422"
 
 
+def test_sidecar_example_pins_runtime_image():
+    """Static sidecar example should not rely on :latest for the runtime image."""
+    doc = yaml.safe_load((K8S_DIR / "sidecar-example.yaml").read_text())
+    containers = doc["spec"]["template"]["spec"]["containers"]
+    proxy = next(container for container in containers if container["name"] == "agent-bom-proxy")
+    assert proxy["image"].startswith("agentbom/agent-bom:")
+    assert not proxy["image"].endswith(":latest")
+
+
+def test_proxy_sidecar_pilot_uses_runtime_proxy_policy_fields():
+    """Pilot sidecar policy example should use the proxy's real local policy DSL."""
+    docs = list(yaml.safe_load_all((K8S_DIR / "proxy-sidecar-pilot.yaml").read_text()))
+    config_map = next(doc for doc in docs if doc and doc["kind"] == "ConfigMap")
+    policy = yaml.safe_load(config_map["data"]["policy.json"])
+    rules = policy["rules"]
+    assert any(rule.get("deny_tool_classes") for rule in rules)
+    assert any(rule.get("block_secret_paths") for rule in rules)
+    assert any(rule.get("block_unknown_egress") for rule in rules)
+    assert any(rule.get("rate_limit") == 60 for rule in rules)
+
+
+def test_proxy_sidecar_pilot_bootstraps_restricted_namespace():
+    """Pilot sidecar manifest should include the namespace with PSA restricted labels."""
+    docs = list(yaml.safe_load_all((K8S_DIR / "proxy-sidecar-pilot.yaml").read_text()))
+    namespace = next(doc for doc in docs if doc and doc["kind"] == "Namespace")
+    labels = namespace["metadata"]["labels"]
+    assert labels["pod-security.kubernetes.io/enforce"] == "restricted"
+    assert labels["pod-security.kubernetes.io/audit"] == "restricted"
+    assert labels["pod-security.kubernetes.io/warn"] == "restricted"
+
+
+def test_endpoint_fleet_templates_exist():
+    """Endpoint fleet pilot templates should ship for macOS and Linux."""
+    expected = {
+        "agent-bom-fleet-sync.sh",
+        "agent-bom-fleet-sync.service",
+        "agent-bom-fleet-sync.timer",
+        "com.agentbom.fleet-sync.plist",
+    }
+    actual = {path.name for path in ENDPOINTS_DIR.iterdir() if path.is_file()}
+    assert expected.issubset(actual)
+
+
+def test_loadtest_harness_assets_exist():
+    """Self-hosted operator load-test assets should ship with the repo."""
+    expected = {
+        "README.md",
+        "k6-control-plane-api.js",
+        "k6-proxy-audit.js",
+    }
+    actual = {path.name for path in LOADTEST_DIR.iterdir() if path.is_file()}
+    assert expected.issubset(actual)
+
+
+def test_restore_backup_script_exists():
+    """Operators should get a concrete restore path with the packaged backup job."""
+    script = OPS_DIR / "restore-postgres-backup.sh"
+    assert script.exists()
+    body = script.read_text()
+    assert "aws s3 cp" in body
+    assert "pg_restore" in body
+
+
+def test_loadtest_scripts_target_real_endpoints():
+    """k6 scripts should exercise the real shipped API and proxy paths."""
+    control_plane = (LOADTEST_DIR / "k6-control-plane-api.js").read_text()
+    proxy_audit = (LOADTEST_DIR / "k6-proxy-audit.js").read_text()
+    assert "/health" in control_plane
+    assert "/v1/fleet" in control_plane
+    assert "/v1/fleet/stats" in control_plane
+    assert "/v1/proxy/audit" in proxy_audit
+
+
+def test_chart_packages_grafana_dashboard_asset():
+    """The Helm chart should package the shipped Grafana dashboard JSON."""
+    dashboard = HELM_DIR / "files" / "grafana-agent-bom.json"
+    assert dashboard.exists()
+    payload = yaml.safe_load(dashboard.read_text())
+    assert payload["title"] == "agent-bom"
+
+
 def test_namespace_manifest():
     """Namespace manifest creates agent-bom namespace."""
     doc = yaml.safe_load((K8S_DIR / "namespace.yaml").read_text())
     assert doc["kind"] == "Namespace"
     assert doc["metadata"]["name"] == "agent-bom"
+
+
+def test_namespace_manifest_sets_psa_restricted():
+    """Namespace manifest should enforce restricted Pod Security Admission."""
+    doc = yaml.safe_load((K8S_DIR / "namespace.yaml").read_text())
+    labels = doc["metadata"]["labels"]
+    assert labels["pod-security.kubernetes.io/enforce"] == "restricted"
+    assert labels["pod-security.kubernetes.io/audit"] == "restricted"
+    assert labels["pod-security.kubernetes.io/warn"] == "restricted"
 
 
 # ─── Helm chart validation ──────────────────────────────────────────────────
@@ -110,16 +231,113 @@ def test_helm_chart_yaml_fields():
 def test_helm_values_yaml_keys():
     """values.yaml has expected top-level keys."""
     doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
-    expected_keys = {"image", "runtimeImage", "scanner", "monitor", "rbac", "serviceAccount", "resources"}
+    expected_keys = {
+        "image",
+        "uiImage",
+        "runtimeImage",
+        "scanner",
+        "monitor",
+        "sidecarInjection",
+        "controlPlane",
+        "rbac",
+        "serviceAccount",
+        "resources",
+        "podSecurityContext",
+        "securityContext",
+        "livenessProbe",
+        "readinessProbe",
+        "startupProbe",
+        "networkPolicy",
+        "pdb",
+        "topologySpread",
+    }
     assert expected_keys.issubset(set(doc.keys()))
 
 
 def test_helm_templates_exist():
     """Helm templates directory has required files."""
     templates_dir = HELM_DIR / "templates"
-    expected = {"_helpers.tpl", "serviceaccount.yaml", "rbac.yaml", "cronjob.yaml", "daemonset.yaml"}
+    expected = {
+        "_helpers.tpl",
+        "controlplane-api-deployment.yaml",
+        "controlplane-api-hpa.yaml",
+        "controlplane-api-service.yaml",
+        "controlplane-backup-cronjob.yaml",
+        "controlplane-externalsecret.yaml",
+        "controlplane-grafana-dashboard.yaml",
+        "controlplane-ingress.yaml",
+        "controlplane-istio-authorizationpolicy.yaml",
+        "controlplane-istio-peerauthentication.yaml",
+        "controlplane-kyverno-policy.yaml",
+        "controlplane-pdb.yaml",
+        "controlplane-priorityclass.yaml",
+        "controlplane-prometheusrule.yaml",
+        "controlplane-ui-deployment.yaml",
+        "controlplane-ui-hpa.yaml",
+        "controlplane-ui-service.yaml",
+        "gateway-hpa.yaml",
+        "gateway-keda-scaledobject.yaml",
+        "gateway-pdb.yaml",
+        "sidecar-injector-cert.yaml",
+        "sidecar-injector-deployment.yaml",
+        "sidecar-injector-service.yaml",
+        "sidecar-injector-webhook.yaml",
+        "teardown-hook-rbac.yaml",
+        "teardown-hook-job.yaml",
+        "serviceaccount.yaml",
+        "rbac.yaml",
+        "cronjob.yaml",
+        "daemonset.yaml",
+        "service.yaml",
+        "servicemonitor.yaml",
+        "pdb.yaml",
+        "ingress.yaml",
+    }
     actual = {f.name for f in templates_dir.iterdir() if f.is_file()}
     assert expected.issubset(actual), f"Missing templates: {expected - actual}"
+
+
+def test_helm_examples_readme_is_shipped():
+    """Operators should get one packaged index of the supported Helm profiles."""
+    readme = HELM_DIR / "examples" / "README.md"
+    assert readme.exists()
+    body = readme.read_text()
+    assert "focused-pilot" in body
+    assert "enterprise-demo" in body
+    assert "byo-postgres" in body
+    assert "sqlite-pilot" in body
+    assert "synthetic-enterprise-story" in body
+    assert "eks-vanilla" in body
+    assert "gateway-runtime" in body
+    assert "keda-autoscaling" in body
+    assert "install_helm_profile.py" in body
+
+
+def test_packaged_helm_profile_installer_script_exists():
+    """Operators should get a one-command wrapper around the shipped Helm profiles."""
+    script = Path(__file__).parent.parent / "scripts" / "install_helm_profile.py"
+    assert script.exists()
+    body = script.read_text()
+    assert "--print-command" in body
+    assert "build_helm_profile_command" in body
+
+
+def test_ci_pipeline_validates_helm_profiles():
+    """CI should render the shipped Helm profiles instead of trusting docs alone."""
+    workflow = yaml.safe_load((Path(__file__).parent.parent / ".github" / "workflows" / "ci.yml").read_text())
+    jobs = workflow["jobs"]
+    assert "helm-profiles" in jobs
+    job = jobs["helm-profiles"]
+    step_runs = [step.get("run", "") for step in job["steps"] if isinstance(step, dict)]
+    assert any("scripts/validate_helm_profiles.py" in run for run in step_runs)
+
+
+def test_release_floating_major_tag_uses_lease():
+    """Floating release tags should fail closed if the remote tag moved."""
+    workflow = (Path(__file__).parent.parent / ".github" / "workflows" / "release.yml").read_text()
+    assert "AGENT_BOM_UPDATE_FLOATING_MAJOR_TAGS == '1'" in workflow
+    assert '--force-with-lease="refs/tags/${MAJOR}:${REMOTE_TAG_SHA}"' in workflow
+    assert 'git push origin "$MAJOR" --force' not in workflow
 
 
 def test_helm_scanner_defaults():
@@ -131,7 +349,871 @@ def test_helm_scanner_defaults():
     assert "schedule" in scanner
 
 
+def test_helm_default_network_policy_is_scoped_to_scanner_pods():
+    """The scanner-only default must not block control-plane traffic."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    policy = doc["networkPolicy"]
+    assert policy["enabled"] is True
+    assert policy["podSelector"] == {"matchLabels": {"app.kubernetes.io/component": "scanner"}}
+
+
+def test_helm_control_plane_autoscaling_defaults():
+    """Control plane ships explicit HPA defaults without enabling autoscaling by default."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    api = doc["controlPlane"]["api"]["autoscaling"]
+    ui = doc["controlPlane"]["ui"]["autoscaling"]
+    assert api["enabled"] is False
+    assert api["minReplicas"] == 2
+    assert api["maxReplicas"] == 6
+    assert api["targetCPUUtilizationPercentage"] == 70
+    assert api["behavior"] == {}
+    assert ui["enabled"] is False
+    assert ui["minReplicas"] == 2
+    assert ui["maxReplicas"] == 4
+    assert ui["behavior"] == {}
+
+
+def test_helm_topology_spread_defaults():
+    """Topology spread knobs are explicit for production operators."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    spread = doc["topologySpread"]
+    assert spread["enabled"] is False
+    assert spread["zone"]["enabled"] is True
+    assert spread["node"]["enabled"] is True
+
+
+def test_helm_control_plane_priority_and_anti_affinity_defaults():
+    """Control-plane HA knobs are explicit and opt-in by default."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    anti_affinity = doc["controlPlane"]["podAntiAffinity"]
+    priority_class = doc["controlPlane"]["priorityClass"]
+    assert anti_affinity["enabled"] is False
+    assert anti_affinity["topologyKey"] == "kubernetes.io/hostname"
+    assert priority_class["create"] is False
+    assert priority_class["name"] == ""
+
+
+def test_helm_external_secrets_defaults():
+    """External secrets support is packaged but disabled by default."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    ext = doc["controlPlane"]["externalSecrets"]
+    assert ext["enabled"] is False
+    assert ext["secretStoreRef"]["kind"] == "ClusterSecretStore"
+    assert ext["target"]["name"] == "agent-bom-control-plane"
+    assert ext["secrets"] == []
+
+
+def test_helm_notes_distinguish_secret_sync_from_scanner_only() -> None:
+    notes = (HELM_DIR / "templates" / "NOTES.txt").read_text()
+    assert "EXTERNAL SECRET SYNC ONLY" in notes
+    assert ".Values.controlPlane.externalSecrets.syncOnly" in notes
+    assert "Keep this release installed" in notes
+
+
+def test_helm_teardown_hooks_defaults():
+    """Teardown hooks should ship enabled with explicit runtime defaults."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    hooks = doc["teardownHooks"]
+    assert hooks["enabled"] is True
+    assert hooks["deletePolicy"] == "before-hook-creation,hook-succeeded"
+    assert hooks["image"]["repository"] == "agentbom/agent-bom"
+    assert hooks["extraTargetSecrets"] == []
+
+
+def test_helm_sidecar_injection_defaults():
+    """Sidecar injector ships as an opt-in chart surface with explicit selectors."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    injector = doc["sidecarInjection"]
+    assert injector["enabled"] is False
+    assert injector["replicas"] == 2
+    assert injector["selectors"]["namespaceLabelKey"] == "agent-bom.io/proxy-inject"
+    assert injector["selectors"]["podLabelKey"] == "agent-bom.io/proxy"
+    assert injector["certManager"]["enabled"] is True
+
+
+def test_helm_control_plane_observability_defaults():
+    """PrometheusRule alerts ship enabled while dashboards remain opt-in."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    observability = doc["controlPlane"]["observability"]
+    assert observability["grafanaDashboard"]["enabled"] is False
+    assert observability["grafanaDashboard"]["folder"] == "agent-bom"
+    assert observability["prometheusRule"]["enabled"] is True
+    assert observability["prometheusRule"]["rules"]["apiErrorRate"]["enabled"] is True
+    assert observability["prometheusRule"]["rules"]["proxyAuditBacklog"]["backlogBytesThreshold"] == 10485760
+
+
+def test_helm_control_plane_mesh_and_policy_defaults():
+    """Service-mesh and policy-controller packaging should be explicit and opt-in."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    mesh = doc["controlPlane"]["serviceMesh"]
+    policy = doc["controlPlane"]["policyController"]
+    assert mesh["enabled"] is False
+    assert mesh["provider"] == "istio"
+    assert mesh["istio"]["peerAuthentication"]["enabled"] is True
+    assert mesh["istio"]["peerAuthentication"]["mode"] == "STRICT"
+    assert mesh["istio"]["authorizationPolicy"]["enabled"] is True
+    assert mesh["istio"]["authorizationPolicy"]["allowSameNamespace"] is True
+    assert mesh["istio"]["authorizationPolicy"]["allowedNamespaces"] == []
+    assert policy["enabled"] is False
+    assert policy["provider"] == "kyverno"
+    assert policy["kyverno"]["validationFailureAction"] == "Audit"
+    assert policy["kyverno"]["requireControlPlanePodHardening"] is True
+
+
+def test_helm_control_plane_backup_defaults():
+    """Postgres backup packaging is explicit and disabled by default."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    backup = doc["controlPlane"]["backup"]
+    assert backup["enabled"] is False
+    assert backup["schedule"] == "0 3 * * *"
+    assert backup["destination"]["prefix"] == "agent-bom/postgres"
+    assert backup["destination"]["bucketRegion"] == ""
+    assert backup["destination"]["encryption"]["enabled"] is True
+    assert backup["destination"]["encryption"]["mode"] == "AES256"
+    assert backup["image"]["dumpRepository"] == "postgres"
+    assert backup["image"]["uploadRepository"] == "amazon/aws-cli"
+    assert backup["serviceAccount"]["create"] is True
+    assert backup["serviceAccount"]["annotations"] == {}
+
+
+def test_helm_gateway_service_account_defaults():
+    """Gateway service account knobs stay explicit for IRSA-style rollout."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    gateway = doc["gateway"]
+    sa = gateway["serviceAccount"]
+    assert sa["create"] is True
+    assert sa["name"] == ""
+    assert sa["annotations"] == {}
+    assert gateway["controlPlaneDiscovery"]["url"] == ""
+    assert gateway["policyReloadSeconds"] == 0
+    assert gateway["runtimeRateLimitPerTenantPerMinute"] == 0
+    assert gateway["requireSharedRateLimit"] is False
+    assert gateway["detectVisualLeaks"] is False
+    assert gateway["allowVisualLeakBestEffort"] is False
+    assert gateway["profileEnforcement"] == "off"
+    assert gateway["profileEnvironment"] == ""
+    assert gateway["profileIssuer"] == "agent-bom"
+
+
+def test_helm_gateway_network_policy_defaults_to_explicit_egress_allowlist():
+    """Gateway pods should get a component-specific egress policy when enabled."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    policy = doc["gateway"]["networkPolicy"]
+    assert policy["enabled"] is True
+    assert policy["allowDns"] is True
+    assert policy["egress"] == []
+    assert policy["additionalEgress"] == []
+
+    template = (HELM_DIR / "templates" / "gateway-networkpolicy.yaml").read_text()
+    assert "kind: NetworkPolicy" in template
+    assert "app.kubernetes.io/component: gateway" in template
+    assert ".Values.gateway.networkPolicy.enabled" in template
+    assert ".Values.gateway.networkPolicy.egress" in template
+    assert ".Values.gateway.networkPolicy.additionalEgress" in template
+    assert "egress: []" in template
+
+
+def test_helm_gateway_template_wires_control_plane_and_runtime_flags():
+    """Gateway deployment should expose the CLI's deploy-time control knobs."""
+    template = (HELM_DIR / "templates" / "gateway-deployment.yaml").read_text()
+    assert "--from-control-plane" in template
+    assert ".Values.gateway.controlPlaneDiscovery.url" in template
+    assert "--policy-reload-seconds" in template
+    assert ".Values.gateway.policyReloadSeconds" in template
+    assert "--runtime-rate-limit-per-tenant-per-minute" in template
+    assert ".Values.gateway.runtimeRateLimitPerTenantPerMinute" in template
+    assert "--require-shared-rate-limit" in template
+    assert "--detect-visual-leaks" in template
+    assert "--allow-visual-leak-best-effort" in template
+    assert "--profile-enforcement" in template
+    assert ".Values.gateway.profileEnforcement" in template
+    assert "--profile-environment" in template
+    assert ".Values.gateway.profileEnvironment" in template
+    assert "--profile-issuer" in template
+    assert "$gatewayEnvFrom = .Values.controlPlane.api.envFrom" not in template
+    assert "gateway profile enforcement requires gateway.envFrom" in template
+
+
+def test_helm_examples_do_not_ship_duplicate_sqlite_pilot_profile():
+    """Packaged Helm example profiles should have one canonical sqlite pilot file."""
+    duplicate = HELM_DIR / "examples" / "eks-control-plane-sqlite-pilot-values 2.yaml"
+    assert not duplicate.exists()
+
+
+def test_helm_gateway_autoscaling_defaults():
+    """Gateway ships explicit HA knobs without forcing autoscaling on by default."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    autoscaling = doc["gateway"]["autoscaling"]
+    assert autoscaling["enabled"] is False
+    assert autoscaling["minReplicas"] == 2
+    assert autoscaling["maxReplicas"] == 6
+    assert autoscaling["targetCPUUtilizationPercentage"] == 70
+    assert autoscaling["targetMemoryUtilizationPercentage"] is None
+    assert autoscaling["behavior"] == {}
+    assert autoscaling["keda"]["enabled"] is False
+    assert autoscaling["keda"]["prometheus"]["relayRateThreshold"] == "25"
+    assert autoscaling["keda"]["prometheus"]["pressureRateThreshold"] == "1"
+
+
+def test_helm_gateway_keda_template_suppresses_static_hpa():
+    """Gateway KEDA must own autoscaling when enabled, not stack with a static HPA."""
+    hpa_template = (HELM_DIR / "templates" / "gateway-hpa.yaml").read_text()
+    scaled_object = (HELM_DIR / "templates" / "gateway-keda-scaledobject.yaml").read_text()
+
+    assert "(not .Values.gateway.autoscaling.keda.enabled)" in hpa_template
+    assert "kind: ScaledObject" in scaled_object
+    assert "agent_bom_gateway_relays_total" in scaled_object
+    assert "gateway.autoscaling.keda.triggers" in scaled_object
+
+
+def test_helm_control_plane_api_extra_volume_defaults():
+    """API deployment exposes opt-in extra volume hooks for SQLite pilot storage."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    api = doc["controlPlane"]["api"]
+    assert api["extraVolumes"] == []
+    assert api["extraVolumeMounts"] == []
+
+
+def test_helm_scanner_service_account_defaults():
+    """Scanner service account knobs stay explicit for IRSA-style rollout."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    sa = doc["scanner"]["serviceAccount"]
+    assert sa["create"] is True
+    assert sa["name"] == ""
+    assert sa["annotations"] == {}
+
+
 def test_helm_monitor_disabled_by_default():
     """Monitor is disabled by default."""
     doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
     assert doc["monitor"]["enabled"] is False
+
+
+def test_helm_monitor_defaults_include_service_and_servicemonitor():
+    """Monitor values expose operator-visible service and ServiceMonitor toggles."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    assert doc["monitor"]["service"]["enabled"] is True
+    assert doc["monitor"]["serviceMonitor"]["enabled"] is False
+    assert doc["monitor"]["ingress"]["enabled"] is False
+
+
+def test_helm_monitor_probes_are_defined():
+    """Monitor readiness and startup probes are configurable in values."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    assert doc["readinessProbe"]["httpGet"]["path"] == "/status"
+    assert doc["startupProbe"]["httpGet"]["path"] == "/status"
+
+
+def test_helm_network_policy_defaults_are_explicit():
+    """Network policy defaults should be explicit, not allow-all."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    policy = doc["networkPolicy"]
+    assert policy["enabled"] is True
+    assert policy["restrictIngress"] is True
+    assert policy["allowDns"] is True
+    assert policy["allowWeb"] is False
+    assert policy["webPorts"] == [80, 443]
+    assert policy["egress"] == []
+    assert policy["additionalEgress"] == []
+
+
+def test_helm_pdb_defaults_are_defined():
+    """PDB values are explicit and disabled by default."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    pdb = doc["pdb"]
+    assert pdb["enabled"] is False
+    assert pdb["minAvailable"] == 1
+    assert pdb["maxUnavailable"] is None
+
+
+def test_helm_monitor_ingress_defaults_are_defined():
+    """Ingress values are explicit and disabled by default."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    ingress = doc["monitor"]["ingress"]
+    assert ingress["enabled"] is False
+    assert ingress["hosts"][0]["paths"][0]["path"] == "/"
+    assert ingress["hosts"][0]["paths"][0]["pathType"] == "Prefix"
+
+
+def test_pilot_values_restrict_ingress():
+    """Focused EKS pilot values should not leave ingress wide open."""
+    pilot = yaml.safe_load((HELM_DIR / "examples" / "eks-mcp-pilot-values.yaml").read_text())
+    policy = pilot["networkPolicy"]
+    assert policy["enabled"] is True
+    assert policy["restrictIngress"] is True
+    assert len(policy["ingress"]) >= 2
+
+
+def test_production_values_enable_operator_defaults():
+    """Production example should turn on the packaged operator defaults."""
+    production = yaml.safe_load((HELM_DIR / "examples" / "eks-production-values.yaml").read_text())
+    assert production["controlPlane"]["api"]["autoscaling"]["enabled"] is True
+    assert production["controlPlane"]["ui"]["autoscaling"]["enabled"] is True
+    assert production["monitor"]["enabled"] is True
+    assert production["monitor"]["serviceMonitor"]["enabled"] is True
+    assert production["controlPlane"]["api"]["autoscaling"]["behavior"]["scaleDown"]["stabilizationWindowSeconds"] == 300
+    assert production["controlPlane"]["ui"]["autoscaling"]["behavior"]["scaleDown"]["stabilizationWindowSeconds"] == 300
+    assert production["controlPlane"]["externalSecrets"]["enabled"] is False
+    assert production["controlPlane"]["externalSecrets"]["syncOnly"] is False
+    assert production["controlPlane"]["observability"]["grafanaDashboard"]["enabled"] is True
+    assert production["controlPlane"]["observability"]["prometheusRule"]["enabled"] is True
+    assert production["controlPlane"]["backup"]["enabled"] is True
+    assert production["controlPlane"]["backup"]["destination"]["bucket"] == "agent-bom-prod-backups"
+    assert production["controlPlane"]["backup"]["destination"]["bucketRegion"] == "REPLACE_ME_BUCKET_REGION"
+    assert production["controlPlane"]["backup"]["destination"]["encryption"]["enabled"] is True
+    assert production["controlPlane"]["backup"]["destination"]["encryption"]["mode"] == "aws:kms"
+    assert production["controlPlane"]["backup"]["destination"]["encryption"]["kmsKeyId"] == "alias/agent-bom-backups"
+    secrets = production["controlPlane"]["externalSecrets"]["secrets"]
+    assert {secret["target"]["name"] for secret in secrets} == {
+        "agent-bom-control-plane-auth",
+        "agent-bom-control-plane-admin",
+        "agent-bom-control-plane-db",
+        "agent-bom-control-plane-maintenance",
+    }
+    assert next(secret for secret in secrets if secret["target"]["name"] == "agent-bom-control-plane-db")["refreshInterval"] == "1h"
+    assert next(secret for secret in secrets if secret["target"]["name"] == "agent-bom-control-plane-auth")["refreshInterval"] == "5m"
+    env_from = production["controlPlane"]["api"]["envFrom"]
+    assert env_from == [{"secretRef": {"name": "agent-bom-control-plane-auth"}}]
+    assert production["controlPlane"]["postgresSecrets"] == {
+        "enabled": True,
+        "appSecretRef": {"name": "agent-bom-control-plane-db"},
+        "maintenanceSecretRef": {"name": "agent-bom-control-plane-maintenance"},
+        "adminSecretRef": {"name": "agent-bom-control-plane-admin"},
+    }
+    env = {entry["name"]: entry["value"] for entry in production["controlPlane"]["api"]["env"]}
+    assert env["AGENT_BOM_REQUIRE_SHARED_RATE_LIMIT"] == "1"
+    assert env["AGENT_BOM_POSTGRES_POOL_MIN_SIZE"] == "5"
+    assert env["AGENT_BOM_POSTGRES_POOL_MAX_SIZE"] == "20"
+    assert env["AGENT_BOM_POSTGRES_CONNECT_TIMEOUT_SECONDS"] == "5"
+    assert env["AGENT_BOM_POSTGRES_STATEMENT_TIMEOUT_MS"] == "15000"
+    assert production["controlPlane"]["podAntiAffinity"]["enabled"] is True
+    assert production["controlPlane"]["priorityClass"]["create"] is True
+    assert production["topologySpread"]["enabled"] is True
+    assert production["networkPolicy"]["restrictIngress"] is True
+    assert "cert-manager.io/cluster-issuer" in production["controlPlane"]["ingress"]["annotations"]
+
+
+def test_eks_vanilla_values_enable_ha_without_mesh_or_external_secret_dependencies():
+    """Vanilla EKS profile should be production-shaped without mesh/ESO/cert-manager."""
+    values = yaml.safe_load((HELM_DIR / "examples" / "eks-vanilla-values.yaml").read_text())
+    control_plane = values["controlPlane"]
+    api = control_plane["api"]
+    ui = control_plane["ui"]
+
+    assert control_plane["enabled"] is True
+    assert control_plane["serviceMesh"]["enabled"] is False
+    assert control_plane["externalSecrets"]["enabled"] is False
+    assert api["replicas"] == 2
+    assert ui["replicas"] == 2
+    assert api["autoscaling"]["enabled"] is True
+    assert ui["autoscaling"]["enabled"] is True
+    assert api["envFrom"] == [{"secretRef": {"name": "agent-bom-control-plane-auth"}}]
+    assert control_plane["postgresSecrets"]["enabled"] is True
+    env = {entry["name"]: entry["value"] for entry in api["env"]}
+    assert env["AGENT_BOM_REQUIRE_SHARED_RATE_LIMIT"] == "1"
+    assert env["AGENT_BOM_REQUIRE_SHARED_SCIM_STORE"] == "1"
+    assert env["AGENT_BOM_SECRET_PROVIDER"] == "kubernetes_secret"
+    assert env["AGENT_BOM_REQUIRE_AUDIT_HMAC"] == "1"
+    assert control_plane["ingress"]["className"] == "alb"
+    annotations = control_plane["ingress"]["annotations"]
+    assert annotations["alb.ingress.kubernetes.io/target-type"] == "ip"
+    assert "alb.ingress.kubernetes.io/certificate-arn" in annotations
+    assert values["networkPolicy"]["enabled"] is True
+    assert values["networkPolicy"]["restrictIngress"] is False
+    assert values["topologySpread"]["enabled"] is True
+    assert values["pdb"]["enabled"] is True
+
+
+def test_eks_vanilla_quickstart_supplies_a_cluster_safe_login_backend() -> None:
+    doc = (Path(__file__).parent.parent / "site-docs" / "deployment" / "eks-vanilla-quickstart.md").read_text()
+
+    assert "AGENT_BOM_API_KEYS=REPLACE_ME_OPENSSL_RAND_HEX_24:admin" in doc
+    assert "AGENT_BOM_CONNECTIONS_KEY=REPLACE_ME_FERNET_KEY" in doc
+    assert "SCIM provisioning does not replace" in doc
+
+
+def test_helm_test_connection_template_checks_api_health_and_readyz():
+    """Helm test should probe the API's real health endpoints."""
+    template = (HELM_DIR / "templates" / "tests" / "test-connection.yaml").read_text()
+    assert '"helm.sh/hook": test' in template
+    assert "/health" in template
+    assert "/readyz" in template
+    assert "/healthz" not in template
+
+
+def test_external_secret_template_supports_top_level_secret_store_defaults():
+    """External secret template should not require per-secret secretStoreRef duplication."""
+    template = (HELM_DIR / "templates" / "controlplane-externalsecret.yaml").read_text()
+    assert 'get $secret "secretStoreRef"' in template
+    assert 'default $defaults.secretStoreRef.kind (get $secretStoreRef "kind")' in template
+    assert 'default $defaults.secretStoreRef.name (get $secretStoreRef "name")' in template
+
+
+def test_external_secret_template_labels_generated_target_secret():
+    """Generated target secrets should inherit chart labels for hook cleanup."""
+    template = (HELM_DIR / "templates" / "controlplane-externalsecret.yaml").read_text()
+    assert "template:" in template
+    assert "app.kubernetes.io/component: control-plane" in template
+
+
+def test_teardown_hook_template_uses_cleanup_module():
+    """Teardown hook jobs should call the packaged Python cleanup entrypoint."""
+    template = (HELM_DIR / "templates" / "teardown-hook-job.yaml").read_text()
+    assert "agent_bom.deploy_k8s_cleanup" in template
+    assert "helm.sh/hook: {{ $hook }}" in template
+
+
+def test_teardown_hook_cleanup_is_scoped_to_its_helm_release_instance() -> None:
+    """A workload uninstall must not delete a sibling secret-sync release."""
+    helpers = (HELM_DIR / "templates" / "_helpers.tpl").read_text(encoding="utf-8")
+    template = (HELM_DIR / "templates" / "teardown-hook-job.yaml").read_text(encoding="utf-8")
+
+    assert "app.kubernetes.io/instance: {{ .Release.Name | quote }}" in helpers
+    assert "app.kubernetes.io/instance={{ $.Release.Name }}" in template
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_helm_release_instance_label_remains_a_string_for_scalar_names() -> None:
+    result = subprocess.run(
+        ["helm", "template", "true", str(HELM_DIR)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+    assert docs
+    assert all(doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/instance") == "true" for doc in docs)
+
+
+def test_helm_single_node_sqlite_pilot_example_is_shipped():
+    """Pilot preset should provide an in-cluster control-plane storage story."""
+    doc = yaml.safe_load((HELM_DIR / "examples" / "eks-control-plane-sqlite-pilot-values.yaml").read_text())
+    assert doc["controlPlane"]["enabled"] is True
+    assert doc["controlPlane"]["api"]["replicas"] == 1
+    assert doc["controlPlane"]["ui"]["replicas"] == 1
+    assert doc["controlPlane"]["api"]["env"][0] == {
+        "name": "AGENT_BOM_DB",
+        "value": "/var/lib/agent-bom/control-plane.sqlite",
+    }
+    assert doc["controlPlane"]["api"]["extraVolumes"][0]["persistentVolumeClaim"]["claimName"] == "agent-bom-sqlite-pilot"
+    assert doc["controlPlane"]["api"]["extraVolumeMounts"][0]["mountPath"] == "/var/lib/agent-bom"
+    assert doc["scanner"]["enabled"] is False
+    assert doc["pdb"]["enabled"] is False
+
+
+def test_mesh_example_enables_istio_and_kyverno_hardening():
+    """Mesh example should wire the chart's Istio and Kyverno packaging coherently."""
+    values = yaml.safe_load((HELM_DIR / "examples" / "eks-istio-kyverno-values.yaml").read_text())
+    mesh = values["controlPlane"]["serviceMesh"]
+    policy = values["controlPlane"]["policyController"]
+    assert values["controlPlane"]["enabled"] is True
+    assert mesh["enabled"] is True
+    assert mesh["provider"] == "istio"
+    assert mesh["istio"]["peerAuthentication"]["mode"] == "STRICT"
+    assert set(mesh["istio"]["authorizationPolicy"]["allowedNamespaces"]) == {"ingress-nginx", "istio-system"}
+    assert policy["enabled"] is True
+    assert policy["provider"] == "kyverno"
+    assert policy["kyverno"]["validationFailureAction"] == "Enforce"
+    ingress_rule = values["networkPolicy"]["ingress"][1]
+    ports = {port["port"] for port in ingress_rule["ports"]}
+    assert ports == {3000, 8422}
+
+
+def test_pilot_and_production_values_narrow_ingress_to_controller_pods_and_ports():
+    """Focused values should narrow ingress traffic to controller pods on UI/API ports."""
+    for name in ("eks-mcp-pilot-values.yaml", "eks-production-values.yaml"):
+        values = yaml.safe_load((HELM_DIR / "examples" / name).read_text())
+        ingress_rule = values["networkPolicy"]["ingress"][1]
+        source = ingress_rule["from"][0]
+        ports = {port["port"] for port in ingress_rule["ports"]}
+        assert source["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"] == "ingress-nginx"
+        assert source["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "controller"
+        assert ports == {3000, 8422}
+
+
+def test_helm_migrations_defaults():
+    """Postgres migrations hook ships enabled for control-plane Postgres profiles."""
+    doc = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    migrations = doc["controlPlane"]["migrations"]
+    assert migrations["enabled"] is True
+    assert migrations["postgres"]["enabled"] is True
+    assert migrations["backoffLimit"] == 0
+    assert migrations["hooks"] == "pre-upgrade,pre-install"
+    assert migrations["alembicConfig"] == "deploy/supabase/postgres/alembic.ini"
+
+
+def test_alembic_migration_hook_template():
+    """Postgres migrations should run as a fail-loud Helm pre-upgrade hook."""
+    template = (HELM_DIR / "templates" / "controlplane-alembic-migration-job.yaml").read_text()
+    assert "controlPlane.migrations.postgres.enabled" in template
+    assert "helm.sh/hook: {{ $migrations.hooks | quote }}" in template
+    assert "deploy/supabase/postgres/compose_migrate.py" in template
+    assert "{{ $migrations.alembicConfig | quote }}" in template
+    assert "backoffLimit: {{ $migrations.backoffLimit }}" in template
+    assert "$envFrom = .Values.controlPlane.api.envFrom" not in template
+    assert "generic envFrom cannot prove an admin identity" in template
+    assert "app, maintenance, and admin Secret names must be distinct" in template
+
+
+def test_scheduled_cronjobs_are_fail_loud():
+    """Scanner / KSPM / backup CronJobs must not silently retry forever."""
+    for name in (
+        "cronjob.yaml",
+        "kspm-cronjob.yaml",
+        "controlplane-backup-cronjob.yaml",
+    ):
+        template = (HELM_DIR / "templates" / name).read_text()
+        assert "backoffLimit: 0" in template, f"{name} must set jobTemplate.spec.backoffLimit: 0"
+        assert "restartPolicy: Never" in template, f"{name} must use restartPolicy: Never"
+        assert "restartPolicy: OnFailure" not in template, f"{name} must not use OnFailure retries"
+
+
+def test_control_plane_backup_uses_scoped_maintenance_identity():
+    template = (HELM_DIR / "templates" / "controlplane-backup-cronjob.yaml").read_text()
+    assert 'pg_dump "$AGENT_BOM_POSTGRES_MAINTENANCE_URL"' in template
+    assert "--enable-row-security" in template
+    assert "PGOPTIONS" in template
+    assert "app.bypass_rls=1" in template
+    assert "generic envFrom cannot prove a maintenance identity" in template
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_helm_postgres_jobs_fail_render_without_distinct_credentials() -> None:
+    common = [
+        "helm",
+        "template",
+        "abom",
+        str(HELM_DIR),
+        "--set",
+        "controlPlane.enabled=true",
+        "--set",
+        "controlPlane.api.envFrom[0].secretRef.name=runtime-db",
+    ]
+
+    missing_admin = subprocess.run(common, capture_output=True, text=True, check=False)
+    assert missing_admin.returncode != 0
+    assert "generic envFrom cannot prove an admin identity" in missing_admin.stderr
+
+    reused_runtime = subprocess.run(
+        [
+            *common,
+            "--set",
+            "controlPlane.migrations.envFrom[0].secretRef.name=runtime-db",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert reused_runtime.returncode != 0
+    assert "generic envFrom cannot prove an admin identity" in reused_runtime.stderr
+
+    missing_maintenance = subprocess.run(
+        [
+            *common,
+            "--set",
+            "controlPlane.migrations.env[0].name=ALEMBIC_DATABASE_URL",
+            "--set",
+            "controlPlane.migrations.env[0].value=postgresql://admin@db/app",
+            "--set",
+            "controlPlane.backup.enabled=true",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert missing_maintenance.returncode != 0
+    assert "generic envFrom cannot prove a maintenance identity" in missing_maintenance.stderr
+
+    duplicate_canonical = subprocess.run(
+        [
+            "helm",
+            "template",
+            "abom",
+            str(HELM_DIR),
+            "--set",
+            "controlPlane.enabled=true",
+            "--set",
+            "controlPlane.postgresSecrets.enabled=true",
+            "--set",
+            "controlPlane.postgresSecrets.appSecretRef.name=runtime-db",
+            "--set",
+            "controlPlane.postgresSecrets.maintenanceSecretRef.name=runtime-db",
+            "--set",
+            "controlPlane.postgresSecrets.adminSecretRef.name=admin-db",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert duplicate_canonical.returncode != 0
+    assert "app, maintenance, and admin Secret names must be distinct" in duplicate_canonical.stderr
+
+    canonical = [
+        "helm",
+        "template",
+        "abom",
+        str(HELM_DIR),
+        "--set",
+        "controlPlane.enabled=true",
+        "--set",
+        "controlPlane.postgresSecrets.enabled=true",
+        "--set",
+        "controlPlane.postgresSecrets.appSecretRef.name=runtime-db",
+        "--set",
+        "controlPlane.postgresSecrets.maintenanceSecretRef.name=maintenance-db",
+        "--set",
+        "controlPlane.postgresSecrets.adminSecretRef.name=admin-db",
+    ]
+    for values_path, variable, expected in (
+        ("controlPlane.api.env", "AGENT_BOM_POSTGRES_URL", "controlPlane.api.env cannot override"),
+        ("controlPlane.migrations.env", "ALEMBIC_DATABASE_URL", "controlPlane.migrations.env cannot override"),
+        (
+            "controlPlane.backup.env",
+            "AGENT_BOM_POSTGRES_MAINTENANCE_URL",
+            "controlPlane.backup.env cannot override",
+        ),
+    ):
+        command = [
+            *canonical,
+            "--set",
+            f"{values_path}[0].name={variable}",
+            "--set",
+            f"{values_path}[0].value=postgresql://wrong@db/agent_bom",
+        ]
+        if values_path == "controlPlane.backup.env":
+            command.extend(["--set", "controlPlane.backup.enabled=true"])
+        overridden = subprocess.run(command, capture_output=True, text=True, check=False)
+        assert overridden.returncode != 0
+        assert expected in overridden.stderr
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_production_render_projects_only_canonical_postgres_identities() -> None:
+    result = subprocess.run(
+        [
+            "helm",
+            "template",
+            "agent-bom",
+            str(HELM_DIR),
+            "--values",
+            str(HELM_DIR / "examples" / "eks-production-values.yaml"),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+    api = next(
+        doc
+        for doc in docs
+        if doc.get("kind") == "Deployment" and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "api"
+    )
+    migration = next(
+        doc
+        for doc in docs
+        if doc.get("kind") == "Job" and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "postgres-migration"
+    )
+    backup = next(doc for doc in docs if doc.get("kind") == "CronJob" and doc["metadata"]["name"].endswith("backup"))
+
+    api_container = api["spec"]["template"]["spec"]["containers"][0]
+    migration_container = migration["spec"]["template"]["spec"]["containers"][0]
+    backup_container = backup["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
+
+    assert [item["secretRef"]["name"] for item in api_container["envFrom"]] == ["agent-bom-control-plane-auth"]
+    assert "envFrom" not in migration_container
+    assert "envFrom" not in backup_container
+
+    def projected_secret_names(container: dict) -> dict[str, str]:
+        return {entry["name"]: entry["valueFrom"]["secretKeyRef"]["name"] for entry in container["env"] if "valueFrom" in entry}
+
+    assert projected_secret_names(api_container) == {
+        "AGENT_BOM_POSTGRES_URL": "agent-bom-control-plane-db",
+        "AGENT_BOM_POSTGRES_MAINTENANCE_URL": "agent-bom-control-plane-maintenance",
+    }
+    assert projected_secret_names(migration_container) == {
+        "ALEMBIC_DATABASE_URL": "agent-bom-control-plane-admin",
+        "AGENT_BOM_POSTGRES_URL": "agent-bom-control-plane-db",
+        "AGENT_BOM_POSTGRES_MAINTENANCE_URL": "agent-bom-control-plane-maintenance",
+    }
+    assert projected_secret_names(backup_container) == {"AGENT_BOM_POSTGRES_MAINTENANCE_URL": "agent-bom-control-plane-maintenance"}
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_published_control_plane_helm_example_renders() -> None:
+    docs = (REPO_ROOT / "site-docs" / "deployment" / "control-plane-helm.md").read_text(encoding="utf-8")
+    match = re.search(r"Then install with a values file like:\n\n```yaml\n(.*?)\n```", docs, flags=re.DOTALL)
+    assert match is not None
+
+    result = subprocess.run(
+        ["helm", "template", "agent-bom", str(HELM_DIR), "--values", "-"],
+        input=match.group(1),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_backup_restore_workflow_proves_rls_maintenance_dump_contract():
+    workflow = (REPO_ROOT / ".github" / "workflows" / "backup-restore.yml").read_text()
+    assert "CREATE ROLE agent_bom_rls_maintenance NOLOGIN" in workflow
+    assert "CREATE ROLE agent_bom_maintenance LOGIN" in workflow
+    assert "NOSUPERUSER NOBYPASSRLS" in workflow
+    assert "GRANT agent_bom_rls_maintenance TO agent_bom_maintenance" in workflow
+    assert "ALTER TABLE scan_jobs ENABLE ROW LEVEL SECURITY" in workflow
+    assert "ALTER TABLE scan_jobs FORCE ROW LEVEL SECURITY" in workflow
+    assert "Verify scoped maintenance RLS boundary" in workflow
+    assert '[ "$role_flags" = "false:false" ]' in workflow
+    assert "PGOPTIONS: -c app.bypass_rls=1" in workflow
+    assert "PGPASSWORD: maintenancepass" in workflow
+    assert ('pg_dump "$AGENT_BOM_POSTGRES_MAINTENANCE_URL" \\\n            --enable-row-security --format=custom --file "$out"') in workflow
+
+
+def test_scanner_only_cronjob_warning_annotation():
+    """Scanner-only renders should surface an install-time warning annotation."""
+    template = (HELM_DIR / "templates" / "cronjob.yaml").read_text()
+    assert "agent-bom.io/scanner-only-warning" in template
+    assert "controlPlane.enabled=true" in template
+
+
+def test_sqlite_pilot_disables_postgres_migration_hook():
+    """SQLite pilot should not render the Alembic migration hook."""
+    doc = yaml.safe_load((HELM_DIR / "examples" / "eks-control-plane-sqlite-pilot-values.yaml").read_text())
+    assert doc["controlPlane"]["migrations"]["postgres"]["enabled"] is False
+
+
+# ─── Control-plane secret wiring: first-run must not CreateContainerConfigError ──
+
+
+def _documented_control_plane_secret_names() -> dict[str, set[str]]:
+    """Map every documented control-plane Secret name → its stringData keys.
+
+    Covers both packaged example manifests (postgres + auth) since no chart
+    template renders these Secrets; operators create them from the examples.
+    """
+    documented: dict[str, set[str]] = {}
+    for name in ("postgres-secret.example.yaml", "control-plane-auth-secret.example.yaml"):
+        path = HELM_DIR / "examples" / name
+        for doc in yaml.safe_load_all(path.read_text()):
+            if not doc or doc.get("kind") != "Secret":
+                continue
+            # A name may appear in more than one per-profile block (e.g. the
+            # combined focused-pilot Secret and the minimal sqlite demo Secret
+            # both use `agent-bom-control-plane`). Union the keys shown for it.
+            keys = set((doc.get("stringData") or {}).keys())
+            documented.setdefault(doc["metadata"]["name"], set()).update(keys)
+    return documented
+
+
+def _profile_envfrom_secret_names(values: dict) -> set[str]:
+    names: set[str] = set()
+    control_plane = values.get("controlPlane") or {}
+    for section in ("api", "backup", "migrations"):
+        block = control_plane.get(section) or {}
+        for entry in block.get("envFrom") or []:
+            ref = entry.get("secretRef") or {}
+            if ref.get("name"):
+                names.add(ref["name"])
+    return names
+
+
+def test_control_plane_auth_secret_example_is_shipped_and_enumerates_code_keys():
+    """The auth Secret every control-plane profile references must be documented.
+
+    Without it a first `helm install` leaves API/UI pods in
+    CreateContainerConfigError. The example must enumerate the exact env-var
+    names the code reads (secret_source.resolve_secret), not guessed keys.
+    """
+    documented = _documented_control_plane_secret_names()
+    # Auth is independent from all database identities.
+    auth = documented["agent-bom-control-plane-auth"]
+    assert {
+        "AGENT_BOM_BROWSER_SESSION_SIGNING_KEY",
+        "AGENT_BOM_AUDIT_HMAC_KEY",
+        "AGENT_BOM_CONNECTIONS_KEY",
+        "AGENT_BOM_API_KEYS",
+    } <= auth
+    assert {"AGENT_BOM_POSTGRES_URL"} <= documented["agent-bom-control-plane-db"]
+    assert {"AGENT_BOM_POSTGRES_MAINTENANCE_URL"} <= documented["agent-bom-control-plane-maintenance"]
+    assert {"ALEMBIC_DATABASE_URL"} <= documented["agent-bom-control-plane-admin"]
+
+
+def test_control_plane_profiles_reference_only_documented_secrets():
+    """Every profile's envFrom secretRef must resolve to a shipped example."""
+    documented = set(_documented_control_plane_secret_names())
+    profiles = (
+        "eks-mcp-pilot-values.yaml",
+        "eks-vanilla-values.yaml",
+        "eks-control-plane-sqlite-pilot-values.yaml",
+    )
+    for profile in profiles:
+        values = yaml.safe_load((HELM_DIR / "examples" / profile).read_text())
+        referenced = _profile_envfrom_secret_names(values)
+        assert referenced, f"{profile} references no control-plane Secret"
+        undocumented = referenced - documented
+        assert not undocumented, f"{profile} references undocumented Secret(s): {undocumented}"
+
+
+def test_sqlite_pilot_opens_a_working_first_run_login():
+    """The single-replica demo profile has no auth backend; it must ship the
+    visible demo-only unauthenticated overlay so login is not a dead wall."""
+    values = yaml.safe_load((HELM_DIR / "examples" / "eks-control-plane-sqlite-pilot-values.yaml").read_text())
+    env = {e["name"]: e["value"] for e in values["controlPlane"]["api"]["env"]}
+    assert env.get("AGENT_BOM_ALLOW_UNAUTHENTICATED_API") == "1"
+
+
+def test_snowflake_key_secret_mount_is_group_readable_under_fsgroup():
+    """The scanner pod runs as uid 100 with fsGroup 1000; the mounted Snowflake
+    key must be group-readable (0440), not owner-only 0400."""
+    cronjob = (HELM_DIR / "templates" / "cronjob.yaml").read_text()
+    assert "defaultMode: 0440" in cronjob
+    assert "defaultMode: 0400" not in cronjob
+    values = yaml.safe_load((HELM_DIR / "values.yaml").read_text())
+    assert values["podSecurityContext"]["fsGroup"] == 1000
+
+
+def test_helm_connections_scheduler_env_gated_by_values():
+    """controlPlane.connectionsScheduler.enabled injects AGENT_BOM_CONNECTIONS_SCHEDULER=1."""
+
+    if shutil.which("helm") is None:
+        pytest.skip("helm not installed")
+
+    def _render(*sets: str) -> str:
+        args = ["helm", "template", "abom", str(HELM_DIR), "--set", "controlPlane.enabled=true"]
+        for item in sets:
+            args += ["--set", item]
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=120, check=False)
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout
+
+    off = _render(
+        "controlPlane.migrations.enabled=false",
+        "controlPlane.connectionsScheduler.enabled=false",
+    )
+    assert "AGENT_BOM_CONNECTIONS_SCHEDULER" not in off
+    assert "AGENT_BOM_CONNECTIONS_SCHEDULER_MAX_CONCURRENCY" not in off
+
+    on = _render(
+        "controlPlane.migrations.enabled=false",
+        "controlPlane.connectionsScheduler.enabled=true",
+        "controlPlane.connectionsScheduler.maxConcurrency=6",
+        "controlPlane.connectionsScheduler.pollSeconds=30",
+    )
+    assert "name: AGENT_BOM_CONNECTIONS_SCHEDULER" in on
+    assert 'value: "1"' in on
+    assert "name: AGENT_BOM_CONNECTIONS_SCHEDULER_MAX_CONCURRENCY" in on
+    assert 'value: "6"' in on
+    assert "name: AGENT_BOM_CONNECTIONS_SCHEDULER_POLL_SECONDS" in on
+    assert 'value: "30"' in on
+
+
+def test_pilot_compose_optional_connections_scheduler_env():
+    """Pilot profile exposes AGENT_BOM_CONNECTIONS_SCHEDULER, defaulted OFF.
+
+    Recurring connection scans run brokered scans against the operator's real
+    cloud account, so the pilot profile must match what config.py, the Helm
+    chart and docs/CLOUD_CONNECT.md all promise: opt-in, never inherited.
+    """
+    text = (DEPLOY_DIR / "docker-compose.pilot.yml").read_text()
+    assert "AGENT_BOM_CONNECTIONS_SCHEDULER" in text
+    assert "${AGENT_BOM_CONNECTIONS_SCHEDULER:-0}" in text

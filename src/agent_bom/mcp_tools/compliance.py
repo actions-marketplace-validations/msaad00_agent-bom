@@ -50,7 +50,8 @@ async def compliance_impl(
         from agent_bom.owasp import OWASP_LLM_TOP10
         from agent_bom.owasp_mcp import OWASP_MCP_TOP10
 
-        agents, blast_radii, _warnings, _srcs = await _run_scan_pipeline(config_path, image)
+        agents, blast_radii, _warnings, scan_sources = await _run_scan_pipeline(config_path, image)
+        has_evidence = bool(agents or blast_radii or scan_sources)
 
         # Convert BlastRadius objects to dicts for aggregation
         br_dicts = []
@@ -64,6 +65,7 @@ async def compliance_impl(
                     "atlas_tags": list(br.atlas_tags),
                     "nist_ai_rmf_tags": list(br.nist_ai_rmf_tags),
                     "owasp_mcp_tags": list(br.owasp_mcp_tags),
+                    "nist_800_53_tags": list(getattr(br, "nist_800_53_tags", [])),
                 }
             )
 
@@ -82,7 +84,17 @@ async def compliance_impl(
                             pkgs.add(br["package"])
                         for a in br.get("affected_agents", []):
                             ags.add(a)
-                status = "pass" if findings == 0 else ("fail" if sev_bk["critical"] > 0 or sev_bk["high"] > 0 else "warning")
+                # A control with no mapped finding is NOT a pass. These
+                # catalogues (OWASP LLM/MCP, ATLAS, NIST AI RMF) are all
+                # corrective/preventive: they are attested by the absence of an
+                # open weakness, and absence of a CVE is not proof the control
+                # is implemented. Scoring them as passes made a clean scan
+                # return "100% / pass" over 99 never-evaluated controls — the
+                # same false green /v1/compliance removed. Mirrors the API's
+                # not_evaluated semantics (see evidence/control_modes.py).
+                status = (
+                    "fail" if findings and (sev_bk["critical"] > 0 or sev_bk["high"] > 0) else "warning" if findings else "not_evaluated"
+                )
                 controls.append(
                     {
                         id_key: code,
@@ -103,21 +115,46 @@ async def compliance_impl(
 
         all_controls = owasp + atlas + nist + owasp_mcp
         total = len(all_controls)
-        total_pass = sum(1 for c in all_controls if c["status"] == "pass")
-        score = round((total_pass / total) * 100, 1) if total > 0 else 100.0
-        has_fail = any(c["status"] == "fail" for c in all_controls)
-        has_warn = any(c["status"] == "warning" for c in all_controls)
+        # Same scorer as /v1/compliance, the per-framework route, the HTML
+        # report and the evidence bundle. None of these catalogues carry
+        # detective controls, so every evaluated control here is substantive.
+        from agent_bom.evidence.scoring import score_compliance
+
+        verdict = score_compliance(
+            passed=sum(1 for c in all_controls if c["status"] == "pass"),
+            warned=sum(1 for c in all_controls if c["status"] == "warning"),
+            failed=sum(1 for c in all_controls if c["status"] == "fail"),
+            has_evidence=has_evidence,
+        )
+        evaluated_controls = verdict.evaluated
+        not_evaluated_controls = total - evaluated_controls
+        score = verdict.score
+
+        # Catalog-backed NIST SP 800-53 Rev 5 line (vendor-asserted), scored
+        # INDEPENDENTLY over evaluated controls only via the shared scorer — the
+        # SAME representation the /v1/compliance API and CLI narrative report.
+        # Deliberately NOT folded into overall_score (the AI-framework score
+        # above): the curated CVE evidence would otherwise be double-counted. No
+        # CIS Foundations checks exist on the local-scan path, so CIS statuses
+        # are empty; scan_count is 1 when agents were discovered so an unmapped
+        # estate reads no_data, never a false pass.
+        from agent_bom.compliance_nist_catalog import build_nist_800_53_catalog_line
+
+        nist_800_53_catalog = build_nist_800_53_catalog_line(br_dicts, {}, 1 if has_evidence else 0)
 
         return _truncate_response(
             json.dumps(
                 {
                     "overall_score": score,
-                    "overall_status": "fail" if has_fail else ("warning" if has_warn else "pass"),
+                    "overall_status": verdict.status,
                     "total_controls": total,
+                    "evaluated_controls": evaluated_controls,
+                    "not_evaluated_controls": not_evaluated_controls,
                     "owasp_llm_top10": owasp,
                     "mitre_atlas": atlas,
                     "nist_ai_rmf": nist,
                     "owasp_mcp_top10": owasp_mcp,
+                    "nist_800_53_catalog": nist_800_53_catalog,
                 },
                 indent=2,
                 default=str,
@@ -147,8 +184,22 @@ async def cis_benchmark_impl(
 
         if region and not _re.fullmatch(r"[a-z]{2}(-gov)?-[a-z]+-\d{1,2}", region):
             return json.dumps({"error": f"Invalid AWS region format: {region}"})
-        if profile and not _re.fullmatch(r"[a-zA-Z0-9._-]{1,100}", profile):
-            return json.dumps({"error": "Invalid AWS profile name. Use alphanumeric, dot, dash, underscore (max 100 chars)."})
+
+        # This benchmark spends the control plane's own cloud identity, so it
+        # carries the same operator opt-in as the REST surface. Gating one and
+        # not the other would leave this tool as a way around it.
+        from agent_bom.cloud.ambient_credentials import (
+            PROFILE_REJECTED_NOTE,
+            ambient_cis_enabled,
+            configured_aws_profile,
+            disabled_payload,
+        )
+
+        if profile:
+            return json.dumps({"error": PROFILE_REJECTED_NOTE})
+        profile = configured_aws_profile()
+        if not ambient_cis_enabled():
+            return json.dumps(disabled_payload(provider))
 
         cis_report: object
         if provider == "aws":
@@ -197,6 +248,7 @@ async def license_compliance_scan_impl(
     *,
     scan_json: str,
     policy_json: str = "",
+    scan_dir: str = "",
     _truncate_response,
 ) -> str:
     """Implementation of the license_compliance_scan tool."""
@@ -248,7 +300,18 @@ async def license_compliance_scan_impl(
             ]
 
         report = evaluate_license_policy(agents, policy=policy)
-        return _truncate_response(json.dumps(to_serializable(report), indent=2))
+        result = to_serializable(report)
+
+        # Optional: scan a local directory for LICENSE files and SPDX headers
+        if scan_dir:
+            from pathlib import Path
+
+            from agent_bom.license_file_scanner import scan_directory
+
+            dir_result = scan_directory(Path(scan_dir))
+            result["license_file_scan"] = dir_result.to_dict()
+
+        return _truncate_response(json.dumps(result, indent=2))
     except Exception as exc:
         logger.exception("MCP tool error")
         return json.dumps({"error": sanitize_error(exc)})

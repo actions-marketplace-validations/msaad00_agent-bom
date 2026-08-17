@@ -12,10 +12,17 @@
 
 # testing
 /coverage
+/playwright-report
+/test-results
+/screenshots
+/.screenshots
 
 # next.js
 /.next/
 /out/
+
+# storybook
+/storybook-static
 
 # production
 /build

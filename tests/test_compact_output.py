@@ -1,9 +1,11 @@
 """Tests for compact CLI output functions."""
 
+import re
 from io import StringIO
 
 from rich.console import Console
 
+from agent_bom.finding import Asset, Finding, FindingSource, FindingType
 from agent_bom.models import (
     Agent,
     AgentStatus,
@@ -19,6 +21,7 @@ from agent_bom.models import (
 from agent_bom.output import (
     print_compact_agents,
     print_compact_blast_radius,
+    print_compact_cis_posture,
     print_compact_export_hint,
     print_compact_remediation,
     print_compact_summary,
@@ -38,6 +41,11 @@ def _capture(fn, *args, **kwargs) -> str:
     finally:
         out_mod.console = orig
     return buf.getvalue()
+
+
+def _plain(text: str) -> str:
+    """Remove ANSI styling so assertions stay stable across CI terminals."""
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
 
 def _make_server(name="test-server", packages=None, env=None, tools=None):
@@ -87,7 +95,7 @@ def _blast(vuln, pkg, agents, servers, creds=None):
 
 
 def test_compact_summary_clean():
-    """0 vulns → CLEAN posture."""
+    """0 vulns → CLEAN posture (verbose form keeps the explicit grade row)."""
     agent = _make_agent(
         servers=[
             _make_server(
@@ -98,32 +106,174 @@ def test_compact_summary_clean():
         ]
     )
     report = AIBOMReport(agents=[agent])
-    output = _capture(print_compact_summary, report)
+    output = _capture(lambda r: print_compact_summary(r, verbose=True), report)
     assert "CLEAN" in output
+    assert "CONFIG POSTURE GRADE" in output
     assert "Agents" in output
     assert "1" in output
 
 
 def test_compact_summary_with_vulns():
-    """Shows severity breakdown when vulns exist."""
+    """Shows severity breakdown when vulns exist (verbose form keeps the explicit grade row)."""
     vuln = _vuln()
     pkg = Package(name="lodash", version="4.17.20", ecosystem="npm", vulnerabilities=[vuln])
     server = _make_server(packages=[pkg])
     agent = _make_agent(servers=[server])
     br = _blast(vuln, pkg, [agent], [server])
     report = AIBOMReport(agents=[agent], blast_radii=[br])
-    output = _capture(print_compact_summary, report)
+    output = _capture(lambda r: print_compact_summary(r, verbose=True), report)
+    assert "CONFIG POSTURE GRADE" in output
     assert "CRIT" in output  # Badge shows " CRIT " not "CRITICAL"
     assert "Vulns" in output
 
 
+def test_compact_summary_distinguishes_clean_vulns_from_config_posture():
+    """Verbose form keeps the explicit CONFIG POSTURE GRADE / SECURITY POSTURE split."""
+    agent = _make_agent(
+        servers=[
+            _make_server(
+                packages=[
+                    Package(name="express", version="4.19.0", ecosystem="npm"),
+                ]
+            )
+        ]
+    )
+    report = AIBOMReport(agents=[agent])
+    output = _plain(_capture(lambda r: print_compact_summary(r, verbose=True), report))
+    assert "CONFIG POSTURE GRADE" in output
+    assert "No vulnerabilities found" in output
+    assert "best-practice/config posture" in output
+    assert "SECURITY POSTURE:" in output
+    assert "CLEAN" in output
+
+
+def test_compact_summary_default_is_verdict_led():
+    """Default form is verdict-led: posture + inventory, no driver/credential dump."""
+    agent = _make_agent(
+        servers=[
+            _make_server(
+                packages=[
+                    Package(name="express", version="4.19.0", ecosystem="npm"),
+                ]
+            )
+        ]
+    )
+    report = AIBOMReport(agents=[agent])
+    output = _plain(_capture(print_compact_summary, report))
+    # Detailed sections moved behind --verbose:
+    assert "CONFIG POSTURE GRADE" not in output
+    assert "Top Drivers" not in output
+    # Verdict + inventory still surface:
+    assert "SCAN" in output
+    assert "CLEAN" in output
+    assert "agents" in output
+    assert "packages" in output
+
+
+def test_compact_summary_includes_non_cve_findings():
+    """Policy and blocklist findings should not render as CLEAN — verbose form keeps the rationale."""
+    finding = Finding(
+        finding_type=FindingType.MCP_BLOCKLIST,
+        source=FindingSource.MCP_SCAN,
+        asset=Asset(name="bad-server", asset_type="mcp_server"),
+        severity="high",
+        title="Blocked MCP server",
+    )
+    report = AIBOMReport(findings=[finding])
+
+    output = _capture(lambda r: print_compact_summary(r, verbose=True), report)
+
+    assert "CLEAN" not in output
+    assert "HIGH" in output
+    assert "Findings" in output
+    assert "high-risk policy/security" in output
+    assert "finding(s) present" in output
+    assert "Strong security posture" not in output
+
+
+def test_compact_summary_default_does_not_render_clean_for_policy_findings():
+    """Default (verdict-led) form must still surface non-CVE policy findings as non-clean."""
+    finding = Finding(
+        finding_type=FindingType.MCP_BLOCKLIST,
+        source=FindingSource.MCP_SCAN,
+        asset=Asset(name="bad-server", asset_type="mcp_server"),
+        severity="high",
+        title="Blocked MCP server",
+    )
+    report = AIBOMReport(findings=[finding])
+    output = _capture(print_compact_summary, report)
+    assert "CLEAN" not in output
+    assert "HIGH" in output
+
+
 def test_compact_summary_credentials():
-    """Shows credential names."""
+    """Verbose form lists credential names; default form just hints at the count."""
     server = _make_server(name="github", env={"GITHUB_TOKEN": "xxx"})
     agent = _make_agent(servers=[server])
     report = AIBOMReport(agents=[agent])
+
+    verbose_output = _capture(lambda r: print_compact_summary(r, verbose=True), report)
+    assert "GITHUB_TOKEN" in verbose_output
+
+    default_output = _plain(_capture(print_compact_summary, report))
+    # Default form does NOT list credential names — it surfaces the count via
+    # the --verbose hint when something interesting exists in the scorecard.
+    assert "GITHUB_TOKEN" not in default_output
+
+
+def test_compact_summary_unknown_severity_is_labeled_advisory():
+    """UNKNOWN severity should read as advisory, not vague unscored noise."""
+    vuln = Vulnerability(id="GHSA-test", summary="Advisory without CVSS", severity=Severity.UNKNOWN)
+    pkg = Package(name="mystery", version="1.0.0", ecosystem="npm", vulnerabilities=[vuln])
+    server = _make_server(packages=[pkg])
+    agent = _make_agent(servers=[server])
+    br = _blast(vuln, pkg, [agent], [server])
+    report = AIBOMReport(agents=[agent], blast_radii=[br])
     output = _capture(print_compact_summary, report)
-    assert "GITHUB_TOKEN" in output
+    assert "advisory" in output.lower()
+    assert "unscored" not in output.lower()
+
+
+def test_compact_summary_shows_top_drivers_for_weak_posture():
+    """Verbose form surfaces the key drivers inline."""
+    vuln = _vuln(severity=Severity.HIGH, fixed="9.9.9")
+    pkg = Package(name="pkg", version="1.0.0", ecosystem="npm", vulnerabilities=[vuln])
+    server = _make_server(packages=[pkg], env={"AWS_SECRET_ACCESS_KEY": "x"})
+    agent = _make_agent(servers=[server])
+    br = _blast(vuln, pkg, [agent], [server], creds=["AWS_SECRET_ACCESS_KEY"])
+    report = AIBOMReport(agents=[agent], blast_radii=[br])
+    output = _capture(lambda r: print_compact_summary(r, verbose=True), report)
+    assert "Top Drivers" in output
+    assert "Credential Hygiene" in output
+
+
+def test_compact_summary_default_offers_verbose_hint_when_drivers_weak():
+    """Default form replaces inline drivers with a -> Run with --verbose hint."""
+    vuln = _vuln(severity=Severity.HIGH, fixed="9.9.9")
+    pkg = Package(name="pkg", version="1.0.0", ecosystem="npm", vulnerabilities=[vuln])
+    server = _make_server(packages=[pkg], env={"AWS_SECRET_ACCESS_KEY": "x"})
+    agent = _make_agent(servers=[server])
+    br = _blast(vuln, pkg, [agent], [server], creds=["AWS_SECRET_ACCESS_KEY"])
+    report = AIBOMReport(agents=[agent], blast_radii=[br])
+    output = _plain(_capture(print_compact_summary, report))
+    assert "Top Drivers" not in output  # moved to --verbose
+    assert "--verbose" in output  # hint surfaces
+    assert "weak driver" in output or "credential" in output  # hint mentions what's behind it
+
+
+def test_compact_summary_default_shows_posture_card_when_not_perfect():
+    """Default form surfaces a posture grade card inline, not only under --posture."""
+    vuln = _vuln(severity=Severity.HIGH, fixed="9.9.9")
+    pkg = Package(name="pkg", version="1.0.0", ecosystem="npm", vulnerabilities=[vuln])
+    server = _make_server(packages=[pkg], env={"AWS_SECRET_ACCESS_KEY": "x"})
+    agent = _make_agent(servers=[server])
+    br = _blast(vuln, pkg, [agent], [server], creds=["AWS_SECRET_ACCESS_KEY"])
+    report = AIBOMReport(agents=[agent], blast_radii=[br])
+    output = _plain(_capture(print_compact_summary, report))
+
+    assert "Posture grade:" in output
+    assert "/100" in output
+    assert "CONFIG POSTURE GRADE" not in output
 
 
 # ── print_compact_agents ─────────────────────────────────────────────────────
@@ -156,8 +306,26 @@ def test_compact_agents_table():
     )
     report = AIBOMReport(agents=[a1, a2])
     output = _capture(print_compact_agents, report)
+    assert "DISCOVER" in _plain(output)
     assert "claude-desktop" in output
     assert "cursor" in output
+
+
+def test_compact_agents_humanizes_project_scoped_names():
+    """Project-scoped synthetic IDs should not be the primary table label."""
+    agent = _make_agent(
+        name="project:agent-bom-first-run",
+        agent_type=AgentType.CUSTOM,
+        servers=[_make_server()],
+    )
+    agent.config_path = "/tmp/agent-bom-first-run/claude-review.json"
+    report = AIBOMReport(agents=[agent])
+
+    output = _plain(_capture(print_compact_agents, report))
+
+    assert "claude-review.json" in output
+    assert "(agent-bom-first-run)" in output
+    assert "project:agent-bom-first-run" not in output
 
 
 def test_compact_agents_skips_unconfigured():
@@ -188,9 +356,32 @@ def test_compact_blast_radius_limit():
     import re
 
     plain = re.sub(r"\x1b\[[0-9;]*m", "", output)
+    assert "ANALYZE" in plain
     assert "3 of 8" in plain
     assert "more" in plain
     assert "--verbose" in plain
+
+
+def test_compact_blast_radius_page_two():
+    """Compact findings can page through a noisy scan without switching to verbose mode."""
+    pkg = Package(name="lodash", version="4.17.20", ecosystem="npm")
+    server = _make_server(packages=[pkg])
+    agent = _make_agent(servers=[server])
+    radii = []
+    for i in range(8):
+        v = _vuln(vid=f"CVE-2024-{i:04d}", severity=Severity.HIGH)
+        radii.append(_blast(v, pkg, [agent], [server]))
+    report = AIBOMReport(agents=[agent], blast_radii=radii)
+    plain = _plain(_capture(print_compact_blast_radius, report, limit=3, page=2))
+
+    assert "page 2/3" in plain
+    assert "4-6 of 8" in plain
+    assert "CVE-2024-0000" not in plain
+    assert "CVE-2024-0003" in plain
+    assert "CVE-2024-0005" in plain
+    assert "CVE-2024-0006" not in plain
+    assert "--page 3 next" in plain
+    assert "--page 1 previous" in plain
 
 
 def test_compact_blast_radius_empty():
@@ -226,8 +417,48 @@ def test_compact_remediation_limit():
         radii.append(_blast(v, p, [agent], [server]))
     report = AIBOMReport(agents=[agent], blast_radii=radii)
     output = _capture(print_compact_remediation, report, limit=2)
+    assert "PROTECT" in _plain(output)
     assert "more" in output
     assert "--verbose" in output
+
+
+def test_compact_remediation_page_two():
+    """Compact remediation can page through fix-first output."""
+    server = _make_server()
+    agent = _make_agent(servers=[server])
+    radii = []
+    for i in range(5):
+        v = _vuln(vid=f"CVE-2024-{i:04d}", severity=Severity.HIGH, fixed="9.9.9")
+        p = Package(name=f"pkg-{i}", version="1.0.0", ecosystem="npm", vulnerabilities=[v])
+        radii.append(_blast(v, p, [agent], [server]))
+    report = AIBOMReport(agents=[agent], blast_radii=radii)
+    plain = _plain(_capture(print_compact_remediation, report, limit=2, page=2))
+
+    assert "page 2/3" in plain
+    assert "3-4 of 5" in plain
+    assert "pkg-0" not in plain
+    assert "pkg-2" in plain
+    assert "pkg-3" in plain
+    assert "pkg-4" not in plain
+    assert "--page 3 next" in plain
+    assert "--page 1 previous" in plain
+
+
+def test_compact_remediation_shows_priority_and_action():
+    """Default remediation output should explain why an item is first."""
+    server = _make_server(env={"GITHUB_TOKEN": "x"}, tools=[{"name": "read_file"}])
+    agent = _make_agent(servers=[server])
+    vuln = _vuln(vid="CVE-2024-0001", severity=Severity.CRITICAL, fixed="2.0.0", kev=True)
+    pkg = Package(name="openssl", version="1.0.0", ecosystem="pypi", vulnerabilities=[vuln])
+    br = _blast(vuln, pkg, [agent], [server], creds=["GITHUB_TOKEN"])
+    report = AIBOMReport(agents=[agent], blast_radii=[br])
+    output = _capture(print_compact_remediation, report)
+    plain = _plain(output)
+    assert "Fix First" in plain
+    assert "P1" in plain
+    assert "rotate exposed credentials" in plain
+    assert "pip install 'openssl>=2.0.0'" in plain
+    assert "agent-bom check openssl@2.0.0 --ecosystem pypi" in plain
 
 
 def test_compact_remediation_empty():
@@ -237,16 +468,174 @@ def test_compact_remediation_empty():
     assert output.strip() == ""
 
 
+def test_compact_remediation_command_prefix_and_spacing():
+    """Install + verify commands render with a `$` prefix (copy-this affordance),
+    and numbered items are separated by a blank line for scan-ability."""
+    server = _make_server(env={"GITHUB_TOKEN": "x"}, tools=[{"name": "read_file"}])
+    agent = _make_agent(servers=[server])
+    radii = []
+    for i in range(3):
+        v = _vuln(vid=f"CVE-2024-{i:04d}", severity=Severity.HIGH, fixed="9.9.9", kev=True)
+        p = Package(name=f"pkg-{i}", version="1.0.0", ecosystem="pypi", vulnerabilities=[v])
+        radii.append(_blast(v, p, [agent], [server], creds=["GITHUB_TOKEN"]))
+    report = AIBOMReport(agents=[agent], blast_radii=radii)
+    plain = _plain(_capture(print_compact_remediation, report, limit=3))
+
+    # Install command is prefixed with "$ " to signal a copy-this line.
+    assert "$ pip install 'pkg-0>=9.9.9'" in plain
+    # Verify command is also "$ "-prefixed and annotated as verify.
+    assert "$ agent-bom check pkg-0@9.9.9 --ecosystem pypi" in plain
+    assert "(verify)" in plain
+
+    # Numbered items are separated by a blank line (breathing room).
+    # Strip leading/trailing blank lines, then look for the pattern of a
+    # dedented numbered item preceded by an empty line.
+    lines = plain.splitlines()
+    item_indices = [idx for idx, line in enumerate(lines) if line.lstrip().startswith(("1.", "2.", "3."))]
+    assert len(item_indices) == 3
+    # Items 2 and 3 must each be preceded by a blank line.
+    for idx in item_indices[1:]:
+        assert lines[idx - 1].strip() == "", f"Expected blank line before {lines[idx]!r}"
+
+
 # ── print_compact_export_hint ────────────────────────────────────────────────
 
 
 def test_compact_export_hint():
-    """Shows export formats and serve hint."""
+    """Shows key metrics summary."""
     agent = _make_agent(servers=[_make_server()])
     report = AIBOMReport(agents=[agent])
-    output = _capture(print_compact_export_hint, report)
-    assert "json" in output
-    assert "cyclonedx" in output
-    assert "sarif" in output
-    assert "serve" in output
-    assert "--verbose" in output
+    output = _plain(_capture(print_compact_export_hint, report))
+    assert "agents" in output
+    assert "servers" in output
+    assert "packages" in output
+    # The per-package CVE-instance total is labelled with an explicit scope so it
+    # can't read as the same metric as the scan-lane finding count (honesty).
+    assert "package CVE instance" in output
+
+
+def test_compact_export_hint_vuln_total_is_scope_labeled():
+    """The export-hint vuln total must NOT reuse the bare word "vulns".
+
+    The demo prints three different vuln totals — scan findings, the
+    severity-with-unknowns breakdown, and this per-package CVE-instance count.
+    Reusing the identical word "vulns" for all three reads as one contradicting
+    metric; this total is scoped as "package CVEs" (#honest-counts)."""
+    pkg = Package(name="requests", version="1.0.0", ecosystem="pypi", vulnerabilities=[_vuln()])
+    server = _make_server(packages=[pkg])
+    report = AIBOMReport(agents=[_make_agent(servers=[server])])
+    output = _plain(_capture(print_compact_export_hint, report))
+    assert report.total_vulnerabilities >= 1
+    assert f"{report.total_vulnerabilities} package CVE instance" in output
+    # The ambiguous bare "N vulns" phrasing is gone.
+    assert " vulns" not in output
+
+
+def test_compact_cis_posture_uses_govern_lane():
+    """CIS posture is a governance surface in the compact CLI."""
+    report = AIBOMReport(
+        agents=[],
+        cis_benchmark_data={
+            "checks": [
+                {
+                    "check_id": "1.1",
+                    "title": "Ensure root account MFA is enabled",
+                    "status": "pass",
+                    "severity": "high",
+                }
+            ],
+            "passed": 1,
+            "failed": 0,
+            "pass_rate": 100.0,
+        },
+    )
+
+    output = _plain(_capture(print_compact_cis_posture, report))
+
+    assert "GOVERN" in output
+    assert "Cloud Security Posture" in output
+
+
+# ---------------------------------------------------------------------------
+# Graph/policy finding drill-down + console honesty polish
+# ---------------------------------------------------------------------------
+
+
+def _capture_width(fn, *args, width=80, **kwargs) -> str:
+    buf = StringIO()
+    con = Console(file=buf, width=width, force_terminal=True, no_color=True)
+    import agent_bom.output as out_mod
+
+    orig = out_mod.console
+    out_mod.console = con
+    try:
+        fn(*args, **kwargs)
+    finally:
+        out_mod.console = orig
+    return buf.getvalue()
+
+
+def _combo_finding(name="cursor"):
+    return Finding(
+        finding_type=FindingType.COMBINATION,
+        source=FindingSource.GRAPH_ANALYSIS,
+        asset=Asset(name=name, asset_type="agent"),
+        severity="high",
+        title=f"AI agent can reach a credential or privileged tool: {name}",
+        description="An AI agent's tool-use chain reaches a credential or privileged tool node.",
+    )
+
+
+def test_compact_graph_findings_lists_titles_and_evidence():
+    """Graph-derived findings must drill to title + severity + evidence in console."""
+    from agent_bom.output import print_compact_graph_findings
+
+    report = AIBOMReport(agents=[], findings=[_combo_finding("cursor")])
+    output = _plain(_capture(print_compact_graph_findings, report))
+
+    assert "AI agent can reach a credential or privileged tool: cursor" in output
+    assert "HIGH" in output
+    assert "COMBINATION" in output
+    assert "tool-use chain reaches a credential" in output
+
+
+def test_compact_graph_findings_silent_when_empty():
+    from agent_bom.output import print_compact_graph_findings
+
+    report = AIBOMReport(agents=[])
+    assert _plain(_capture(print_compact_graph_findings, report)).strip() == ""
+
+
+def test_compact_graph_findings_escapes_untrusted_rich_markup():
+    from agent_bom.output import print_compact_graph_findings
+
+    report = AIBOMReport(agents=[], findings=[_combo_finding("close [/bold]")])
+    output = _plain(_capture(print_compact_graph_findings, report))
+
+    assert "close" in output
+    assert "[/bold]" in output
+
+
+def test_compact_blast_radius_never_truncates_cve_ids_at_80_cols():
+    """The vulnerability ID is the one column that must never truncate."""
+    pkg = Package(name="averyverylongpackagename-for-width", version="1.2.3", ecosystem="pypi", vulnerabilities=[])
+    server = _make_server(name="server-with-long-name", packages=[pkg])
+    agent = _make_agent(name="agent-with-long-name", servers=[server])
+    vuln = _vuln("CVE-2020-14343", Severity.CRITICAL, fixed="5.4")
+    br = _blast(vuln, pkg, [agent], [server], creds=["AWS_SECRET_ACCESS_KEY"])
+    report = AIBOMReport(agents=[agent], blast_radii=[br])
+
+    output = _plain(_capture_width(print_compact_blast_radius, report, width=80))
+
+    assert "CVE-2020-14343" in output
+    assert "CVE-2020-143…" not in output
+
+
+def test_compact_detail_never_ends_on_dangling_punctuation():
+    from agent_bom.output.compact import _compact_detail
+
+    text = "Weak best-practice/config posture (F, 37.0%) — improve credential hygiene now"
+    out = _compact_detail(text, limit=48)
+    assert out.endswith("…")
+    trimmed = out[:-1].rstrip()
+    assert not trimmed.endswith(("—", "·", "-", ","))

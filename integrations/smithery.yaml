@@ -1,3 +1,11 @@
+# Smithery listing metadata. Keep this aligned with integrations/glama/server.json
+# and pyproject.toml so the next successful deploy carries current information.
+# The startCommand / configSchema / commandFunction block below is the runtime
+# contract Smithery executes — do not change its shape.
+name: agent-bom
+description: "Open security scanner and self-hosted control plane for AI/MCP infrastructure — agents, MCP servers, runtime, and blast radius. Exposes 81 MCP tools for scanning, compliance, and graph analysis."
+homepage: "https://github.com/msaad00/agent-bom"
+
 runtime: "python"
 startCommand:
   type: stdio
@@ -13,17 +21,7 @@ startCommand:
         type: string
         title: ClickHouse URL
         description: "Optional. HTTP URL for ClickHouse analytics backend (e.g. http://localhost:8123). Enables vuln trend storage and posture tracking."
-      snykToken:
-        type: string
-        title: Snyk Token
-        description: "Optional. Snyk API token for additional vulnerability enrichment."
-  commandFunction: |-
-    config => ({
-      command: 'uvx',
-      args: ['agent-bom[mcp-server]', 'mcp-server'],
-      env: {
-        ...(config.nvdApiKey ? { NVD_API_KEY: config.nvdApiKey } : {}),
-        ...(config.clickhouseUrl ? { AGENT_BOM_CLICKHOUSE_URL: config.clickhouseUrl } : {}),
-        ...(config.snykToken ? { SNYK_TOKEN: config.snykToken } : {})
-      }
-    })
+  commandFunction:
+    type: python
+    module: agent_bom.mcp_server
+    function: create_smithery_server

@@ -112,12 +112,18 @@ class TestPatternCoverage:
         assert "chromadb" in names
         assert "mlflow" in names
         assert "vllm" in names
+        assert "langsmith" in names
+        assert "langfuse" in names
+        assert "phoenix" in names
+        assert "braintrust" in names
 
     def test_js_has_patterns(self):
         names = {p.name for p in SDK_PATTERNS_BY_LANGUAGE["javascript"]}
         assert "openai" in names
         assert "anthropic" in names
         assert "langchain" in names
+        assert "langfuse" in names
+        assert "helicone" in names
 
     def test_all_sdk_patterns_combined(self):
         assert len(ALL_SDK_PATTERNS) >= 50  # 40+ Python + JS + Java + Go + Rust + Ruby
@@ -177,6 +183,25 @@ class TestScanner:
         assert "openai" in names
         assert "langchain" in names
         assert "chromadb" in names
+
+    def test_scan_ai_observability_imports(self, tmp_path: Path):
+        (tmp_path / "observability.py").write_text(
+            "from langsmith import Client\n"
+            "from langfuse import Langfuse\n"
+            "import phoenix as px\n"
+            "import braintrust\n"
+            "from arize import Client as ArizeClient\n"
+        )
+        (tmp_path / "observability.ts").write_text(
+            'import { Langfuse } from "langfuse";\nimport { HeliconeManualLogger } from "@helicone/helicone";\n'
+        )
+
+        report = scan_source(str(tmp_path))
+        observability = [c for c in report.components if c.component_type == AIComponentType.OBSERVABILITY]
+        names = {c.name for c in observability}
+
+        assert {"langsmith", "langfuse", "phoenix", "braintrust", "arize", "helicone"}.issubset(names)
+        assert {c.ecosystem for c in observability} == {"pypi", "npm"}
 
     def test_scan_js_imports(self, tmp_project: Path):
         report = scan_source(str(tmp_project))
@@ -475,6 +500,14 @@ class TestAIComponentReport:
         models = report.unique_models
         assert "gpt-4o" in models
 
+    def test_to_dict(self, tmp_project: Path):
+        report = scan_source(str(tmp_project))
+        data = report.to_dict()
+        assert data["files_scanned"] == report.files_scanned
+        assert data["stats"]["total_components"] == report.total
+        assert data["stats"]["by_language"]["javascript"] >= 1
+        assert any(component["language"] == "python" for component in data["components"])
+
 
 # ── Edge cases ───────────────────────────────────────────────────────────────
 
@@ -584,6 +617,38 @@ class TestDeepSeekDetection:
         report = scan_source(str(tmp_path))
         models = [c.name for c in report.components if c.component_type == AIComponentType.MODEL_REFERENCE]
         assert "deepseek-v3" in models
+
+
+class TestGlmDetection:
+    """Tests for Zhipu GLM SDK and model detection."""
+
+    def test_zhipu_python_import(self, tmp_path: Path):
+        f = tmp_path / "app.py"
+        f.write_text("from zhipuai import ZhipuAI\n")
+        report = scan_source(str(tmp_path))
+        names = [c.name for c in report.components if c.component_type == AIComponentType.LLM_PROVIDER]
+        assert "zhipu" in names
+
+    def test_glm4_model_ref(self, tmp_path: Path):
+        f = tmp_path / "app.py"
+        f.write_text('model = "glm-4-plus"\n')
+        report = scan_source(str(tmp_path))
+        models = [c.name for c in report.components if c.component_type == AIComponentType.MODEL_REFERENCE]
+        assert "glm-4-plus" in models
+
+    def test_glm46_model_ref(self, tmp_path: Path):
+        f = tmp_path / "app.py"
+        f.write_text('model = "glm-4.6-flash"\n')
+        report = scan_source(str(tmp_path))
+        models = [c.name for c in report.components if c.component_type == AIComponentType.MODEL_REFERENCE]
+        assert "glm-4.6-flash" in models
+
+    def test_chatglm_model_ref(self, tmp_path: Path):
+        f = tmp_path / "app.py"
+        f.write_text('model = "chatglm3-6b"\n')
+        report = scan_source(str(tmp_path))
+        models = [c.name for c in report.components if c.component_type == AIComponentType.MODEL_REFERENCE]
+        assert "chatglm3-6b" in models
 
 
 class TestInvisibleUnicodeDetection:

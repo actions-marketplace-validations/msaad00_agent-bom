@@ -17,14 +17,26 @@ spec:
       labels:
         {{- include "agent-bom.labels" . | nindent 8 }}
         app.kubernetes.io/component: monitor
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
-      serviceAccountName: {{ include "agent-bom.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      serviceAccountName: {{ include "agent-bom.monitorServiceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: monitor
           image: "{{ .Values.runtimeImage.repository }}:{{ .Values.runtimeImage.tag }}"
           imagePullPolicy: {{ .Values.runtimeImage.pullPolicy }}
           command: ["agent-bom"]
           args:
+            - "runtime"
             - "protect"
             - "--mode"
             - {{ .Values.monitor.mode | quote }}
@@ -36,12 +48,32 @@ spec:
             - containerPort: {{ .Values.monitor.port }}
               name: protect
               protocol: TCP
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           livenessProbe:
-            httpGet:
-              path: /status
-              port: protect
-            initialDelaySeconds: 5
-            periodSeconds: 30
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          startupProbe:
+            {{- toYaml .Values.startupProbe | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
 {{- end }}

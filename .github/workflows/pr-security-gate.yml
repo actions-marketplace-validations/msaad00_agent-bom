@@ -1,0 +1,325 @@
+name: PR Security Gate
+
+# Hard gate on PRs: pip-audit must pass using machine-readable JSON output
+# and agent-bom self-scans its own installed deps. This complements the
+# existing cve-freshness.yml scheduled job by catching regressions on PRs,
+# not just twice a week.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-security-gate-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Security change classifier
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Classify documentation-only changes
+        id: classify
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            before="${{ github.event.before }}"
+            if [ -n "$before" ] && ! printf '%s' "$before" | grep -qE '^0+$'; then
+              changed="$(git diff --name-only "$before" "$GITHUB_SHA")"
+            fi
+          fi
+          printf '%s\n' "$changed" | python3 scripts/classify_ci_changes.py --github-output "$GITHUB_OUTPUT"
+
+  code-scanning-config-pr:
+    name: Code scanning config placeholders
+    needs: changes
+    if: >-
+      !cancelled() &&
+      github.event_name == 'pull_request' &&
+      (needs.changes.result != 'success' || needs.changes.outputs.docs_only != 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      security-events: write
+    steps:
+      - name: Write empty agent-bom SARIF
+        run: |
+          mkdir -p sarif
+          cat > sarif/empty-agent-bom.sarif <<'EOF'
+          {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [
+              {
+                "tool": {
+                  "driver": {
+                    "name": "agent-bom",
+                    "version": "0.0.0",
+                    "informationUri": "https://github.com/msaad00/agent-bom"
+                  }
+                },
+                "results": []
+              }
+            ]
+          }
+          EOF
+
+      - name: Upload dependency self-scan config placeholder
+        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
+        with:
+          sarif_file: sarif/empty-agent-bom.sarif
+          category: agent-bom-self-dep
+
+      - name: Upload SAST self-scan config placeholder
+        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
+        with:
+          sarif_file: sarif/empty-agent-bom.sarif
+          category: agent-bom-self-sast
+
+  pip-audit-pr:
+    name: pip-audit on PR
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (needs.changes.result != 'success' || needs.changes.outputs.docs_only != 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-python
+        with:
+          python-version: "3.11"
+
+      - name: Install runtime deps (not dev) — scan the shipping dep set
+        run: uv sync --frozen --extra api --extra postgres --extra mcp-server --extra oidc
+
+      - name: Run pip-audit on current checkout
+        run: |
+          run_pip_audit() {
+            local output="$1"
+            local status=0
+
+            set +e
+            uv run --with pip-audit pip-audit --ignore-vuln CVE-2026-3219 \
+              -s osv \
+              --format json \
+              --output "$output"
+            status=$?
+            set -e
+
+            if [ -s "$output" ]; then
+              return 0
+            fi
+
+            echo "::warning::pip-audit OSV source did not produce $output (exit $status); retrying with PyPI advisory source"
+            set +e
+            uv run --with pip-audit pip-audit --ignore-vuln CVE-2026-3219 \
+              -s pypi \
+              --format json \
+              --output "$output"
+            status=$?
+            set -e
+
+            if [ ! -s "$output" ]; then
+              echo "::error::pip-audit did not produce $output after OSV and PyPI retries"
+              return "${status:-1}"
+            fi
+
+            return 0
+          }
+
+          run_pip_audit audit.json
+
+      - name: Run pip-audit on PR base for delta comparison
+        if: github.event_name == 'pull_request'
+        run: |
+          run_pip_audit() {
+            local output="$1"
+            local status=0
+
+            set +e
+            uv run --with pip-audit pip-audit --ignore-vuln CVE-2026-3219 \
+              -s osv \
+              --format json \
+              --output "$output"
+            status=$?
+            set -e
+
+            if [ -s "$output" ]; then
+              return 0
+            fi
+
+            echo "::warning::pip-audit OSV source did not produce $output (exit $status); retrying with PyPI advisory source"
+            set +e
+            uv run --with pip-audit pip-audit --ignore-vuln CVE-2026-3219 \
+              -s pypi \
+              --format json \
+              --output "$output"
+            status=$?
+            set -e
+
+            if [ ! -s "$output" ]; then
+              echo "::error::pip-audit did not produce $output after OSV and PyPI retries"
+              return "${status:-1}"
+            fi
+
+            return 0
+          }
+
+          current_dir="$PWD"
+          base_dir="$RUNNER_TEMP/agent-bom-base"
+          git fetch --depth=1 origin "+${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+          git worktree add "$base_dir" "origin/${{ github.base_ref }}"
+          (
+            cd "$base_dir"
+            uv sync --frozen --extra api --extra postgres --extra mcp-server --extra oidc
+            run_pip_audit "$current_dir/base-audit.json"
+          )
+
+      - name: Evaluate pip-audit gate
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            python scripts/pip_audit_delta_gate.py \
+              --mode delta \
+              --current audit.json \
+              --base base-audit.json
+          else
+            python scripts/pip_audit_delta_gate.py \
+              --mode strict \
+              --current audit.json
+          fi
+
+      - name: Upload pip-audit report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pip-audit-report
+          path: |
+            audit.json
+            base-audit.json
+
+  self-scan-pr:
+    name: agent-bom self-scan on PR
+    needs: changes
+    if: >-
+      !cancelled() &&
+      (needs.changes.result != 'success' || needs.changes.outputs.docs_only != 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write   # upload SARIF
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-python
+        with:
+          python-version: "3.11"
+
+      - name: Install agent-bom + dev extras
+        run: uv sync --frozen --extra dev
+
+      - name: Self-scan current agent-bom dependencies
+        id: self_scan
+        run: |
+          set +e
+          uv run agent-bom scan --self-scan \
+            --format sarif \
+            -o self-scan.sarif \
+            --fail-on-severity high \
+            --exclude-unfixable \
+            --quiet
+          SCAN_EXIT=$?
+          set -e
+
+          if [ ! -s self-scan.sarif ]; then
+            echo "::error::agent-bom self-scan did not produce self-scan.sarif"
+            exit 2
+          fi
+
+          export SCAN_EXIT
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          data = json.loads(Path("self-scan.sarif").read_text(encoding="utf-8"))
+          run = (data.get("runs") or [{}])[0]
+          results = run.get("results") or []
+          rules = {
+              rule.get("id"): rule
+              for rule in (run.get("tool", {}).get("driver", {}).get("rules") or [])
+          }
+          high_or_critical = []
+          kev = 0
+          for result in results:
+              props = rules.get(result.get("ruleId"), {}).get("properties", {})
+              score = float(props.get("security-severity") or 0)
+              kev += 1 if props.get("kev") else 0
+              if score >= 7.0:
+                  high_or_critical.append(result.get("ruleId", "<unknown>"))
+          print(f"agent-bom self-scan SARIF findings: total={len(results)} high_or_critical={len(high_or_critical)} kev={kev}")
+          if kev:
+              print(f"::warning::agent-bom self-scan found {kev} KEV-listed finding(s)")
+          if high_or_critical:
+              print(f"::error::agent-bom self-scan found high/critical SARIF finding(s): {', '.join(high_or_critical[:10])}")
+              sys.exit(1)
+          if os.environ.get("SCAN_EXIT") not in {"0", None}:
+              print("::warning::agent-bom self-scan returned non-zero but SARIF contains no blocking findings")
+          PY
+
+      - name: Align self-scan SARIF category
+        if: always() && hashFiles('self-scan.sarif') != ''
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          # agent-bom's SARIF formatter pre-sets runs[].automationDetails.id to
+          # "agent-bom/<scan_id>". github/codeql-action/upload-sarif only injects
+          # its `category` input when automationDetails is absent, so the pre-set
+          # id wins and GitHub derives the category from it (the part before the
+          # final "/", i.e. "agent-bom") instead of "agent-bom-self-scan". Drop it
+          # so the upload `category` below applies.
+          path = Path("self-scan.sarif")
+          data = json.loads(path.read_text())
+          for run in data.get("runs", []):
+              run.pop("automationDetails", None)
+          path.write_text(json.dumps(data, indent=2) + "\n")
+          PY
+
+      - name: Filter first-party informational skill findings
+        if: always() && hashFiles('self-scan.sarif') != ''
+        run: uv run python scripts/filter_first_party_skill_sarif.py self-scan.sarif
+
+      - name: Upload SARIF to code-scanning
+        if: always() && hashFiles('self-scan.sarif') != ''
+        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
+        with:
+          sarif_file: self-scan.sarif
+          category: agent-bom-self-scan

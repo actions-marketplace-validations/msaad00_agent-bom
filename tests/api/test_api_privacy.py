@@ -1,0 +1,372 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+from starlette.testclient import TestClient
+
+from agent_bom.api.audit_log import InMemoryAuditLog, set_audit_log
+from agent_bom.api.auth import KeyStore, Role, create_api_key_record, set_key_store
+from agent_bom.api.connection_store import CloudConnectionRecord, InMemoryConnectionStore, set_connection_store
+from agent_bom.api.credential_store import InMemoryCredentialRefStore
+from agent_bom.api.exception_store import InMemoryExceptionStore, VulnException
+from agent_bom.api.fleet_store import FleetAgent, InMemoryFleetStore
+from agent_bom.api.graph_store import SQLiteGraphStore
+from agent_bom.api.models import CredentialRefRecord, JobStatus, ScanJob, ScanRequest, SourceKind, SourceRecord
+from agent_bom.api.policy_store import GatewayPolicy, InMemoryPolicyStore
+from agent_bom.api.postgres_access import PostgresKeyStore
+from agent_bom.api.postgres_common import reset_current_tenant, set_current_tenant
+from agent_bom.api.routes.privacy import delete_tenant_data, export_tenant_data
+from agent_bom.api.schedule_store import InMemoryScheduleStore, ScanSchedule
+from agent_bom.api.server import app, configure_api
+from agent_bom.api.source_store import InMemorySourceStore
+from agent_bom.api.store import InMemoryJobStore
+from agent_bom.api.stores import (
+    set_credential_ref_store,
+    set_exception_store,
+    set_fleet_store,
+    set_graph_store,
+    set_job_store,
+    set_policy_store,
+    set_schedule_store,
+    set_source_store,
+    set_tenant_quota_store,
+)
+from agent_bom.api.tenant_quota_store import InMemoryTenantQuotaStore
+from tests.auth_helpers import disable_trusted_proxy_env, enable_trusted_proxy_env, proxy_headers
+
+
+def setup_module() -> None:
+    enable_trusted_proxy_env()
+
+
+def teardown_module() -> None:
+    disable_trusted_proxy_env()
+
+
+class _GraphStore:
+    def __init__(self) -> None:
+        self.snapshots = {
+            "tenant-a": [{"scan_id": "scan-a", "tenant_id": "tenant-a"}],
+            "tenant-b": [{"scan_id": "scan-b", "tenant_id": "tenant-b"}],
+        }
+
+    def list_snapshots(self, *, tenant_id: str = "", limit: int = 50):
+        return self.snapshots.get(tenant_id, [])[:limit]
+
+    def delete_tenant(self, *, tenant_id: str = "") -> int:
+        rows = len(self.snapshots.pop(tenant_id, []))
+        return rows
+
+
+@pytest.fixture()
+def tenant_stores():
+    jobs = InMemoryJobStore()
+    fleet = InMemoryFleetStore()
+    policies = InMemoryPolicyStore()
+    schedules = InMemoryScheduleStore()
+    sources = InMemorySourceStore()
+    exceptions = InMemoryExceptionStore()
+    quota = InMemoryTenantQuotaStore()
+    graph = _GraphStore()
+    audit = InMemoryAuditLog()
+    connections = InMemoryConnectionStore()
+    credentials = InMemoryCredentialRefStore()
+    keys = KeyStore()
+
+    set_job_store(jobs)
+    set_fleet_store(fleet)
+    set_policy_store(policies)
+    set_schedule_store(schedules)
+    set_source_store(sources)
+    set_exception_store(exceptions)
+    set_tenant_quota_store(quota)
+    set_graph_store(graph)
+    set_audit_log(audit)
+    set_connection_store(connections)
+    set_credential_ref_store(credentials)
+    set_key_store(keys)
+
+    for tenant_id in ("tenant-a", "tenant-b"):
+        jobs.put(
+            ScanJob(
+                job_id=f"job-{tenant_id}",
+                tenant_id=tenant_id,
+                triggered_by="tester",
+                status=JobStatus.DONE,
+                created_at="2026-04-24T00:00:00Z",
+                completed_at="2026-04-24T00:01:00Z",
+                request=ScanRequest(),
+            )
+        )
+        fleet.put(FleetAgent(agent_id=f"agent-{tenant_id}", name=f"Agent {tenant_id}", agent_type="mcp", tenant_id=tenant_id))
+        policies.put_policy(GatewayPolicy(policy_id=f"policy-{tenant_id}", name=f"Policy {tenant_id}", tenant_id=tenant_id))
+        schedules.put(
+            ScanSchedule(
+                schedule_id=f"schedule-{tenant_id}",
+                name=f"Schedule {tenant_id}",
+                cron_expression="0 * * * *",
+                scan_config={},
+                tenant_id=tenant_id,
+            )
+        )
+        sources.put(
+            SourceRecord(
+                source_id=f"source-{tenant_id}",
+                tenant_id=tenant_id,
+                display_name=f"Source {tenant_id}",
+                kind=SourceKind.SCAN_REPO,
+                credential_ref="secret/ref",
+                config={"token": "do-not-export"},
+            )
+        )
+        exceptions.put(VulnException(exception_id=f"exception-{tenant_id}", vuln_id="CVE-2026-0001", tenant_id=tenant_id))
+        quota.put(tenant_id, {"scan_jobs": 10})
+        connections.put(
+            CloudConnectionRecord(
+                id=f"connection-{tenant_id}",
+                tenant_id=tenant_id,
+                provider="aws",
+                display_name=f"Connection {tenant_id}",
+                role_ref="arn:aws:iam::000000000000:role/ReadOnly",
+                external_id_encrypted="encrypted-secret",
+            )
+        )
+        credentials.put(
+            CredentialRefRecord(
+                credential_ref_id=f"credential-{tenant_id}",
+                tenant_id=tenant_id,
+                display_name=f"Credential {tenant_id}",
+                provider="aws",
+                external_ref="secret/example",
+            )
+        )
+        keys.add(
+            create_api_key_record(
+                f"abom_{tenant_id}_secret",
+                name=f"Key {tenant_id}",
+                role=Role.ADMIN,
+                tenant_id=tenant_id,
+            )
+        )
+
+    yield {
+        "jobs": jobs,
+        "fleet": fleet,
+        "policies": policies,
+        "schedules": schedules,
+        "sources": sources,
+        "exceptions": exceptions,
+        "quota": quota,
+        "graph": graph,
+        "connections": connections,
+        "credentials": credentials,
+        "keys": keys,
+    }
+
+
+def _request(tenant_id: str = "tenant-a"):
+    return SimpleNamespace(state=SimpleNamespace(tenant_id=tenant_id, api_key_name="admin-key", auth_method="api_key"))
+
+
+def test_tenant_data_export_is_tenant_scoped_and_redacts_source_secrets(tenant_stores) -> None:
+    response = export_tenant_data("tenant-a", _request("tenant-a"), include_records=True, record_limit=10)
+
+    assert response["counts"]["jobs"] == 1
+    assert response["records"]["jobs"][0]["job_id"] == "job-tenant-a"
+    assert response["records"]["fleet_agents"][0]["agent_id"] == "agent-tenant-a"
+    assert response["records"]["sources"][0]["credential_ref"] == "[redacted]"
+    assert response["records"]["sources"][0]["config"] == {"redacted": True}
+    assert response["counts"]["cloud_connections"] == 1
+    assert response["counts"]["credential_refs"] == 1
+    assert response["counts"]["api_keys"] == 1
+    assert response["records"]["credential_refs"][0]["external_ref"] == "[redacted]"
+    assert "key_hash" not in response["records"]["api_keys"][0]
+    assert "retained_immutable_hmac_chain" == response["retention"]["audit_log"]
+
+
+def test_tenant_data_http_endpoint_requires_authenticated_admin(tenant_stores, monkeypatch) -> None:
+    # The shared harness enables the anonymous opt-in by default; this contract
+    # asserts fail-closed auth, so disable it and rebuild the middleware.
+    monkeypatch.delenv("AGENT_BOM_ALLOW_UNAUTHENTICATED_API", raising=False)
+    configure_api(api_key=None)
+    client = TestClient(app)
+
+    unauthenticated = client.get("/v1/tenant/tenant-a/data")
+    assert unauthenticated.status_code == 401
+
+    viewer = client.get(
+        "/v1/tenant/tenant-a/data",
+        headers=proxy_headers(role="viewer", tenant="tenant-a"),
+    )
+    assert viewer.status_code == 403
+
+    admin = client.get(
+        "/v1/tenant/tenant-a/data",
+        headers=proxy_headers(role="admin", tenant="tenant-a"),
+    )
+    assert admin.status_code == 200
+    assert admin.json()["counts"]["jobs"] == 1
+
+
+def test_tenant_data_export_rejects_cross_tenant_access(tenant_stores) -> None:
+    with pytest.raises(Exception) as exc:
+        export_tenant_data("tenant-b", _request("tenant-a"), include_records=False, record_limit=10)
+
+    assert getattr(exc.value, "status_code", None) == 403
+
+
+def test_tenant_dataset_unavailable_never_echoes_raw_exception(tenant_stores, monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_bom.api.routes import privacy as privacy_mod
+
+    def _boom(*_args: object, **_kwargs: object) -> list[object]:
+        raise RuntimeError("Traceback (most recent call last): secret=AKIATEST at /etc/passwd")
+
+    monkeypatch.setattr(
+        privacy_mod,
+        "_get_store",
+        lambda: SimpleNamespace(list_summary=_boom),
+    )
+    payload = privacy_mod._tenant_dataset("tenant-a", include_records=False)
+
+    assert payload["unavailable"]["jobs"] == "An internal error occurred. Please contact support."
+    assert "Traceback" not in payload["unavailable"]["jobs"]
+    assert "AKIATEST" not in payload["unavailable"]["jobs"]
+
+
+def test_tenant_data_delete_defaults_to_dry_run(tenant_stores) -> None:
+    response = delete_tenant_data("tenant-a", _request("tenant-a"))
+
+    assert response["dry_run"] is True
+    assert response["would_delete"]["jobs"] == 1
+    assert tenant_stores["jobs"].get("job-tenant-a", tenant_id="tenant-a") is not None
+
+
+def test_tenant_data_delete_requires_exact_confirmation(tenant_stores) -> None:
+    with pytest.raises(Exception) as exc:
+        delete_tenant_data("tenant-a", _request("tenant-a"), dry_run=False, confirm_tenant_id="")
+
+    assert getattr(exc.value, "status_code", None) == 400
+    assert tenant_stores["jobs"].get("job-tenant-a", tenant_id="tenant-a") is not None
+
+
+def test_tenant_data_delete_removes_only_authenticated_tenant(tenant_stores) -> None:
+    response = delete_tenant_data("tenant-a", _request("tenant-a"), dry_run=False, confirm_tenant_id="tenant-a")
+
+    assert response["dry_run"] is False
+    assert response["deleted"]["jobs"] == 1
+    assert response["deleted"]["fleet_agents"] == 1
+    assert response["deleted"]["gateway_policies"] == 1
+    assert response["deleted"]["scan_schedules"] == 1
+    assert response["deleted"]["sources"] == 1
+    assert response["deleted"]["exceptions"] == 1
+    assert response["deleted"]["tenant_quota_overrides"] == 1
+    assert response["deleted"]["graph_rows"] == 1
+    assert response["deleted"]["cloud_connections"] == 1
+    assert response["deleted"]["credential_refs"] == 1
+    assert response["deleted"]["api_keys"] == 1
+
+    assert tenant_stores["jobs"].get("job-tenant-a", tenant_id="tenant-a") is None
+    assert tenant_stores["jobs"].get("job-tenant-b", tenant_id="tenant-b") is not None
+    assert tenant_stores["sources"].get("source-tenant-b") is not None
+    assert tenant_stores["connections"].get("tenant-a", "connection-tenant-a") is None
+    assert tenant_stores["connections"].get("tenant-b", "connection-tenant-b") is not None
+    assert tenant_stores["credentials"].get("credential-tenant-a", tenant_id="tenant-a") is None
+    assert tenant_stores["credentials"].get("credential-tenant-b", tenant_id="tenant-b") is not None
+    assert tenant_stores["keys"].list_keys(tenant_id="tenant-a") == []
+    assert len(tenant_stores["keys"].list_keys(tenant_id="tenant-b")) == 1
+
+
+def test_postgres_key_purge_is_bound_to_current_tenant() -> None:
+    class _Connection:
+        def __init__(self) -> None:
+            self.executed: list[tuple[str, tuple[object, ...] | None]] = []
+            self.committed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def execute(self, sql: str, params: tuple[object, ...] | None = None):
+            self.executed.append((sql, params))
+            return SimpleNamespace(rowcount=2 if sql.startswith("DELETE FROM api_keys") else 0)
+
+        def commit(self) -> None:
+            self.committed = True
+
+    connection = _Connection()
+    pool = SimpleNamespace(connection=lambda: connection)
+    store = PostgresKeyStore.__new__(PostgresKeyStore)
+    store._pool = pool
+
+    token = set_current_tenant("tenant-a")
+    try:
+        assert store.delete_tenant("tenant-a") == 2
+    finally:
+        reset_current_tenant(token)
+
+    assert connection.committed is True
+    assert ("DELETE FROM api_keys WHERE team_id = %s", ("tenant-a",)) in connection.executed
+    assert ("SELECT set_config('app.tenant_id', %s, true)", ("tenant-a",)) in connection.executed
+
+
+def test_sqlite_graph_store_delete_tenant_removes_graph_rows(tmp_path) -> None:
+    store = SQLiteGraphStore(tmp_path / "graph.db")
+    conn = store._open_rw_conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO graph_nodes (
+                id, entity_type, label, first_seen, last_seen, scan_id, tenant_id
+            ) VALUES ('node-a', 'agent', 'Node A', 'now', 'now', 'scan-a', 'tenant-a')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO graph_edges (
+                source_id, target_id, relationship, first_seen, last_seen, scan_id, tenant_id
+            ) VALUES ('node-a', 'node-b', 'invoked', 'now', 'now', 'scan-a', 'tenant-a')
+            """
+        )
+        conn.execute("INSERT INTO graph_snapshots (scan_id, tenant_id, created_at) VALUES ('scan-a', 'tenant-a', 'now')")
+        conn.execute("INSERT INTO graph_snapshots (scan_id, tenant_id, created_at) VALUES ('scan-b', 'tenant-b', 'now')")
+        conn.execute(
+            """
+            INSERT INTO attack_paths (source_node, target_node, scan_id, tenant_id, computed_at)
+            VALUES ('node-a', 'node-b', 'scan-a', 'tenant-a', 'now')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO interaction_risks (pattern, agents, scan_id, tenant_id)
+            VALUES ('pattern', '[]', 'scan-a', 'tenant-a')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO graph_filter_presets (name, tenant_id, filters, created_at)
+            VALUES ('preset-a', 'tenant-a', '{}', 'now')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO graph_node_search (
+                tenant_id, scan_id, node_id, entity_type, severity, compliance_tags, data_sources, search_text
+            ) VALUES ('tenant-a', 'scan-a', 'node-a', 'agent', '', '', '', 'node a')
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert store.delete_tenant(tenant_id="tenant-a") == 7
+
+    conn = store._open_ro_conn()
+    assert conn is not None
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM graph_snapshots WHERE tenant_id = 'tenant-a'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM graph_snapshots WHERE tenant_id = 'tenant-b'").fetchone()[0] == 1
+    finally:
+        conn.close()

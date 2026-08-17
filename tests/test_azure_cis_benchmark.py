@@ -9,6 +9,8 @@ import pytest
 from agent_bom.cloud.aws_cis_benchmark import CheckStatus, CISCheckResult
 from agent_bom.cloud.azure_cis_benchmark import (
     AzureCISReport,
+    _check_1_1,
+    _check_1_2,
     _check_1_3,
     _check_1_5,
     _check_1_7,
@@ -61,6 +63,67 @@ def _make_report(*statuses: CheckStatus) -> AzureCISReport:
             )
         )
     return report
+
+
+@pytest.mark.parametrize(
+    ("check", "role_id", "role_name"),
+    [
+        (_check_1_1, "8e3af657-a8ff-443c-a75c-2fe8c4bcb635", "Owner"),
+        (_check_1_2, "b24988ac-6180-42a0-ab88-20f7382dd24c", "Contributor"),
+    ],
+)
+def test_privileged_guest_identity_check_is_unevaluable_without_graph(check, role_id, role_name):
+    assignment = MagicMock()
+    assignment.role_definition_id = f"/subscriptions/sub-123/providers/Microsoft.Authorization/roleDefinitions/{role_id}"
+    assignment.principal_id = "principal-123"
+    auth_client = MagicMock()
+    auth_client.role_assignments.list_for_scope.return_value = [assignment]
+
+    result = check(auth_client, "sub-123")
+
+    assert result.status == CheckStatus.ERROR
+    assert role_name in result.evidence
+    assert "Microsoft Graph" in result.evidence
+    assert "1" in result.evidence
+
+
+@pytest.mark.parametrize("check", [_check_1_1, _check_1_2])
+def test_privileged_guest_identity_check_passes_when_no_matching_assignments(check):
+    auth_client = MagicMock()
+    auth_client.role_assignments.list_for_scope.return_value = []
+
+    result = check(auth_client, "sub-123")
+
+    assert result.status == CheckStatus.PASS
+    assert "No " in result.evidence
+
+
+def test_privileged_assignment_without_principal_id_remains_counted_but_not_emitted_as_empty_resource():
+    assignment = MagicMock()
+    assignment.role_definition_id = "/roleDefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
+    assignment.principal_id = None
+    auth_client = MagicMock()
+    auth_client.role_assignments.list_for_scope.return_value = [assignment]
+
+    result = _check_1_1(auth_client, "sub-123")
+
+    assert result.status == CheckStatus.ERROR
+    assert "1 Owner assignment" in result.evidence
+    assert result.resource_ids == []
+
+
+@pytest.mark.parametrize("check", [_check_1_1, _check_1_2])
+def test_privileged_assignment_read_failure_redacts_secret_bearing_error(check):
+    auth_client = MagicMock()
+    secret = "client_secret=do-not-return-this"
+    auth_client.role_assignments.list_for_scope.side_effect = Exception(secret)
+
+    result = check(auth_client, "sub-123")
+
+    assert result.status == CheckStatus.ERROR
+    assert secret not in result.evidence
+    assert "do-not-return-this" not in result.evidence
+    assert result.evidence.endswith("An internal error occurred. Please contact support.")
 
 
 def test_report_pass_count():
@@ -716,15 +779,25 @@ def test_run_benchmark_no_subscription_id(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _check_1_3 — Guest users reviewed (NOT_APPLICABLE)
+# _check_1_3 — Guest users reviewed (now Microsoft Graph access-review evidence)
 # ---------------------------------------------------------------------------
 
 
-def test_check_1_3_not_applicable():
-    result = _check_1_3()
-    assert result.status == CheckStatus.NOT_APPLICABLE
+def test_check_1_3_unevaluable_without_graph_evidence():
+    """1.3 is now Graph-backed: a client that cannot read is unevaluable, never a pass.
+
+    Detailed PASS/FAIL/unevaluable behavior lives in test_azure_identity_graph.py.
+    """
+    from agent_bom.cloud.azure_graph import GraphPermissionDeniedError
+
+    class _DeniedGraph:
+        def list(self, path):
+            raise GraphPermissionDeniedError("denied")
+
+    result = _check_1_3(_DeniedGraph())
+    assert result.status == CheckStatus.ERROR
+    assert result.status != CheckStatus.PASS
     assert result.check_id == "1.3"
-    assert "Graph API" in result.evidence
 
 
 # ---------------------------------------------------------------------------

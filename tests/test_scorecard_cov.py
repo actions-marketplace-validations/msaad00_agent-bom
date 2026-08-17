@@ -7,7 +7,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent_bom.scorecard import (
+    _bounded_cache_set,
     enrich_packages_with_scorecard,
+    enrich_packages_with_scorecard_stats,
     extract_github_repo,
     extract_github_repo_from_purl,
     fetch_scorecard,
@@ -73,7 +75,7 @@ class TestFetchScorecard:
 
     @pytest.mark.asyncio
     async def test_cache_none_hit(self):
-        with patch("agent_bom.scorecard._scorecard_cache", {"bad/repo": None}):
+        with patch("agent_bom.scorecard._scorecard_failure_cache", {"bad/repo": ("scorecard_not_found", None)}):
             result = await fetch_scorecard("bad/repo")
             assert result is None
 
@@ -112,6 +114,17 @@ class TestFetchScorecard:
             result = await fetch_scorecard("owner/repo")
             assert result is None
 
+    def test_bounded_cache_evicts_oldest_entries(self):
+        from collections import OrderedDict
+
+        cache: OrderedDict[str, dict] = OrderedDict()
+        with patch("agent_bom.scorecard._MAX_SCORECARD_CACHE_ENTRIES", 2):
+            _bounded_cache_set(cache, "repo/one", {"score": 1})
+            _bounded_cache_set(cache, "repo/two", {"score": 2})
+            _bounded_cache_set(cache, "repo/three", {"score": 3})
+
+        assert list(cache.keys()) == ["repo/two", "repo/three"]
+
 
 class TestEnrichPackagesWithScorecard:
     @pytest.mark.asyncio
@@ -146,3 +159,92 @@ class TestEnrichPackagesWithScorecard:
         with patch("agent_bom.scorecard.fetch_scorecard", return_value=None):
             count = await enrich_packages_with_scorecard([pkg])
             assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_stats_uses_repository_url_and_sets_enriched_state(self):
+        from agent_bom.models import Package
+
+        pkg = Package(name="express", version="4.18.2", ecosystem="npm", repository_url="https://github.com/expressjs/express")
+        with patch("agent_bom.scorecard.fetch_scorecard", return_value={"score": 7.5, "checks": {"Maintained": 10}}):
+            stats = await enrich_packages_with_scorecard_stats([pkg])
+            assert stats.eligible_packages == 1
+            assert stats.enriched_packages == 1
+            assert pkg.scorecard_lookup_state == "enriched"
+            assert pkg.scorecard_repo == "expressjs/express"
+
+    @pytest.mark.asyncio
+    async def test_stats_marks_unresolved_when_repo_missing(self):
+        from agent_bom.models import Package
+
+        pkg = Package(name="pkg", version="1.0.0", ecosystem="pypi")
+        stats = await enrich_packages_with_scorecard_stats([pkg])
+        assert stats.eligible_packages == 0
+        assert stats.unresolved_packages == 1
+        assert pkg.scorecard_lookup_state == "unresolved"
+
+    @pytest.mark.asyncio
+    async def test_stats_marks_failed_when_lookup_fails(self):
+        from agent_bom.models import Package
+
+        pkg = Package(name="express", version="4.18.2", ecosystem="npm", homepage="https://github.com/expressjs/express")
+        with patch("agent_bom.scorecard.fetch_scorecard", return_value=None):
+            stats = await enrich_packages_with_scorecard_stats([pkg])
+            assert stats.eligible_packages == 1
+            assert stats.failed_packages == 1
+            assert pkg.scorecard_lookup_state == "failed"
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_sets_reason_and_cooldown(self):
+        from agent_bom.models import Package
+
+        pkg1 = Package(name="express", version="4.18.2", ecosystem="npm", homepage="https://github.com/expressjs/express")
+        pkg2 = Package(name="next", version="16.2.1", ecosystem="npm", homepage="https://github.com/vercel/next.js")
+        mock_response = MagicMock()
+        mock_response.status_code = 429
+        mock_response.headers = {"Retry-After": "7"}
+
+        with (
+            patch("agent_bom.scorecard.create_client"),
+            patch("agent_bom.scorecard.request_with_retry", return_value=mock_response) as mock_request,
+            patch("agent_bom.scorecard._scorecard_cache", {}),
+            patch("agent_bom.scorecard._scorecard_reason_cache", {}),
+            patch("agent_bom.scorecard._scorecard_failure_cache", {}),
+            patch("agent_bom.scorecard._scorecard_cooldown_until", 0.0),
+            patch("agent_bom.scorecard._scorecard_cooldown_reason", None),
+            patch("agent_bom.scorecard.time.monotonic", return_value=100.0),
+        ):
+            stats = await enrich_packages_with_scorecard_stats([pkg1, pkg2])
+
+        assert stats.failed_packages == 2
+        assert stats.transient_failed_packages == 2
+        assert stats.persistent_failed_packages == 0
+        assert mock_request.call_count == 1
+        assert pkg1.scorecard_lookup_reason == "scorecard_rate_limited"
+        assert pkg2.scorecard_lookup_reason == "scorecard_rate_limited"
+        assert stats.failed_reasons["scorecard_rate_limited"] == 2
+
+    @pytest.mark.asyncio
+    async def test_access_denied_is_classified_persistent(self):
+        from agent_bom.models import Package
+
+        pkg = Package(name="express", version="4.18.2", ecosystem="npm", homepage="https://github.com/expressjs/express")
+        mock_response = MagicMock()
+        mock_response.status_code = 403
+        mock_response.headers = {}
+
+        with (
+            patch("agent_bom.scorecard.create_client"),
+            patch("agent_bom.scorecard.request_with_retry", return_value=mock_response),
+            patch("agent_bom.scorecard._scorecard_cache", {}),
+            patch("agent_bom.scorecard._scorecard_reason_cache", {}),
+            patch("agent_bom.scorecard._scorecard_failure_cache", {}),
+            patch("agent_bom.scorecard._scorecard_cooldown_until", 0.0),
+            patch("agent_bom.scorecard._scorecard_cooldown_reason", None),
+        ):
+            stats = await enrich_packages_with_scorecard_stats([pkg])
+
+        assert stats.failed_packages == 1
+        assert stats.transient_failed_packages == 0
+        assert stats.persistent_failed_packages == 1
+        assert pkg.scorecard_lookup_reason == "scorecard_access_denied"
+        assert stats.failed_reasons["scorecard_access_denied"] == 1

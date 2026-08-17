@@ -10,6 +10,17 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from agent_bom.proxy import check_policy
+from agent_bom.proxy_policy import check_policy_detail, summarize_policy_bundle
+
+__all__ = [
+    "check_policy",
+    "evaluate_gateway_policies",
+    "evaluate_gateway_policies_detail",
+    "evaluate_gateway_policy_bundle",
+    "gateway_policies_to_proxy_bundle",
+    "gateway_policy_to_proxy_format",
+    "summarize_gateway_policies",
+]
 
 if TYPE_CHECKING:
     from agent_bom.api.policy_store import GatewayPolicy
@@ -33,8 +44,69 @@ def gateway_policy_to_proxy_format(policy: "GatewayPolicy") -> dict:
             d["tool_name_pattern"] = rule.tool_name_pattern
         if rule.arg_pattern:
             d["arg_pattern"] = rule.arg_pattern
+        if rule.deny_tool_classes:
+            d["deny_tool_classes"] = rule.deny_tool_classes
+        if rule.read_only:
+            d["read_only"] = True
+        if rule.block_secret_paths:
+            d["block_secret_paths"] = True
+        if rule.block_unknown_egress:
+            d["block_unknown_egress"] = True
+        if rule.allowed_hosts:
+            d["allowed_hosts"] = rule.allowed_hosts
+        if rule.rate_limit is not None:
+            d["rate_limit"] = rule.rate_limit
         rules.append(d)
     return {"rules": rules}
+
+
+def gateway_policies_to_proxy_bundle(policies: list["GatewayPolicy"]) -> dict:
+    """Convert enabled gateway policies into an effective proxy policy bundle.
+
+    Audit-mode policies are translated to advisory-only rules so any rollout
+    summary reflects actual runtime behavior rather than raw stored rule
+    actions.
+    """
+    rules: list[dict] = []
+    for policy in policies:
+        if not policy.enabled:
+            continue
+        proxy_fmt = gateway_policy_to_proxy_format(policy)
+        for rule in proxy_fmt["rules"]:
+            effective_rule = dict(rule)
+            if policy.mode.value != "enforce" and effective_rule.get("action", "block") in ("block", "fail"):
+                effective_rule["action"] = "warn"
+            rules.append(effective_rule)
+    return {"rules": rules}
+
+
+def summarize_gateway_policies(policies: list["GatewayPolicy"]) -> dict[str, object]:
+    """Summarize the effective runtime posture of control-plane gateway policies."""
+    return summarize_policy_bundle(gateway_policies_to_proxy_bundle(policies))
+
+
+def evaluate_gateway_policy_bundle(
+    policies: list["GatewayPolicy"],
+    agent_name: str,
+    tool_name: str,
+    arguments: dict,
+) -> tuple[bool, str]:
+    """Evaluate a GatewayPolicy bundle scoped to one calling agent.
+
+    Policies with a non-empty ``bound_agents`` list apply only when
+    ``agent_name`` is listed. Unbound policies apply to every agent.
+    Returns ``(allowed, reason)`` — the public entry point for both the
+    per-MCP proxy and the standalone gateway relay (do not reach into
+    private ``proxy._*`` helpers for this).
+    """
+    scoped: list[GatewayPolicy] = []
+    for policy in policies:
+        bound = getattr(policy, "bound_agents", None)
+        if bound and agent_name not in bound:
+            continue
+        scoped.append(policy)
+    allowed, reason, _policy_id = evaluate_gateway_policies(scoped, tool_name, arguments)
+    return allowed, reason
 
 
 def evaluate_gateway_policies(
@@ -53,17 +125,56 @@ def evaluate_gateway_policies(
         ``(allowed, reason, policy_id)`` — if blocked, ``reason``
         explains why and ``policy_id`` identifies the blocking policy.
     """
+    allowed, reason, policy_id, _rule_id, _policy_name, _mode = evaluate_gateway_policies_detail(policies, tool_name, arguments)
+    return allowed, reason, policy_id
+
+
+def evaluate_gateway_policies_detail(
+    policies: list["GatewayPolicy"],
+    tool_name: str,
+    arguments: dict,
+) -> tuple[bool, str, str | None, str | None, str | None, str | None]:
+    """Evaluate a tool call and return full audit-trail metadata.
+
+    Same semantics as :func:`evaluate_gateway_policies` but additionally
+    returns the matched ``rule_id``, the policy's display ``name``, and
+    the policy ``mode`` (``enforce`` or ``audit``).  Used by the
+    ``/v1/gateway/evaluate`` route to write a structured audit row for
+    every decision so block actions are traceable to a specific policy
+    *and* a specific rule, not just a pattern string.
+
+    Returns:
+        ``(allowed, reason, policy_id, rule_id, policy_name, policy_mode)``.
+
+        - On enforce-mode block: ``allowed=False`` with all four metadata
+          fields populated.
+        - On audit-mode match: ``allowed=True`` (call goes through) but
+          ``reason`` is prefixed with ``[audit]`` and the metadata
+          fields point at the audit-mode rule that would have blocked.
+        - On clean allow: ``allowed=True`` with all metadata ``None``.
+    """
+    first_audit_match: tuple[str, str, str | None, str, str] | None = None
     for policy in policies:
         if not policy.enabled:
             continue
 
         proxy_fmt = gateway_policy_to_proxy_format(policy)
-        allowed, reason = check_policy(proxy_fmt, tool_name, arguments)
+        allowed, reason, rule_id = check_policy_detail(proxy_fmt, tool_name, arguments)
 
         if not allowed:
             if policy.mode.value == "enforce":
-                return False, reason, policy.policy_id
+                return False, reason, policy.policy_id, rule_id, policy.name, policy.mode.value
             # audit mode — log but allow
-            return True, f"[audit] {reason}", policy.policy_id
+            if first_audit_match is None:
+                first_audit_match = (
+                    f"[audit] {reason}",
+                    policy.policy_id,
+                    rule_id,
+                    policy.name,
+                    policy.mode.value,
+                )
 
-    return True, "", None
+    if first_audit_match is not None:
+        reason, policy_id, rule_id, policy_name, mode = first_audit_match
+        return True, reason, policy_id, rule_id, policy_name, mode
+    return True, "", None, None, None, None

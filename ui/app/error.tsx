@@ -1,6 +1,10 @@
 "use client";
 
+import { useEffect } from "react";
 import { ShieldX } from "lucide-react";
+
+import { api } from "@/lib/api";
+import { errorBoundaryMessage, errorReference } from "@/lib/error-boundary-message";
 
 export default function GlobalError({
   error,
@@ -9,17 +13,35 @@ export default function GlobalError({
   error: Error & { digest?: string };
   reset: () => void;
 }) {
+  const message = errorBoundaryMessage(error);
+  const reference = errorReference(error.digest);
+
+  useEffect(() => {
+    void api
+      .reportClientError({
+        message,
+        digest: reference ?? undefined,
+        path: window.location.pathname,
+        component: "global-error-boundary",
+      })
+      .catch(() => {});
+  }, [message, reference]);
+
   return (
-    <div className="flex flex-col items-center justify-center h-[80vh] gap-4 text-center">
-      <ShieldX className="w-12 h-12 text-red-500" />
-      <h2 className="text-lg font-semibold text-zinc-200">Something went wrong</h2>
-      <p className="text-sm text-zinc-400 max-w-md">{error.message}</p>
+    <main className="flex h-[80vh] flex-col items-center justify-center gap-4 px-6 text-center">
+      <ShieldX className="h-12 w-12 text-red-500" aria-hidden="true" />
+      <h1 className="text-lg font-semibold text-[var(--foreground)]">Something went wrong</h1>
+      <p className="max-w-md text-sm text-[var(--text-secondary)]">{message}</p>
+      {reference ? (
+        <p className="text-xs text-[var(--text-secondary)]">Reference: {reference}</p>
+      ) : null}
       <button
+        type="button"
         onClick={reset}
-        className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-md text-sm text-white transition-colors"
+        className="rounded-md bg-emerald-600 px-4 py-2 text-sm text-white transition-colors hover:bg-emerald-500"
       >
         Try again
       </button>
-    </div>
+    </main>
   );
 }

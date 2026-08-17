@@ -16,6 +16,7 @@ Tests cover:
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import tempfile
@@ -27,7 +28,9 @@ from click.testing import CliRunner
 from agent_bom.output.graph_export import (
     DepGraph,
     load_graph_from_scan,
+    to_cypher,
     to_dot,
+    to_graphml,
     to_json,
     to_mermaid,
 )
@@ -69,7 +72,13 @@ def _vuln(vid: str = "CVE-2024-0001", severity: str = "high") -> dict:
     return {"id": vid, "severity": severity, "summary": "A test vulnerability.", "cvss_score": 7.5}
 
 
-def _server(name: str, pkgs: list | None = None, has_creds: bool = False) -> dict:
+def _server(
+    name: str,
+    pkgs: list | None = None,
+    has_creds: bool = False,
+    tools: list[dict] | None = None,
+    credential_env_vars: list[str] | None = None,
+) -> dict:
     return {
         "name": name,
         "command": "npx",
@@ -77,6 +86,8 @@ def _server(name: str, pkgs: list | None = None, has_creds: bool = False) -> dic
         "transport": "stdio",
         "url": "",
         "has_credentials": has_creds,
+        "tools": tools or [],
+        "credential_env_vars": credential_env_vars or [],
         "packages": pkgs or [],
     }
 
@@ -90,6 +101,28 @@ def _agent(name: str, servers: list | None = None, source: str = "local") -> dic
         "status": "active",
         "mcp_servers": servers or [],
     }
+
+
+def _cloud_agent(name: str = "bedrock-agent") -> dict:
+    agent = _agent(name, [], source="aws")
+    agent.update(
+        {
+            "discovered_at": "2026-04-28T10:00:00Z",
+            "last_seen": "2026-04-28T11:00:00Z",
+            "metadata": {
+                "cloud_origin": {
+                    "provider": "aws",
+                    "service": "bedrock",
+                    "resource_type": "agent",
+                    "resource_id": "agent-123",
+                    "location": "us-east-1",
+                    "scope": {"account_id": "123456789012"},
+                },
+                "cloud_state": {"lifecycle_state": "ready", "raw_state": "PREPARED"},
+            },
+        }
+    )
+    return agent
 
 
 def _write_scan(data: dict) -> str:
@@ -124,6 +157,154 @@ def test_loads_agent_server_package_nodes():
         assert "pkg" in kinds
     finally:
         os.unlink(path)
+
+
+def test_package_nodes_preserve_version_provenance():
+    pkg = _pkg("requests", "2.31.0", "pypi")
+    pkg["version_provenance"] = {
+        "version_source": "lockfile",
+        "confidence": "exact",
+        "resolved_version": "2.31.0",
+    }
+    data = _make_scan_json([_agent("myagent", [_server("myserver", [pkg])])])
+    path = _write_scan(data)
+    try:
+        graph = load_graph_from_scan(path)
+        payload = to_json(graph)
+        pkg_node = next(node for node in payload["nodes"] if node["kind"] == "pkg")
+        edge = next(edge for edge in payload["edges"] if edge["kind"] == "depends_on")
+
+        assert pkg_node["attributes"]["version_source"] == "lockfile"
+        assert pkg_node["attributes"]["version_confidence"] == "exact"
+        assert edge["evidence"]["version_provenance"]["resolved_version"] == "2.31.0"
+    finally:
+        os.unlink(path)
+
+
+def test_credential_to_tool_reaches_edges_export_with_evidence():
+    server = _server(
+        "github",
+        tools=[{"name": "create_issue"}, {"name": "delete_repo"}],
+        credential_env_vars=["GITHUB_TOKEN"],
+    )
+    data = _make_scan_json([_agent("a", [server])])
+    path = _write_scan(data)
+    try:
+        graph = load_graph_from_scan(path)
+        payload = to_json(graph)
+        edge = next(edge for edge in payload["edges"] if edge["kind"] == "reaches_tool" and edge["target"].endswith("/delete_repo"))
+
+        assert edge["source"] == "cred:server:a/github:GITHUB_TOKEN"
+        assert edge["evidence"]["mapping_method"] == "server_scope_conservative"
+        assert edge["evidence"]["confidence"] == "medium"
+        assert "|reaches_tool|" in to_mermaid(graph)
+        assert "REACHES_TOOL" in to_cypher(graph)
+        assert "reaches_tool" in to_graphml(graph)
+    finally:
+        os.unlink(path)
+
+
+def test_same_env_var_name_stays_scoped_to_each_exported_server():
+    data = _make_scan_json(
+        [
+            _agent("a", [_server("github", tools=[{"name": "create_issue"}], credential_env_vars=["GITHUB_TOKEN"])]),
+            _agent("b", [_server("github", tools=[{"name": "delete_repo"}], credential_env_vars=["GITHUB_TOKEN"])]),
+        ]
+    )
+    path = _write_scan(data)
+    try:
+        graph = load_graph_from_scan(path)
+    finally:
+        os.unlink(path)
+
+    credential_ids = {node.id for node in graph.nodes if node.kind == "credential"}
+    assert credential_ids == {
+        "cred:server:a/github:GITHUB_TOKEN",
+        "cred:server:b/github:GITHUB_TOKEN",
+    }
+    for edge in graph.edges:
+        if edge.kind != "reaches_tool":
+            continue
+        credential = next(node for node in graph.nodes if node.id == edge.source)
+        tool = next(node for node in graph.nodes if node.id == edge.target)
+        assert credential.attributes["server"] == tool.attributes["server"]
+
+
+def test_redacted_report_keeps_distinct_credential_nodes_and_no_phantom_edges():
+    """Regression: credential slots retain names without becoming global IDs.
+
+    The report-write path (``to_redacted_json`` → ``sanitize_sensitive_payload``)
+    must not collapse distinct credential names into one ``***REDACTED***`` label.
+    A collapse mints a single ``cred:***REDACTED***`` node that set-dedups across
+    unrelated agents and invents phantom cross-agent ``reaches_tool`` edges.
+    """
+    from agent_bom.security import sanitize_sensitive_payload
+
+    agent_a = _agent(
+        "agent-a",
+        [
+            _server(
+                "openai-srv",
+                has_creds=True,
+                tools=[{"name": "chat"}],
+                credential_env_vars=["OPENAI_API_KEY"],
+            ),
+            _server(
+                "vector-srv",
+                has_creds=True,
+                tools=[{"name": "vector_search"}],
+                credential_env_vars=["VECTOR_DB_TOKEN"],
+            ),
+        ],
+    )
+    agent_b = _agent(
+        "agent-b",
+        [
+            _server(
+                "browser-srv",
+                has_creds=True,
+                tools=[{"name": "browse"}],
+                credential_env_vars=["BROWSER_SESSION_TOKEN"],
+            ),
+            _server(
+                "anthropic-srv",
+                has_creds=True,
+                tools=[{"name": "complete"}],
+                credential_env_vars=["ANTHROPIC_API_KEY"],
+            ),
+        ],
+    )
+    raw = _make_scan_json([agent_a, agent_b])
+
+    # Run through the exact redaction the report writer applies before persistence.
+    redacted = sanitize_sensitive_payload(raw)
+    assert isinstance(redacted, dict)
+
+    path = _write_scan(redacted)
+    try:
+        graph = load_graph_from_scan(path)
+    finally:
+        os.unlink(path)
+
+    cred_nodes = {node.id for node in graph.nodes if node.kind == "credential"}
+    # (a) each distinct credential stays its own node — no collapse to one label.
+    assert cred_nodes == {
+        "cred:server:agent-a/openai-srv:OPENAI_API_KEY",
+        "cred:server:agent-a/vector-srv:VECTOR_DB_TOKEN",
+        "cred:server:agent-b/browser-srv:BROWSER_SESSION_TOKEN",
+        "cred:server:agent-b/anthropic-srv:ANTHROPIC_API_KEY",
+    }
+    assert "cred:***REDACTED***" not in cred_nodes
+
+    # (b) no phantom cross-agent credential→tool edge: every reaches_tool edge
+    # must connect a credential and a tool that belong to the SAME server.
+    for edge in graph.edges:
+        if edge.kind != "reaches_tool":
+            continue
+        target_node = next(node for node in graph.nodes if node.id == edge.target)
+        server_id = target_node.attributes.get("server")
+        cred_node = next(node for node in graph.nodes if node.id == edge.source)
+        assert cred_node.attributes.get("server") == server_id, f"phantom cross-server edge {edge.source} -> {edge.target}"
 
 
 def test_vulnerable_package_gets_pkg_vuln_kind():
@@ -278,11 +459,59 @@ def test_to_mermaid_basic_structure():
         os.unlink(path)
 
 
+def test_to_mermaid_uses_short_ids_and_descriptive_labels():
+    pkg = _pkg("@scope/very-long-package", "1.2.3", "npm", vulns=[_vuln("CVE-2026-9999")])
+    data = _make_scan_json([_agent("claude desktop", [_server("filesystem server", [pkg])])])
+    path = _write_scan(data)
+    try:
+        g = load_graph_from_scan(path)
+        mmd = to_mermaid(g)
+        assert "n1" in mmd
+        assert "agent_claude_desktop" not in mmd
+        assert "server_claude_desktop_filesystem_server" not in mmd
+        assert "claude desktop" in mmd
+        assert "filesystem server" in mmd
+        assert "@scope/very-long-package@1.2.3" in mmd
+        assert "CVE-2026-9999" in mmd
+    finally:
+        os.unlink(path)
+
+
 def test_to_mermaid_empty_graph():
     g = DepGraph()
     mmd = to_mermaid(g)
     assert "flowchart LR" in mmd
     assert "-->" not in mmd
+
+
+def test_to_mermaid_elides_large_graph_by_default():
+    g = DepGraph()
+    for index in range(90):
+        g.add_node(f"pkg:{index}", f"pkg-{index}", "pkg")
+        if index:
+            g.add_edge(f"pkg:{index - 1}", f"pkg:{index}", "depends_on")
+
+    mmd = to_mermaid(g)
+
+    assert "Rendered 80 of 90 nodes" in mmd
+    assert "10 nodes / 10 edges omitted" in mmd
+    assert "pkg-0" in mmd
+    assert "pkg-89" not in mmd
+    assert "export JSON, DOT, GraphML, or Cypher for full graph" in mmd
+
+
+def test_to_mermaid_can_render_full_graph_when_requested():
+    g = DepGraph()
+    for index in range(3):
+        g.add_node(f"pkg:{index}", f"pkg-{index}", "pkg")
+        if index:
+            g.add_edge(f"pkg:{index - 1}", f"pkg:{index}", "depends_on")
+
+    mmd = to_mermaid(g, max_nodes=None, max_edges=None)
+
+    assert "Rendered" not in mmd
+    assert "omitted" not in mmd
+    assert "pkg-2" in mmd
 
 
 # ── to_json ──────────────────────────────────────────────────────────────────
@@ -317,6 +546,24 @@ def test_to_json_node_has_required_fields():
             assert "id" in node
             assert "label" in node
             assert "kind" in node
+    finally:
+        os.unlink(path)
+
+
+def test_to_json_preserves_cloud_context_attributes():
+    data = _make_scan_json([_cloud_agent()])
+    path = _write_scan(data)
+    try:
+        graph = load_graph_from_scan(path)
+        result = to_json(graph)
+        agent_node = next(node for node in result["nodes"] if node["id"] == "agent:bedrock-agent")
+        attrs = agent_node["attributes"]
+        assert attrs["cloud_origin"]["provider"] == "aws"
+        assert attrs["cloud_origin"]["service"] == "bedrock"
+        assert attrs["cloud_origin"]["scope"]["account_id"] == "123456789012"
+        assert attrs["cloud_state"]["lifecycle_state"] == "ready"
+        assert attrs["discovered_at"] == "2026-04-28T10:00:00Z"
+        assert attrs["last_seen"] == "2026-04-28T11:00:00Z"
     finally:
         os.unlink(path)
 
@@ -375,6 +622,91 @@ def test_cli_graph_mermaid_to_stdout():
         os.unlink(path)
 
 
+def test_cli_graph_evaluates_expected_fixture(tmp_path: Path):
+    from agent_bom.cli import main
+
+    data = _make_scan_json(
+        [
+            _agent(
+                "eval-agent",
+                [
+                    _server(
+                        "github",
+                        [_pkg("next", "16.2.6", "npm", vulns=[_vuln("CVE-2026-21441", "critical")])],
+                        credential_env_vars=["GITHUB_TOKEN"],
+                        tools=[{"name": "create_pull_request"}],
+                    )
+                ],
+            )
+        ]
+    )
+    scan_path = _write_scan(data)
+    expected_path = tmp_path / "expected-graph.json"
+    evaluation_path = tmp_path / "graph-eval.json"
+    expected_path.write_text(
+        json.dumps(
+            {
+                "name": "cli-eval",
+                "expected_nodes": [
+                    "agent:eval-agent",
+                    "server:eval-agent/github",
+                    "pkg:npm/next@16.2.6",
+                    "cve:CVE-2026-21441",
+                ],
+                "expected_edges": [
+                    ["agent:eval-agent", "server:eval-agent/github", "uses"],
+                    ["server:eval-agent/github", "pkg:npm/next@16.2.6", "depends_on"],
+                    ["pkg:npm/next@16.2.6", "cve:CVE-2026-21441", "affects"],
+                ],
+            }
+        )
+    )
+
+    try:
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "graph",
+                scan_path,
+                "--format",
+                "json",
+                "--output",
+                str(tmp_path / "graph.json"),
+                "--expected",
+                str(expected_path),
+                "--eval-output",
+                str(evaluation_path),
+                "--fail-under",
+                "0.80",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(evaluation_path.read_text())
+        assert payload["name"] == "cli-eval"
+        assert payload["overall_score"] >= 0.8
+        assert payload["scores"]["edges"]["matched"] == 3
+    finally:
+        os.unlink(scan_path)
+
+
+def test_cli_graph_evaluation_fail_under_exits_nonzero(tmp_path: Path):
+    from agent_bom.cli import main
+
+    scan_path = _write_scan(_make_scan_json([_agent("a", [_server("s", [_pkg("pkg", "1.0.0")])])]))
+    expected_path = tmp_path / "expected-graph.json"
+    expected_path.write_text(json.dumps({"expected_nodes": ["agent:missing"]}))
+
+    try:
+        runner = CliRunner()
+        result = runner.invoke(main, ["graph", scan_path, "--expected", str(expected_path), "--fail-under", "0.99"])
+
+        assert result.exit_code != 0
+    finally:
+        os.unlink(scan_path)
+
+
 def test_cli_graph_invalid_file_exits_nonzero():
     from agent_bom.cli import main
 
@@ -385,3 +717,137 @@ def test_cli_graph_invalid_file_exits_nonzero():
         assert result.exit_code != 0
     finally:
         os.unlink(path)
+
+
+# ── to_graphml ─────────────────────────────────────────────────────────────
+
+
+def test_to_graphml_basic_structure():
+    pkg = _pkg("fastapi", "0.100.0", "pypi")
+    data = _make_scan_json([_agent("a", [_server("s", [pkg])])])
+    path = _write_scan(data)
+    try:
+        g = load_graph_from_scan(path)
+        gml = to_graphml(g)
+        assert '<?xml version="1.0"' in gml
+        assert "<graphml" in gml
+        assert 'id="aibom"' in gml
+        assert "<node" in gml
+        assert "<edge" in gml
+        assert 'key="kind"' in gml
+        assert 'xmlns="http://graphml.graphdrawing.org/xmlns"' in gml
+    finally:
+        os.unlink(path)
+
+
+def test_to_graphml_aibom_attributes():
+    pkg = _pkg("lodash", "4.17.20", "npm", vulns=[_vuln("CVE-2021-23337")])
+    srv = _server("cred-srv", [pkg], has_creds=True)
+    data = _make_scan_json([_agent("a", [srv])])
+    path = _write_scan(data)
+    try:
+        g = load_graph_from_scan(path)
+        gml = to_graphml(g)
+        assert "has_credentials" in gml
+        assert "is_vulnerable" in gml
+        assert "severity" in gml
+    finally:
+        os.unlink(path)
+
+
+def test_to_graphml_empty_graph():
+    g = DepGraph()
+    gml = to_graphml(g)
+    assert "<graphml" in gml
+    assert "<node" not in gml
+
+
+def test_to_graphml_round_trips_through_networkx_with_escaped_labels():
+    nx = pytest.importorskip("networkx")
+    graph = DepGraph()
+    graph.add_node('node<&"', "Agent <prod> & ops", "agent")
+    graph.add_node("target", "Target", "server")
+    graph.add_edge('node<&"', "target", "uses_server")
+
+    parsed = nx.read_graphml(io.BytesIO(to_graphml(graph).encode("utf-8")))
+
+    assert parsed.is_directed()
+    assert set(parsed.nodes) == {'node<&"', "target"}
+    assert parsed.nodes['node<&"']["label"] == "Agent <prod> & ops"
+
+
+# ── to_cypher ──────────────────────────────────────────────────────────────
+
+
+def test_to_cypher_basic_structure():
+    pkg = _pkg("express", "4.18.0", "npm")
+    data = _make_scan_json([_agent("a", [_server("s", [pkg])])])
+    path = _write_scan(data)
+    try:
+        g = load_graph_from_scan(path)
+        cypher = to_cypher(g)
+        assert "CREATE CONSTRAINT" in cypher
+        assert "MERGE" in cypher
+        assert ":AIAgent" in cypher or ":Provider" in cypher
+        assert "USES_SERVER" in cypher or "HOSTS" in cypher
+    finally:
+        os.unlink(path)
+
+
+def test_to_cypher_aibom_labels():
+    pkg = _pkg("react", "18.0.0", "npm", vulns=[_vuln("CVE-2024-1234")])
+    data = _make_scan_json([_agent("myagent", [_server("mysrv", [pkg])])])
+    path = _write_scan(data)
+    try:
+        g = load_graph_from_scan(path)
+        cypher = to_cypher(g)
+        assert ":AIAgent" in cypher
+        assert ":MCPServer" in cypher
+        assert ":Package" in cypher
+        assert ":Vulnerability" in cypher
+        assert "DEPENDS_ON" in cypher
+        assert "AFFECTS" in cypher
+    finally:
+        os.unlink(path)
+
+
+def test_to_cypher_empty_graph():
+    g = DepGraph()
+    cypher = to_cypher(g)
+    assert "CREATE CONSTRAINT" in cypher
+    assert "Total: 0 nodes" in cypher
+
+
+# ── CLI graphml / cypher ──────────────────────────────────────────────────
+
+
+def test_cli_graph_graphml_to_stdout():
+    from agent_bom.cli import main
+
+    data = _make_scan_json([_agent("a", [_server("s", [_pkg("pkg", "1.0.0")])])])
+    path = _write_scan(data)
+    try:
+        runner = CliRunner()
+        result = runner.invoke(main, ["graph", path, "--format", "graphml"])
+        assert result.exit_code == 0
+        assert "<graphml" in result.output
+    finally:
+        os.unlink(path)
+
+
+def test_cli_graph_cypher_to_file():
+    from agent_bom.cli import main
+
+    data = _make_scan_json([_agent("a", [_server("s", [_pkg("pkg", "1.0.0")])])])
+    path = _write_scan(data)
+    with tempfile.NamedTemporaryFile(suffix=".cypher", delete=False) as out:
+        out_path = out.name
+    try:
+        runner = CliRunner()
+        result = runner.invoke(main, ["graph", path, "--format", "cypher", "--output", out_path])
+        assert result.exit_code == 0
+        content = Path(out_path).read_text()
+        assert "MERGE" in content
+    finally:
+        os.unlink(path)
+        os.unlink(out_path)

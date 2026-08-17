@@ -2,62 +2,778 @@
 
 from __future__ import annotations
 
+import importlib.util
+import ipaddress
+import os
+import secrets
+import ssl
 import sys
+import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import click
 
+from agent_bom.cli._common import LISTEN_PORT_RANGE
+
+
+def _require_optional_dependencies(command: str, extra: str, modules: dict[str, str]) -> None:
+    """Fail fast with an actionable install hint for optional runtime surfaces."""
+    missing = [label for label, module_name in modules.items() if importlib.util.find_spec(module_name) is None]
+    if not missing:
+        return
+    _fail_missing_optional_dependencies(command, extra, missing)
+
+
+def _fail_missing_optional_dependencies(command: str, extra: str, missing: list[str]) -> None:
+    """Print the shared optional-extra install hint and exit."""
+    missing_text = ", ".join(missing)
+    click.echo(
+        f"ERROR: {missing_text} required for `{command}`.\n"
+        f"Install with:  uv pip install 'agent-bom[{extra}]'  (or: pip install 'agent-bom[{extra}]')",
+        err=True,
+    )
+    sys.exit(1)
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Return True when ``host`` resolves to loopback-only access."""
+    cleaned = host.strip().lower()
+    if cleaned in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(cleaned).is_loopback
+    except ValueError:
+        return False
+
+
+def _oidc_enabled() -> bool:
+    """Return True when OIDC auth is configured via environment."""
+    from agent_bom.api.oidc import oidc_enabled_from_env
+
+    return oidc_enabled_from_env()
+
+
+def _scim_bearer_enabled() -> bool:
+    """True when a SCIM bearer token is configured.
+
+    Imported lazily so command-line tooling that doesn't touch SCIM doesn't
+    pay the import cost.
+    """
+    from agent_bom.api.scim import scim_enabled_from_env
+
+    return scim_enabled_from_env()
+
+
+def _saml_enabled() -> bool:
+    """True when SAML SSO is configured via environment.
+
+    Imported lazily so command-line tooling that doesn't touch SAML doesn't
+    pay the import cost.
+    """
+    from agent_bom.api.saml import saml_enabled_from_env
+
+    return saml_enabled_from_env()
+
+
+def _enforce_auth_defaults(command: str, host: str, api_key: str | None, allow_insecure_no_auth: bool) -> None:
+    """Refuse unauthenticated non-loopback binds unless explicitly overridden.
+
+    Recognises six auth paths:
+    - explicit API key (--api-key / AGENT_BOM_API_KEY)
+    - OIDC (AGENT_BOM_OIDC_ISSUER + tenant providers)
+    - SCIM bearer (AGENT_BOM_SCIM_BEARER_TOKEN) -- the SCIM middleware
+      authenticates every endpoint when this is configured
+    - SAML SSO (AGENT_BOM_SAML_IDP_* + AGENT_BOM_SAML_SP_*) -- browser users
+      authenticate against the IdP and receive a short-lived session API key;
+      anonymous requests still fail closed via the API-key middleware, which
+      stays installed whenever any auth path is configured
+    - trusted reverse-proxy auth (feature flag + strong env/file secret)
+    - --allow-insecure-no-auth (explicit override; emits a loud warning when
+      another auth method is also configured so operators understand that
+      their `--allow-insecure-no-auth` does NOT actually disable the SCIM /
+      SAML / OIDC / API-key middleware path that's still in effect)
+    """
+    from agent_bom.api.middleware import (
+        AuthPostureError,
+        derive_auth_posture,
+        validate_auth_posture,
+    )
+    from agent_bom.api.secret_source import secret_is_configured
+
+    has_api_key = bool(api_key or secret_is_configured("AGENT_BOM_API_KEYS") or secret_is_configured("AGENT_BOM_API_KEY"))
+    # One derivation, shared with configure_api: the CLI serve gate reads the
+    # same posture rather than re-deriving each credential-source fact from env.
+    posture = derive_auth_posture(
+        api_key_configured=has_api_key,
+        allow_unauthenticated=_resolve_allow_unauthenticated(allow_insecure_no_auth),
+        listener_host=host,
+    )
+    # A contradictory/broken auth configuration (e.g. malformed OIDC) is a
+    # fail-fast startup error on any host — consolidation surfaces it here
+    # instead of a per-request 500 later.
+    try:
+        validate_auth_posture(posture)
+    except AuthPostureError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if posture.listener_loopback:
+        return
+
+    if posture.programmatic_auth_configured:
+        if allow_insecure_no_auth:
+            active: list[str] = []
+            if posture.api_key:
+                active.append("API-key")
+            if posture.oidc_bearer:
+                active.append("OIDC")
+            if posture.scim_bearer:
+                active.append("SCIM-bearer")
+            if posture.saml:
+                active.append("SAML")
+            if posture.trusted_proxy:
+                active.append("trusted-proxy")
+            click.secho(
+                f"warning: --allow-insecure-no-auth was passed but {', '.join(active)} authentication is "
+                "still configured -- requests will continue to be authenticated. "
+                "Unset the relevant env vars to actually run unauthenticated.",
+                fg="yellow",
+                err=True,
+            )
+        return
+    if allow_insecure_no_auth:
+        return
+    raise click.ClickException(
+        f"Refusing to expose `{command}` on non-loopback host {host!r} without authentication. "
+        "Set --api-key / AGENT_BOM_API_KEY, configure AGENT_BOM_API_KEYS, configure AGENT_BOM_OIDC_ISSUER / "
+        "AGENT_BOM_OIDC_TENANT_PROVIDERS_JSON, set AGENT_BOM_SCIM_BEARER_TOKEN, configure SAML SSO "
+        "(AGENT_BOM_SAML_IDP_ENTITY_ID / AGENT_BOM_SAML_SP_ENTITY_ID + related), "
+        "configure AGENT_BOM_TRUST_PROXY_AUTH with a strong AGENT_BOM_TRUST_PROXY_AUTH_SECRET, "
+        "or pass --allow-insecure-no-auth to override."
+    )
+
+
+def _uvicorn_tls_kwargs() -> dict[str, Any]:
+    """Return uvicorn TLS kwargs from app-native control-plane TLS env vars."""
+    cert_file = os.environ.get("AGENT_BOM_TLS_CERT_FILE", "").strip()
+    key_file = os.environ.get("AGENT_BOM_TLS_KEY_FILE", "").strip()
+    client_ca_file = os.environ.get("AGENT_BOM_TLS_CLIENT_CA_FILE", "").strip()
+    require_client_cert = os.environ.get("AGENT_BOM_TLS_REQUIRE_CLIENT_CERT", "").strip().lower() in {"1", "true", "yes", "on"}
+
+    if require_client_cert and not client_ca_file:
+        raise click.ClickException("AGENT_BOM_TLS_REQUIRE_CLIENT_CERT requires AGENT_BOM_TLS_CLIENT_CA_FILE.")
+    if client_ca_file and not require_client_cert:
+        raise click.ClickException("AGENT_BOM_TLS_CLIENT_CA_FILE requires AGENT_BOM_TLS_REQUIRE_CLIENT_CERT=1.")
+    if bool(cert_file) != bool(key_file):
+        raise click.ClickException("AGENT_BOM_TLS_CERT_FILE and AGENT_BOM_TLS_KEY_FILE must be configured together.")
+    if not cert_file:
+        return {}
+
+    kwargs: dict[str, Any] = {
+        "ssl_certfile": cert_file,
+        "ssl_keyfile": key_file,
+    }
+    if require_client_cert:
+        kwargs["ssl_ca_certs"] = client_ca_file
+        kwargs["ssl_cert_reqs"] = ssl.CERT_REQUIRED
+    return kwargs
+
+
+def _enforce_control_plane_listener_posture(host: str) -> None:
+    """Fail closed when production/clustered direct listener posture is unsafe."""
+    from agent_bom.api.middleware import require_safe_control_plane_listener
+
+    try:
+        require_safe_control_plane_listener(listener_host=host)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _enforce_database_role_posture(command: str) -> None:
+    """Fail fast when Postgres application or maintenance roles are unsafe.
+
+    Tenant isolation on Postgres is enforced solely by ``FORCE ROW LEVEL
+    SECURITY``; a ``SUPERUSER`` / ``BYPASSRLS`` role ignores it and voids the
+    isolation. ``_guard_rls_capable_role`` already refuses such a role, but only
+    lazily on the first pool use (i.e. per request). Running it here — beside the
+    non-loopback auth gate, before uvicorn binds — turns that into a single,
+    actionable boot error instead of a 500 on every request. The same preflight
+    requires an independently named, marker-authorized maintenance login so
+    cross-tenant work cannot reuse the application principal. No-op unless
+    Postgres is active. Every failed probe is fatal because a configured
+    maintenance boundary that cannot be authenticated and validated is not a
+    safe state in which to accept requests.
+    """
+    if os.environ.get("SNOWFLAKE_ACCOUNT"):
+        return
+    if not os.environ.get("AGENT_BOM_POSTGRES_URL"):
+        return
+    from agent_bom.api import postgres_common
+
+    try:
+        postgres_common.preflight_rls_capable_role()
+    except (
+        postgres_common.MaintenanceRoleConfigurationError,
+        postgres_common.RlsRolePrivilegeError,
+        ValueError,
+    ) as exc:
+        raise click.ClickException(str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - convert driver/config failures into a safe CLI error
+        # Do not expose the raw driver exception: authentication failures can
+        # include connection strings, hosts, usernames, or secret-file paths.
+        raise click.ClickException(
+            f"Postgres role preflight failed before {command} could bind. Verify the distinct "
+            "application and maintenance credentials, database reachability, migrations, and "
+            "agent_bom_rls_maintenance membership."
+        ) from exc
+
+
+def _enforce_writable_control_plane_state(command: str) -> None:
+    """Fail once, before app import, when durable SQLite state is unwritable."""
+    from agent_bom.api.durable_store import select_backend, sqlite_path
+
+    if select_backend() != "sqlite":
+        return
+    raw_path = sqlite_path(create_parent=False)
+    if raw_path == ":memory:":
+        return
+
+    database_path = Path(raw_path).expanduser()
+    directory = database_path.parent
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        # SQLite may create journal, WAL, and shared-memory sidecars even when
+        # the database file already exists, so the parent must always be
+        # writable as well as the file itself.
+        with tempfile.NamedTemporaryFile(prefix=".agent-bom-write-probe-", dir=directory):
+            pass
+        if database_path.exists():
+            descriptor = os.open(database_path, os.O_WRONLY | os.O_APPEND)
+            os.close(descriptor)
+    except OSError as exc:
+        raise click.ClickException(
+            "Control-plane state is not writable. Set a writable state directory and retry:\n"
+            f"  AGENT_BOM_STATE_DIR=/writable/path agent-bom {command}\n"
+            "Or choose an explicit database with --persist /writable/path/control-plane.db."
+        ) from exc
+
+
+def _enforce_remote_mcp_auth_defaults(host: str, bearer_token: str | None, allow_insecure_no_auth: bool) -> None:
+    """Refuse unauthenticated remote MCP transports on non-loopback binds."""
+    if bearer_token or _is_loopback_host(host):
+        return
+    if allow_insecure_no_auth:
+        return
+    raise click.ClickException(
+        f"Refusing to expose `mcp server` on non-loopback host {host!r} without transport authentication. "
+        "Set --bearer-token / AGENT_BOM_MCP_BEARER_TOKEN or pass --allow-insecure-no-auth to override."
+    )
+
+
+def _configure_analytics_backend(
+    *,
+    analytics_backend: str | None,
+    clickhouse_url: str | None,
+    analytics_buffered: bool,
+    analytics_flush_interval: float,
+    analytics_max_batch: int,
+    analytics_max_queue: int,
+) -> tuple[str, str | None]:
+    """Resolve and export the requested analytics backend contract."""
+    resolved_backend = (analytics_backend or "").strip().lower()
+    env_clickhouse_url = os.environ.get("AGENT_BOM_CLICKHOUSE_URL") or ""
+    resolved_url = (clickhouse_url or env_clickhouse_url).strip() or None
+    if resolved_backend in {"", "auto"}:
+        resolved_backend = "clickhouse" if resolved_url else "disabled"
+    if resolved_backend == "clickhouse" and not resolved_url:
+        raise click.ClickException("ClickHouse analytics requires --clickhouse-url or AGENT_BOM_CLICKHOUSE_URL.")
+
+    os.environ["AGENT_BOM_ANALYTICS_BACKEND"] = resolved_backend
+    if resolved_url:
+        os.environ["AGENT_BOM_CLICKHOUSE_URL"] = resolved_url
+    elif resolved_backend == "disabled":
+        os.environ.pop("AGENT_BOM_CLICKHOUSE_URL", None)
+
+    os.environ["AGENT_BOM_CLICKHOUSE_BUFFERED"] = "1" if analytics_buffered else "0"
+    os.environ["AGENT_BOM_CLICKHOUSE_FLUSH_INTERVAL"] = f"{analytics_flush_interval:.3f}"
+    os.environ["AGENT_BOM_CLICKHOUSE_MAX_BATCH"] = str(max(1, analytics_max_batch))
+    os.environ["AGENT_BOM_CLICKHOUSE_MAX_QUEUE"] = str(max(1, analytics_max_queue))
+    return resolved_backend, resolved_url
+
+
+def _emit_runtime_summary(title: str, rows: list[tuple[str, str]], *, err: bool = False) -> None:
+    """Print a compact, aligned startup summary block with the BOM mark."""
+    from agent_bom.output.brand_tokens import emit_cli_runtime_summary
+
+    emit_cli_runtime_summary(title, rows, err=err)
+
+
+_MCP_WORKFLOW_NAMES = (
+    "quick-audit",
+    "pre-install-check",
+    "compliance-report",
+    "fleet-audit",
+    "incident-triage",
+    "remediation-plan",
+    "cloud-connection-review",
+    "gateway-fleet-live-demo",
+)
+
+
+def _emit_mcp_stdio_workflow_splash() -> None:
+    """Emit a TTY-only MCP workflow hint without touching protocol stdout."""
+    if not sys.stderr.isatty():
+        return
+    rows = [
+        ("Transport", "stdio"),
+        ("Workflows", f"{len(_MCP_WORKFLOW_NAMES)} prompts; see docs/MCP_WORKFLOWS.md"),
+        ("Tools", "full catalog available after workflow prompts"),
+    ]
+    _emit_runtime_summary("agent-bom MCP server", rows, err=True)
+
+
+def _auth_summary(
+    *,
+    host: str,
+    api_key: str | None = None,
+    bearer_token: str | None = None,
+    allow_insecure_no_auth: bool = False,
+    oidc_enabled: bool = False,
+    mcp_remote: bool = False,
+) -> str:
+    """Return a user-facing summary for the active auth mode."""
+    from agent_bom.api.secret_source import secret_is_configured
+
+    if api_key or secret_is_configured("AGENT_BOM_API_KEYS") or secret_is_configured("AGENT_BOM_API_KEY"):
+        return "API key required (Bearer / X-API-Key)"
+    if bearer_token:
+        return "Bearer token required"
+    if oidc_enabled:
+        return "OIDC bearer token required"
+    if allow_insecure_no_auth and not _is_loopback_host(host):
+        return "Disabled by explicit override (--allow-insecure-no-auth)"
+    if mcp_remote:
+        return "Loopback-only without transport auth; add --bearer-token before exposing remotely"
+    return "local unauthenticated mode (loopback only); add --api-key or OIDC before exposing remotely"
+
+
+def _env_truthy(name: str) -> bool:
+    """Return True when environment variable ``name`` holds a truthy flag."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_allow_unauthenticated(allow_insecure_no_auth: bool) -> bool:
+    """Resolve the effective unauthenticated-API posture the server will apply.
+
+    Mirrors ``configure_api``: the ``--allow-insecure-no-auth`` flag OR the
+    ``AGENT_BOM_ALLOW_UNAUTHENTICATED_API`` env var enables it. Non-loopback
+    binds are already gated fail-closed by ``_enforce_auth_defaults`` before
+    this runs, so the env var can only take effect on loopback.
+    """
+    return bool(allow_insecure_no_auth) or _env_truthy("AGENT_BOM_ALLOW_UNAUTHENTICATED_API")
+
+
+_DEV_API_KEY_PREFIX = "abk"
+
+
+def _generate_dev_api_key() -> str:
+    """Return a fresh ephemeral loopback dev API key (per-process, not persisted)."""
+    return f"{_DEV_API_KEY_PREFIX}_{secrets.token_urlsafe(24)}"
+
+
+def _should_auto_generate_dev_key(*, host: str, api_key: str | None, allow_insecure_no_auth: bool) -> bool:
+    """Decide whether a zero-config loopback dev API key should be auto-generated.
+
+    Fail-closed by construction: only ever true on a loopback bind with no other
+    auth path configured. Any explicit key, override, configured auth backend, or
+    the ``AGENT_BOM_NO_AUTO_DEV_KEY`` opt-out keeps the current behaviour (fail
+    closed on loopback, or the existing non-loopback refusal in
+    ``_enforce_auth_defaults``). A non-loopback host NEVER auto-generates a key.
+    """
+    if not _is_loopback_host(host):
+        return False
+    if _env_truthy("AGENT_BOM_NO_AUTO_DEV_KEY"):
+        return False
+    if api_key or allow_insecure_no_auth:
+        return False
+    from agent_bom.api.secret_source import secret_is_configured
+
+    if secret_is_configured("AGENT_BOM_API_KEYS") or secret_is_configured("AGENT_BOM_API_KEY"):
+        return False
+    if _oidc_enabled() or _scim_bearer_enabled() or _saml_enabled():
+        return False
+    if _env_truthy("AGENT_BOM_ALLOW_UNAUTHENTICATED_API"):
+        return False
+    if _env_truthy("AGENT_BOM_TRUST_PROXY_AUTH"):
+        return False
+    return True
+
+
+def _maybe_seed_local_connection_key(*, host: str, allow_insecure_no_auth: bool) -> str | None:
+    """Auto-seed an at-rest connection encryption key for a local/no-auth stack.
+
+    Fail-closed by construction. Fires only when *all* of these hold:
+
+    - the deployment is clearly local: a loopback bind, or an explicit
+      ``--allow-insecure-no-auth`` local-demo override;
+    - the default ``env`` key provider is in effect (a managed provider owns its
+      own key material and must never be shadowed by a local file);
+    - no connection key is already configured (env, ``*_FILE``, or a prior seed);
+    - the ``AGENT_BOM_NO_AUTO_CONNECTIONS_KEY`` opt-out is unset.
+
+    Otherwise this is a no-op and connection creation keeps its existing
+    behaviour (a 503 until the operator provides ``AGENT_BOM_CONNECTIONS_KEY``).
+
+    The key is written beneath ``AGENT_BOM_STATE_DIR`` when set (otherwise
+    ``~/.agent-bom/connections.key``) so local stacks can isolate all state.
+    It survives restarts and previously-stored ciphertext stays decryptable. On success the
+    process-local ``AGENT_BOM_CONNECTIONS_KEY_FILE`` is pointed at the file and
+    the resolver cache is reset. Any failure degrades silently to the prior
+    fail-closed behaviour rather than blocking boot.
+    """
+    if _env_truthy("AGENT_BOM_NO_AUTO_CONNECTIONS_KEY"):
+        return None
+    if not (_is_loopback_host(host) or allow_insecure_no_auth):
+        return None
+    from agent_bom.api.connection_crypto import (
+        CONNECTIONS_KEY_ENV,
+        CONNECTIONS_KEY_PROVIDER_ENV,
+        connections_key_configured,
+        reset_key_cache,
+        seed_local_connection_key,
+    )
+
+    provider = os.environ.get(CONNECTIONS_KEY_PROVIDER_ENV, "env").strip().lower() or "env"
+    if provider != "env":
+        return None
+    if connections_key_configured():
+        return None
+    try:
+        state_dir = Path(os.environ.get("AGENT_BOM_STATE_DIR", Path.home() / ".agent-bom"))
+        path = seed_local_connection_key(state_dir)
+    except Exception:  # noqa: BLE001 - never block boot; stay fail-closed on connect
+        return None
+    os.environ[f"{CONNECTIONS_KEY_ENV}_FILE"] = str(path)
+    reset_key_cache()
+    return str(path)
+
+
+def _api_auth_summary(
+    *,
+    host: str,
+    api_key: str | None,
+    oidc_enabled: bool,
+    allow_unauthenticated: bool,
+    dev_api_key: str | None = None,
+) -> str:
+    """Return a startup banner that matches the server's real auth posture.
+
+    Derived from the same inputs ``configure_api`` uses so the banner can never
+    claim unauthenticated access while the API actually fails closed (or vice
+    versa). ``allow_unauthenticated`` is the resolved flag-OR-env value.
+    ``dev_api_key`` is the auto-generated loopback key, if one was minted.
+    """
+    from agent_bom.api.secret_source import secret_is_configured
+
+    if api_key or secret_is_configured("AGENT_BOM_API_KEYS") or secret_is_configured("AGENT_BOM_API_KEY"):
+        return "API key required (Bearer / X-API-Key)"
+    if dev_api_key:
+        return "auto dev API key (loopback only); the local UI uses it automatically"
+    if oidc_enabled:
+        return "OIDC bearer token required"
+    if _scim_bearer_enabled():
+        return "SCIM bearer token required"
+    if _saml_enabled():
+        return "SAML SSO (IdP session mints a short-lived session API key)"
+    if _env_truthy("AGENT_BOM_TRUST_PROXY_AUTH"):
+        return "Reverse-proxy auth (trusted proxy headers)"
+    if allow_unauthenticated:
+        if _is_loopback_host(host):
+            return "local unauthenticated mode (loopback only); add --api-key or OIDC before exposing remotely"
+        return "Disabled by explicit override (--allow-insecure-no-auth)"
+    return (
+        "auth required but no key configured; requests fail closed (401). "
+        "Pass --allow-insecure-no-auth for a local demo, or set --api-key / AGENT_BOM_API_KEY."
+    )
+
+
+def _storage_summary(*, persist: str | None) -> str:
+    """Describe the active API job storage mode."""
+    pg_url = os.environ.get("AGENT_BOM_POSTGRES_URL")
+    if pg_url and not persist:
+        return "PostgreSQL"
+    if persist:
+        return f"SQLite ({persist})"
+    return "In-memory (ephemeral)"
+
+
+def _analytics_summary_rows(
+    *,
+    resolved_backend: str,
+    resolved_url: str | None,
+    analytics_buffered: bool,
+    analytics_flush_interval: float,
+    analytics_max_batch: int,
+    analytics_max_queue: int,
+) -> list[tuple[str, str]]:
+    """Describe analytics mode in one or two aligned rows."""
+    if resolved_backend != "clickhouse":
+        return [("Analytics", "Disabled")]
+    mode = "buffered" if analytics_buffered else "direct"
+    return [
+        (
+            "Analytics",
+            f"ClickHouse ({mode}, batch={max(1, analytics_max_batch)}, queue={max(1, analytics_max_queue)}, "
+            f"flush={analytics_flush_interval:.2f}s)",
+        ),
+        ("Analytics URL", resolved_url or "(unset)"),
+    ]
+
 
 @click.command("serve")
-@click.option("--host", default="127.0.0.1", show_default=True, help="Host to bind to (use 0.0.0.0 for LAN access)")
-@click.option("--port", default=8422, show_default=True, help="API server port")
+@click.option(
+    "--host",
+    default="127.0.0.1",
+    show_default=True,
+    help="Host to bind to (non-loopback requires --api-key / OIDC or --allow-insecure-no-auth).",
+)
+@click.option("--port", default=8422, show_default=True, type=LISTEN_PORT_RANGE, help="API server port")
 @click.option("--persist", default=None, metavar="DB_PATH", help="Enable persistent job storage via SQLite (e.g. --persist jobs.db).")
 @click.option("--cors-allow-all", is_flag=True, default=False, help="Allow all CORS origins (dev mode).")
+@click.option(
+    "--api-key",
+    default=None,
+    envvar="AGENT_BOM_API_KEY",
+    metavar="KEY",
+    help=(
+        "Require API key auth (Bearer token or X-API-Key header). "
+        "Other accepted auth paths: AGENT_BOM_OIDC_ISSUER (OIDC) and "
+        "AGENT_BOM_SCIM_BEARER_TOKEN (SCIM bearer for IdP integration)."
+    ),
+)
+@click.option(
+    "--allow-insecure-no-auth",
+    is_flag=True,
+    default=False,
+    help=(
+        "Allow unauthenticated non-loopback API exposure. Unsafe outside local development. "
+        "Note: when AGENT_BOM_API_KEY / AGENT_BOM_OIDC_ISSUER / "
+        "AGENT_BOM_SCIM_BEARER_TOKEN is also set, those auth paths still "
+        "enforce; the flag emits a warning instead of bypassing them."
+    ),
+)
 @click.option("--reload", is_flag=True, help="Auto-reload on code changes (development mode)")
-@click.option("--log-level", "log_level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default="INFO")
+@click.option(
+    "--no-ui",
+    "no_ui",
+    is_flag=True,
+    default=False,
+    help="Serve the REST API only; do not mount the bundled dashboard (REST-only mode, formerly `agent-bom api`).",
+)
+@click.option(
+    "--log-level",
+    "log_level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
+    default="INFO",
+)
 @click.option("--log-json", "log_json", is_flag=True, help="Structured JSON logs")
-def serve_cmd(host: str, port: int, persist: Optional[str], cors_allow_all: bool, reload: bool, log_level: str, log_json: bool):
-    """Start the API server + Next.js dashboard.
+@click.option(
+    "--analytics-backend",
+    type=click.Choice(["auto", "disabled", "clickhouse"], case_sensitive=False),
+    default="auto",
+    show_default=True,
+    help="Analytics backend for trend/event persistence.",
+)
+@click.option(
+    "--clickhouse-url",
+    default=None,
+    envvar="AGENT_BOM_CLICKHOUSE_URL",
+    metavar="URL",
+    help="ClickHouse HTTP URL for analytics.",
+)
+@click.option(
+    "--analytics-buffered/--no-analytics-buffered",
+    default=True,
+    show_default=True,
+    help="Buffer ClickHouse analytics writes in a background thread.",
+)
+@click.option(
+    "--analytics-flush-interval",
+    default=1.0,
+    show_default=True,
+    type=float,
+    metavar="SECONDS",
+    help="Buffered ClickHouse flush interval.",
+)
+@click.option(
+    "--analytics-max-batch",
+    default=200,
+    show_default=True,
+    type=int,
+    metavar="ROWS",
+    help="Maximum rows to flush per ClickHouse batch.",
+)
+@click.option(
+    "--analytics-max-queue",
+    default=10_000,
+    show_default=True,
+    type=int,
+    metavar="ENTRIES",
+    help="Maximum buffered ClickHouse entries before oldest evidence is dropped.",
+)
+@click.option(
+    "--demo-estate",
+    is_flag=True,
+    default=False,
+    envvar="AGENT_BOM_DEMO_ESTATE",
+    help="Seed a labeled demo graph and curated offline findings on first API start.",
+)
+def serve_cmd(
+    host: str,
+    port: int,
+    persist: Optional[str],
+    cors_allow_all: bool,
+    api_key: str | None,
+    allow_insecure_no_auth: bool,
+    reload: bool,
+    no_ui: bool,
+    log_level: str,
+    log_json: bool,
+    analytics_backend: str,
+    clickhouse_url: str | None,
+    analytics_buffered: bool,
+    analytics_flush_interval: float,
+    analytics_max_batch: int,
+    analytics_max_queue: int,
+    demo_estate: bool,
+):
+    """Start the API server and serve the dashboard when UI assets are built.
 
     \b
     Requires:  pip install 'agent-bom[ui]'
+               make build-ui   (for the bundled dashboard)
 
     \b
     Usage:
-      agent-bom serve
-      agent-bom serve --port 8422 --persist jobs.db
+      Local only:
+        agent-bom serve
+      Remote with auth:
+        agent-bom serve --host 0.0.0.0 --api-key <key>
+      Persistent jobs:
+        agent-bom serve --port 8422 --persist jobs.db
     """
     from agent_bom.logging_config import setup_logging
 
     setup_logging(level=log_level, json_output=log_json)
 
-    try:
-        import uvicorn  # noqa: F401
-    except ImportError:
-        click.echo(
-            "ERROR: FastAPI + Uvicorn are required for `agent-bom serve`.\nInstall them with:  pip install 'agent-bom[ui]'",
-            err=True,
-        )
-        sys.exit(1)
+    _require_optional_dependencies(
+        "agent-bom serve",
+        "ui",
+        {"FastAPI": "fastapi", "Uvicorn": "uvicorn"},
+    )
 
     import os as _os
 
+    if demo_estate:
+        _os.environ["AGENT_BOM_DEMO_ESTATE"] = "1"
     if persist:
         _os.environ["AGENT_BOM_DB"] = str(Path(persist).resolve())
     if cors_allow_all:
         _os.environ["AGENT_BOM_CORS_ALL"] = "1"
+    # REST-only mode: signal the API app (imported below) to skip mounting the
+    # dashboard. Set before the first `agent_bom.api.server` import.
+    if no_ui:
+        _os.environ["AGENT_BOM_NO_UI"] = "1"
+    resolved_backend, resolved_url = _configure_analytics_backend(
+        analytics_backend=analytics_backend,
+        clickhouse_url=clickhouse_url,
+        analytics_buffered=analytics_buffered,
+        analytics_flush_interval=analytics_flush_interval,
+        analytics_max_batch=analytics_max_batch,
+        analytics_max_queue=analytics_max_queue,
+    )
 
-    _ui_dist = Path(__file__).parent / "ui_dist"
-    click.echo(f"\n  API server  →  http://{host}:{port}")
-    click.echo(f"  API docs    →  http://{host}:{port}/docs")
-    if (_ui_dist / "index.html").exists():
-        click.echo(f"  Dashboard   →  http://{host}:{port}")
-    else:
-        click.echo("  Dashboard   →  not bundled (run: make build-ui)")
-    click.echo("  Press Ctrl+C to stop.\n")
+    _enforce_auth_defaults("serve", host, api_key, allow_insecure_no_auth)
+    _enforce_control_plane_listener_posture(host)
+    _enforce_database_role_posture("serve")
+    _enforce_writable_control_plane_state("serve")
+    tls_kwargs = _uvicorn_tls_kwargs()
 
-    import uvicorn as _uvicorn
+    seeded_connection_key = _maybe_seed_local_connection_key(host=host, allow_insecure_no_auth=allow_insecure_no_auth)
+
+    # Zero-config loopback: when bound to loopback with no auth configured and no
+    # opt-out, mint an ephemeral dev key so the dashboard loads without flags.
+    # Non-loopback binds never reach here unauthenticated (see the gate above),
+    # so this can only ever fire on loopback.
+    dev_api_key = (
+        _generate_dev_api_key()
+        if _should_auto_generate_dev_key(host=host, api_key=api_key, allow_insecure_no_auth=allow_insecure_no_auth)
+        else None
+    )
+
+    from agent_bom.api.server import configure_api, set_dev_api_key
+
+    configure_api(
+        cors_allow_all=cors_allow_all,
+        api_key=api_key or dev_api_key,
+        allow_unauthenticated=allow_insecure_no_auth,
+    )
+    set_dev_api_key(dev_api_key)
+
+    _ui_dist = Path(__file__).resolve().parents[1] / "ui_dist"
+    rows = [
+        ("API", f"http://{host}:{port}"),
+        ("Docs", f"http://{host}:{port}/docs"),
+        (
+            "Dashboard",
+            "Disabled (--no-ui, REST only)"
+            if no_ui
+            else (f"http://{host}:{port}" if (_ui_dist / "index.html").exists() else "Not bundled (run: make build-ui)"),
+        ),
+        (
+            "Auth",
+            _api_auth_summary(
+                host=host,
+                api_key=api_key,
+                oidc_enabled=_oidc_enabled(),
+                allow_unauthenticated=_resolve_allow_unauthenticated(allow_insecure_no_auth),
+                dev_api_key=dev_api_key,
+            ),
+        ),
+        ("TLS", "app-native mTLS" if tls_kwargs.get("ssl_ca_certs") else ("server TLS" if tls_kwargs else "delegated/none")),
+        ("Storage", _storage_summary(persist=persist)),
+        *_analytics_summary_rows(
+            resolved_backend=resolved_backend,
+            resolved_url=resolved_url,
+            analytics_buffered=analytics_buffered,
+            analytics_flush_interval=analytics_flush_interval,
+            analytics_max_batch=analytics_max_batch,
+            analytics_max_queue=analytics_max_queue,
+        ),
+    ]
+    _emit_runtime_summary("agent-bom serve", rows)
+    if seeded_connection_key:
+        click.echo(
+            f"  Connection secrets: auto-sealed at rest with a locally generated key ({seeded_connection_key}).\n"
+            "  Set AGENT_BOM_CONNECTIONS_KEY / _FILE or a managed provider to bring your own; "
+            "AGENT_BOM_NO_AUTO_CONNECTIONS_KEY=1 disables auto-seeding.\n"
+        )
+    if dev_api_key:
+        click.secho(
+            f"  Dev API key (loopback only): {dev_api_key}",
+            fg="cyan",
+            bold=True,
+        )
+        click.echo(
+            "  The local dashboard uses this automatically. Send it as "
+            "'Authorization: Bearer <key>' for CLI/API calls.\n"
+            "  Ephemeral (per-process, not saved). Set AGENT_BOM_NO_AUTO_DEV_KEY=1 to disable.\n"
+        )
+
+    try:
+        import uvicorn as _uvicorn
+    except ImportError:
+        _fail_missing_optional_dependencies("agent-bom serve", "ui", ["Uvicorn"])
 
     _uvicorn.run(
         "agent_bom.api.server:app",
@@ -66,25 +782,50 @@ def serve_cmd(host: str, port: int, persist: Optional[str], cors_allow_all: bool
         reload=reload,
         timeout_keep_alive=5,
         limit_concurrency=500,
+        **tls_kwargs,
     )
 
 
 @click.command("api")
-@click.option("--host", default="127.0.0.1", show_default=True, help="Host to bind to (use 0.0.0.0 for LAN access)")
-@click.option("--port", default=8422, show_default=True, help="Port to listen on")
+@click.option(
+    "--host",
+    default="127.0.0.1",
+    show_default=True,
+    help="Host to bind to (non-loopback requires --api-key / OIDC or --allow-insecure-no-auth).",
+)
+@click.option("--port", default=8422, show_default=True, type=LISTEN_PORT_RANGE, help="Port to listen on")
 @click.option("--reload", is_flag=True, help="Auto-reload on code changes (development mode)")
 @click.option("--workers", default=1, show_default=True, help="Number of worker processes")
 @click.option("--cors-origins", default=None, metavar="ORIGINS", help="Comma-separated CORS origins (default: localhost:3000).")
 @click.option("--cors-allow-all", is_flag=True, default=False, help="Allow all CORS origins (dev mode).")
 @click.option(
-    "--api-key", default=None, envvar="AGENT_BOM_API_KEY", metavar="KEY", help="Require API key auth (Bearer token or X-API-Key header)."
+    "--api-key",
+    default=None,
+    envvar="AGENT_BOM_API_KEY",
+    metavar="KEY",
+    help=(
+        "Require API key auth (Bearer token or X-API-Key header). "
+        "Other accepted auth paths: AGENT_BOM_OIDC_ISSUER (OIDC) and "
+        "AGENT_BOM_SCIM_BEARER_TOKEN (SCIM bearer for IdP integration)."
+    ),
+)
+@click.option(
+    "--allow-insecure-no-auth",
+    is_flag=True,
+    default=False,
+    help=(
+        "Allow unauthenticated non-loopback API exposure. Unsafe outside local development. "
+        "Note: when AGENT_BOM_API_KEY / AGENT_BOM_OIDC_ISSUER / "
+        "AGENT_BOM_SCIM_BEARER_TOKEN is also set, those auth paths still "
+        "enforce; the flag emits a warning instead of bypassing them."
+    ),
 )
 @click.option(
     "--rate-limit",
     "rate_limit_rpm",
-    default=60,
+    default=600,
     show_default=True,
-    type=int,
+    type=click.IntRange(1, 60_000),
     metavar="RPM",
     help="Rate limit for scan endpoints (requests/minute per IP).",
 )
@@ -103,6 +844,57 @@ def serve_cmd(host: str, port: int, persist: Optional[str], cors_allow_all: bool
     help="Log verbosity level.",
 )
 @click.option("--log-json", "log_json", is_flag=True, help="Emit structured JSON logs (for log aggregation pipelines).")
+@click.option(
+    "--analytics-backend",
+    type=click.Choice(["auto", "disabled", "clickhouse"], case_sensitive=False),
+    default="auto",
+    show_default=True,
+    help="Analytics backend for trend/event persistence.",
+)
+@click.option(
+    "--clickhouse-url",
+    default=None,
+    envvar="AGENT_BOM_CLICKHOUSE_URL",
+    metavar="URL",
+    help="ClickHouse HTTP URL for analytics.",
+)
+@click.option(
+    "--analytics-buffered/--no-analytics-buffered",
+    default=True,
+    show_default=True,
+    help="Buffer ClickHouse analytics writes in a background thread.",
+)
+@click.option(
+    "--analytics-flush-interval",
+    default=1.0,
+    show_default=True,
+    type=float,
+    metavar="SECONDS",
+    help="Buffered ClickHouse flush interval.",
+)
+@click.option(
+    "--analytics-max-batch",
+    default=200,
+    show_default=True,
+    type=int,
+    metavar="ROWS",
+    help="Maximum rows to flush per ClickHouse batch.",
+)
+@click.option(
+    "--analytics-max-queue",
+    default=10_000,
+    show_default=True,
+    type=int,
+    metavar="ENTRIES",
+    help="Maximum buffered ClickHouse entries before oldest evidence is dropped.",
+)
+@click.option(
+    "--demo-estate",
+    is_flag=True,
+    default=False,
+    envvar="AGENT_BOM_DEMO_ESTATE",
+    help="Seed a labeled demo graph and curated offline findings on first API start.",
+)
 def api_cmd(
     host: str,
     port: int,
@@ -111,10 +903,18 @@ def api_cmd(
     cors_origins: str | None,
     cors_allow_all: bool,
     api_key: str | None,
+    allow_insecure_no_auth: bool,
     rate_limit_rpm: int,
     persist: str | None,
     log_level: str,
     log_json: bool,
+    analytics_backend: str,
+    clickhouse_url: str | None,
+    analytics_buffered: bool,
+    analytics_flush_interval: float,
+    analytics_max_batch: int,
+    analytics_max_queue: int,
+    demo_estate: bool,
 ):
     """Start the agent-bom REST API server.
 
@@ -134,28 +934,53 @@ def api_cmd(
 
     \b
     Usage:
-      agent-bom api                           # local dev: http://127.0.0.1:8422
-      agent-bom api --host 0.0.0.0            # expose on LAN
-      agent-bom api --port 9000               # custom port
-      agent-bom api --reload                  # dev mode
+      Local only:
+        agent-bom api
+      Remote with auth:
+        agent-bom api --host 0.0.0.0 --api-key <key>
+      Custom port / dev reload:
+        agent-bom api --port 9000
+        agent-bom api --reload
     """
     from agent_bom.logging_config import setup_logging
 
     setup_logging(level=log_level, json_output=log_json)
 
-    try:
-        import uvicorn
-    except ImportError:
-        click.echo(
-            "ERROR: uvicorn is required for `agent-bom api`.\nInstall it with:  pip install 'agent-bom[api]'",
-            err=True,
-        )
-        sys.exit(1)
+    _require_optional_dependencies(
+        "agent-bom api",
+        "api",
+        {"FastAPI": "fastapi", "Uvicorn": "uvicorn"},
+    )
 
     import os as _os
 
+    if demo_estate:
+        _os.environ["AGENT_BOM_DEMO_ESTATE"] = "1"
+
+    try:
+        import uvicorn
+    except ImportError:
+        _fail_missing_optional_dependencies("agent-bom api", "api", ["Uvicorn"])
+
+    resolved_backend, resolved_url = _configure_analytics_backend(
+        analytics_backend=analytics_backend,
+        clickhouse_url=clickhouse_url,
+        analytics_buffered=analytics_buffered,
+        analytics_flush_interval=analytics_flush_interval,
+        analytics_max_batch=analytics_max_batch,
+        analytics_max_queue=analytics_max_queue,
+    )
+
     from agent_bom import __version__ as _ver
     from agent_bom.api.server import configure_api, set_job_store
+
+    _enforce_auth_defaults("api", host, api_key, allow_insecure_no_auth)
+    _enforce_control_plane_listener_posture(host)
+    _enforce_database_role_posture("api")
+    _enforce_writable_control_plane_state("api")
+    tls_kwargs = _uvicorn_tls_kwargs()
+
+    seeded_connection_key = _maybe_seed_local_connection_key(host=host, allow_insecure_no_auth=allow_insecure_no_auth)
 
     origins = cors_origins.split(",") if cors_origins else None
     configure_api(
@@ -163,6 +988,7 @@ def api_cmd(
         cors_allow_all=cors_allow_all,
         api_key=api_key,
         rate_limit_rpm=rate_limit_rpm,
+        allow_unauthenticated=allow_insecure_no_auth,
     )
 
     pg_url = _os.environ.get("AGENT_BOM_POSTGRES_URL")
@@ -176,16 +1002,37 @@ def api_cmd(
 
         set_job_store(SQLiteJobStore(db_path=persist))
 
-    click.echo(f"  agent-bom API v{_ver}")
-    click.echo(f"  Listening on http://{host}:{port}")
-    click.echo(f"  Docs:         http://{host}:{port}/docs")
-    if api_key:
-        click.echo("  Auth:         API key required (Bearer / X-API-Key)")
-    if pg_url and not persist:
-        click.echo("  Storage:      PostgreSQL")
-    elif persist:
-        click.echo(f"  Storage:      SQLite ({persist})")
-    click.echo("  Press Ctrl+C to stop.\n")
+    rows = [
+        ("Version", _ver),
+        ("Bind", f"http://{host}:{port}"),
+        ("Docs", f"http://{host}:{port}/docs"),
+        (
+            "Auth",
+            _api_auth_summary(
+                host=host,
+                api_key=api_key,
+                oidc_enabled=_oidc_enabled(),
+                allow_unauthenticated=_resolve_allow_unauthenticated(allow_insecure_no_auth),
+            ),
+        ),
+        ("TLS", "app-native mTLS" if tls_kwargs.get("ssl_ca_certs") else ("server TLS" if tls_kwargs else "delegated/none")),
+        ("Storage", _storage_summary(persist=persist)),
+        *_analytics_summary_rows(
+            resolved_backend=resolved_backend,
+            resolved_url=resolved_url,
+            analytics_buffered=analytics_buffered,
+            analytics_flush_interval=analytics_flush_interval,
+            analytics_max_batch=analytics_max_batch,
+            analytics_max_queue=analytics_max_queue,
+        ),
+    ]
+    _emit_runtime_summary("agent-bom API", rows)
+    if seeded_connection_key:
+        click.echo(
+            f"  Connection secrets: auto-sealed at rest with a locally generated key ({seeded_connection_key}).\n"
+            "  Set AGENT_BOM_CONNECTIONS_KEY / _FILE or a managed provider to bring your own; "
+            "AGENT_BOM_NO_AUTO_CONNECTIONS_KEY=1 disables auto-seeding.\n"
+        )
 
     uvicorn.run(
         "agent_bom.api.server:app",
@@ -201,6 +1048,7 @@ def api_cmd(
         # Hard cap on concurrent in-flight requests; prevents thread/FD exhaustion
         # under a slow-connection flood. 500 ≫ any realistic single-server load.
         limit_concurrency=500,
+        **tls_kwargs,
     )
 
 
@@ -212,82 +1060,116 @@ def api_cmd(
     show_default=True,
     help="MCP transport protocol.",
 )
-@click.option("--port", default=8423, show_default=True, help="Port for HTTP/SSE transport.")
+@click.option("--port", default=8423, show_default=True, type=LISTEN_PORT_RANGE, help="Port for HTTP/SSE transport.")
 @click.option("--host", default="127.0.0.1", show_default=True, help="Host for HTTP/SSE transport.")
+@click.option(
+    "--bearer-token",
+    default=None,
+    envvar="AGENT_BOM_MCP_BEARER_TOKEN",
+    metavar="TOKEN",
+    help="Require Bearer token auth for SSE / Streamable HTTP transports.",
+)
+@click.option(
+    "--allow-insecure-no-auth",
+    is_flag=True,
+    default=False,
+    help="Allow unauthenticated non-loopback SSE / HTTP exposure. Unsafe outside local development.",
+)
 @click.option("--log-level", "log_level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default="INFO")
 @click.option("--log-json", "log_json", is_flag=True, help="Structured JSON logs")
-def mcp_server_cmd(transport: str, port: int, host: str, log_level: str, log_json: bool):
+def mcp_server_cmd(
+    transport: str,
+    port: int,
+    host: str,
+    bearer_token: str | None,
+    allow_insecure_no_auth: bool,
+    log_level: str,
+    log_json: bool,
+):
     """Start agent-bom as an MCP server.
 
     \b
     Requires:  pip install 'agent-bom[mcp-server]'
 
     \b
-    Exposes 32 security tools via MCP protocol:
-      scan                   Full scan — CVEs, config security, blast radius, compliance
-      check                  Check a specific package for CVEs before installing
-      blast_radius           Look up blast radius for a specific CVE
-      policy_check           Evaluate policy rules against scan findings
-      registry_lookup        Query MCP server security metadata registry
-      generate_sbom          Generate CycloneDX or SPDX SBOM
-      compliance             13-framework compliance posture
-      remediate              Generate actionable remediation plan
-      skill_trust            Trust assessment for SKILL.md files
-      verify                 Package integrity + SLSA provenance verification
-      where                  Show all MCP discovery paths + existence status
-      inventory              List agents/servers without CVE scanning
-      diff                   Compare scan against baseline for new/resolved vulns
-      marketplace_check      Pre-install marketplace trust check
-      code_scan              SAST scanning via Semgrep with CWE mapping
-      context_graph          Agent context graph with lateral movement analysis
-      analytics_query        Query vulnerability trends from ClickHouse
-      cis_benchmark          Run CIS benchmark checks (AWS/Snowflake)
-      fleet_scan             Batch registry lookup for fleet inventories
-      runtime_correlate      Cross-reference runtime logs with CVE findings
-      vector_db_scan         Discover vector databases and assess auth exposure
-      aisvs_benchmark        OWASP AISVS v1.0 compliance checks
-      gpu_infra_scan         GPU container and K8s node inventory + DCGM probe
-      ai_inventory_scan      Detect AI SDK imports, shadow AI, deprecated models
-      browser_extension_scan Audit browser extensions for AI/MCP capabilities
-      dataset_card_scan      Scan dataset cards for license and provenance
-      ingest_external_scan   Import Trivy/Grype/Syft scan results
-      license_compliance_scan License risk detection for dependencies
-      model_file_scan        Scan ML model files for security risks
-      model_provenance_scan  Verify model origin and supply chain integrity
-      prompt_scan            Detect prompt injection patterns
-      training_pipeline_scan Audit ML training pipeline configurations
+    Workflow prompts first:
+      quick-audit              scan -> exposure_paths -> compliance
+      pre-install-check        check -> registry_lookup -> should_i_deploy
+      compliance-report        compliance -> audit_integrity -> report export
+      fleet-audit              fleet_scan -> context_graph -> policy_check
+      incident-triage          intel_lookup -> exposure_paths -> runtime_correlate
+      remediation-plan         remediate -> generate_sbom -> policy_check
+      cloud-connection-review  connection evidence -> cis_benchmark -> graph_export
+      gateway-fleet-live-demo  gateway_status -> proxy_alerts -> fleet_scan -> firewall_check
+
+    \b
+    The server still exposes the full tool catalog for advanced agents. Start
+    from prompts unless you already know the exact tool sequence. See:
+      docs/MCP_WORKFLOWS.md
+
+    \b
+    Exposes 81 security tools via MCP protocol, organized behind 8 workflow
+    prompts. Advanced direct tools include skill_scan, skill_verify,
+    compliance, and remediate.
 
     \b
     Usage:
-      agent-bom mcp-server                                # stdio (Claude Desktop, Cursor)
-      agent-bom mcp-server --transport sse                # SSE (remote clients)
-      agent-bom mcp-server --transport streamable-http    # Streamable HTTP (Smithery, etc.)
+      Local stdio:
+        agent-bom mcp server
+      Remote with bearer auth:
+        agent-bom mcp server --transport sse --bearer-token <token>
+        agent-bom mcp server --transport streamable-http --bearer-token <token>
 
     \b
     Claude Desktop config (~/.claude/claude_desktop_config.json):
-      {"mcpServers": {"agent-bom": {"command": "agent-bom", "args": ["mcp-server"]}}}
+      {"mcpServers": {"agent-bom": {"command": "agent-bom", "args": ["mcp", "server"]}}}
     """
     from agent_bom.logging_config import setup_logging
 
     setup_logging(level=log_level, json_output=log_json)
 
+    _require_optional_dependencies(
+        "agent-bom mcp server",
+        "mcp-server",
+        {"MCP SDK": "mcp"},
+    )
+
     try:
         from agent_bom.mcp_server import create_mcp_server
     except ImportError:
-        click.echo(
-            "ERROR: mcp SDK is required for `agent-bom mcp-server`.\nInstall it with:  pip install 'agent-bom[mcp-server]'",
-            err=True,
-        )
-        sys.exit(1)
+        _fail_missing_optional_dependencies("agent-bom mcp server", "mcp-server", ["MCP SDK"])
 
-    server = create_mcp_server(host=host, port=port)
+    if transport in ("sse", "streamable-http"):
+        _enforce_remote_mcp_auth_defaults(host, bearer_token, allow_insecure_no_auth)
+        # Signal a remotely-bound (internet-reachable) MCP transport so repo
+        # scans fail closed unless an explicit host allowlist is configured.
+        if not _is_loopback_host(host):
+            os.environ["AGENT_BOM_MCP_REMOTE_BIND"] = "1"
+
+    server = create_mcp_server(host=host, port=port, bearer_token=bearer_token)
 
     if transport in ("sse", "streamable-http"):
         from agent_bom import __version__ as _ver
 
-        click.echo(f"  agent-bom MCP Server v{_ver}", err=True)
-        click.echo(f"  Transport: {transport} on http://{host}:{port}", err=True)
-        click.echo("  Press Ctrl+C to stop.\n", err=True)
+        rows = [
+            ("Version", _ver),
+            ("Transport", transport),
+            ("Bind", f"http://{host}:{port}"),
+            ("Workflows", f"{len(_MCP_WORKFLOW_NAMES)} prompts; see docs/MCP_WORKFLOWS.md"),
+            (
+                "Auth",
+                _auth_summary(
+                    host=host,
+                    bearer_token=bearer_token,
+                    allow_insecure_no_auth=allow_insecure_no_auth,
+                    mcp_remote=True,
+                ),
+            ),
+        ]
+        _emit_runtime_summary("agent-bom MCP server", rows, err=True)
         server.run(transport=transport)
     else:
+        if bearer_token:
+            click.echo("  Warning:   --bearer-token applies only to SSE / Streamable HTTP transports", err=True)
+        _emit_mcp_stdio_workflow_splash()
         server.run(transport="stdio")

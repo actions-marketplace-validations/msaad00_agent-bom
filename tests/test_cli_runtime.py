@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from click.testing import CliRunner
 
 from agent_bom.cli._runtime import (
     _NoOpDetector,
+    audit_drain_dlq_cmd,
     audit_replay_cmd,
+    protect_cmd,
+    proxy_bootstrap_cmd,
     proxy_cmd,
     proxy_configure_cmd,
     watch_cmd,
@@ -38,24 +41,151 @@ def test_noop_detector_record():
 def test_proxy_cmd_runs_proxy(tmp_path):
     runner = CliRunner()
     with (
-        patch("asyncio.run", return_value=0),
-        patch("agent_bom.proxy.run_proxy", return_value=0),
+        patch("agent_bom.proxy.run_proxy", new_callable=AsyncMock, return_value=0),
         patch("agent_bom.project_config.load_project_config", return_value=None),
     ):
-        result = runner.invoke(proxy_cmd, ["--", "echo", "hello"])
+        result = runner.invoke(proxy_cmd, ["--no-isolate", "--", "echo", "hello"])
         assert result.exit_code == 0
+
+
+def test_proxy_cmd_sandbox_is_enabled_by_default():
+    runner = CliRunner()
+    with (
+        patch("agent_bom.proxy.run_proxy", new_callable=AsyncMock, return_value=0) as mock_run,
+        patch("agent_bom.project_config.load_project_config", return_value=None),
+    ):
+        result = runner.invoke(proxy_cmd, ["--sandbox-image", "ghcr.io/acme/mcp-sandbox:1", "--", "echo", "hello"])
+
+    assert result.exit_code == 0
+    assert mock_run.await_args.kwargs["sandbox_config"].enabled is True
+
+
+def test_proxy_cmd_plain_isolated_command_requires_sandbox_image():
+    runner = CliRunner()
+    with patch("agent_bom.project_config.load_project_config", return_value=None):
+        result = runner.invoke(proxy_cmd, ["--", "echo", "hello"])
+
+    assert result.exit_code == 2
+    assert "requires --sandbox-image" in result.output
+    assert "--no-isolate" in result.output
+
+
+def test_proxy_cmd_no_isolate_opts_out():
+    runner = CliRunner()
+    with (
+        patch("agent_bom.proxy.run_proxy", new_callable=AsyncMock, return_value=0) as mock_run,
+        patch("agent_bom.project_config.load_project_config", return_value=None),
+    ):
+        result = runner.invoke(proxy_cmd, ["--no-isolate", "--", "echo", "hello"])
+
+    assert result.exit_code == 0
+    assert mock_run.await_args.kwargs["sandbox_config"].enabled is False
+
+
+def test_proxy_cmd_invalid_metrics_port_is_usage_error():
+    runner = CliRunner()
+    result = runner.invoke(proxy_cmd, ["--metrics-port", "99999", "--", "echo", "hello"])
+
+    assert result.exit_code == 2
+    assert "Invalid value for '--metrics-port'" in result.output
+    assert "0<=x<=65535" in result.output
+
+
+def test_protect_cmd_invalid_http_port_is_usage_error():
+    runner = CliRunner()
+    result = runner.invoke(protect_cmd, ["--mode", "http", "--port", "99999"])
+
+    assert result.exit_code == 2
+    assert "Invalid value for '--port'" in result.output
+    assert "1<=x<=65535" in result.output
 
 
 def test_proxy_cmd_with_project_config():
     runner = CliRunner()
     with (
-        patch("asyncio.run", return_value=0),
-        patch("agent_bom.proxy.run_proxy", return_value=0),
+        patch("agent_bom.proxy.run_proxy", new_callable=AsyncMock, return_value=0),
         patch("agent_bom.project_config.load_project_config", return_value={"policy": "test.json"}),
         patch("agent_bom.project_config.get_policy_path", return_value=None),
     ):
-        result = runner.invoke(proxy_cmd, ["--", "echo"])
+        result = runner.invoke(proxy_cmd, ["--no-isolate", "--", "echo"])
         assert result.exit_code == 0
+
+
+def test_proxy_cmd_passes_control_plane_settings():
+    runner = CliRunner()
+    with (
+        patch("agent_bom.proxy.run_proxy", new_callable=AsyncMock, return_value=0) as mock_run,
+        patch("agent_bom.project_config.load_project_config", return_value=None),
+    ):
+        result = runner.invoke(
+            proxy_cmd,
+            [
+                "--control-plane-url",
+                "https://agent-bom.internal.example.com",
+                "--control-plane-token",
+                "token-123",
+                "--policy-refresh-seconds",
+                "45",
+                "--audit-push-interval",
+                "15",
+                "--no-isolate",
+                "--",
+                "echo",
+                "hello",
+            ],
+        )
+        assert result.exit_code == 0
+    assert mock_run.await_args.kwargs["control_plane_url"] == "https://agent-bom.internal.example.com"
+    assert mock_run.await_args.kwargs["control_plane_token"] == "token-123"
+    assert mock_run.await_args.kwargs["policy_refresh_seconds"] == 45
+    assert mock_run.await_args.kwargs["audit_push_interval"] == 15
+
+
+def test_proxy_cmd_passes_sandbox_config():
+    runner = CliRunner()
+    with (
+        patch("agent_bom.proxy.run_proxy", new_callable=AsyncMock, return_value=0) as mock_run,
+        patch("agent_bom.project_config.load_project_config", return_value=None),
+    ):
+        result = runner.invoke(
+            proxy_cmd,
+            [
+                "--isolate",
+                "--sandbox-runtime",
+                "docker",
+                "--sandbox-image",
+                "ghcr.io/acme/mcp-sandbox:1",
+                "--sandbox-image-pin-policy",
+                "enforce",
+                "--sandbox-cpus",
+                "0.5",
+                "--sandbox-memory",
+                "256m",
+                "--sandbox-pids-limit",
+                "64",
+                "--sandbox-tmpfs-size",
+                "32m",
+                "--sandbox-timeout-seconds",
+                "300",
+                "--sandbox-egress",
+                "allow-all",
+                "--",
+                "npx",
+                "@mcp/server",
+            ],
+        )
+        assert result.exit_code == 0
+    config = mock_run.await_args.kwargs["sandbox_config"]
+    assert config.enabled is True
+    assert config.runtime == "docker"
+    assert config.image == "ghcr.io/acme/mcp-sandbox:1"
+    assert config.image_pin_policy == "enforce"
+    assert config.cpus == "0.5"
+    assert config.memory == "256m"
+    assert config.pids_limit == 64
+    assert config.tmpfs_size == "32m"
+    assert config.timeout_seconds == 300
+    assert config.egress_policy == "allow_all"
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +261,122 @@ def test_proxy_configure_apply_no_patch():
         assert result.exit_code == 0
 
 
+def test_proxy_configure_secure_defaults_enabled_by_default():
+    runner = CliRunner()
+    with (
+        patch("agent_bom.discovery.discover_all", return_value=[]),
+        patch("agent_bom.proxy_configure.auto_configure_proxies", return_value=[]) as mock_auto_configure,
+    ):
+        result = runner.invoke(proxy_configure_cmd, [])
+        assert result.exit_code == 0
+    mock_auto_configure.assert_called_once()
+    assert mock_auto_configure.call_args.kwargs["secure_defaults"] is True
+
+
+def test_proxy_configure_secure_defaults_can_be_disabled():
+    runner = CliRunner()
+    with (
+        patch("agent_bom.discovery.discover_all", return_value=[]),
+        patch("agent_bom.proxy_configure.auto_configure_proxies", return_value=[]) as mock_auto_configure,
+    ):
+        result = runner.invoke(proxy_configure_cmd, ["--no-secure-defaults"])
+        assert result.exit_code == 0
+    mock_auto_configure.assert_called_once()
+    assert mock_auto_configure.call_args.kwargs["secure_defaults"] is False
+
+
+def test_proxy_configure_passes_control_plane_settings():
+    runner = CliRunner()
+    with (
+        patch("agent_bom.discovery.discover_all", return_value=[]),
+        patch("agent_bom.proxy_configure.auto_configure_proxies", return_value=[]) as mock_auto_configure,
+    ):
+        result = runner.invoke(
+            proxy_configure_cmd,
+            [
+                "--control-plane-url",
+                "https://agent-bom.internal.example.com",
+                "--control-plane-token",
+                "token-123",
+                "--policy-refresh-seconds",
+                "45",
+                "--audit-push-interval",
+                "15",
+            ],
+        )
+        assert result.exit_code == 0
+    assert mock_auto_configure.call_args.kwargs["control_plane_url"] == "https://agent-bom.internal.example.com"
+    assert mock_auto_configure.call_args.kwargs["control_plane_token"] == "token-123"
+    assert mock_auto_configure.call_args.kwargs["policy_refresh_seconds"] == 45
+    assert mock_auto_configure.call_args.kwargs["audit_push_interval"] == 15
+
+
+def test_proxy_configure_passes_sandbox_settings():
+    runner = CliRunner()
+    with (
+        patch("agent_bom.discovery.discover_all", return_value=[]),
+        patch("agent_bom.proxy_configure.auto_configure_proxies", return_value=[]) as mock_auto_configure,
+    ):
+        result = runner.invoke(
+            proxy_configure_cmd,
+            [
+                "--sandbox-image",
+                "ghcr.io/acme/mcp-runtime@sha256:" + "a" * 64,
+                "--sandbox-image-pin-policy",
+                "enforce",
+                "--sandbox-mount",
+                "/workspace:/workspace:ro",
+            ],
+        )
+        assert result.exit_code == 0
+    assert mock_auto_configure.call_args.kwargs["sandbox_image"].startswith("ghcr.io/acme/mcp-runtime@sha256:")
+    assert mock_auto_configure.call_args.kwargs["sandbox_image_pin_policy"] == "enforce"
+    assert mock_auto_configure.call_args.kwargs["sandbox_mounts"] == ("/workspace:/workspace:ro",)
+
+
+def test_proxy_bootstrap_writes_bundle(tmp_path):
+    runner = CliRunner()
+    result = runner.invoke(
+        proxy_bootstrap_cmd,
+        [
+            "--bundle-dir",
+            str(tmp_path),
+            "--control-plane-url",
+            "https://agent-bom.internal.example.com",
+            "--control-plane-token",
+            "token-123",
+            "--push-url",
+            "https://agent-bom.internal.example.com/v1/fleet/sync",
+            "--push-api-key",
+            "fleet-key",
+            "--source-id",
+            "device-acme-001",
+            "--enrollment-name",
+            "corp-rollout",
+            "--owner",
+            "platform-security",
+            "--environment",
+            "production",
+            "--tag",
+            "developer-endpoint",
+            "--tag",
+            "mdm",
+            "--mdm-provider",
+            "jamf",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "Wrote endpoint onboarding bundle" in result.output
+    assert (tmp_path / "install-agent-bom-endpoint.sh").exists()
+    assert (tmp_path / "install-agent-bom-endpoint.ps1").exists()
+    assert (tmp_path / "jamf" / "install-agent-bom-endpoint.sh").exists()
+    assert (tmp_path / "intune" / "install-agent-bom-endpoint.ps1").exists()
+    assert (tmp_path / "intune" / "detect-agent-bom-endpoint.ps1").exists()
+    assert (tmp_path / "kandji" / "install-agent-bom-endpoint.sh").exists()
+    assert (tmp_path / "endpoint-onboarding-summary.json").exists()
+    assert (tmp_path / "endpoint-enrollment.json").exists()
+
+
 # ---------------------------------------------------------------------------
 # watch_cmd
 # ---------------------------------------------------------------------------
@@ -168,7 +414,10 @@ def test_audit_replay_cmd_blocked(tmp_path):
 
     runner = CliRunner()
     result = runner.invoke(audit_replay_cmd, [str(log_file), "--blocked-only"])
-    assert result.exit_code == 0
+    # Per the documented contract (--help: "Exits 1 when the log contains
+    # blocked calls"), --blocked-only on a log with blocked entries returns 1
+    # so CI gates can fail closed.
+    assert result.exit_code == 1
 
 
 def test_audit_replay_cmd_json(tmp_path):
@@ -191,3 +440,52 @@ def test_audit_replay_cmd_alerts_only(tmp_path):
     runner = CliRunner()
     result = runner.invoke(audit_replay_cmd, [str(log_file), "--alerts-only"])
     assert result.exit_code == 0
+
+
+def test_audit_replay_cmd_cryptography_missing_emits_install_hint(tmp_path, monkeypatch):
+    """If cryptography is not importable, `agent-bom audit` should surface a
+    clean `pip install 'agent-bom[runtime]'` hint and exit 2, not a traceback.
+    """
+    import builtins
+    import json
+    import sys
+
+    log_file = tmp_path / "audit.jsonl"
+    log_file.write_text(json.dumps({"type": "tools/call", "tool": "x"}) + "\n")
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "agent_bom.audit_replay":
+            raise ImportError("No module named 'cryptography'", name="cryptography")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.delitem(sys.modules, "agent_bom.audit_replay", raising=False)
+
+    runner = CliRunner()
+    result = runner.invoke(audit_replay_cmd, [str(log_file)])
+    assert result.exit_code == 2
+    assert "cryptography" in result.output
+    assert "agent-bom[runtime]" in result.output
+
+
+def test_audit_drain_dlq_cmd_writes_json_summary_and_deletes_drained(tmp_path):
+    import json
+
+    dlq = tmp_path / "audit.dlq.jsonl"
+    output = tmp_path / "drained.jsonl"
+    dlq.write_text('{"event":"one"}\nnot-json\n{"event":"two"}\n', encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        audit_drain_dlq_cmd,
+        [str(dlq), "--output", str(output), "--max-records", "1", "--delete-drained", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["records_written"] == 1
+    assert payload["invalid_lines"] == 1
+    assert output.read_text(encoding="utf-8") == '{"event":"one"}\n'
+    assert dlq.read_text(encoding="utf-8") == 'not-json\n{"event":"two"}\n'

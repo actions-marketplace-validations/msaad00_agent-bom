@@ -1,0 +1,86 @@
+{
+  "properties": {
+    "backend": {
+      "default": "disabled",
+      "title": "Backend",
+      "type": "string"
+    },
+    "buffered": {
+      "default": false,
+      "title": "Buffered",
+      "type": "boolean"
+    },
+    "clickhouse_url_configured": {
+      "default": false,
+      "title": "Clickhouse Url Configured",
+      "type": "boolean"
+    },
+    "dropped_count": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Dropped Count"
+    },
+    "enabled": {
+      "default": false,
+      "title": "Enabled",
+      "type": "boolean"
+    },
+    "flush_interval_seconds": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Flush Interval Seconds"
+    },
+    "max_batch": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Max Batch"
+    },
+    "queue_capacity": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Queue Capacity"
+    },
+    "queue_depth": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Queue Depth"
+    }
+  },
+  "title": "AnalyticsHealth",
+  "type": "object"
+}

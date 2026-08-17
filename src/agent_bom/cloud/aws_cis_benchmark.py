@@ -60,9 +60,17 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable
 
+from .aws_inventory import is_access_denied_error
 from .base import CloudDiscoveryError
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_error_evidence(prefix: str, error_code: str) -> str:
+    """Build client-safe evidence text without leaking raw exception details."""
+    if error_code:
+        return f"{prefix} (AWS error code: {error_code})"
+    return prefix
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +97,20 @@ class CISCheckResult:
     resource_ids: list[str] = field(default_factory=list)
     recommendation: str = ""
     cis_section: str = ""
+    # Boundary attribution for multi-account / multi-subscription / multi-project
+    # fan-out. Holds the AWS account id, Azure subscription id, or GCP project id
+    # the check ran against. Empty for a single-boundary run. Lets an aggregated
+    # report keep per-boundary provenance on every finding.
+    account_id: str = ""
+    # Structured network exposure (open ports/CIDR to the internet) so the graph
+    # can model port-level reachability instead of keyword-matching evidence text.
+    # Each entry: {"resource": str, "from_port": int, "to_port": int,
+    # "protocol": str, "scope": "internet"}.
+    network_exposure: list[dict] = field(default_factory=list)
+    # Structured remediation (issue #665). Populated by
+    # ``agent_bom.cloud.cis_remediation.attach_remediation(result, cloud=...)``
+    # so per-check functions stay thin. Schema defined in that module.
+    remediation: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -99,6 +121,12 @@ class CISBenchmarkReport:
     checks: list[CISCheckResult] = field(default_factory=list)
     region: str = ""
     account_id: str = ""
+    # Populated only by the multi-account fan-out: the member accounts actually
+    # evaluated and any per-account warnings (e.g. an account skipped because the
+    # read-only role could not be assumed). Empty on a single-account run.
+    accounts_scanned: list[str] = field(default_factory=list)
+    regions_scanned: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def passed(self) -> int:
@@ -109,26 +137,45 @@ class CISBenchmarkReport:
         return sum(1 for c in self.checks if c.status == CheckStatus.FAIL)
 
     @property
+    def errored(self) -> int:
+        return sum(1 for c in self.checks if c.status == CheckStatus.ERROR)
+
+    @property
+    def not_applicable(self) -> int:
+        return sum(1 for c in self.checks if c.status == CheckStatus.NOT_APPLICABLE)
+
+    @property
+    def evaluated(self) -> int:
+        return self.passed + self.failed
+
+    @property
     def total(self) -> int:
         return len(self.checks)
 
     @property
     def pass_rate(self) -> float:
-        evaluated = sum(1 for c in self.checks if c.status in (CheckStatus.PASS, CheckStatus.FAIL))
-        return (self.passed / evaluated * 100) if evaluated else 0.0
+        return (self.passed / self.evaluated * 100) if self.evaluated else 0.0
 
     def to_dict(self) -> dict:
+        from agent_bom.cloud.benchmark_manifests import benchmark_manifest
         from agent_bom.mitre_attack import tag_cis_check
 
         return {
             "benchmark": "CIS AWS Foundations",
             "benchmark_version": self.benchmark_version,
+            "benchmark_manifest": benchmark_manifest("aws"),
             "account_id": self.account_id,
+            "accounts_scanned": self.accounts_scanned,
+            "regions_scanned": self.regions_scanned,
             "region": self.region,
             "pass_rate": round(self.pass_rate, 1),
             "passed": self.passed,
             "failed": self.failed,
+            "errored": self.errored,
+            "not_applicable": self.not_applicable,
+            "evaluated": self.evaluated,
             "total": self.total,
+            "warnings": self.warnings,
             "checks": [
                 {
                     "check_id": c.check_id,
@@ -138,12 +185,61 @@ class CISBenchmarkReport:
                     "evidence": c.evidence,
                     "resource_ids": c.resource_ids,
                     "recommendation": c.recommendation,
+                    "remediation": c.remediation,
                     "cis_section": c.cis_section,
+                    "account_id": c.account_id,
+                    "network_exposure": c.network_exposure,
                     "attack_techniques": tag_cis_check(c),
                 }
                 for c in self.checks
             ],
         }
+
+
+def finalize_read_coverage(
+    result: CISCheckResult,
+    *,
+    inspected: int,
+    denied: list,
+    permission: str,
+    resource_kind: str,
+    pass_evidence: str,
+) -> CISCheckResult:
+    """Decide PASS vs ERROR for a per-resource read check with no failures.
+
+    Strict GRC contract: any permission denial on a listed resource means the
+    full scope cannot be certified compliant. PASS only when every listed
+    resource was read successfully (or there were genuinely zero resources).
+    Call this only in the branch where the ``failing`` accumulator is empty —
+    FAIL is decided by the caller and left untouched.
+
+    Decision table (``denied`` is the list of resources whose read was denied):
+      * ``denied`` non-empty  -> ERROR (names missing permission + coverage);
+      * ``denied`` empty      -> PASS with ``pass_evidence`` (includes the
+        genuine "0 resources exist" NOT_APPLICABLE path).
+    """
+    denied_count = len(denied)
+    if denied_count:
+        result.status = CheckStatus.ERROR
+        if inspected == 0:
+            result.evidence = (
+                f"Could not read {denied_count} {resource_kind}(s) — permission denied on every one "
+                f"(0 inspected). Grant '{permission}' so this check can be evaluated; "
+                "reporting PASS here would be a false compliant."
+            )
+        else:
+            total = inspected + denied_count
+            result.evidence = (
+                f"Incomplete evaluation: read {inspected}/{total} {resource_kind}(s); "
+                f"{denied_count} could not be read (permission denied). "
+                f"Grant '{permission}' for full coverage — PASS not reported; "
+                "compliance is unknown for skipped resources."
+            )
+        result.resource_ids = list(denied)[:20]
+    else:
+        result.status = CheckStatus.PASS
+        result.evidence = pass_evidence
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -154,10 +250,10 @@ _IAM_SECTION = "1 - Identity and Access Management"
 
 
 def _check_1_1(account_client: Any) -> CISCheckResult:
-    """CIS 1.1 — Maintain current contact details."""
+    """CIS 1.1 — Account contact details kept current."""
     result = CISCheckResult(
         check_id="1.1",
-        title="Maintain current contact details",
+        title="Account contact details kept current",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_IAM_SECTION,
@@ -174,15 +270,15 @@ def _check_1_1(account_client: Any) -> CISCheckResult:
     except Exception as exc:
         error_code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not retrieve contact information: {error_code or exc}"
+        result.evidence = _safe_error_evidence("Could not retrieve contact information.", error_code)
     return result
 
 
 def _check_1_2(account_client: Any) -> CISCheckResult:
-    """CIS 1.2 — Ensure security contact information is registered."""
+    """CIS 1.2 — Security contact information registered."""
     result = CISCheckResult(
         check_id="1.2",
-        title="Ensure security contact information is registered",
+        title="Security contact information registered",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_IAM_SECTION,
@@ -203,15 +299,15 @@ def _check_1_2(account_client: Any) -> CISCheckResult:
             result.evidence = "No security alternate contact is registered."
         else:
             result.status = CheckStatus.ERROR
-            result.evidence = f"Could not retrieve security contact: {error_code or exc}"
+            result.evidence = _safe_error_evidence("Could not retrieve security contact.", error_code)
     return result
 
 
 def _check_1_3() -> CISCheckResult:
-    """CIS 1.3 — Ensure security questions are not the only way to authenticate to root."""
+    """CIS 1.3 — Root not reliant on security questions alone."""
     return CISCheckResult(
         check_id="1.3",
-        title="Ensure security questions are not the only way to authenticate to root",
+        title="Root not reliant on security questions alone",
         status=CheckStatus.NOT_APPLICABLE,
         severity="medium",
         cis_section=_IAM_SECTION,
@@ -221,10 +317,10 @@ def _check_1_3() -> CISCheckResult:
 
 
 def _check_1_4(iam_client: Any) -> CISCheckResult:
-    """CIS 1.4 — Ensure no 'root' user account access key exists."""
+    """CIS 1.4 — No root account access keys."""
     result = CISCheckResult(
         check_id="1.4",
-        title="Ensure no root user account access key exists",
+        title="No root account access keys",
         status=CheckStatus.PASS,
         severity="critical",
         cis_section=_IAM_SECTION,
@@ -242,10 +338,10 @@ def _check_1_4(iam_client: Any) -> CISCheckResult:
 
 
 def _check_1_5(iam_client: Any) -> CISCheckResult:
-    """CIS 1.5 — Ensure MFA is enabled for the root user account."""
+    """CIS 1.5 — Root account MFA enabled."""
     result = CISCheckResult(
         check_id="1.5",
-        title="Ensure MFA is enabled for the root user account",
+        title="Root account MFA enabled",
         status=CheckStatus.PASS,
         severity="critical",
         cis_section=_IAM_SECTION,
@@ -263,10 +359,10 @@ def _check_1_5(iam_client: Any) -> CISCheckResult:
 
 
 def _check_1_6(iam_client: Any) -> CISCheckResult:
-    """CIS 1.6 — Ensure hardware MFA is enabled for the root user account."""
+    """CIS 1.6 — Hardware MFA for root account."""
     result = CISCheckResult(
         check_id="1.6",
-        title="Ensure hardware MFA is enabled for the root user account",
+        title="Hardware MFA for root account",
         status=CheckStatus.PASS,
         severity="critical",
         cis_section=_IAM_SECTION,
@@ -291,10 +387,10 @@ def _check_1_6(iam_client: Any) -> CISCheckResult:
 
 
 def _check_1_7(iam_client: Any) -> CISCheckResult:
-    """CIS 1.7 — Eliminate use of the root user for administrative and daily tasks."""
+    """CIS 1.7 — Root user not used for daily tasks."""
     result = CISCheckResult(
         check_id="1.7",
-        title="Eliminate use of the root user for administrative and daily tasks",
+        title="Root user not used for daily tasks",
         status=CheckStatus.PASS,
         severity="high",
         cis_section=_IAM_SECTION,
@@ -346,10 +442,10 @@ def _check_1_7(iam_client: Any) -> CISCheckResult:
 
 
 def _check_1_8(iam_client: Any) -> CISCheckResult:
-    """CIS 1.8 — Ensure IAM password policy requires minimum length >= 14."""
+    """CIS 1.8 — IAM password policy minimum length >= 14."""
     result = CISCheckResult(
         check_id="1.8",
-        title="Ensure IAM password policy requires minimum length >= 14",
+        title="IAM password policy minimum length >= 14",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_IAM_SECTION,
@@ -374,10 +470,10 @@ def _check_1_8(iam_client: Any) -> CISCheckResult:
 
 
 def _check_1_10(iam_client: Any) -> CISCheckResult:
-    """CIS 1.10 — Ensure MFA is enabled for all IAM users with console access."""
+    """CIS 1.10 — MFA on all console-access IAM users."""
     result = CISCheckResult(
         check_id="1.10",
-        title="Ensure MFA is enabled for all IAM users with console access",
+        title="MFA on all console-access IAM users",
         status=CheckStatus.PASS,
         severity="high",
         cis_section=_IAM_SECTION,
@@ -411,10 +507,10 @@ def _check_1_10(iam_client: Any) -> CISCheckResult:
 
 
 def _check_1_11(iam_client: Any) -> CISCheckResult:
-    """CIS 1.11 — Do not setup access keys during initial user setup."""
+    """CIS 1.11 — No access keys created at user setup."""
     result = CISCheckResult(
         check_id="1.11",
-        title="Do not setup access keys during initial user setup",
+        title="No access keys created at user setup",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_IAM_SECTION,
@@ -481,10 +577,10 @@ def _check_1_11(iam_client: Any) -> CISCheckResult:
 
 
 def _check_1_12(iam_client: Any) -> CISCheckResult:
-    """CIS 1.12 — Ensure credentials unused for 45 days or greater are disabled."""
+    """CIS 1.12 — Credentials unused 45+ days disabled."""
     result = CISCheckResult(
         check_id="1.12",
-        title="Ensure credentials unused for 45 days or greater are disabled",
+        title="Credentials unused 45+ days disabled",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_IAM_SECTION,
@@ -532,7 +628,7 @@ def _check_1_12(iam_client: Any) -> CISCheckResult:
             try:
                 used_dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
                 days_unused = (now - used_dt).days
-                if days_unused >= threshold_days:
+                if days_unused > threshold_days:
                     is_stale = True
                     break
             except (ValueError, TypeError):
@@ -553,10 +649,10 @@ def _check_1_12(iam_client: Any) -> CISCheckResult:
 
 
 def _check_1_13(iam_client: Any) -> CISCheckResult:
-    """CIS 1.13 — Ensure there is only one active access key available for any single IAM user."""
+    """CIS 1.13 — At most one active access key per IAM user."""
     result = CISCheckResult(
         check_id="1.13",
-        title="Ensure there is only one active access key available for any single IAM user",
+        title="At most one active access key per IAM user",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_IAM_SECTION,
@@ -585,10 +681,10 @@ def _check_1_13(iam_client: Any) -> CISCheckResult:
 
 
 def _check_1_15(iam_client: Any) -> CISCheckResult:
-    """CIS 1.15 — Ensure IAM users receive permissions only through groups or roles."""
+    """CIS 1.15 — IAM permissions granted via groups or roles only."""
     result = CISCheckResult(
         check_id="1.15",
-        title="Ensure IAM users receive permissions only through groups or roles",
+        title="IAM permissions granted via groups or roles only",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_IAM_SECTION,
@@ -617,10 +713,10 @@ def _check_1_15(iam_client: Any) -> CISCheckResult:
 
 
 def _check_1_9(iam_client: Any) -> CISCheckResult:
-    """CIS 1.9 — Ensure IAM password policy prevents password reuse."""
+    """CIS 1.9 — IAM password policy blocks password reuse."""
     result = CISCheckResult(
         check_id="1.9",
-        title="Ensure IAM password policy prevents password reuse",
+        title="IAM password policy blocks password reuse",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_IAM_SECTION,
@@ -645,10 +741,10 @@ def _check_1_9(iam_client: Any) -> CISCheckResult:
 
 
 def _check_1_14(iam_client: Any) -> CISCheckResult:
-    """CIS 1.14 — Ensure access keys are rotated every 90 days or less."""
+    """CIS 1.14 — Access keys rotated within 90 days."""
     result = CISCheckResult(
         check_id="1.14",
-        title="Ensure access keys are rotated every 90 days or less",
+        title="Access keys rotated within 90 days",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_IAM_SECTION,
@@ -681,10 +777,10 @@ def _check_1_14(iam_client: Any) -> CISCheckResult:
 
 
 def _check_1_16(iam_client: Any) -> CISCheckResult:
-    """CIS 1.16 — Ensure IAM policies with full '*:*' admin privileges are not attached."""
+    """CIS 1.16 — No full-admin IAM policies attached."""
     result = CISCheckResult(
         check_id="1.16",
-        title="Ensure IAM policies with full admin privileges are not attached",
+        title="No full-admin IAM policies attached",
         status=CheckStatus.PASS,
         severity="critical",
         cis_section=_IAM_SECTION,
@@ -694,6 +790,8 @@ def _check_1_16(iam_client: Any) -> CISCheckResult:
 
     paginator = iam_client.get_paginator("list_policies")
     admin_policies: list[str] = []
+    inspected = 0
+    denied: list[str] = []
 
     for page in paginator.paginate(Scope="Local", OnlyAttached=True):
         for policy in page["Policies"]:
@@ -703,6 +801,7 @@ def _check_1_16(iam_client: Any) -> CISCheckResult:
                     PolicyArn=policy["Arn"],
                     VersionId=version_id,
                 )["PolicyVersion"]
+                inspected += 1
                 doc = version.get("Document", {})
                 # Document may be URL-encoded JSON string
                 if isinstance(doc, str):
@@ -724,7 +823,9 @@ def _check_1_16(iam_client: Any) -> CISCheckResult:
                     if "*" in actions and "*" in resources:
                         admin_policies.append(policy["PolicyName"])
                         break
-            except Exception:
+            except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(policy.get("PolicyName") or policy.get("Arn", "unknown"))
                 logger.debug("Could not inspect policy %s", policy.get("Arn"))
 
     if admin_policies:
@@ -734,15 +835,22 @@ def _check_1_16(iam_client: Any) -> CISCheckResult:
             result.evidence += f" (+{len(admin_policies) - 5} more)"
         result.resource_ids = admin_policies[:20]
     else:
-        result.evidence = "No attached customer-managed policies grant full '*:*' admin privileges."
+        finalize_read_coverage(
+            result,
+            inspected=inspected,
+            denied=denied,
+            permission="iam:GetPolicyVersion",
+            resource_kind="policy",
+            pass_evidence="No attached customer-managed policies grant full '*:*' admin privileges.",
+        )
     return result
 
 
 def _check_1_17(iam_client: Any) -> CISCheckResult:
-    """CIS 1.17 — Ensure a support role has been created to manage incidents with AWS Support."""
+    """CIS 1.17 — Support role exists for AWS Support incidents."""
     result = CISCheckResult(
         check_id="1.17",
-        title="Ensure a support role has been created to manage incidents with AWS Support",
+        title="Support role exists for AWS Support incidents",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_IAM_SECTION,
@@ -769,10 +877,10 @@ def _check_1_17(iam_client: Any) -> CISCheckResult:
 
 
 def _check_1_19(ec2_client: Any) -> CISCheckResult:
-    """CIS 1.19 — Ensure that IAM instance roles are used for AWS resource access from instances."""
+    """CIS 1.19 — Instance roles used for resource access."""
     result = CISCheckResult(
         check_id="1.19",
-        title="Ensure that IAM instance roles are used for AWS resource access from instances",
+        title="Instance roles used for resource access",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_IAM_SECTION,
@@ -801,15 +909,15 @@ def _check_1_19(ec2_client: Any) -> CISCheckResult:
     except Exception as exc:
         error_code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check EC2 instances: {error_code or exc}"
+        result.evidence = _safe_error_evidence("Could not check EC2 instances.", error_code)
     return result
 
 
 def _check_1_20(accessanalyzer_client: Any) -> CISCheckResult:
-    """CIS 1.20 — Ensure that IAM Access Analyzer is enabled for all regions."""
+    """CIS 1.20 — IAM Access Analyzer enabled in all regions."""
     result = CISCheckResult(
         check_id="1.20",
-        title="Ensure that IAM Access Analyzer is enabled for all regions",
+        title="IAM Access Analyzer enabled in all regions",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_IAM_SECTION,
@@ -827,15 +935,15 @@ def _check_1_20(accessanalyzer_client: Any) -> CISCheckResult:
     except Exception as exc:
         error_code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check IAM Access Analyzer: {error_code or exc}"
+        result.evidence = _safe_error_evidence("Could not check IAM Access Analyzer.", error_code)
     return result
 
 
 def _check_1_22(iam_client: Any) -> CISCheckResult:
-    """CIS 1.22 — Ensure access to AWSCloudShellFullAccess is restricted."""
+    """CIS 1.22 — AWSCloudShellFullAccess access restricted."""
     result = CISCheckResult(
         check_id="1.22",
-        title="Ensure access to AWSCloudShellFullAccess is restricted",
+        title="AWSCloudShellFullAccess access restricted",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_IAM_SECTION,
@@ -872,10 +980,10 @@ _STORAGE_SECTION = "2 - Storage"
 
 
 def _check_2_1_1(s3control_client: Any, account_id: str) -> CISCheckResult:
-    """CIS 2.1.1 — Ensure S3 account-level public access block is configured."""
+    """CIS 2.1.1 — S3 account-level public access block configured."""
     result = CISCheckResult(
         check_id="2.1.1",
-        title="Ensure S3 account-level public access block is configured",
+        title="S3 account-level public access block configured",
         status=CheckStatus.PASS,
         severity="high",
         cis_section=_STORAGE_SECTION,
@@ -901,10 +1009,10 @@ def _check_2_1_1(s3control_client: Any, account_id: str) -> CISCheckResult:
 
 
 def _check_2_1_2(s3_client: Any) -> CISCheckResult:
-    """CIS 2.1.2 — Ensure S3 buckets have server-side encryption enabled."""
+    """CIS 2.1.2 — S3 bucket server-side encryption enabled."""
     result = CISCheckResult(
         check_id="2.1.2",
-        title="Ensure S3 buckets have server-side encryption enabled",
+        title="S3 bucket server-side encryption enabled",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_STORAGE_SECTION,
@@ -912,15 +1020,24 @@ def _check_2_1_2(s3_client: Any) -> CISCheckResult:
     )
     buckets = s3_client.list_buckets().get("Buckets", [])
     unencrypted = []
+    inspected = 0
+    denied: list[str] = []
     for bucket in buckets:
         name = bucket["Name"]
         try:
             s3_client.get_bucket_encryption(Bucket=name)
+            inspected += 1
         except Exception as exc:
             error_code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
             if error_code == "ServerSideEncryptionConfigurationNotFoundError":
+                # Successful determination: bucket has no default encryption.
                 unencrypted.append(name)
-            # Skip buckets we can't access (cross-region, etc.)
+                inspected += 1
+            elif is_access_denied_error(exc):
+                denied.append(name)
+            else:
+                # Skip buckets we can't access (cross-region, deleted, etc.)
+                logger.debug("Could not check encryption for bucket %s: %s", name, exc)
 
     if unencrypted:
         result.status = CheckStatus.FAIL
@@ -929,15 +1046,22 @@ def _check_2_1_2(s3_client: Any) -> CISCheckResult:
             result.evidence += f" (+{len(unencrypted) - 5} more)"
         result.resource_ids = [f"arn:aws:s3:::{b}" for b in unencrypted]
     else:
-        result.evidence = f"All {len(buckets)} bucket(s) have server-side encryption enabled."
+        finalize_read_coverage(
+            result,
+            inspected=inspected,
+            denied=denied,
+            permission="s3:GetEncryptionConfiguration",
+            resource_kind="bucket",
+            pass_evidence=f"All {len(buckets)} bucket(s) have server-side encryption enabled.",
+        )
     return result
 
 
 def _check_2_1_3(s3_client: Any) -> CISCheckResult:
-    """CIS 2.1.3 — Ensure MFA Delete is enabled on S3 buckets."""
+    """CIS 2.1.3 — S3 bucket MFA Delete enabled."""
     result = CISCheckResult(
         check_id="2.1.3",
-        title="Ensure MFA Delete is enabled on S3 buckets",
+        title="S3 bucket MFA Delete enabled",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_STORAGE_SECTION,
@@ -945,13 +1069,18 @@ def _check_2_1_3(s3_client: Any) -> CISCheckResult:
     )
     buckets = s3_client.list_buckets().get("Buckets", [])
     no_mfa_delete: list[str] = []
+    inspected = 0
+    denied: list[str] = []
     for bucket in buckets:
         name = bucket["Name"]
         try:
             versioning = s3_client.get_bucket_versioning(Bucket=name)
+            inspected += 1
             if versioning.get("MFADelete") != "Enabled":
                 no_mfa_delete.append(name)
         except Exception as exc:
+            if is_access_denied_error(exc):
+                denied.append(name)
             logger.debug("Could not check MFA Delete for bucket %s: %s", name, exc)
 
     if no_mfa_delete:
@@ -961,15 +1090,22 @@ def _check_2_1_3(s3_client: Any) -> CISCheckResult:
             result.evidence += f" (+{len(no_mfa_delete) - 5} more)"
         result.resource_ids = [f"arn:aws:s3:::{b}" for b in no_mfa_delete]
     else:
-        result.evidence = f"All {len(buckets)} bucket(s) have MFA Delete enabled."
+        finalize_read_coverage(
+            result,
+            inspected=inspected,
+            denied=denied,
+            permission="s3:GetBucketVersioning",
+            resource_kind="bucket",
+            pass_evidence=f"All {len(buckets)} bucket(s) have MFA Delete enabled.",
+        )
     return result
 
 
 def _check_2_1_4(s3_client: Any) -> CISCheckResult:
-    """CIS 2.1.4 — Ensure S3 bucket versioning is enabled."""
+    """CIS 2.1.4 — S3 bucket versioning enabled."""
     result = CISCheckResult(
         check_id="2.1.4",
-        title="Ensure S3 bucket versioning is enabled",
+        title="S3 bucket versioning enabled",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_STORAGE_SECTION,
@@ -977,14 +1113,19 @@ def _check_2_1_4(s3_client: Any) -> CISCheckResult:
     )
     buckets = s3_client.list_buckets().get("Buckets", [])
     unversioned = []
+    inspected = 0
+    denied: list[str] = []
     for bucket in buckets:
         name = bucket["Name"]
         try:
             versioning = s3_client.get_bucket_versioning(Bucket=name)
+            inspected += 1
             if versioning.get("Status") != "Enabled":
                 unversioned.append(name)
         except Exception as exc:
             # Skip inaccessible buckets (permissions, deleted, etc.)
+            if is_access_denied_error(exc):
+                denied.append(name)
             logger.debug("Could not check versioning for bucket %s: %s", name, exc)
 
     if unversioned:
@@ -994,15 +1135,22 @@ def _check_2_1_4(s3_client: Any) -> CISCheckResult:
             result.evidence += f" (+{len(unversioned) - 5} more)"
         result.resource_ids = [f"arn:aws:s3:::{b}" for b in unversioned]
     else:
-        result.evidence = f"All {len(buckets)} bucket(s) have versioning enabled."
+        finalize_read_coverage(
+            result,
+            inspected=inspected,
+            denied=denied,
+            permission="s3:GetBucketVersioning",
+            resource_kind="bucket",
+            pass_evidence=f"All {len(buckets)} bucket(s) have versioning enabled.",
+        )
     return result
 
 
 def _check_2_2_1(ec2_client: Any) -> CISCheckResult:
-    """CIS 2.2.1 — Ensure EBS volume encryption is enabled by default."""
+    """CIS 2.2.1 — EBS default volume encryption enabled."""
     result = CISCheckResult(
         check_id="2.2.1",
-        title="Ensure EBS volume encryption is enabled by default",
+        title="EBS default volume encryption enabled",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_STORAGE_SECTION,
@@ -1024,10 +1172,10 @@ def _check_2_2_1(ec2_client: Any) -> CISCheckResult:
 
 
 def _check_2_3_1(rds_client: Any) -> CISCheckResult:
-    """CIS 2.3.1 — Ensure RDS instances have encryption at rest enabled."""
+    """CIS 2.3.1 — RDS encryption at rest enabled."""
     result = CISCheckResult(
         check_id="2.3.1",
-        title="Ensure RDS instances have encryption at rest enabled",
+        title="RDS encryption at rest enabled",
         status=CheckStatus.PASS,
         severity="high",
         cis_section=_STORAGE_SECTION,
@@ -1053,10 +1201,10 @@ def _check_2_3_1(rds_client: Any) -> CISCheckResult:
 
 
 def _check_2_3_2(rds_client: Any) -> CISCheckResult:
-    """CIS 2.3.2 — Ensure auto minor version upgrade is enabled for RDS instances."""
+    """CIS 2.3.2 — RDS auto minor version upgrade enabled."""
     result = CISCheckResult(
         check_id="2.3.2",
-        title="Ensure auto minor version upgrade is enabled for RDS instances",
+        title="RDS auto minor version upgrade enabled",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_STORAGE_SECTION,
@@ -1082,10 +1230,10 @@ def _check_2_3_2(rds_client: Any) -> CISCheckResult:
 
 
 def _check_2_4_1(kms_client: Any) -> CISCheckResult:
-    """CIS 2.4.1 — Ensure rotation is enabled for customer-managed KMS keys."""
+    """CIS 2.4.1 — Customer-managed KMS key rotation enabled."""
     result = CISCheckResult(
         check_id="2.4.1",
-        title="Ensure rotation is enabled for customer-managed KMS keys",
+        title="Customer-managed KMS key rotation enabled",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_STORAGE_SECTION,
@@ -1093,6 +1241,8 @@ def _check_2_4_1(kms_client: Any) -> CISCheckResult:
     )
     paginator = kms_client.get_paginator("list_keys")
     no_rotation: list[str] = []
+    inspected = 0
+    denied: list[str] = []
 
     for page in paginator.paginate():
         for key in page["Keys"]:
@@ -1100,6 +1250,7 @@ def _check_2_4_1(kms_client: Any) -> CISCheckResult:
             try:
                 # Only check customer-managed keys (skip AWS-managed and AWS-owned)
                 desc = kms_client.describe_key(KeyId=key_id)["KeyMetadata"]
+                inspected += 1
                 if desc.get("KeyManager") != "CUSTOMER":
                     continue
                 if desc.get("KeyState") != "Enabled":
@@ -1109,7 +1260,11 @@ def _check_2_4_1(kms_client: Any) -> CISCheckResult:
                     no_rotation.append(key_id)
             except Exception as exc:
                 error_code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
-                if error_code in ("AccessDeniedException", "NotFoundException"):
+                if error_code == "NotFoundException":
+                    # Key was deleted between list and read — legitimate skip.
+                    continue
+                if is_access_denied_error(exc):
+                    denied.append(key_id)
                     continue
                 logger.debug("Could not check rotation for key %s: %s", key_id, exc)
 
@@ -1120,7 +1275,14 @@ def _check_2_4_1(kms_client: Any) -> CISCheckResult:
             result.evidence += f" (+{len(no_rotation) - 5} more)"
         result.resource_ids = no_rotation[:20]
     else:
-        result.evidence = "All customer-managed KMS keys have rotation enabled (or no keys found)."
+        finalize_read_coverage(
+            result,
+            inspected=inspected,
+            denied=denied,
+            permission="kms:GetKeyRotationStatus",
+            resource_kind="KMS key",
+            pass_evidence="All customer-managed KMS keys have rotation enabled (or no keys found).",
+        )
     return result
 
 
@@ -1132,10 +1294,10 @@ _LOGGING_SECTION = "3 - Logging"
 
 
 def _check_3_1(cloudtrail_client: Any) -> CISCheckResult:
-    """CIS 3.1 — Ensure CloudTrail is enabled in all regions."""
+    """CIS 3.1 — CloudTrail enabled in all regions."""
     result = CISCheckResult(
         check_id="3.1",
-        title="Ensure CloudTrail is enabled in all regions",
+        title="CloudTrail enabled in all regions",
         status=CheckStatus.PASS,
         severity="high",
         cis_section=_LOGGING_SECTION,
@@ -1169,10 +1331,10 @@ def _check_3_1(cloudtrail_client: Any) -> CISCheckResult:
 
 
 def _check_3_2(cloudtrail_client: Any) -> CISCheckResult:
-    """CIS 3.2 — Ensure CloudTrail log file validation is enabled."""
+    """CIS 3.2 — CloudTrail log file validation enabled."""
     result = CISCheckResult(
         check_id="3.2",
-        title="Ensure CloudTrail log file validation is enabled",
+        title="CloudTrail log file validation enabled",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_LOGGING_SECTION,
@@ -1195,10 +1357,10 @@ def _check_3_2(cloudtrail_client: Any) -> CISCheckResult:
 
 
 def _check_3_4(cloudtrail_client: Any) -> CISCheckResult:
-    """CIS 3.4 — Ensure CloudTrail trails are integrated with CloudWatch Logs."""
+    """CIS 3.4 — CloudTrail integrated with CloudWatch Logs."""
     result = CISCheckResult(
         check_id="3.4",
-        title="Ensure CloudTrail trails are integrated with CloudWatch Logs",
+        title="CloudTrail integrated with CloudWatch Logs",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_LOGGING_SECTION,
@@ -1221,12 +1383,12 @@ def _check_3_4(cloudtrail_client: Any) -> CISCheckResult:
 
 
 def _check_3_5(cloudtrail_client: Any) -> CISCheckResult:
-    """CIS 3.5 — Ensure AWS Config is enabled in all regions."""
+    """CIS 3.5 — CloudTrail records management events in all regions."""
     # Note: We check via CloudTrail for management event recording as a proxy.
     # Full Config check requires config:DescribeConfigurationRecorders.
     result = CISCheckResult(
         check_id="3.5",
-        title="Ensure CloudTrail records management events in all regions",
+        title="CloudTrail records management events in all regions",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_LOGGING_SECTION,
@@ -1268,10 +1430,10 @@ def _check_3_5(cloudtrail_client: Any) -> CISCheckResult:
 
 
 def _check_3_6(s3_client: Any, cloudtrail_client: Any) -> CISCheckResult:
-    """CIS 3.6 — Ensure S3 bucket access logging is enabled on the CloudTrail S3 bucket."""
+    """CIS 3.6 — Access logging enabled on CloudTrail S3 bucket."""
     result = CISCheckResult(
         check_id="3.6",
-        title="Ensure S3 bucket access logging is enabled on the CloudTrail S3 bucket",
+        title="Access logging enabled on CloudTrail S3 bucket",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_LOGGING_SECTION,
@@ -1285,13 +1447,18 @@ def _check_3_6(s3_client: Any, cloudtrail_client: Any) -> CISCheckResult:
 
     ct_buckets = {t["S3BucketName"] for t in trails if t.get("S3BucketName")}
     no_logging = []
+    inspected = 0
+    denied: list[str] = []
     for bucket_name in ct_buckets:
         try:
             logging_conf = s3_client.get_bucket_logging(Bucket=bucket_name)
+            inspected += 1
             if not logging_conf.get("LoggingEnabled"):
                 no_logging.append(bucket_name)
         except Exception as exc:
             # Skip inaccessible buckets
+            if is_access_denied_error(exc):
+                denied.append(bucket_name)
             logger.debug("Could not check logging for bucket %s: %s", bucket_name, exc)
 
     if no_logging:
@@ -1299,15 +1466,22 @@ def _check_3_6(s3_client: Any, cloudtrail_client: Any) -> CISCheckResult:
         result.evidence = f"CloudTrail S3 bucket(s) without access logging: {', '.join(no_logging)}"
         result.resource_ids = [f"arn:aws:s3:::{b}" for b in no_logging]
     else:
-        result.evidence = "All CloudTrail S3 buckets have access logging enabled."
+        finalize_read_coverage(
+            result,
+            inspected=inspected,
+            denied=denied,
+            permission="s3:GetBucketLogging",
+            resource_kind="CloudTrail bucket",
+            pass_evidence="All CloudTrail S3 buckets have access logging enabled.",
+        )
     return result
 
 
 def _check_3_3(s3_client: Any, cloudtrail_client: Any) -> CISCheckResult:
-    """CIS 3.3 — Ensure CloudTrail S3 bucket is not publicly accessible."""
+    """CIS 3.3 — CloudTrail S3 bucket not publicly accessible."""
     result = CISCheckResult(
         check_id="3.3",
-        title="Ensure CloudTrail S3 bucket is not publicly accessible",
+        title="CloudTrail S3 bucket not publicly accessible",
         status=CheckStatus.PASS,
         severity="critical",
         cis_section=_LOGGING_SECTION,
@@ -1323,10 +1497,13 @@ def _check_3_3(s3_client: Any, cloudtrail_client: Any) -> CISCheckResult:
 
     ct_buckets = {t["S3BucketName"] for t in trails if t.get("S3BucketName")}
     public_buckets: list[str] = []
+    inspected = 0
+    denied: list[str] = []
 
     for bucket_name in ct_buckets:
         try:
             policy_resp = s3_client.get_bucket_policy(Bucket=bucket_name)
+            inspected += 1
             policy_doc = _json.loads(policy_resp["Policy"])
             for stmt in policy_doc.get("Statement", []):
                 principal = stmt.get("Principal", {})
@@ -1339,7 +1516,12 @@ def _check_3_3(s3_client: Any, cloudtrail_client: Any) -> CISCheckResult:
         except Exception as exc:
             error_code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
             if error_code == "NoSuchBucketPolicy":
-                continue  # No policy = not public via policy
+                # No policy = not public via policy — a successful determination.
+                inspected += 1
+                continue
+            if is_access_denied_error(exc):
+                denied.append(bucket_name)
+                continue
             logger.debug("Could not check bucket policy for %s: %s", bucket_name, exc)
 
     if public_buckets:
@@ -1347,15 +1529,22 @@ def _check_3_3(s3_client: Any, cloudtrail_client: Any) -> CISCheckResult:
         result.evidence = f"CloudTrail S3 bucket(s) with public policy: {', '.join(public_buckets)}"
         result.resource_ids = [f"arn:aws:s3:::{b}" for b in public_buckets]
     else:
-        result.evidence = "No CloudTrail S3 buckets have public bucket policies."
+        finalize_read_coverage(
+            result,
+            inspected=inspected,
+            denied=denied,
+            permission="s3:GetBucketPolicy",
+            resource_kind="CloudTrail bucket",
+            pass_evidence="No CloudTrail S3 buckets have public bucket policies.",
+        )
     return result
 
 
 def _check_3_7(cloudtrail_client: Any) -> CISCheckResult:
-    """CIS 3.7 — Ensure CloudTrail logs are encrypted with KMS CMK."""
+    """CIS 3.7 — CloudTrail logs encrypted with KMS CMK."""
     result = CISCheckResult(
         check_id="3.7",
-        title="Ensure CloudTrail logs are encrypted with KMS CMK",
+        title="CloudTrail logs encrypted with KMS CMK",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_LOGGING_SECTION,
@@ -1380,10 +1569,10 @@ def _check_3_7(cloudtrail_client: Any) -> CISCheckResult:
 
 
 def _check_3_9(ec2_client: Any) -> CISCheckResult:
-    """CIS 3.9 — Ensure VPC flow logging is enabled in all VPCs."""
+    """CIS 3.9 — VPC flow logging enabled in all VPCs."""
     result = CISCheckResult(
         check_id="3.9",
-        title="Ensure VPC flow logging is enabled in all VPCs",
+        title="VPC flow logging enabled in all VPCs",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_LOGGING_SECTION,
@@ -1415,10 +1604,10 @@ def _check_3_9(ec2_client: Any) -> CISCheckResult:
 
 
 def _check_3_10(cloudtrail_client: Any) -> CISCheckResult:
-    """CIS 3.10 — Ensure Object-level logging for write events is enabled for S3 buckets."""
+    """CIS 3.10 — S3 object-level write-event logging enabled."""
     result = CISCheckResult(
         check_id="3.10",
-        title="Ensure Object-level logging for write events is enabled for S3 buckets",
+        title="S3 object-level write-event logging enabled",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_LOGGING_SECTION,
@@ -1475,10 +1664,10 @@ def _check_3_10(cloudtrail_client: Any) -> CISCheckResult:
 
 
 def _check_3_11(cloudtrail_client: Any) -> CISCheckResult:
-    """CIS 3.11 — Ensure Object-level logging for read events is enabled for S3 buckets."""
+    """CIS 3.11 — S3 object-level read-event logging enabled."""
     result = CISCheckResult(
         check_id="3.11",
-        title="Ensure Object-level logging for read events is enabled for S3 buckets",
+        title="S3 object-level read-event logging enabled",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_LOGGING_SECTION,
@@ -1540,10 +1729,10 @@ _MONITORING_SECTION = "4 - Monitoring"
 
 
 def _check_4_3(logs_client: Any) -> CISCheckResult:
-    """CIS 4.3 — Ensure a metric filter and alarm exist for root account usage."""
+    """CIS 4.3 — Metric filter and alarm for root account usage."""
     result = CISCheckResult(
         check_id="4.3",
-        title="Ensure a metric filter and alarm exist for root account usage",
+        title="Metric filter and alarm for root account usage",
         status=CheckStatus.PASS,
         severity="high",
         cis_section=_MONITORING_SECTION,
@@ -1582,10 +1771,10 @@ def _check_4_3(logs_client: Any) -> CISCheckResult:
 
 
 def _check_4_4(logs_client: Any) -> CISCheckResult:
-    """CIS 4.4 — Ensure a metric filter and alarm exist for IAM policy changes."""
+    """CIS 4.4 — Metric filter and alarm for IAM policy changes."""
     result = CISCheckResult(
         check_id="4.4",
-        title="Ensure a metric filter and alarm exist for IAM policy changes",
+        title="Metric filter and alarm for IAM policy changes",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_MONITORING_SECTION,
@@ -1636,10 +1825,10 @@ def _check_4_4(logs_client: Any) -> CISCheckResult:
 
 
 def _check_4_5(logs_client: Any, cloudtrail_client: Any) -> CISCheckResult:
-    """CIS 4.5 — Ensure a metric filter and alarm exist for CloudTrail config changes."""
+    """CIS 4.5 — Metric filter and alarm for CloudTrail config changes."""
     result = CISCheckResult(
         check_id="4.5",
-        title="Ensure a metric filter and alarm exist for CloudTrail config changes",
+        title="Metric filter and alarm for CloudTrail config changes",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_MONITORING_SECTION,
@@ -1684,15 +1873,15 @@ def _check_4_5(logs_client: Any, cloudtrail_client: Any) -> CISCheckResult:
         error_code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
         logger.debug("Could not check metric filters: %s (%s)", exc, error_code)
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not query metric filters: {error_code or exc}"
+        result.evidence = _safe_error_evidence("Could not query metric filters.", error_code)
     return result
 
 
 def _check_4_1(logs_client: Any) -> CISCheckResult:
-    """CIS 4.1 — Ensure a metric filter and alarm exist for unauthorized API calls."""
+    """CIS 4.1 — Metric filter and alarm for unauthorized API calls."""
     result = CISCheckResult(
         check_id="4.1",
-        title="Ensure a metric filter and alarm exist for unauthorized API calls",
+        title="Metric filter and alarm for unauthorized API calls",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_MONITORING_SECTION,
@@ -1723,10 +1912,10 @@ def _check_4_1(logs_client: Any) -> CISCheckResult:
 
 
 def _check_4_2(logs_client: Any) -> CISCheckResult:
-    """CIS 4.2 — Ensure a metric filter and alarm exist for console sign-in without MFA."""
+    """CIS 4.2 — Metric filter and alarm for console sign-in without MFA."""
     result = CISCheckResult(
         check_id="4.2",
-        title="Ensure a metric filter and alarm exist for console sign-in without MFA",
+        title="Metric filter and alarm for console sign-in without MFA",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_MONITORING_SECTION,
@@ -1757,10 +1946,10 @@ def _check_4_2(logs_client: Any) -> CISCheckResult:
 
 
 def _check_4_6(logs_client: Any) -> CISCheckResult:
-    """CIS 4.6 — Ensure a metric filter and alarm exist for console authentication failures."""
+    """CIS 4.6 — Metric filter and alarm for console auth failures."""
     result = CISCheckResult(
         check_id="4.6",
-        title="Ensure a metric filter and alarm exist for console authentication failures",
+        title="Metric filter and alarm for console auth failures",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_MONITORING_SECTION,
@@ -1791,10 +1980,10 @@ def _check_4_6(logs_client: Any) -> CISCheckResult:
 
 
 def _check_4_7(logs_client: Any) -> CISCheckResult:
-    """CIS 4.7 — Ensure a metric filter and alarm exist for disabling or scheduled deletion of CMKs."""
+    """CIS 4.7 — Metric filter and alarm for CMK disable or deletion."""
     result = CISCheckResult(
         check_id="4.7",
-        title="Ensure a metric filter and alarm exist for disabling or scheduled deletion of CMKs",
+        title="Metric filter and alarm for CMK disable or deletion",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_MONITORING_SECTION,
@@ -1826,10 +2015,10 @@ def _check_4_7(logs_client: Any) -> CISCheckResult:
 
 
 def _check_4_8(logs_client: Any) -> CISCheckResult:
-    """CIS 4.8 — Ensure a metric filter and alarm exist for S3 bucket policy changes."""
+    """CIS 4.8 — Metric filter and alarm for S3 bucket policy changes."""
     result = CISCheckResult(
         check_id="4.8",
-        title="Ensure a metric filter and alarm exist for S3 bucket policy changes",
+        title="Metric filter and alarm for S3 bucket policy changes",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_MONITORING_SECTION,
@@ -1871,10 +2060,10 @@ def _check_4_8(logs_client: Any) -> CISCheckResult:
 
 
 def _check_4_9(logs_client: Any) -> CISCheckResult:
-    """CIS 4.9 — Ensure a metric filter and alarm exist for AWS Config configuration changes."""
+    """CIS 4.9 — Metric filter and alarm for AWS Config changes."""
     result = CISCheckResult(
         check_id="4.9",
-        title="Ensure a metric filter and alarm exist for AWS Config configuration changes",
+        title="Metric filter and alarm for AWS Config changes",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_MONITORING_SECTION,
@@ -1911,10 +2100,10 @@ def _check_4_9(logs_client: Any) -> CISCheckResult:
 
 
 def _check_4_10(logs_client: Any) -> CISCheckResult:
-    """CIS 4.10 — Ensure a metric filter and alarm exist for security group changes."""
+    """CIS 4.10 — Metric filter and alarm for security group changes."""
     result = CISCheckResult(
         check_id="4.10",
-        title="Ensure a metric filter and alarm exist for security group changes",
+        title="Metric filter and alarm for security group changes",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_MONITORING_SECTION,
@@ -1953,10 +2142,10 @@ def _check_4_10(logs_client: Any) -> CISCheckResult:
 
 
 def _check_4_11(logs_client: Any) -> CISCheckResult:
-    """CIS 4.11 — Ensure a metric filter and alarm exist for changes to Network Access Control Lists."""
+    """CIS 4.11 — Metric filter and alarm for NACL changes."""
     result = CISCheckResult(
         check_id="4.11",
-        title="Ensure a metric filter and alarm exist for changes to NACLs",
+        title="Metric filter and alarm for NACL changes",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_MONITORING_SECTION,
@@ -1995,10 +2184,10 @@ def _check_4_11(logs_client: Any) -> CISCheckResult:
 
 
 def _check_4_12(logs_client: Any) -> CISCheckResult:
-    """CIS 4.12 — Ensure a metric filter and alarm exist for changes to network gateways."""
+    """CIS 4.12 — Metric filter and alarm for network gateway changes."""
     result = CISCheckResult(
         check_id="4.12",
-        title="Ensure a metric filter and alarm exist for changes to network gateways",
+        title="Metric filter and alarm for network gateway changes",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_MONITORING_SECTION,
@@ -2037,10 +2226,10 @@ def _check_4_12(logs_client: Any) -> CISCheckResult:
 
 
 def _check_4_13(logs_client: Any) -> CISCheckResult:
-    """CIS 4.13 — Ensure a metric filter and alarm exist for route table changes."""
+    """CIS 4.13 — Metric filter and alarm for route table changes."""
     result = CISCheckResult(
         check_id="4.13",
-        title="Ensure a metric filter and alarm exist for route table changes",
+        title="Metric filter and alarm for route table changes",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_MONITORING_SECTION,
@@ -2080,10 +2269,10 @@ def _check_4_13(logs_client: Any) -> CISCheckResult:
 
 
 def _check_4_14(logs_client: Any) -> CISCheckResult:
-    """CIS 4.14 — Ensure a metric filter and alarm exist for VPC changes."""
+    """CIS 4.14 — Metric filter and alarm for VPC changes."""
     result = CISCheckResult(
         check_id="4.14",
-        title="Ensure a metric filter and alarm exist for VPC changes",
+        title="Metric filter and alarm for VPC changes",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_MONITORING_SECTION,
@@ -2127,10 +2316,10 @@ def _check_4_14(logs_client: Any) -> CISCheckResult:
 
 
 def _check_4_15(logs_client: Any) -> CISCheckResult:
-    """CIS 4.15 — Ensure a metric filter and alarm exist for AWS Organizations changes."""
+    """CIS 4.15 — Metric filter and alarm for AWS Organizations changes."""
     result = CISCheckResult(
         check_id="4.15",
-        title="Ensure a metric filter and alarm exist for AWS Organizations changes",
+        title="Metric filter and alarm for AWS Organizations changes",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_MONITORING_SECTION,
@@ -2165,15 +2354,15 @@ def _check_4_15(logs_client: Any) -> CISCheckResult:
     except Exception as exc:
         error_code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not query metric filters: {error_code or exc}"
+        result.evidence = _safe_error_evidence("Could not query metric filters.", error_code)
     return result
 
 
 def _check_4_16(securityhub_client: Any) -> CISCheckResult:
-    """CIS 4.16 — Ensure AWS Security Hub is enabled."""
+    """CIS 4.16 — AWS Security Hub enabled."""
     result = CISCheckResult(
         check_id="4.16",
-        title="Ensure AWS Security Hub is enabled",
+        title="AWS Security Hub enabled",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_MONITORING_SECTION,
@@ -2188,12 +2377,15 @@ def _check_4_16(securityhub_client: Any) -> CISCheckResult:
             result.evidence = "Security Hub is not enabled."
     except Exception as exc:
         error_code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
-        if error_code in ("InvalidAccessException", "ResourceNotFoundException"):
+        if error_code in ("InvalidAccessException", "ResourceNotFoundException", "SubscriptionRequiredException"):
+            # Security Hub not subscribed/enabled — this is a control FAIL with
+            # actionable guidance, not an opaque API error. SubscriptionRequired
+            # is AWS's signal that the service is simply not turned on.
             result.status = CheckStatus.FAIL
-            result.evidence = "Security Hub is not enabled in this region."
+            result.evidence = "Security Hub not enabled — enable it to evaluate this control."
         else:
             result.status = CheckStatus.ERROR
-            result.evidence = f"Could not check Security Hub: {error_code or exc}"
+            result.evidence = _safe_error_evidence("Could not check Security Hub.", error_code)
     return result
 
 
@@ -2205,10 +2397,10 @@ _NETWORKING_SECTION = "5 - Networking"
 
 
 def _check_5_2(ec2_client: Any) -> CISCheckResult:
-    """CIS 5.2 — Ensure no security groups allow ingress from 0.0.0.0/0 to remote admin ports."""
+    """CIS 5.2 — No unrestricted ingress to admin ports (22, 3389)."""
     result = CISCheckResult(
         check_id="5.2",
-        title="Ensure no security groups allow unrestricted ingress to admin ports (22, 3389)",
+        title="No unrestricted ingress to admin ports (22, 3389)",
         status=CheckStatus.PASS,
         severity="high",
         cis_section=_NETWORKING_SECTION,
@@ -2216,6 +2408,7 @@ def _check_5_2(ec2_client: Any) -> CISCheckResult:
     )
     admin_ports = {22, 3389}
     open_sgs = []
+    exposures: list[dict] = []
 
     paginator = ec2_client.get_paginator("describe_security_groups")
     for page in paginator.paginate():
@@ -2223,6 +2416,7 @@ def _check_5_2(ec2_client: Any) -> CISCheckResult:
             for perm in sg.get("IpPermissions", []):
                 from_port = perm.get("FromPort", 0)
                 to_port = perm.get("ToPort", 0)
+                protocol = str(perm.get("IpProtocol", "tcp"))
                 # Check if any admin port falls in this range
                 if not any(from_port <= p <= to_port for p in admin_ports):
                     continue
@@ -2230,10 +2424,28 @@ def _check_5_2(ec2_client: Any) -> CISCheckResult:
                 for ip_range in perm.get("IpRanges", []):
                     if ip_range.get("CidrIp") == "0.0.0.0/0":
                         open_sgs.append(f"{sg['GroupId']} (port {from_port}-{to_port})")
+                        exposures.append(
+                            {
+                                "resource": sg["GroupId"],
+                                "from_port": from_port,
+                                "to_port": to_port,
+                                "protocol": protocol,
+                                "scope": "internet",
+                            }
+                        )
                         break
                 for ip_range in perm.get("Ipv6Ranges", []):
                     if ip_range.get("CidrIpv6") == "::/0":
                         open_sgs.append(f"{sg['GroupId']} (port {from_port}-{to_port}, IPv6)")
+                        exposures.append(
+                            {
+                                "resource": sg["GroupId"],
+                                "from_port": from_port,
+                                "to_port": to_port,
+                                "protocol": protocol,
+                                "scope": "internet",
+                            }
+                        )
                         break
 
     # Deduplicate
@@ -2245,16 +2457,17 @@ def _check_5_2(ec2_client: Any) -> CISCheckResult:
         if len(open_sgs) > 5:
             result.evidence += f" (+{len(open_sgs) - 5} more)"
         result.resource_ids = open_sgs[:20]
+        result.network_exposure = exposures[:50]
     else:
         result.evidence = "No security groups allow unrestricted ingress to SSH/RDP."
     return result
 
 
 def _check_5_3(ec2_client: Any) -> CISCheckResult:
-    """CIS 5.3 — Ensure the default security group of every VPC restricts all traffic."""
+    """CIS 5.3 — Default security group restricts all traffic."""
     result = CISCheckResult(
         check_id="5.3",
-        title="Ensure the default security group of every VPC restricts all traffic",
+        title="Default security group restricts all traffic",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_NETWORKING_SECTION,
@@ -2283,10 +2496,10 @@ def _check_5_3(ec2_client: Any) -> CISCheckResult:
 
 
 def _check_5_5(ec2_client: Any) -> CISCheckResult:
-    """CIS 5.5 — Ensure no security groups allow ingress from 0.0.0.0/0 or ::/0 to all ports."""
+    """CIS 5.5 — No security group allows all-ports ingress from any IP."""
     result = CISCheckResult(
         check_id="5.5",
-        title="Ensure no security groups allow ingress from 0.0.0.0/0 or ::/0 to all ports",
+        title="No security group allows all-ports ingress from any IP",
         status=CheckStatus.PASS,
         severity="high",
         cis_section=_NETWORKING_SECTION,
@@ -2330,10 +2543,10 @@ def _check_5_5(ec2_client: Any) -> CISCheckResult:
 
 
 def _check_5_6(ec2_client: Any) -> CISCheckResult:
-    """CIS 5.6 — Ensure VPC flow logging is enabled in all VPCs."""
+    """CIS 5.6 — VPC flow logging enabled in all VPCs."""
     result = CISCheckResult(
         check_id="5.6",
-        title="Ensure VPC flow logging is enabled in all VPCs",
+        title="VPC flow logging enabled in all VPCs",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_NETWORKING_SECTION,
@@ -2365,10 +2578,10 @@ def _check_5_6(ec2_client: Any) -> CISCheckResult:
 
 
 def _check_5_1(ec2_client: Any) -> CISCheckResult:
-    """CIS 5.1 — Ensure no Network ACLs allow ingress from 0.0.0.0/0 to remote admin ports."""
+    """CIS 5.1 — No NACL allows unrestricted ingress to admin ports."""
     result = CISCheckResult(
         check_id="5.1",
-        title="Ensure no Network ACLs allow unrestricted ingress to admin ports",
+        title="No NACL allows unrestricted ingress to admin ports",
         status=CheckStatus.PASS,
         severity="high",
         cis_section=_NETWORKING_SECTION,
@@ -2420,10 +2633,10 @@ def _check_5_1(ec2_client: Any) -> CISCheckResult:
 
 
 def _check_5_4(ec2_client: Any) -> CISCheckResult:
-    """CIS 5.4 — Ensure routing tables for VPC peering are least-privilege."""
+    """CIS 5.4 — VPC peering route tables least-privilege."""
     result = CISCheckResult(
         check_id="5.4",
-        title="Ensure routing tables for VPC peering are least-privilege",
+        title="VPC peering route tables least-privilege",
         status=CheckStatus.PASS,
         severity="medium",
         cis_section=_NETWORKING_SECTION,
@@ -2547,6 +2760,8 @@ def run_benchmark(
     region: str | None = None,
     profile: str | None = None,
     checks: list[str] | None = None,
+    *,
+    session: Any = None,
 ) -> CISBenchmarkReport:
     """Run CIS AWS Foundations Benchmark v3.0 checks.
 
@@ -2557,6 +2772,10 @@ def run_benchmark(
         profile: AWS credential profile name.
         checks: Optional list of check IDs to run (e.g. ``["1.4", "1.5"]``).
             Runs all checks if *None*.
+        session: Optional pre-built boto3 session (e.g. the read-only session
+            the credential broker assumes from a stored connection). When
+            supplied it is used as-is and ``region`` / ``profile`` are ignored,
+            so the same read-only checks run against the brokered credentials.
 
     Returns:
         CISBenchmarkReport with per-check pass/fail results.
@@ -2567,13 +2786,14 @@ def run_benchmark(
     except ImportError:
         raise CloudDiscoveryError("boto3 is required for CIS AWS Benchmark checks. Install with: pip install 'agent-bom[aws]'")
 
-    session_kwargs: dict[str, Any] = {}
-    if region:
-        session_kwargs["region_name"] = region
-    if profile:
-        session_kwargs["profile_name"] = profile
+    if session is None:
+        session_kwargs: dict[str, Any] = {}
+        if region:
+            session_kwargs["region_name"] = region
+        if profile:
+            session_kwargs["profile_name"] = profile
 
-    session = boto3.Session(**session_kwargs)
+        session = boto3.Session(**session_kwargs)
     resolved_region = session.region_name or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
     # Get account ID for the report
@@ -2651,4 +2871,261 @@ def run_benchmark(
     # Sort checks by check_id for consistent output
     report.checks.sort(key=lambda c: [int(x) if x.isdigit() else x for x in c.check_id.replace(".", " ").split()])
 
+    # Structured remediation per #665 — every check gets a non-empty
+    # ``remediation`` dict (schema in ``cis_remediation``).
+    from agent_bom.cloud.cis_remediation import attach_all
+
+    attach_all(report, cloud="aws")
+
     return report
+
+
+# Regional checks (EC2/RDS/KMS/logging/network) must run in every enabled region.
+# Global IAM/S3/account checks run once on the home region only.
+_REGIONAL_CIS_CHECK_IDS: frozenset[str] = frozenset(
+    {
+        "1.19",
+        "1.20",
+        "2.2.1",
+        "2.3.1",
+        "2.3.2",
+        "2.4.1",
+        "3.1",
+        "3.2",
+        "3.4",
+        "3.5",
+        "3.7",
+        "3.9",
+        "3.10",
+        "3.11",
+        "4.1",
+        "4.2",
+        "4.3",
+        "4.4",
+        "4.5",
+        "4.6",
+        "4.7",
+        "4.8",
+        "4.9",
+        "4.10",
+        "4.11",
+        "4.12",
+        "4.13",
+        "4.14",
+        "4.15",
+        "4.16",
+        "5.1",
+        "5.2",
+        "5.3",
+        "5.4",
+        "5.5",
+        "5.6",
+    }
+)
+
+_STATUS_RANK = {
+    CheckStatus.FAIL: 0,
+    CheckStatus.ERROR: 1,
+    CheckStatus.PASS: 2,
+    CheckStatus.NOT_APPLICABLE: 3,
+}
+
+
+def _merge_regional_cis_check(existing: CISCheckResult, incoming: CISCheckResult, region: str) -> CISCheckResult:
+    """Merge two results for the same check_id across regions (worst status wins)."""
+    if _STATUS_RANK[incoming.status] < _STATUS_RANK[existing.status]:
+        winner = incoming
+        other = existing
+    else:
+        winner = existing
+        other = incoming
+    suffix = f"[{region}] {other.evidence}" if other.evidence else f"[{region}]"
+    evidence = winner.evidence
+    if suffix not in evidence:
+        evidence = f"{evidence}; {suffix}" if evidence else suffix
+    return CISCheckResult(
+        check_id=winner.check_id,
+        title=winner.title,
+        status=winner.status,
+        severity=winner.severity,
+        evidence=evidence,
+        resource_ids=list(dict.fromkeys([*winner.resource_ids, *other.resource_ids]))[:20],
+        account_id=winner.account_id or other.account_id,
+        network_exposure=winner.network_exposure or other.network_exposure,
+        remediation=winner.remediation or other.remediation,
+    )
+
+
+def run_benchmark_all_regions(
+    region: str | None = None,
+    profile: str | None = None,
+    checks: list[str] | None = None,
+    *,
+    regions: list[str] | None = None,
+) -> CISBenchmarkReport:
+    """Run CIS AWS checks across every enabled region in the account.
+
+    Global IAM/S3/account checks run once on the home region; regional checks
+    (EC2, RDS, KMS, logging, networking) fan out to each enabled region.
+    """
+    try:
+        import boto3
+    except ImportError:
+        raise CloudDiscoveryError("boto3 is required for CIS AWS Benchmark checks. Install with: pip install 'agent-bom[aws]'")
+
+    from agent_bom.cloud.aws_inventory import _resolve_region_list
+    from agent_bom.cloud.normalization import sanitize_discovery_warning
+
+    session_kwargs: dict[str, Any] = {}
+    if region:
+        session_kwargs["region_name"] = region
+    if profile:
+        session_kwargs["profile_name"] = profile
+    session = boto3.Session(**session_kwargs)
+    default_region = session.region_name or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+    scan_warnings: list[str] = []
+    region_list = _resolve_region_list(session, default_region, regions=regions, warnings=scan_warnings)
+    if len(region_list) <= 1:
+        report = run_benchmark(region=default_region, profile=profile, checks=checks, session=session)
+        report.warnings.extend(scan_warnings)
+        return report
+
+    home_region = region_list[0]
+    merged = run_benchmark(region=home_region, profile=profile, checks=checks)
+    merged.regions_scanned = list(region_list)
+    merged.region = f"multi:{','.join(region_list)}"
+    merged.warnings.extend(scan_warnings)
+
+    if checks is None:
+        regional_ids = sorted(_REGIONAL_CIS_CHECK_IDS)
+    else:
+        regional_ids = [check_id for check_id in checks if check_id in _REGIONAL_CIS_CHECK_IDS]
+    if not regional_ids:
+        return merged
+
+    by_id = {check.check_id: check for check in merged.checks}
+    for scan_region in region_list[1:]:
+        try:
+            partial = run_benchmark(region=scan_region, profile=profile, checks=regional_ids)
+        except Exception as exc:  # noqa: BLE001
+            merged.warnings.append(f"CIS benchmark skipped region {scan_region}: {sanitize_discovery_warning(exc)}")
+            continue
+        for check in partial.checks:
+            prev = by_id.get(check.check_id)
+            if prev is None:
+                by_id[check.check_id] = check
+            else:
+                by_id[check.check_id] = _merge_regional_cis_check(prev, check, scan_region)
+
+    merged.checks = sorted(
+        by_id.values(),
+        key=lambda c: [int(x) if x.isdigit() else x for x in c.check_id.replace(".", " ").split()],
+    )
+    from agent_bom.cloud.cis_remediation import attach_all
+
+    attach_all(merged, cloud="aws")
+    return merged
+
+
+# Bounded concurrency for the multi-account fan-out — mirrors the AWS inventory
+# fan-out's thread pool so an org-wide CIS run collapses the per-account
+# latencies instead of summing them.
+_MAX_CIS_FANOUT_WORKERS = 8
+
+
+def run_all_account_benchmarks(
+    checks: list[str] | None = None,
+    profile: str | None = None,
+    *,
+    session: Any = None,
+    external_id: str | None = None,
+    role_name: str | None = None,
+) -> CISBenchmarkReport:
+    """Run the CIS AWS benchmark for EVERY member account of the organization.
+
+    The CIS counterpart of
+    :func:`agent_bom.cloud.aws_inventory.discover_all_account_inventories`: it
+    reuses the same member-account enumeration
+    (:func:`agent_bom.cloud.aws_organizations.list_member_account_ids`) and the
+    same read-only AssumeRole broker
+    (:func:`agent_bom.cloud.aws_organizations.assume_account_session`) so the
+    benchmark covers the identical estate the inventory fan-out does. Each account
+    is benchmarked concurrently (bounded thread pool) and the per-account results
+    are aggregated into one :class:`CISBenchmarkReport` with every check tagged by
+    its ``account_id``.
+
+    ``session`` / ``external_id`` / ``role_name`` mirror the inventory fan-out so
+    Connections org scans can reuse the brokered management session.
+
+    Read-only and partial-permission tolerant: an account whose read-only role
+    cannot be assumed is skipped with a warning rather than failing the whole run.
+    Falls back to a single ambient-credential benchmark when no org is visible (a
+    standalone account).
+
+    Raises:
+        CloudDiscoveryError: if boto3 is not installed.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from agent_bom.cloud import aws_organizations
+
+    from .normalization import sanitize_discovery_warning
+
+    try:
+        import boto3  # noqa: F401
+    except ImportError:
+        raise CloudDiscoveryError("boto3 is required for CIS AWS Benchmark checks. Install with: pip install 'agent-bom[aws]'")
+
+    try:
+        account_ids = aws_organizations.list_member_account_ids(profile, force=True, session=session)
+    except Exception as exc:  # noqa: BLE001 — org enumeration failure must degrade, not crash
+        logger.warning("AWS org account enumeration failed: %s", sanitize_discovery_warning(exc))
+        account_ids = []
+
+    if not account_ids:
+        # Standalone account (not in an org) — single-account benchmark.
+        return run_benchmark(profile=profile, checks=checks, session=session)
+
+    cap = aws_organizations.max_accounts()
+    capped = account_ids[:cap]
+
+    aggregate = CISBenchmarkReport(account_id=", ".join(capped))
+    if len(account_ids) > cap:
+        aggregate.warnings.append(
+            f"AWS multi-account CIS benchmark capped at {cap} of {len(account_ids)} accounts (set AGENT_BOM_AWS_MAX_ACCOUNTS to raise)."
+        )
+
+    def _run_one(account_id: str) -> tuple[str, CISBenchmarkReport]:
+        assumed = aws_organizations.assume_account_session(
+            account_id,
+            profile=profile,
+            role_name=role_name,
+            external_id=external_id,
+            base_session=session,
+        )
+        return account_id, run_benchmark(session=assumed, checks=checks)
+
+    # Deterministic aggregation: collect per-account reports keyed by id, then
+    # merge in enumeration order so output is stable across runs.
+    reports: dict[str, CISBenchmarkReport] = {}
+    with ThreadPoolExecutor(max_workers=min(_MAX_CIS_FANOUT_WORKERS, len(capped))) as executor:
+        future_to_account = {executor.submit(_run_one, aid): aid for aid in capped}
+        for future in as_completed(future_to_account):
+            account_id = future_to_account[future]
+            try:
+                _aid, account_report = future.result()
+                reports[account_id] = account_report
+            except Exception as exc:  # noqa: BLE001 — one unreadable account must not sink the rest
+                aggregate.warnings.append(f"Account {account_id} skipped: {sanitize_discovery_warning(exc)}")
+
+    for account_id in capped:
+        merged = reports.get(account_id)
+        if merged is None:
+            continue
+        aggregate.accounts_scanned.append(account_id)
+        for check in merged.checks:
+            check.account_id = account_id
+            aggregate.checks.append(check)
+        aggregate.warnings.extend(merged.warnings)
+
+    return aggregate

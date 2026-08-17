@@ -13,11 +13,31 @@ from __future__ import annotations
 import logging
 import os
 
-from agent_bom.models import Agent, AgentType, MCPServer, TransportType
+from agent_bom.discovery_envelope import RedactionStatus, ScanMode, attach_envelope_to_agents
+from agent_bom.models import Agent, AgentType, MCPServer, Package, TransportType
 
 from .base import CloudDiscoveryError
+from .normalization import (
+    build_cloud_origin,
+    build_cloud_principal,
+    build_cloud_scope,
+    build_cloud_timestamps,
+    build_package_purl,
+    parse_container_image_package,
+    sanitize_discovery_warning,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _text_attr(value: object, name: str) -> str:
+    """Return a provider attribute only when it is a concrete string."""
+    attr = getattr(value, name, "")
+    return attr if isinstance(attr, str) else ""
+
+
+def _is_mock_value(value: object) -> bool:
+    return type(value).__module__.startswith("unittest.mock")
 
 
 def discover(
@@ -64,7 +84,7 @@ def discover(
         agents.extend(vertex_agents)
         warnings.extend(vertex_warns)
     except Exception as exc:
-        warnings.append(f"Vertex AI discovery error: {exc}")
+        warnings.append(sanitize_discovery_warning(f"Vertex AI discovery error: {exc}"))
 
     # -- Cloud Functions -------------------------------------------------------
     try:
@@ -72,7 +92,7 @@ def discover(
         agents.extend(cf_agents)
         warnings.extend(cf_warns)
     except Exception as exc:
-        warnings.append(f"Cloud Functions discovery error: {exc}")
+        warnings.append(sanitize_discovery_warning(f"Cloud Functions discovery error: {exc}"))
 
     # -- GKE Clusters ----------------------------------------------------------
     try:
@@ -80,7 +100,7 @@ def discover(
         agents.extend(gke_agents)
         warnings.extend(gke_warns)
     except Exception as exc:
-        warnings.append(f"GKE discovery error: {exc}")
+        warnings.append(sanitize_discovery_warning(f"GKE discovery error: {exc}"))
 
     # -- Cloud Run services ----------------------------------------------------
     try:
@@ -88,8 +108,30 @@ def discover(
         agents.extend(run_agents)
         warnings.extend(run_warns)
     except Exception as exc:
-        warnings.append(f"Cloud Run discovery error: {exc}")
+        warnings.append(sanitize_discovery_warning(f"Cloud Run discovery error: {exc}"))
 
+    # Per-run discovery envelope (#2083 PR B).
+    scope: list[str] = []
+    if resolved_project:
+        scope.append(f"gcp:project/{resolved_project}")
+    if region:
+        scope.append(f"gcp:region/{region}")
+    attach_envelope_to_agents(
+        agents,
+        scan_mode=ScanMode.CLOUD_READ_ONLY,
+        discovery_scope=tuple(scope),
+        permissions_used=(
+            "aiplatform.endpoints.list",
+            "aiplatform.endpoints.get",
+            "cloudfunctions.functions.list",
+            "cloudfunctions.functions.get",
+            "container.clusters.list",
+            "container.clusters.get",
+            "run.services.list",
+            "run.services.get",
+        ),
+        redaction_status=RedactionStatus.CENTRAL_SANITIZER_APPLIED,
+    )
     return agents, warnings
 
 
@@ -104,11 +146,11 @@ def _discover_vertex_ai(
 ) -> tuple[list[Agent], list[str]]:
     """Discover Vertex AI endpoints and their deployed models.
 
-    Uses ``google.cloud.aiplatform`` to enumerate endpoints and extract
-    deployed model metadata (model name, version, machine type).
+    Uses a per-request Vertex AI GAPIC client to enumerate endpoints and
+    extract deployed model metadata (model name, version, machine type).
     """
     try:
-        import google.cloud.aiplatform as aiplatform
+        import google.cloud.aiplatform_v1 as aiplatform_v1
     except ImportError:
         return [], ["google-cloud-aiplatform not installed. Skipping Vertex AI discovery."]
 
@@ -116,16 +158,21 @@ def _discover_vertex_ai(
     warnings: list[str] = []
 
     try:
-        aiplatform.init(project=project_id, location=region)
-        endpoints = aiplatform.Endpoint.list()
+        api_endpoint = f"{region}-aiplatform.googleapis.com"
+        client = aiplatform_v1.EndpointServiceClient(client_options={"api_endpoint": api_endpoint})
+        parent = f"projects/{project_id}/locations/{region}"
+        endpoints = client.list_endpoints(parent=parent)
 
         for endpoint in endpoints:
-            ep_name = endpoint.display_name or "unknown"
-            ep_resource = endpoint.resource_name
+            ep_name = _text_attr(endpoint, "display_name") or "unknown"
+            ep_resource = _text_attr(endpoint, "name") or _text_attr(endpoint, "resource_name")
 
             # Enumerate deployed models on this endpoint
             servers: list[MCPServer] = []
-            deployed_models = getattr(endpoint.gca_resource, "deployed_models", []) or []
+            deployed_models = getattr(endpoint, "deployed_models", None)
+            if deployed_models is None or _is_mock_value(deployed_models):
+                deployed_models = getattr(getattr(endpoint, "gca_resource", None), "deployed_models", [])
+            deployed_models = deployed_models or []
             for deployed in deployed_models:
                 model_id = getattr(deployed, "model", "") or ""
                 model_display = getattr(deployed, "display_name", "") or model_id
@@ -173,12 +220,45 @@ def _discover_vertex_ai(
                     "gcp_project": project_id,
                     "region": region,
                     "resource_name": ep_resource,
+                    "cloud_origin": build_cloud_origin(
+                        provider="gcp",
+                        service="vertex-ai",
+                        resource_type="endpoint",
+                        resource_id=ep_resource,
+                        resource_name=ep_name,
+                        location=region,
+                        project_id=project_id,
+                        raw_identity={"resource_name": ep_resource, "display_name": ep_name},
+                    ),
                 },
             )
+            cloud_timestamps = build_cloud_timestamps(
+                provider="gcp",
+                service="vertex-ai",
+                resource_type="endpoint",
+                created_at=getattr(endpoint, "create_time", None),
+                updated_at=getattr(endpoint, "update_time", None),
+                created_source="create_time",
+                updated_source="update_time",
+            )
+            if cloud_timestamps:
+                agent.metadata["cloud_timestamps"] = cloud_timestamps
+            cloud_scope = build_cloud_scope(
+                provider="gcp",
+                service="vertex-ai",
+                resource_type="endpoint",
+                scope_type="project",
+                scope_id=project_id,
+                scope_name=project_id,
+                location=region,
+                source_fields=["resource_name", "create_time", "update_time"],
+            )
+            if cloud_scope:
+                agent.metadata["cloud_scope"] = cloud_scope
             agents.append(agent)
 
     except Exception as exc:
-        warnings.append(f"Could not list Vertex AI endpoints: {exc}")
+        warnings.append(sanitize_discovery_warning(f"Could not list Vertex AI endpoints: {exc}"))
 
     return agents, warnings
 
@@ -237,9 +317,11 @@ def _discover_cloud_functions(
 
             # Service config for URL and resource limits
             service_url = ""
+            service_account = ""
             service_config = getattr(function, "service_config", None)
             if service_config:
                 service_url = getattr(service_config, "uri", "") or ""
+                service_account = getattr(service_config, "service_account_email", "") or ""
 
             server = MCPServer(
                 name=f"cloud-function:{fn_name}",
@@ -247,6 +329,15 @@ def _discover_cloud_functions(
                 transport=TransportType.STREAMABLE_HTTP,
                 url=service_url or f"https://{region}-{project_id}.cloudfunctions.net/{fn_name}",
             )
+            dep_packages: list[Package] = []
+            if source_uri.startswith("gs://"):
+                from agent_bom.cloud.serverless_zip import extract_gcp_storage_source_packages
+
+                without_scheme = source_uri[len("gs://") :]
+                bucket, _, obj = without_scheme.partition("/")
+                dep_packages = extract_gcp_storage_source_packages(bucket, obj, runtime, warnings)
+            if dep_packages:
+                server.packages = dep_packages
 
             agent = Agent(
                 name=f"cloud-function:{fn_name}",
@@ -260,8 +351,42 @@ def _discover_cloud_functions(
                     "runtime": runtime,
                     "entry_point": entry_point,
                     "source_uri": source_uri,
+                    "cloud_origin": build_cloud_origin(
+                        provider="gcp",
+                        service="cloud-functions",
+                        resource_type="function",
+                        resource_id=fn_resource,
+                        resource_name=fn_name,
+                        location=region,
+                        project_id=project_id,
+                        raw_identity={"name": fn_resource, "display_name": fn_name, "runtime": runtime},
+                    ),
                 },
             )
+            cloud_scope = build_cloud_scope(
+                provider="gcp",
+                service="cloud-functions",
+                resource_type="function",
+                scope_type="project",
+                scope_id=project_id,
+                scope_name=project_id,
+                location=region,
+                source_fields=["name", "service_config.uri"],
+            )
+            if cloud_scope:
+                agent.metadata["cloud_scope"] = cloud_scope
+            cloud_principal = build_cloud_principal(
+                provider="gcp",
+                service="cloud-functions",
+                resource_type="function",
+                principal_type="service-account",
+                principal_id=service_account or None,
+                principal_name=service_account or None,
+                source_field="service_config.service_account_email",
+                raw_identity={"service_account_email": service_account},
+            )
+            if cloud_principal:
+                agent.metadata["cloud_principal"] = cloud_principal
             agents.append(agent)
 
             logger.debug(
@@ -273,7 +398,7 @@ def _discover_cloud_functions(
             )
 
     except Exception as exc:
-        warnings.append(f"Could not list Cloud Functions: {exc}")
+        warnings.append(sanitize_discovery_warning(f"Could not list Cloud Functions: {exc}"))
 
     return agents, warnings
 
@@ -356,6 +481,16 @@ def _discover_gke_clusters(
                     "region": cluster_location,
                     "cluster_version": cluster_version,
                     "node_pools": node_pool_info,
+                    "cloud_origin": build_cloud_origin(
+                        provider="gcp",
+                        service="gke",
+                        resource_type="cluster",
+                        resource_id=cluster_self_link or f"projects/{project_id}/locations/{cluster_location}/clusters/{cluster_name}",
+                        resource_name=cluster_name,
+                        location=cluster_location,
+                        project_id=project_id,
+                        raw_identity={"name": cluster_name, "self_link": cluster_self_link, "version": cluster_version},
+                    ),
                 },
             )
             agents.append(agent)
@@ -369,7 +504,7 @@ def _discover_gke_clusters(
             )
 
     except Exception as exc:
-        warnings.append(f"Could not list GKE clusters: {exc}")
+        warnings.append(sanitize_discovery_warning(f"Could not list GKE clusters: {exc}"))
 
     return agents, warnings
 
@@ -406,11 +541,23 @@ def _discover_cloud_run(
             for container in template.containers:
                 image = container.image or ""
                 if image:
+                    image_parts = parse_container_image_package(image)
+                    service_account = getattr(template, "service_account", "") or ""
                     server = MCPServer(
                         name=f"cloud-run:{svc_name}",
                         command="docker",
                         args=["run", image],
                         transport=TransportType.STDIO,
+                        packages=[
+                            Package(
+                                name=image_parts[0],
+                                version=image_parts[1],
+                                ecosystem="container-image",
+                                purl=build_package_purl(ecosystem="container-image", name=image_parts[0], version=image_parts[1]),
+                            )
+                        ]
+                        if image_parts
+                        else [],
                     )
                     agent = Agent(
                         name=f"cloud-run:{svc_name}",
@@ -422,11 +569,45 @@ def _discover_cloud_run(
                             "gcp_project": project_id,
                             "region": region,
                             "image": image,
+                            "cloud_origin": build_cloud_origin(
+                                provider="gcp",
+                                service="cloud-run",
+                                resource_type="service",
+                                resource_id=service.name or f"gcp://{svc_name}",
+                                resource_name=svc_name,
+                                location=region,
+                                project_id=project_id,
+                                raw_identity={"name": service.name or "", "image": image},
+                            ),
                         },
                     )
+                    cloud_scope = build_cloud_scope(
+                        provider="gcp",
+                        service="cloud-run",
+                        resource_type="service",
+                        scope_type="project",
+                        scope_id=project_id,
+                        scope_name=project_id,
+                        location=region,
+                        source_fields=["name", "template.service_account"],
+                    )
+                    if cloud_scope:
+                        agent.metadata["cloud_scope"] = cloud_scope
+                    cloud_principal = build_cloud_principal(
+                        provider="gcp",
+                        service="cloud-run",
+                        resource_type="service",
+                        principal_type="service-account",
+                        principal_id=service_account or None,
+                        principal_name=service_account or None,
+                        source_field="template.service_account",
+                        raw_identity={"service_account": service_account},
+                    )
+                    if cloud_principal:
+                        agent.metadata["cloud_principal"] = cloud_principal
                     agents.append(agent)
 
     except Exception as exc:
-        warnings.append(f"Could not list Cloud Run services: {exc}")
+        warnings.append(sanitize_discovery_warning(f"Could not list Cloud Run services: {exc}"))
 
     return agents, warnings

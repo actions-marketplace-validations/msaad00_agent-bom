@@ -1,5 +1,10 @@
 # Runtime Monitoring — Deployment Guide
 
+> Part of the **runtime doc set**. For the canonical map of all five runtime
+> surfaces and which one owns which decision, see
+> [`RUNTIME_REFERENCE.md`](RUNTIME_REFERENCE.md). The audit record format is in
+> [`RUNTIME_PROXY_AUDIT_JSONL.md`](RUNTIME_PROXY_AUDIT_JSONL.md).
+
 agent-bom includes a runtime security proxy (`agent-bom proxy`) that sits between MCP clients and servers, intercepting JSON-RPC messages in real time. This guide covers sidecar deployment, detector configuration, enforcement modes, and alert routing.
 
 ## What the Runtime Proxy Does
@@ -7,12 +12,12 @@ agent-bom includes a runtime security proxy (`agent-bom proxy`) that sits betwee
 The proxy interposes on the stdio channel between an MCP client (Claude Desktop, Cursor, VS Code, etc.) and an MCP server. Every JSON-RPC message passes through the proxy, which:
 
 1. **Logs** every `tools/call` invocation to a JSONL audit trail
-2. **Detects** anomalous or dangerous tool usage via five built-in detectors
+2. **Detects** anomalous or dangerous tool usage via seven inline detectors
 3. **Enforces** policy rules — optionally blocking tool calls that violate policy
 4. **Tracks** declared vs. actual tool usage (drift detection)
 5. **Measures** latency, call counts, and blocked-call metrics
 
-### Five Detectors
+### Seven Inline Detectors
 
 | Detector | What it catches | Default mode |
 |---|---|---|
@@ -21,6 +26,8 @@ The proxy interposes on the stdio channel between an MCP client (Claude Desktop,
 | **Credential leak** | Arguments containing patterns that look like API keys, tokens, passwords, or connection strings being passed to tools. | Log |
 | **Rate limiting** | Abnormal call frequency for a single tool within a time window — detects runaway loops or abuse. | Log |
 | **Sequence analysis** | Suspicious sequences of tool calls (e.g., `list_files` followed by `read_file` on every file, or `exec` after `write_file`). | Log |
+| **Response inspection** | Cloaking, invisible Unicode, SVG/script payloads, and poisoned response content. | Log |
+| **Vector DB injection** | Retrieved prompt chunks or vector-backed content attempting to coerce downstream tools or agents. | Log |
 
 ---
 
@@ -28,29 +35,33 @@ The proxy interposes on the stdio channel between an MCP client (Claude Desktop,
 
 ### Docker
 
-Build the slim runtime image:
+Use the published main runtime image:
 
 ```bash
-docker build -f deploy/docker/Dockerfile.runtime -t agent-bom-runtime .
+docker pull agentbom/agent-bom:0.101.0
 ```
+
+If you need to rebuild locally from the checked-out repo, you can still use
+`deploy/docker/Dockerfile.runtime`, but the public runtime/proxy path now ships
+through `agentbom/agent-bom`.
 
 Run as a wrapper around any MCP server:
 
 ```bash
 docker run --rm \
   -v $(pwd)/audit-logs:/var/log/agent-bom \
-  agent-bom-runtime \
+  agentbom/agent-bom:0.101.0 \
   --log /var/log/agent-bom/audit.jsonl \
   --block-undeclared \
-  -- npx -y @modelcontextprotocol/server-filesystem /tmp
+  -- npx -y @modelcontextprotocol/server-filesystem /workspace
 ```
 
 ### Docker Compose
 
-Use the provided `deploy/docker-compose.runtime.yml` for a complete sidecar example:
+Use the provided `deploy/docker-compose.runtime-example.yml` for a complete sidecar example:
 
 ```bash
-docker compose -f deploy/docker-compose.runtime.yml up
+docker compose -f deploy/docker-compose.runtime-example.yml up
 ```
 
 This starts:
@@ -88,8 +99,9 @@ spec:
 
         # agent-bom runtime proxy sidecar
         - name: agent-bom-proxy
-          image: agent-bom-runtime:latest
+          image: agentbom/agent-bom:0.101.0
           args:
+            - "proxy"
             - "--log"
             - "/var/log/agent-bom/audit.jsonl"
             - "--block-undeclared"
@@ -131,6 +143,19 @@ volumeMounts:
 
 Then add `--policy /etc/agent-bom/policy.json` to the proxy args.
 
+For the packaged Helm control-plane path, the chart now also ships an
+optional mutating webhook for the HTTP/SSE sidecar model. Enable
+`sidecarInjection.enabled=true`, then opt in either:
+
+- an entire namespace with `agent-bom.io/proxy-inject=enabled`
+- or a single workload with pod label `agent-bom.io/proxy=true`
+
+Each opted-in pod must still declare the local MCP target explicitly through
+`agent-bom.io/mcp-url` or `agent-bom.io/mcp-port`. The webhook injects the
+`agent-bom proxy` container, audit volume, metrics annotations, and
+control-plane policy/audit wiring; it does not try to infer stdio server
+commands for you.
+
 ---
 
 ## Log vs Enforce Mode
@@ -142,8 +167,28 @@ The proxy supports two operational modes:
 All tool calls are allowed through. Every invocation is recorded in the JSONL audit log with full metadata (tool name, truncated arguments, timestamp). Use this mode to build a baseline of normal behavior before enabling enforcement.
 
 ```bash
-agent-bom proxy --log audit.jsonl -- npx @mcp/server-filesystem /tmp
+agent-bom proxy --no-isolate --log audit.jsonl -- npx @mcp/server-filesystem /workspace
 ```
+
+Hermetic smoke without npm (uses the bundled JSON-RPC fixture; invoke via
+module name — do not pass an absolute venv `python` path to the proxy):
+
+```bash
+agent-bom proxy --no-isolate --log audit.jsonl -- python3 -m agent_bom.runtime_smoke_mcp
+```
+
+For Claude Desktop, Claude Code, and Cortex JSON configs, you can auto-wrap eligible stdio servers:
+
+```bash
+agent-bom proxy-configure --log-dir ~/.agent-bom/logs --detect-credentials
+```
+
+Add `--apply` to persist the wrapped config entries. Generated configs include
+`--no-isolate` unless you pass `--sandbox-image`; that keeps audit/policy mode
+explicit and avoids implying process containment without an operator-provided
+Docker/Podman runtime image.
+
+If you need cross-agent correlation and the broader 8-detector runtime engine, use `agent-bom runtime protect --shield` alongside or upstream of the proxy pipeline.
 
 ### Enforce mode
 
@@ -151,10 +196,11 @@ Add `--block-undeclared` and/or `--policy policy.json` to actively block tool ca
 
 ```bash
 agent-bom proxy \
+  --no-isolate \
   --log audit.jsonl \
   --policy policy.json \
   --block-undeclared \
-  -- npx @mcp/server-filesystem /tmp
+  -- npx @mcp/server-filesystem /workspace
 ```
 
 Blocked calls receive a JSON-RPC error response (`code: -32600`) and are recorded in the audit log with `"policy": "blocked"` and the reason.
@@ -167,15 +213,18 @@ Blocked calls receive a JSON-RPC error response (`code: -32600`) and are recorde
 
 Every tool call is appended to the JSONL log file as a single-line JSON object:
 
-```json
-{"ts": "2026-02-26T12:00:00Z", "type": "tools/call", "tool": "read_file", "args": {"path": "/etc/passwd"}, "policy": "blocked", "reason": "Argument 'path' matches blocked pattern '/etc/(passwd|shadow)'"}
+```jsonl
+{"ts":"2026-05-08T18:56:05.635108+00:00","type":"tools/call","tool":"read_file","agent_id":"anonymous","tenant_id":"default","policy":"blocked","event_relationships":{"normalization_version":"1","source":"proxy_tool_call","targets":[{"type":"tool","id":"read_file","role":"invoked_tool","source_field":"tool"}],"resources":[{"type":"path","id":"<path:passwd>","role":"referenced_input","source_field":"path"}]},"prev_hash":"","record_hash_algorithm":"aes-cmac-128","record_hash":"be865de2cfeef8d0f1056cbc8b40ad36"}
 ```
 
 When the proxy shuts down, it writes a summary record:
 
-```json
-{"ts": "2026-02-26T12:05:00Z", "type": "proxy_summary", "uptime_seconds": 300.0, "total_tool_calls": 42, "total_blocked": 3, "calls_by_tool": {"read_file": 30, "write_file": 12}, "blocked_by_reason": {"policy": 2, "undeclared": 1}, "latency": {"min_ms": 1.2, "max_ms": 450.0, "avg_ms": 23.5, "p50_ms": 15.0, "p95_ms": 120.0, "count": 42}, "messages_client_to_server": 50, "messages_server_to_client": 48}
+```jsonl
+{"ts":"2026-05-08T18:58:00.000000+00:00","type":"proxy_summary","uptime_seconds":300.0,"total_tool_calls":42,"total_blocked":3,"calls_by_tool":{"read_file":30,"write_file":12},"blocked_by_reason":{"policy":2,"undeclared":1},"latency":{"min_ms":1.2,"max_ms":450.0,"avg_ms":23.5,"p50_ms":15.0,"p95_ms":120.0,"count":42},"messages_client_to_server":50,"messages_server_to_client":48,"replay_rejections":0,"relay_errors":0,"audit_buffer_bytes":0,"audit_spillover_bytes":0,"audit_dlq_bytes":0,"policy_fetch_failures":0,"audit_push_failures":0,"audit_push_backoff_seconds":0,"audit_circuit_open":0}
 ```
+
+See [`RUNTIME_PROXY_AUDIT_JSONL.md`](RUNTIME_PROXY_AUDIT_JSONL.md) for the
+field guide, redaction boundary, and operator `jq` checks.
 
 ### Webhook Alerts
 
@@ -183,7 +232,7 @@ Use the `agent-bom watch` command alongside the proxy to route alerts to Slack, 
 
 ```bash
 # In one terminal: run the proxy
-agent-bom proxy --log audit.jsonl -- npx @mcp/server-filesystem /tmp
+agent-bom proxy --no-isolate --log audit.jsonl -- npx @mcp/server-filesystem /workspace
 
 # In another terminal: watch the audit log and send alerts
 agent-bom watch --webhook https://hooks.slack.com/services/T.../B.../xxx --log alerts.jsonl
@@ -215,7 +264,13 @@ Tracks call frequency per tool within a sliding time window. Detects runaway loo
 
 Analyzes the order of tool calls to detect suspicious multi-step patterns. For example: `list_directory` followed by `read_file` on every discovered file (bulk exfiltration), or `write_file` followed by `exec` (code injection + execution).
 
----
+### Response Inspection
+
+Scans tool responses for cloaking tricks, invisible Unicode, SVG/script payloads, and other content that tries to smuggle instructions back into the agent.
+
+### Vector DB Injection
+
+Detects prompt-coercion or poisoning patterns from retrieval-backed tools and escalates them when the response clearly comes from vector or RAG-like sources.
 
 ## Configuration Examples
 
@@ -223,7 +278,7 @@ Analyzes the order of tool calls to detect suspicious multi-step patterns. For e
 
 ```bash
 agent-bom proxy --log /var/log/agent-bom/audit.jsonl \
-  -- npx @modelcontextprotocol/server-filesystem /tmp
+  -- npx @modelcontextprotocol/server-filesystem /workspace
 ```
 
 ### Enforce with policy file
@@ -233,7 +288,7 @@ agent-bom proxy \
   --policy policy.json \
   --log /var/log/agent-bom/audit.jsonl \
   --block-undeclared \
-  -- npx @modelcontextprotocol/server-filesystem /tmp
+  -- npx @modelcontextprotocol/server-filesystem /workspace
 ```
 
 ### Policy file example
@@ -279,7 +334,7 @@ Point Claude Desktop at the proxy instead of the raw MCP server:
         "--policy", "/etc/agent-bom/policy.json",
         "--block-undeclared",
         "--",
-        "npx", "@modelcontextprotocol/server-filesystem", "/tmp"
+        "npx", "@modelcontextprotocol/server-filesystem", "/workspace"
       ]
     }
   }
@@ -297,9 +352,9 @@ Use the runtime container directly from Claude Desktop:
       "command": "docker",
       "args": [
         "run", "--rm", "-i",
-        "-v", "/tmp:/workspace",
+        "-v", "./workspace:/workspace",
         "-v", "./audit-logs:/var/log/agent-bom",
-        "agent-bom-runtime:latest",
+        "agentbom/agent-bom:0.101.0",
         "--log", "/var/log/agent-bom/audit.jsonl",
         "--block-undeclared",
         "--",
@@ -338,6 +393,27 @@ To enable runtime monitoring on all nodes:
 kubectl apply -f deploy/k8s/daemonset.yaml
 ```
 
+### Continuous Kubernetes Inventory Reconciliation
+
+For fleet deployments, treat Kubernetes discovery as a repeated reconciliation
+loop rather than a one-off scan. Capture the previous and current inventory
+snapshots, then compare them with:
+
+```bash
+agent-bom fleet reconcile-k8s \
+  --previous /state/previous-inventory.json \
+  --current /state/current-inventory.json \
+  --json
+```
+
+The reconciliation contract emits stable Kubernetes identity keys, added,
+changed, missing, and stale records. The identity key intentionally uses
+tenant, cluster, namespace, workload, agent, server, and surface metadata
+instead of pod UID/name so normal rollout churn does not create duplicate
+assets. CronJobs, selected-node DaemonSets, and future operators can publish
+that JSON alongside `agent-bom inventory --json` to prove whether the inventory
+is current and what changed since the last observation.
+
 ---
 
 ## Helm Chart
@@ -351,6 +427,11 @@ helm install agent-bom deploy/helm/agent-bom/ -n agent-bom --create-namespace
 # Enable runtime monitoring DaemonSet
 helm install agent-bom deploy/helm/agent-bom/ -n agent-bom --create-namespace \
   --set monitor.enabled=true
+
+# Enable Prometheus scraping for the runtime monitor
+helm install agent-bom deploy/helm/agent-bom/ -n agent-bom --create-namespace \
+  --set monitor.enabled=true \
+  --set monitor.serviceMonitor.enabled=true
 
 # Custom scan schedule (every 2 hours)
 helm install agent-bom deploy/helm/agent-bom/ -n agent-bom --create-namespace \
@@ -366,7 +447,31 @@ helm install agent-bom deploy/helm/agent-bom/ -n agent-bom --create-namespace \
 | `scanner.allNamespaces` | `true` | Scan all namespaces |
 | `monitor.enabled` | `false` | Deploy the DaemonSet runtime monitor |
 | `monitor.port` | `8423` | HTTP port for the protect endpoint |
-| `rbac.create` | `true` | Create ClusterRole + ClusterRoleBinding |
+| `monitor.service.enabled` | `true` | Expose the monitor DaemonSet through a ClusterIP Service when enabled |
+| `monitor.serviceMonitor.enabled` | `false` | Create a Prometheus Operator ServiceMonitor that scrapes `/metrics` |
+| `monitor.ingress.enabled` | `false` | Create an Ingress for the monitor Service when remote access is needed |
+| `networkPolicy.allowDns` | `true` | Allow outbound DNS resolution on TCP/UDP 53 |
+| `networkPolicy.allowWeb` | `true` | Allow outbound TCP web traffic for registry/API access |
+| `networkPolicy.webPorts` | `[80, 443]` | TCP ports permitted when `allowWeb` is enabled |
+| `networkPolicy.additionalEgress` | `[]` | Extra egress rules for stricter or more specialized environments |
+| `pdb.enabled` | `false` | Create a PodDisruptionBudget for the runtime monitor pods |
+| `rbac.create` | `true` | Create the cluster-scoped read RBAC needed for pod and namespace discovery |
+
+When the monitor is enabled, the chart now wires:
+- `livenessProbe` on `/status`
+- `readinessProbe` on `/status`
+- `startupProbe` on `/status`
+- optional Prometheus scraping on `/metrics`
+- optional `Ingress` for the monitor Service
+- optional `PodDisruptionBudget` for voluntary-eviction safety
+
+The chart's default `NetworkPolicy` also avoids unrestricted outbound traffic. By default it permits:
+- DNS resolution on TCP/UDP 53
+- outbound TCP 80/443 for package registries, APIs, and control-plane calls
+
+Use `networkPolicy.additionalEgress` to add tighter environment-specific rules without editing templates.
+
+The chart RBAC is intentionally cluster-scoped today because the monitor and scanner read both pods and namespaces. It is focused cluster-read access rather than a richer workload-specific RBAC partitioning story.
 
 ---
 
@@ -392,7 +497,7 @@ kubectl apply -f deploy/k8s/sidecar-example.yaml
 The proxy exposes Prometheus-compatible metrics on port 8422 (configurable via `--metrics-port`):
 
 ```bash
-agent-bom proxy --metrics-port 8422 --log audit.jsonl -- npx @mcp/server-filesystem /tmp
+agent-bom proxy --no-isolate --metrics-port 8422 --log audit.jsonl -- npx @mcp/server-filesystem /workspace
 ```
 
 ### Metrics endpoint

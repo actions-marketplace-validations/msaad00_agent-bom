@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -381,19 +381,16 @@ def _nvd_response_with_cwes(
     return json.dumps(payload).encode()
 
 
-def _mock_urlopen_with_cwes(cwes: list[str], score: float = 8.1, severity: str = "HIGH"):
-    def side_effect(req, timeout=30):
+def _mock_fetch_json_with_cwes(cwes: list[str], score: float = 8.1, severity: str = "HIGH"):
+    """Side effect for patching fetch_json — returns parsed NVD JSON."""
+
+    def side_effect(url: str, *, timeout: int = 30, headers: dict | None = None):
         from urllib.parse import parse_qs, urlparse
 
-        url = req.full_url if hasattr(req, "full_url") else str(req)
         parsed = urlparse(url)
         qs = parse_qs(parsed.query)
         cve_id = qs.get("cveId", ["CVE-UNKNOWN"])[0]
-        cm = MagicMock()
-        cm.__enter__ = MagicMock(return_value=cm)
-        cm.__exit__ = MagicMock(return_value=False)
-        cm.read = MagicMock(return_value=_nvd_response_with_cwes(cve_id, score, severity, cwes))
-        return cm
+        return json.loads(_nvd_response_with_cwes(cve_id, score, severity, cwes))
 
     return side_effect
 
@@ -403,7 +400,7 @@ def test_sync_nvd_stores_cwe_ids() -> None:
     conn = _make_conn()
     _insert_vuln(conn, "CVE-2024-99010", severity="unknown")
 
-    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_with_cwes(["CWE-79", "CWE-89"])):
+    with patch("agent_bom.http_client.fetch_json", side_effect=_mock_fetch_json_with_cwes(["CWE-79", "CWE-89"])):
         with patch("time.sleep"):
             count = sync_nvd(conn, url="https://services.nvd.nist.gov/rest/json/cves/2.0", max_entries=10)
 
@@ -411,6 +408,62 @@ def test_sync_nvd_stores_cwe_ids() -> None:
     row = conn.execute("SELECT cwe_ids FROM vulns WHERE id = 'CVE-2024-99010'").fetchone()
     cwes = set(row["cwe_ids"].split(","))
     assert cwes == {"CWE-79", "CWE-89"}
+    meta = conn.execute("SELECT metadata_json FROM sync_meta WHERE source='nvd'").fetchone()
+    assert meta is not None
+    details = json.loads(meta["metadata_json"])
+    assert details["mode"] == "enrichment_only"
+    assert details["candidate_rows"] == 1
+    assert details["selected_rows"] == 1
+
+
+def test_sync_nvd_derives_canonical_cve_for_debian_advisory() -> None:
+    """DEBIAN-CVE rows should inherit NVD CVSS from the canonical CVE ID."""
+    conn = _make_conn()
+    _insert_vuln(conn, "DEBIAN-CVE-2014-6271", severity="unknown")
+    requested: list[str] = []
+
+    def fetch_json(url: str, *, timeout: int = 30, headers: dict | None = None):
+        from urllib.parse import parse_qs, urlparse
+
+        cve_id = parse_qs(urlparse(url).query).get("cveId", [""])[0]
+        requested.append(cve_id)
+        return json.loads(_nvd_response_with_cwes(cve_id, score=9.8, severity="CRITICAL", cwes=["CWE-78"]))
+
+    with patch("agent_bom.http_client.fetch_json", side_effect=fetch_json):
+        with patch("time.sleep"):
+            count = sync_nvd(conn, url="https://services.nvd.nist.gov/rest/json/cves/2.0", max_entries=10)
+
+    assert count == 1
+    assert requested == ["CVE-2014-6271"]
+    row = conn.execute("SELECT severity, cvss_score, cwe_ids FROM vulns WHERE id = 'DEBIAN-CVE-2014-6271'").fetchone()
+    assert row["severity"] == "critical"
+    assert row["cvss_score"] == pytest.approx(9.8)
+    assert row["cwe_ids"] == "CWE-78"
+
+
+def test_sync_nvd_uses_cve_alias_for_non_cve_advisory() -> None:
+    conn = _make_conn()
+    _insert_vuln(conn, "OSV-2026-0001", severity="unknown")
+    conn.execute("UPDATE vulns SET aliases='CVE-2026-99010' WHERE id='OSV-2026-0001'")
+    conn.commit()
+    requested: list[str] = []
+
+    def fetch_json(url: str, *, timeout: int = 30, headers: dict | None = None):
+        from urllib.parse import parse_qs, urlparse
+
+        cve_id = parse_qs(urlparse(url).query).get("cveId", [""])[0]
+        requested.append(cve_id)
+        return json.loads(_nvd_response_with_cwes(cve_id, score=7.5, severity="HIGH", cwes=[]))
+
+    with patch("agent_bom.http_client.fetch_json", side_effect=fetch_json):
+        with patch("time.sleep"):
+            count = sync_nvd(conn, url="https://services.nvd.nist.gov/rest/json/cves/2.0", max_entries=10)
+
+    assert count == 1
+    assert requested == ["CVE-2026-99010"]
+    row = conn.execute("SELECT severity, cvss_score FROM vulns WHERE id = 'OSV-2026-0001'").fetchone()
+    assert row["severity"] == "high"
+    assert row["cvss_score"] == pytest.approx(7.5)
 
 
 def test_sync_nvd_merges_cwe_ids_with_existing() -> None:
@@ -418,7 +471,7 @@ def test_sync_nvd_merges_cwe_ids_with_existing() -> None:
     conn = _make_conn()
     _insert_vuln(conn, "CVE-2024-99011", severity="unknown", cwe_ids="CWE-79")
 
-    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_with_cwes(["CWE-89"])):
+    with patch("agent_bom.http_client.fetch_json", side_effect=_mock_fetch_json_with_cwes(["CWE-89"])):
         with patch("time.sleep"):
             sync_nvd(conn, url="https://services.nvd.nist.gov/rest/json/cves/2.0", max_entries=10)
 
@@ -432,7 +485,7 @@ def test_sync_nvd_preserves_existing_cwes_when_nvd_has_none() -> None:
     conn = _make_conn()
     _insert_vuln(conn, "CVE-2024-99014", severity="unknown", cwe_ids="CWE-79")
 
-    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_with_cwes([], score=7.5)):
+    with patch("agent_bom.http_client.fetch_json", side_effect=_mock_fetch_json_with_cwes([], score=7.5)):
         with patch("time.sleep"):
             sync_nvd(conn, url="https://services.nvd.nist.gov/rest/json/cves/2.0", max_entries=10)
 
@@ -445,14 +498,13 @@ def test_sync_nvd_cwe_only_no_cvss() -> None:
     conn = _make_conn()
     _insert_vuln(conn, "CVE-2024-99013", severity="unknown")
 
-    def urlopen_cwe_only(req, timeout=30):
+    def fetch_json_cwe_only(url: str, *, timeout: int = 30, headers: dict | None = None):
         from urllib.parse import parse_qs, urlparse
 
-        url = req.full_url if hasattr(req, "full_url") else str(req)
         parsed = urlparse(url)
         qs = parse_qs(parsed.query)
         cve_id = qs.get("cveId", ["CVE-UNKNOWN"])[0]
-        payload = {
+        return {
             "vulnerabilities": [
                 {
                     "cve": {
@@ -463,13 +515,8 @@ def test_sync_nvd_cwe_only_no_cvss() -> None:
                 }
             ]
         }
-        cm = MagicMock()
-        cm.__enter__ = MagicMock(return_value=cm)
-        cm.__exit__ = MagicMock(return_value=False)
-        cm.read = MagicMock(return_value=json.dumps(payload).encode())
-        return cm
 
-    with patch("urllib.request.urlopen", side_effect=urlopen_cwe_only):
+    with patch("agent_bom.http_client.fetch_json", side_effect=fetch_json_cwe_only):
         with patch("time.sleep"):
             count = sync_nvd(conn, url="https://services.nvd.nist.gov/rest/json/cves/2.0", max_entries=10)
 

@@ -6,6 +6,7 @@ import textwrap
 
 from agent_bom.parsers import (
     parse_conda_environment,
+    parse_npm_packages,
     parse_pip_packages,
     parse_pnpm_lock,
     parse_poetry_lock,
@@ -87,6 +88,15 @@ class TestPoetryLock:
         by_name = {p.name: p for p in pkgs}
         # poetry.lock wins — version from poetry, not requirements.txt
         assert by_name["requests"].version == "2.31.0"
+
+    def test_poetry_declarations_are_used_without_lock(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text('[tool.poetry.dependencies]\npython = "^3.11"\nrequests = "^2.31"\n')
+
+        pkgs = parse_pip_packages(tmp_path)
+
+        assert [pkg.name for pkg in pkgs] == ["requests"]
+        assert pkgs[0].version == "unknown"
+        assert pkgs[0].is_direct is True
 
 
 # ── uv.lock ──────────────────────────────────────────────────────────────────
@@ -291,6 +301,51 @@ class TestPnpmLock:
         assert parse_pnpm_lock(tmp_path) == []
 
 
+def test_package_json_resolves_workspace_dependencies(tmp_path):
+    (tmp_path / "pnpm-workspace.yaml").write_text(
+        textwrap.dedent("""\
+            packages:
+              - "packages/**"
+              - "web"
+        """)
+    )
+    shared = tmp_path / "packages" / "shared"
+    eslint = tmp_path / "packages" / "config-eslint"
+    web = tmp_path / "web"
+    shared.mkdir(parents=True)
+    eslint.mkdir(parents=True)
+    web.mkdir()
+    (shared / "package.json").write_text('{"name": "@langfuse/shared", "version": "1.0.0"}')
+    (eslint / "package.json").write_text('{"name": "@repo/eslint-config", "version": "0.0.0"}')
+    (web / "package.json").write_text(
+        textwrap.dedent("""\
+            {
+              "name": "web",
+              "dependencies": {
+                "@langfuse/shared": "workspace:*",
+                "next": "16.2.6"
+              },
+              "devDependencies": {
+                "@repo/eslint-config": "workspace:*",
+                "typescript": "^5.9.3"
+              }
+            }
+        """)
+    )
+
+    by_name = {pkg.name: pkg for pkg in parse_npm_packages(web)}
+
+    assert by_name["@langfuse/shared"].version == "1.0.0"
+    assert by_name["@langfuse/shared"].version_source == "workspace"
+    assert by_name["@langfuse/shared"].declared_version == "workspace:*"
+    assert by_name["@langfuse/shared"].resolved_version == "1.0.0"
+    assert by_name["@langfuse/shared"].version_confidence == "workspace_manifest"
+    assert by_name["@langfuse/shared"].reachability_evidence == "workspace_manifest"
+    assert by_name["@repo/eslint-config"].version == "0.0.0"
+    assert by_name["next"].version == "16.2.6"
+    assert by_name["typescript"].version == "5.9.3"
+
+
 # ── ECOSYSTEM_MAP includes conda ──────────────────────────────────────────────
 
 
@@ -300,3 +355,38 @@ def test_conda_in_ecosystem_map():
     assert "conda" in ECOSYSTEM_MAP
     # conda maps to PyPI in OSV (conda packages are pip-installable)
     assert ECOSYSTEM_MAP["conda"] == "PyPI"
+
+
+# ── Git URL/SHA requirements ──────────────────────────────────────────────────
+
+
+def test_pip_git_url_requirement_marked_floating_not_exact(tmp_path):
+    """A `name @ git+…@<sha>` requirement must not claim an exact pin.
+
+    The version resolves to whatever the host env has installed, which is not an
+    exact match to the pinned commit; it must be flagged floating with lowered
+    confidence so downstream matching does not trust the coincidence.
+    """
+    (tmp_path / "requirements.txt").write_text(
+        "flask @ git+https://github.com/pallets/flask.git@a1b2c3d4e5f60718293a4b5c6d7e8f9012345678\nrequests==2.0.0\n",
+        encoding="utf-8",
+    )
+    pkgs = {p.name: p for p in parse_pip_packages(tmp_path)}
+
+    flask = pkgs["flask"]
+    assert flask.floating_reference is True
+    assert flask.version_confidence != "exact"
+    assert "git+" in (flask.declared_version or "")
+
+    # A normal pinned requirement is unaffected.
+    assert pkgs["requests"].floating_reference is False
+
+
+def test_pip_git_egg_requirement_marked_floating(tmp_path):
+    (tmp_path / "requirements.txt").write_text(
+        "git+https://github.com/pallets/flask.git@abcdef1234#egg=flask\n",
+        encoding="utf-8",
+    )
+    pkgs = {p.name: p for p in parse_pip_packages(tmp_path)}
+    assert "flask" in pkgs
+    assert pkgs["flask"].floating_reference is True

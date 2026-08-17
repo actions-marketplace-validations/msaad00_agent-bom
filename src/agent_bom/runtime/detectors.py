@@ -11,25 +11,35 @@ Pluggable detectors that analyze MCP JSON-RPC traffic in real-time:
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 
 from agent_bom.runtime.patterns import (
     CREDENTIAL_PATTERNS,
     DANGEROUS_ARG_PATTERNS,
     RESPONSE_BASE64_PATTERN,
+    RESPONSE_BIAS_PATTERNS,
     RESPONSE_CLOAKING_PATTERNS,
+    RESPONSE_HALLUCINATION_PATTERNS,
     RESPONSE_INJECTION_PATTERNS,
     RESPONSE_INVISIBLE_CHARS,
     RESPONSE_SVG_PATTERNS,
+    RESPONSE_TOXICITY_PATTERNS,
     SUSPICIOUS_SEQUENCES,
     detect_cortex_models,
     score_semantic_injection,
 )
+from agent_bom.runtime.patterns import (
+    PII_PATTERNS as _PII_PATTERNS,
+)
+from agent_bom.security import sanitize_sensitive_payload, sanitize_text
 
 
 class AlertSeverity(str, Enum):
@@ -54,11 +64,102 @@ class Alert:
         return {
             "type": "runtime_alert",
             "ts": self.timestamp,
-            "detector": self.detector,
+            "detector": sanitize_text(self.detector, max_len=100),
             "severity": self.severity.value,
-            "message": self.message,
-            "details": self.details,
+            "message": sanitize_text(self.message, max_len=500),
+            "details": sanitize_sensitive_payload(self.details),
         }
+
+
+# ─── Detector Telemetry ───────────────────────────────────────────────────
+#
+# Tracks fire counts, suppression counts, and false positive feedback
+# per detector. Exposed via Prometheus metrics when proxy runs with
+# --metrics-port.
+
+
+@dataclass
+class DetectorMetrics:
+    """Per-detector telemetry counters."""
+
+    fires: int = 0
+    suppressed: int = 0
+    false_positives: int = 0
+
+    def record_fire(self) -> None:
+        self.fires += 1
+
+    def record_suppression(self) -> None:
+        self.suppressed += 1
+
+    def record_false_positive(self) -> None:
+        self.false_positives += 1
+
+    @property
+    def false_positive_rate(self) -> float:
+        """False positive rate (0.0-1.0). Returns 0.0 if no fires."""
+        if self.fires == 0:
+            return 0.0
+        return self.false_positives / self.fires
+
+    def to_dict(self) -> dict:
+        return {
+            "fires": self.fires,
+            "suppressed": self.suppressed,
+            "false_positives": self.false_positives,
+            "false_positive_rate": round(self.false_positive_rate, 4),
+        }
+
+
+# Global metrics registry — one entry per detector name
+_DETECTOR_METRICS: dict[str, DetectorMetrics] = {}
+
+
+def get_detector_metrics(detector_name: str) -> DetectorMetrics:
+    """Get or create metrics for a detector."""
+    if detector_name not in _DETECTOR_METRICS:
+        _DETECTOR_METRICS[detector_name] = DetectorMetrics()
+    return _DETECTOR_METRICS[detector_name]
+
+
+def all_detector_metrics() -> dict[str, dict]:
+    """Return all detector metrics as a dict for API/Prometheus export."""
+    return {name: m.to_dict() for name, m in _DETECTOR_METRICS.items()}
+
+
+def reset_detector_metrics() -> None:
+    """Reset all metrics (for testing)."""
+    _DETECTOR_METRICS.clear()
+
+
+# ─── Detector Sensitivity Config ──────────────────────────────────────────
+#
+# Per-detector sensitivity levels loaded from .agent-bom.yaml:
+#   detectors:
+#     ArgumentAnalyzer: high       # high, medium, low, off
+#     RateLimitTracker: medium
+#     ResponseInspector: low
+
+_SENSITIVITY_LEVELS = ("off", "low", "medium", "high")
+_DEFAULT_SENSITIVITY = "high"
+_DETECTOR_SENSITIVITY: dict[str, str] = {}
+
+
+def configure_detector_sensitivity(config: dict[str, str]) -> None:
+    """Set per-detector sensitivity from project config."""
+    for name, level in config.items():
+        if level.lower() in _SENSITIVITY_LEVELS:
+            _DETECTOR_SENSITIVITY[name] = level.lower()
+
+
+def get_detector_sensitivity(detector_name: str) -> str:
+    """Get sensitivity level for a detector (default: high)."""
+    return _DETECTOR_SENSITIVITY.get(detector_name, _DEFAULT_SENSITIVITY)
+
+
+def is_detector_enabled(detector_name: str) -> bool:
+    """Check if a detector is enabled (sensitivity != off)."""
+    return get_detector_sensitivity(detector_name) != "off"
 
 
 # ─── Tool Drift Detector ────────────────────────────────────────────────────
@@ -69,14 +170,43 @@ class ToolDriftDetector:
 
     Compares the initial tools/list snapshot against subsequent ones.
     New tools that weren't in the initial set trigger HIGH alerts.
+    Persists baseline to disk so it survives engine restarts.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, restore: bool = False) -> None:
         self._baseline: set[str] | None = None
+        if restore:
+            self._restore_baseline()
+
+    @staticmethod
+    def _baseline_path() -> Path:
+        state_dir = Path(os.environ.get("AGENT_BOM_STATE_DIR", Path.home() / ".agent-bom"))
+        state_dir.mkdir(parents=True, exist_ok=True)
+        return state_dir / "drift_baseline.json"
+
+    def _persist_baseline(self) -> None:
+        try:
+            path = self._baseline_path()
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(sorted(self._baseline or [])))
+            tmp.replace(path)
+        except OSError:
+            pass
+
+    def _restore_baseline(self) -> None:
+        try:
+            path = self._baseline_path()
+            if path.exists():
+                tools = json.loads(path.read_text())
+                if isinstance(tools, list):
+                    self._baseline = set(tools)
+        except (OSError, json.JSONDecodeError):
+            pass
 
     def set_baseline(self, tools: list[str]) -> None:
         """Set the initial tool baseline from the first tools/list response."""
         self._baseline = set(tools)
+        self._persist_baseline()
 
     def check(self, current_tools: list[str]) -> list[Alert]:
         """Compare current tools against baseline. Returns alerts for new tools."""
@@ -124,9 +254,11 @@ class ArgumentAnalyzer:
     credential-like values, and Cortex AI model calls in argument strings.
     """
 
-    def check(self, tool_name: str, arguments: dict) -> list[Alert]:
+    def check(self, tool_name: str, arguments: dict | None) -> list[Alert]:
         """Analyze tool arguments for dangerous patterns and AI model usage."""
         alerts: list[Alert] = []
+        if not arguments:
+            return alerts
         for arg_name, arg_value in arguments.items():
             if not isinstance(arg_value, str):
                 arg_value = str(arg_value)
@@ -141,7 +273,7 @@ class ArgumentAnalyzer:
                                 "tool": tool_name,
                                 "argument": arg_name,
                                 "pattern": pattern_name,
-                                "value_preview": arg_value[:100],
+                                "value_preview": sanitize_sensitive_payload(arg_value[:100], key=arg_name),
                             },
                         )
                     )
@@ -175,19 +307,22 @@ class ArgumentAnalyzer:
 
 
 class CredentialLeakDetector:
-    """Detect API keys and tokens in tool response content.
+    """Detect and optionally redact API keys, tokens, and PII in tool responses.
 
     Scans the text content of tool call responses for known credential
-    patterns (AWS keys, GitHub tokens, OpenAI keys, etc.).
+    patterns (AWS keys, GitHub tokens, OpenAI keys, etc.) and PII
+    (email addresses, phone numbers, SSNs, credit card numbers).
+
+    When ``redact=True``, returns sanitized text with sensitive values
+    replaced by ``[REDACTED:<type>]`` markers.
     """
 
     def check(self, tool_name: str, response_text: str) -> list[Alert]:
-        """Scan response text for credential patterns."""
+        """Scan response text for credential and PII patterns."""
         alerts: list[Alert] = []
         for cred_name, pattern in CREDENTIAL_PATTERNS:
             matches = pattern.findall(response_text)
             if matches:
-                # Redact the actual credential value
                 redacted = [m[:4] + "..." if len(m) > 4 else "***" for m in matches[:3]]
                 alerts.append(
                     Alert(
@@ -202,17 +337,101 @@ class CredentialLeakDetector:
                         },
                     )
                 )
+        # PII detection
+        for pii_name, pattern in _PII_PATTERNS:
+            matches = pattern.findall(response_text)
+            if matches:
+                alerts.append(
+                    Alert(
+                        detector="pii_leak",
+                        severity=AlertSeverity.HIGH,
+                        message=f"PII detected: {pii_name} in response from {tool_name}",
+                        details={
+                            "tool": tool_name,
+                            "pii_type": pii_name,
+                            "match_count": len(matches),
+                        },
+                    )
+                )
         return alerts
+
+    @staticmethod
+    def redact(text: str) -> str:
+        """Return a copy of *text* with credentials and PII replaced.
+
+        Replaces matched values with ``[REDACTED:<type>]`` markers.
+        The original text is never modified.
+        """
+        result = text
+        for cred_name, pattern in CREDENTIAL_PATTERNS:
+            result = pattern.sub(f"[REDACTED:{cred_name}]", result)
+        for pii_name, pattern in _PII_PATTERNS:
+            result = pattern.sub(f"[REDACTED:{pii_name}]", result)
+        return result
+
+
+# ─── AI-safety response detectors (bias / toxicity / hallucination) ───────────
+
+
+class _PatternResponseDetector:
+    """Shared base for high-precision pattern detectors over response text.
+
+    Heuristic first-pass: flags explicit assertions, not topic mentions, to keep
+    false positives low. The LLM-harnessed red-team layer deepens detection.
+    """
+
+    detector_name: str = "ai_safety"
+    severity: AlertSeverity = AlertSeverity.MEDIUM
+    patterns: list[tuple[str, "re.Pattern"]] = []
+
+    def check(self, tool_name: str, response_text: str) -> list[Alert]:
+        alerts: list[Alert] = []
+        for pattern_name, pattern in self.patterns:
+            if pattern.search(response_text):
+                alerts.append(
+                    Alert(
+                        detector=self.detector_name,
+                        severity=self.severity,
+                        message=f"{self.detector_name} pattern '{pattern_name}' in response from {tool_name}",
+                        details={"tool": tool_name, "pattern": pattern_name},
+                    )
+                )
+        return alerts
+
+
+class BiasTriggerDetector(_PatternResponseDetector):
+    """Flag demographic-leading generalisations / stereotype assertions in responses."""
+
+    detector_name = "bias"
+    severity = AlertSeverity.MEDIUM
+    patterns = RESPONSE_BIAS_PATTERNS
+
+
+class ToxicityDetector(_PatternResponseDetector):
+    """Flag explicit threats or direct personal abuse in responses."""
+
+    detector_name = "toxicity"
+    severity = AlertSeverity.HIGH
+    patterns = RESPONSE_TOXICITY_PATTERNS
+
+
+class HallucinationDetector(_PatternResponseDetector):
+    """Flag fabricated citations / admitted fabrication / unsupported authority claims."""
+
+    detector_name = "hallucination"
+    severity = AlertSeverity.MEDIUM
+    patterns = RESPONSE_HALLUCINATION_PATTERNS
 
 
 # ─── Rate Limit Tracker ──────────────────────────────────────────────────────
 
 
 class RateLimitTracker:
-    """Track tool call rates and alert on excessive usage.
+    """Track tool call rates and block on excessive usage.
 
-    Uses a sliding window to track calls per tool. Alerts when any tool
-    exceeds the configured threshold within the window.
+    Uses a sliding window to track calls per source-agent and tool. When any
+    bucket exceeds the threshold, returns a CRITICAL alert with
+    ``blocked=True`` so the caller can enforce the rate limit.
     """
 
     def __init__(self, threshold: int = 50, window_seconds: float = 60.0) -> None:
@@ -220,13 +439,22 @@ class RateLimitTracker:
         self._window = window_seconds
         self._calls: dict[str, deque[float]] = {}
 
-    def record(self, tool_name: str) -> list[Alert]:
-        """Record a tool call and check rate limits."""
-        now = time.monotonic()
-        if tool_name not in self._calls:
-            self._calls[tool_name] = deque()
+    def record(self, tool_name: str, threshold: int | None = None, source_agent: str | None = None) -> list[Alert]:
+        """Record a tool call and check rate limits.
 
-        q = self._calls[tool_name]
+        Returns a CRITICAL alert with ``details.blocked = True`` when the
+        rate limit is exceeded, signaling the caller to deny the call.
+        """
+        effective_threshold = threshold if threshold is not None else self._threshold
+        if effective_threshold <= 0:
+            return []
+        now = time.monotonic()
+        agent_bucket = (source_agent or "anonymous").strip() or "anonymous"
+        bucket = f"{agent_bucket}:{tool_name}"
+        if bucket not in self._calls:
+            self._calls[bucket] = deque()
+
+        q = self._calls[bucket]
         q.append(now)
 
         # Prune old entries
@@ -234,17 +462,23 @@ class RateLimitTracker:
             q.popleft()
 
         alerts: list[Alert] = []
-        if len(q) >= self._threshold:
+        if len(q) >= effective_threshold:
+            # Escalate severity based on how far over the limit
+            over_ratio = len(q) / effective_threshold
+            severity = AlertSeverity.CRITICAL if over_ratio >= 2.0 else AlertSeverity.HIGH
             alerts.append(
                 Alert(
                     detector="rate_limit",
-                    severity=AlertSeverity.MEDIUM,
-                    message=f"Excessive tool calls: {tool_name} called {len(q)} times in {self._window}s (threshold: {self._threshold})",
+                    severity=severity,
+                    message=f"Rate limit exceeded: {tool_name} called {len(q)} times in {self._window}s (threshold: {effective_threshold})",
                     details={
                         "tool": tool_name,
+                        "source_agent": agent_bucket,
+                        "bucket": bucket,
                         "count": len(q),
-                        "threshold": self._threshold,
+                        "threshold": effective_threshold,
                         "window_seconds": self._window,
+                        "blocked": True,
                     },
                 )
             )
@@ -537,3 +771,116 @@ class VectorDBInjectionDetector:
                 alerts.append(alert)
 
         return alerts
+
+
+# ─── Cross-Agent Correlator ──────────────────────────────────────────────────
+
+
+class CrossAgentCorrelator:
+    """Detect suspicious patterns across multiple agent sessions.
+
+    Maintains per-agent tool call history and detects lateral movement
+    when multiple agents converge on the same sensitive tools within a
+    short time window — a strong signal of coordinated compromise or
+    credential-sharing between agents.
+    """
+
+    def __init__(self) -> None:
+        self._agent_calls: dict[str, list[dict]] = {}  # agent_id -> recent calls
+        self._baselines: dict[str, dict] = {}  # agent_id -> tool frequency baseline
+        self._max_history = 1000
+
+    def record_call(self, agent_id: str, tool_name: str, timestamp: float) -> None:
+        """Record a tool call for cross-agent analysis."""
+        if agent_id not in self._agent_calls:
+            self._agent_calls[agent_id] = []
+        self._agent_calls[agent_id].append(
+            {
+                "tool": tool_name,
+                "timestamp": timestamp,
+            }
+        )
+        # Trim history to bounded size to prevent unbounded memory growth
+        if len(self._agent_calls[agent_id]) > self._max_history:
+            self._agent_calls[agent_id] = self._agent_calls[agent_id][-self._max_history :]
+
+    def detect_lateral_movement(self) -> list[dict]:
+        """Detect when multiple agents access the same sensitive tools in sequence.
+
+        Flags tools used by 3 or more distinct agents within a 5-minute window.
+        This pattern indicates lateral movement, credential sharing, or a
+        coordinated attack across agent sessions.
+
+        Returns:
+            List of alert dicts with type ``cross_agent_tool_convergence``.
+        """
+        alerts: list[dict] = []
+        recent_window = time.time() - 300  # 5-minute window
+
+        # Collect which agents used each tool in the window
+        tool_agents: dict[str, list[str]] = {}
+        for agent_id, calls in self._agent_calls.items():
+            for call in calls:
+                if call["timestamp"] > recent_window:
+                    tool = call["tool"]
+                    if tool not in tool_agents:
+                        tool_agents[tool] = []
+                    if agent_id not in tool_agents[tool]:
+                        tool_agents[tool].append(agent_id)
+
+        # Flag tools used by 3+ different agents in the window
+        for tool, agents in tool_agents.items():
+            if len(agents) >= 3:
+                alerts.append(
+                    {
+                        "type": "cross_agent_tool_convergence",
+                        "tool": tool,
+                        "agents": agents,
+                        "severity": "high",
+                        "message": (
+                            f"Tool '{tool}' used by {len(agents)} agents in 5-minute window — "
+                            "possible lateral movement or coordinated access"
+                        ),
+                    }
+                )
+
+        return alerts
+
+    def compute_baseline(self, agent_id: str) -> dict:
+        """Compute tool frequency baseline for anomaly detection.
+
+        Returns a dict mapping tool name to its relative frequency (0.0–1.0)
+        in the agent's historical call log.
+        """
+        calls = self._agent_calls.get(agent_id, [])
+        freq: dict[str, int] = {}
+        for call in calls:
+            freq[call["tool"]] = freq.get(call["tool"], 0) + 1
+        total = sum(freq.values()) or 1
+        return {tool: count / total for tool, count in freq.items()}
+
+    def update_baseline(self, agent_id: str) -> None:
+        """Compute and store the tool frequency baseline for an agent.
+
+        Should be called periodically (e.g. after every N calls) to keep
+        the baseline current without paying compute cost on every call.
+        """
+        self._baselines[agent_id] = self.compute_baseline(agent_id)
+
+    def detect_anomaly(self, agent_id: str, tool_name: str) -> bool:
+        """Check if a tool call is anomalous based on historical baseline.
+
+        Returns True when the tool has never been seen in the stored baseline,
+        which indicates either a new capability being exercised or an agent
+        behaving outside its normal operational envelope.
+
+        The baseline must be stored via ``update_baseline()`` before this
+        method will return meaningful results.  Returns False (not anomalous)
+        when no baseline exists for the agent.
+        """
+        baseline = self._baselines.get(agent_id)
+        if not baseline:
+            return False
+        expected_freq = baseline.get(tool_name, 0.0)
+        # Tool never seen in baseline = anomalous
+        return expected_freq == 0.0

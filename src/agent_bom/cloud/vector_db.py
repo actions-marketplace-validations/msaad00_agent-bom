@@ -28,8 +28,6 @@ from __future__ import annotations
 import json
 import logging
 import socket
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -64,6 +62,8 @@ _HEALTH_ENDPOINTS: dict[str, str] = {
 }
 
 _DEFAULT_TIMEOUT = 3  # seconds
+
+_PROBE_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 MAESTRO_LAYER = "KC4: Memory & Context"
 
@@ -130,6 +130,19 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
+def _validate_probe_target(host: str, port: int) -> str | None:
+    """Return an error string when the host must not be probed (SSRF guard)."""
+    from agent_bom.security import SecurityError, validate_url
+
+    cleaned = (host or "").strip().lower()
+    allow_private = cleaned in _PROBE_LOOPBACK_HOSTS
+    try:
+        validate_url(f"http://{host}:{port}/", allowed_schemes=("http",), allow_private=allow_private)
+    except SecurityError as exc:
+        return str(exc)
+    return None
+
+
 def _http_get(host: str, port: int, path: str, timeout: int = _DEFAULT_TIMEOUT) -> tuple[int, bytes]:
     """Make a plain HTTP GET request; return (status_code, body_bytes).
 
@@ -139,11 +152,12 @@ def _http_get(host: str, port: int, path: str, timeout: int = _DEFAULT_TIMEOUT) 
     if not url.startswith(("http://", "https://")):  # defensive
         return -1, b""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "agent-bom/vectordb-check"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
-            return resp.status, resp.read()
-    except urllib.error.HTTPError as e:
-        return e.code, b""
+        from agent_bom.http_client import sync_get
+
+        resp = sync_get(url, timeout=timeout, headers={"User-Agent": "agent-bom/vectordb-check"})
+        if resp is None:
+            return -1, b""
+        return resp.status_code, resp.content
     except Exception:
         return -1, b""
 
@@ -232,6 +246,21 @@ def check_vector_db(
             is_loopback=_is_loopback(host),
             risk_flags=[],
             metadata={"error": f"Unknown db_type '{db_type}'"},
+        )
+
+    deny_reason = _validate_probe_target(host, resolved_port)
+    if deny_reason:
+        return VectorDBResult(
+            db_type=db_type,
+            host=host,
+            port=resolved_port,
+            is_reachable=False,
+            requires_auth=True,
+            version="",
+            collection_count=0,
+            is_loopback=_is_loopback(host),
+            risk_flags=[],
+            metadata={"error": deny_reason},
         )
 
     result = VectorDBResult(
@@ -336,7 +365,7 @@ def discover_vector_dbs(
 
 
 # ---------------------------------------------------------------------------
-# Pinecone cloud vector DB — API-authenticated scanning (closes #310)
+# Pinecone cloud vector DB — API-authenticated scanning
 # ---------------------------------------------------------------------------
 
 _PINECONE_API_BASE = "https://api.pinecone.io"
@@ -390,27 +419,53 @@ def _pinecone_get(path: str, api_key: str, timeout: int = _DEFAULT_TIMEOUT) -> t
     """
     url = f"{_PINECONE_API_BASE}{path}"
     try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Api-Key": api_key,
-                "User-Agent": "agent-bom/pinecone-scan",
-                "Accept": "application/json",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
-            return resp.status, json.loads(resp.read())
-    except urllib.error.HTTPError as e:
+        from agent_bom.http_client import create_sync_client, sync_request_with_retry
+
+        hdrs = {
+            "Api-Key": api_key,
+            "User-Agent": "agent-bom/pinecone-scan",
+            "Accept": "application/json",
+        }
+        with create_sync_client(timeout=timeout) as client:
+            resp = sync_request_with_retry(client, "GET", url, headers=hdrs)
+        if resp is None:
+            return -1, {}
         try:
-            body = json.loads(e.read())
+            body = resp.json()
         except Exception:
             body = {}
-        return e.code, body
+        return resp.status_code, body
     except Exception as exc:
         # Sanitize: ensure the API key cannot appear in logged exception messages.
         sanitized = str(exc).replace(api_key, "***REDACTED***") if api_key else str(exc)
         logger.debug("Pinecone request failed: %s", sanitized)
         return -1, {}
+
+
+def _record_pinecone_coverage_gap(reason: str, detail: str) -> None:
+    """Emit a structured coverage warning when Pinecone could not be evaluated.
+
+    A 401/403/outage must be distinguishable from a genuinely empty account:
+    both otherwise return an empty result and read as "no vector databases".
+    Mirrors the Snowflake inventory-failure coverage-warning contract so the
+    gap surfaces in the report instead of masquerading as a clean empty.
+    """
+    try:
+        from agent_bom.coverage import CoverageWarning
+        from agent_bom.scanners.state import record_coverage_warning
+
+        record_coverage_warning(
+            CoverageWarning(
+                ecosystem="pinecone",
+                release=f"pinecone:{reason}",
+                reason=reason,
+                detail=detail,
+                package_count=0,
+                advisory_rows=0,
+            ).to_dict()
+        )
+    except Exception:  # noqa: BLE001 — coverage evidence is supplementary; never fail discovery
+        logger.debug("Could not record Pinecone coverage warning", exc_info=True)
 
 
 def check_pinecone(api_key: str, timeout: int = _DEFAULT_TIMEOUT) -> list[PineconeIndexResult]:
@@ -437,12 +492,24 @@ def check_pinecone(api_key: str, timeout: int = _DEFAULT_TIMEOUT) -> list[Pineco
     status, data = _pinecone_get("/indexes", api_key, timeout)
     if status == 401:
         logger.warning("Pinecone: invalid or expired API key")
+        _record_pinecone_coverage_gap(
+            "pinecone_auth_failed",
+            "Pinecone API key invalid or expired (HTTP 401); indexes were not evaluated.",
+        )
         return []
     if status == 403:
         logger.warning("Pinecone: API key lacks list-indexes permission")
+        _record_pinecone_coverage_gap(
+            "pinecone_permission_denied",
+            "Pinecone API key lacks list-indexes permission (HTTP 403); indexes were not evaluated.",
+        )
         return []
     if status < 0 or status >= 300:
         logger.debug("Pinecone: unexpected status %d listing indexes", status)
+        _record_pinecone_coverage_gap(
+            "pinecone_api_unavailable",
+            f"Pinecone API returned status {status} listing indexes; indexes were not evaluated.",
+        )
         return []
 
     indexes = data.get("indexes", [])

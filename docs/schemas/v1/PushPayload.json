@@ -1,0 +1,244 @@
+{
+  "$defs": {
+    "ScanIssuePayload": {
+      "additionalProperties": false,
+      "description": "Bounded execution issue accepted from a trusted scan producer.",
+      "properties": {
+        "affects_coverage": {
+          "default": true,
+          "title": "Affects Coverage",
+          "type": "boolean"
+        },
+        "code": {
+          "maxLength": 100,
+          "minLength": 1,
+          "title": "Code",
+          "type": "string"
+        },
+        "message": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        },
+        "severity": {
+          "default": "warning",
+          "enum": [
+            "warning",
+            "error"
+          ],
+          "title": "Severity",
+          "type": "string"
+        },
+        "source": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Source",
+          "type": "string"
+        },
+        "stage": {
+          "maxLength": 100,
+          "minLength": 1,
+          "title": "Stage",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "stage",
+        "source",
+        "message"
+      ],
+      "title": "ScanIssuePayload",
+      "type": "object"
+    },
+    "ScanRunPayload": {
+      "additionalProperties": true,
+      "description": "Canonical evidence-quality contract, separate from job lifecycle.",
+      "properties": {
+        "complete_scope_count": {
+          "default": 0,
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Complete Scope Count",
+          "type": "integer"
+        },
+        "incomplete_scope_count": {
+          "default": 0,
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Incomplete Scope Count",
+          "type": "integer"
+        },
+        "issues": {
+          "items": {
+            "$ref": "#/$defs/ScanIssuePayload"
+          },
+          "maxItems": 100,
+          "title": "Issues",
+          "type": "array"
+        },
+        "outcome": {
+          "default": "complete",
+          "enum": [
+            "complete",
+            "partial",
+            "failed"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "requested_scope_count": {
+          "default": 0,
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Requested Scope Count",
+          "type": "integer"
+        },
+        "scopes": {
+          "items": {
+            "$ref": "#/$defs/ScanScopePayload"
+          },
+          "maxItems": 100,
+          "title": "Scopes",
+          "type": "array"
+        },
+        "warning_count": {
+          "default": 0,
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Warning Count",
+          "type": "integer"
+        }
+      },
+      "title": "ScanRunPayload",
+      "type": "object"
+    },
+    "ScanScopePayload": {
+      "additionalProperties": false,
+      "description": "Bounded completeness metadata for one requested collection scope.",
+      "properties": {
+        "item_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Item Count"
+        },
+        "message": {
+          "default": "",
+          "maxLength": 500,
+          "title": "Message",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 100,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "requested": {
+          "default": true,
+          "title": "Requested",
+          "type": "boolean"
+        },
+        "status": {
+          "enum": [
+            "complete",
+            "partial",
+            "unsupported",
+            "unavailable",
+            "permission_denied",
+            "skipped"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "status"
+      ],
+      "title": "ScanScopePayload",
+      "type": "object"
+    }
+  },
+  "additionalProperties": true,
+  "properties": {
+    "agents": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Agents",
+      "type": "array"
+    },
+    "blast_radii": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Blast Radii",
+      "type": "array"
+    },
+    "endpoint_inventory": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Endpoint Inventory"
+    },
+    "idempotency_key": {
+      "default": "",
+      "title": "Idempotency Key",
+      "type": "string"
+    },
+    "scan_run": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ScanRunPayload"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "source_id": {
+      "default": "",
+      "maxLength": 200,
+      "title": "Source Id",
+      "type": "string"
+    },
+    "warnings": {
+      "items": {
+        "anyOf": [
+          {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          {
+            "type": "string"
+          }
+        ]
+      },
+      "maxItems": 100,
+      "title": "Warnings",
+      "type": "array"
+    }
+  },
+  "title": "PushPayload",
+  "type": "object"
+}

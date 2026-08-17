@@ -1,7 +1,17 @@
 name: Deployment Freshness
 
-# Checks that all live deployments (Railway/Smithery) serve the latest
-# released version.  Runs daily and on-demand.  Opens an issue if stale.
+# Checks that the protected Railway surface serves the exact latest release
+# version and MCP tool-schema inventory, and that
+# the Smithery catalog listing is live with a non-empty tool inventory. Runs
+# daily and on-demand. Opens an issue if stale or misconfigured.
+#
+# No hosted-demo probe here. The public demo IS ours (Cloud Run, see
+# demo-deploy-cloudrun.yml), but its freshness is gated at deploy time: that
+# workflow asserts the served version matches the image it just pushed and that
+# the seeded estate is non-empty, and it fails the deploy otherwise. Its URL is
+# also not a repo-level configured surface, so there is nothing for this daily
+# probe to resolve. If the demo ever needs continuous monitoring rather than
+# deploy-time verification, add it here rather than assuming it is covered.
 
 on:
   schedule:
@@ -10,94 +20,285 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Get expected version from repo
+      - name: Get expected contract from latest published release
         id: expected
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION=$(python3 -c "
-          import re, pathlib
-          text = pathlib.Path('pyproject.toml').read_text()
-          m = re.search(r'version\s*=\s*\"([^\"]+)\"', text)
-          print(m.group(1))
-          ")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Expected version: $VERSION"
+          set -euo pipefail
+          RELEASE_JSON=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest")
+          RELEASE_TAG=$(echo "$RELEASE_JSON" | jq -er '.tag_name')
+          if [ "$(echo "$RELEASE_JSON" | jq -r '.draft != false')" = "true" ]; then
+            echo "::error::Latest GitHub release is a draft"
+            exit 1
+          fi
+          git fetch --force --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          RELEASE_SHA=$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")
+          VERSION="${RELEASE_TAG#v}"
+          METRICS_JSON=$(git show "${RELEASE_SHA}:docs/PRODUCT_METRICS.json")
+          METRICS_VERSION=$(echo "$METRICS_JSON" | jq -er '.version')
+          TOOL_COUNT=$(echo "$METRICS_JSON" | jq -er 'first(.metrics[] | select(.name == "MCP tools") | .value)')
+          if [ "$METRICS_VERSION" != "$VERSION" ]; then
+            echo "::error::Published release metrics version $METRICS_VERSION does not match $VERSION"
+            exit 1
+          fi
+          if ! echo "$TOOL_COUNT" | grep -qE '^[1-9][0-9]*$'; then
+            echo "::error::Published release metrics do not declare a positive MCP tool count"
+            exit 1
+          fi
+          {
+            echo "version=$VERSION"
+            echo "tool_count=$TOOL_COUNT"
+            echo "release_sha=$RELEASE_SHA"
+          } >> "$GITHUB_OUTPUT"
+          echo "Expected published contract: v${VERSION}, ${TOOL_COUNT} MCP tools"
 
       - name: Check Railway deployment
+        shell: bash
         id: railway
         continue-on-error: true
+        env:
+          RAILWAY_MCP_URL: ${{ vars.RAILWAY_MCP_URL }}
+          RAILWAY_MCP_BEARER_TOKEN: ${{ secrets.RAILWAY_MCP_BEARER_TOKEN }}
         run: |
-          DEPLOY_URL="https://agent-bom-mcp.up.railway.app"
-          echo "Checking $DEPLOY_URL/health ..."
-          RESPONSE=$(curl -sf --max-time 15 "$DEPLOY_URL/health" 2>/dev/null || echo '{}')
-          DEPLOYED=$(echo "$RESPONSE" | python3 -c "
-          import sys, json
+          set -euo pipefail
+          DEPLOY_URL="${RAILWAY_MCP_URL:-https://agent-bom-mcp.up.railway.app}"
+          if RESPONSE=$(PYTHONPATH=src python3 -m agent_bom.deployment_probe \
+            --base-url "$DEPLOY_URL" \
+            --bearer-token "${RAILWAY_MCP_BEARER_TOKEN:-}" \
+            --server-card \
+            --expected-version "${{ steps.expected.outputs.version }}" \
+            --expected-tool-count "${{ steps.expected.outputs.tool_count }}" \
+            --attempts 3 \
+            --backoff-seconds 5 \
+            --timeout 15); then
+            DEPLOYED=$(echo "$RESPONSE" | jq -er '.serverInfo.version')
+            TOOL_COUNT=$(echo "$RESPONSE" | jq -er '.tools | length')
+          else
+            {
+              echo "railway_version=unreachable"
+              echo "tool_count=unknown"
+              echo "probe_failed=true"
+            } >> "$GITHUB_OUTPUT"
+            echo "::warning::Railway server card does not match the latest published release contract"
+            exit 0
+          fi
+          {
+            echo "railway_version=$DEPLOYED"
+            echo "tool_count=$TOOL_COUNT"
+          } >> "$GITHUB_OUTPUT"
+          echo "Railway contract: v${DEPLOYED}, ${TOOL_COUNT} tools"
+
+      - name: Check Smithery catalog listing
+        shell: bash
+        id: public
+        continue-on-error: true
+        env:
+          SMITHERY_SERVER_QUALIFIED_NAME: ${{ vars.SMITHERY_SERVER_QUALIFIED_NAME }}
+        run: |
+          QUALIFIED_NAME="${SMITHERY_SERVER_QUALIFIED_NAME:-agent-bom/agent-bom}"
+          RESPONSE=$(python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          name = os.environ.get("SMITHERY_SERVER_QUALIFIED_NAME") or "agent-bom/agent-bom"
+          if "/" not in name:
+              print(json.dumps({"error": f"invalid Smithery qualified name: {name!r}"}))
+              sys.exit(1)
+          namespace, server = name.split("/", 1)
+          url = "https://api.smithery.ai/servers/" + urllib.parse.quote(namespace, safe="") + "/" + urllib.parse.quote(server, safe="")
+          req = urllib.request.Request(
+              url,
+              headers={"Accept": "application/json", "User-Agent": "agent-bom-deployment-freshness"},
+          )
           try:
-              data = json.load(sys.stdin)
-              print(data.get('version', 'unknown'))
-          except Exception:
-              print('unreachable')
+              with urllib.request.urlopen(req, timeout=15) as response:
+                  data = json.loads(response.read().decode("utf-8", errors="replace"))
+          except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+              print(json.dumps({"error": str(exc), "url": url}))
+              sys.exit(1)
+          tools = data.get("tools") if isinstance(data.get("tools"), list) else []
+          print(json.dumps({
+              "qualified_name": data.get("qualifiedName"),
+              "remote": bool(data.get("remote")),
+              "deployment_url": data.get("deploymentUrl") or "",
+              "tool_count": len(tools),
+          }, separators=(",", ":")))
+          PY
+          ) || {
+            {
+              echo "public_version=unreachable"
+              echo "tool_count=unknown"
+              echo "auth_required=smithery-oauth"
+              echo "probe_failed=true"
+            } >> "$GITHUB_OUTPUT"
+            echo "::warning::Could not verify Smithery catalog listing"
+            exit 0
+          }
+          STATE=$(echo "$RESPONSE" | EXPECTED_QUALIFIED_NAME="$QUALIFIED_NAME" python3 -c "
+          import json, os, sys
+          data = json.load(sys.stdin)
+          if data.get('qualified_name') != os.environ['EXPECTED_QUALIFIED_NAME'] or not data.get('remote') or not data.get('deployment_url') or int(data.get('tool_count') or 0) < 1:
+              print('invalid')
+          else:
+              print('catalog_live')
           ")
-          echo "railway_version=$DEPLOYED" >> "$GITHUB_OUTPUT"
-          echo "Railway version: $DEPLOYED (expected: ${{ steps.expected.outputs.version }})"
-          if [ "$DEPLOYED" != "${{ steps.expected.outputs.version }}" ]; then
-            echo "stale=true" >> "$GITHUB_OUTPUT"
+          TOOL_COUNT=$(echo "$RESPONSE" | python3 -c "import json, sys; print(json.load(sys.stdin).get('tool_count', 'unknown'))")
+          DEPLOY_URL=$(echo "$RESPONSE" | python3 -c "import json, sys; print(json.load(sys.stdin).get('deployment_url', 'unknown'))")
+          {
+            echo "public_version=$STATE"
+            echo "tool_count=$TOOL_COUNT"
+            echo "auth_required=smithery-oauth"
+          } >> "$GITHUB_OUTPUT"
+          echo "Smithery catalog state: $STATE"
+          echo "Smithery deployment URL: $DEPLOY_URL"
+          echo "Smithery tool count: $TOOL_COUNT"
+          if [ "$STATE" != "catalog_live" ]; then
+            echo "probe_failed=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Smithery catalog listing is missing remote deployment metadata or tools"
           fi
 
-      - name: Check Smithery tool count
-        id: smithery
-        continue-on-error: true
-        run: |
-          DEPLOY_URL="https://agent-bom-mcp.up.railway.app"
-          # Connect to MCP endpoint and check capabilities
-          RESPONSE=$(curl -sf --max-time 15 "$DEPLOY_URL/health" 2>/dev/null || echo '{}')
-          TOOL_COUNT=$(echo "$RESPONSE" | python3 -c "
-          import sys, json
-          try:
-              data = json.load(sys.stdin)
-              print(data.get('tools', 'unknown'))
-          except Exception:
-              print('unknown')
-          ")
-          echo "tool_count=$TOOL_COUNT" >> "$GITHUB_OUTPUT"
-          echo "Deployed tool count: $TOOL_COUNT"
-
-      - name: Open issue if stale
-        if: steps.railway.outputs.stale == 'true'
+      - name: Open issue if deployment surfaces drift or public endpoint is misconfigured
+        shell: bash
+        if: steps.railway.outputs.stale == 'true' || steps.railway.outputs.probe_failed == 'true' || steps.public.outputs.stale == 'true' || steps.public.outputs.auth_gate == 'true' || steps.public.outputs.probe_failed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           EXPECTED="${{ steps.expected.outputs.version }}"
           RAILWAY="${{ steps.railway.outputs.railway_version }}"
-          TOOLS="${{ steps.smithery.outputs.tool_count }}"
+          RAILWAY_TOOLS="${{ steps.railway.outputs.tool_count }}"
+          PUBLIC="${{ steps.public.outputs.public_version }}"
+          PUBLIC_TOOLS="${{ steps.public.outputs.tool_count }}"
+          PUBLIC_AUTH="${{ steps.public.outputs.auth_required }}"
+          TITLE="supply-chain-drift: deployment surfaces out of sync"
+          LEGACY_TITLE_PREFIX="${TITLE} with "
 
-          # Check if an issue already exists
-          EXISTING=$(gh issue list --label "deployment-stale" --state open --json number --jq 'length')
-          if [ "$EXISTING" -gt "0" ]; then
-            echo "Stale deployment issue already open — skipping"
+          gh label create supply-chain-drift --color FBCA04 --description "Automated supply-chain or deployment drift detection" >/dev/null 2>&1 || true
+          gh label create security-preventive --color 0E8A16 --description "Preventive daily security automation findings" >/dev/null 2>&1 || true
+          gh label create automated --color 5319E7 --description "Opened or updated automatically by CI" >/dev/null 2>&1 || true
+
+          # Match the stable title and migrate version-bound alerts created by
+          # older workflow revisions. Labels and the exact prefix keep the
+          # separate distribution-surface alert out of scope.
+          EXISTING=$(gh issue list --state open --label automated --label supply-chain-drift --limit 100 --json number,title |
+            jq -r --arg title "$TITLE" --arg legacy "$LEGACY_TITLE_PREFIX" '.[] | select(.title == $title or (.title | startswith($legacy))) | .number' |
+            head -n 1)
+          if [ -n "$EXISTING" ]; then
+            gh issue edit "$EXISTING" --title "$TITLE"
+            gh issue comment "$EXISTING" --body "$(cat <<EOF
+          ## Supply-Chain Drift Check Failed
+
+          | Surface | Version | Expected | Auth Required | Tool Count |
+          |---------|---------|----------|---------------|------------|
+          | Railway (protected) | $RAILWAY | $EXPECTED | true | $RAILWAY_TOOLS |
+          | Public marketplace | $PUBLIC | $EXPECTED | $PUBLIC_AUTH | $PUBLIC_TOOLS |
+
+          **Action**: Ensure the protected Railway deployment is fresh and the Smithery catalog API lists a remote deployment with tools, then re-run this workflow.
+
+          This issue was auto-updated by the deployment-freshness workflow.
+          EOF
+          )"
             exit 0
           fi
 
           gh issue create \
-            --title "Deployment stale: Railway serving $RAILWAY, expected $EXPECTED" \
-            --label "deployment-stale,bug" \
+            --title "$TITLE" \
+            --label "supply-chain-drift,security-preventive,automated" \
             --body "$(cat <<EOF
-          ## Deployment Freshness Check Failed
+          ## Supply-Chain Drift Check Failed
 
-          | Surface | Deployed | Expected |
-          |---------|----------|----------|
-          | Railway | $RAILWAY | $EXPECTED |
-          | Tool count | $TOOLS | (check mcp_server.py) |
+          | Surface | Version | Expected | Auth Required | Tool Count |
+          |---------|---------|----------|---------------|------------|
+          | Railway (protected) | $RAILWAY | $EXPECTED | true | $RAILWAY_TOOLS |
+          | Public marketplace | $PUBLIC | $EXPECTED | $PUBLIC_AUTH | $PUBLIC_TOOLS |
 
-          **Action**: Re-run the Deploy MCP SSE workflow or trigger a new release.
+          **Action**: Ensure the protected Railway deployment is fresh and the Smithery catalog API lists a remote deployment with tools, then re-run this workflow.
 
           This issue was auto-created by the deployment-freshness workflow.
           EOF
           )"
+
+      - name: Open or update misconfiguration issue for unmonitored surfaces
+        if: steps.public.outputs.not_configured == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const title = "deployment-monitoring: a deployment surface is UNMONITORED (missing config)";
+            const labels = ["supply-chain-drift", "security-preventive", "automated"];
+
+            const unmonitored = [
+              "**Smithery / public marketplace** — set repo variable `SMITHERY_SERVER_QUALIFIED_NAME` only if the listing is not `agent-bom/agent-bom`. The monitor checks Smithery's catalog API because Smithery-hosted remotes are OAuth-gated and do not expose agent-bom `/health`.",
+            ];
+
+            const body = [
+              "## Deployment surface is unmonitored",
+              "",
+              "One or more deployment surfaces have no monitoring configuration, so drift on them is invisible. This issue replaces the old silent `::notice:: skipping` behavior.",
+              "",
+              ...unmonitored.map((u) => `- ${u}`),
+              "",
+              "Set the named repo variable(s) under **Settings → Secrets and variables → Actions → Variables**, then re-run the **Deployment Freshness** workflow. This issue auto-closes once every surface is monitored.",
+            ].join("\n");
+
+            for (const name of labels) {
+              try { await github.rest.issues.createLabel({ owner, repo, name }); } catch (e) {}
+            }
+            const existing = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: "open", labels: "supply-chain-drift", per_page: 100,
+            });
+            const match = existing.find((issue) => issue.title === title);
+            if (match) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: match.number, body });
+              return;
+            }
+            await github.rest.issues.create({ owner, repo, title, body, labels });
+
+      - name: Close misconfiguration issue when every surface is monitored
+        if: steps.public.outputs.not_configured != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE="deployment-monitoring: a deployment surface is UNMONITORED (missing config)"
+          EXISTING=$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue close "$EXISTING" --comment "All deployment surfaces are now configured for monitoring; closing the misconfiguration alert."
+          fi
+
+      - name: Close supply-chain drift issue when deployment is fresh
+        if: steps.railway.outputs.stale != 'true' && steps.railway.outputs.probe_failed != 'true' && steps.public.outputs.not_configured != 'true' && steps.public.outputs.stale != 'true' && steps.public.outputs.probe_failed != 'true' && steps.public.outputs.auth_gate != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE="supply-chain-drift: deployment surfaces out of sync"
+          LEGACY_TITLE_PREFIX="${TITLE} with "
+          # Close every stable or legacy deployment alert. The title predicate
+          # deliberately excludes the separate distribution-surface issue.
+          gh issue list --state open --label automated --label supply-chain-drift --limit 100 --json number,title |
+            jq -r --arg title "$TITLE" --arg legacy "$LEGACY_TITLE_PREFIX" '.[] | select(.title == $title or (.title | startswith($legacy))) | .number' |
+            while read -r issue; do
+              if [ -n "$issue" ]; then
+                gh issue close "$issue" --comment "Deployment freshness check is clean again; closing the automated supply-chain drift alert."
+              fi
+            done

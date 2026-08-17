@@ -11,7 +11,9 @@ from agent_bom.cli._analysis import (
     analytics_cmd,
     dashboard_cmd,
     graph_cmd,
+    graph_evidence_cmd,
     introspect_cmd,
+    mesh_cmd,
 )
 
 # ---------------------------------------------------------------------------
@@ -61,6 +63,33 @@ def test_analytics_top_cves():
     mock_store.query_top_cves.return_value = [{"cve_id": "CVE-2025-0001", "cnt": 5, "max_cvss": 9.8}]
     with patch("agent_bom.api.clickhouse_store.ClickHouseAnalyticsStore", return_value=mock_store):
         result = runner.invoke(analytics_cmd, ["top-cves", "--clickhouse-url", "http://localhost:8123"])
+        assert result.exit_code == 0
+
+
+def test_analytics_fleet():
+    runner = CliRunner()
+    mock_store = MagicMock()
+    mock_store.query_top_riskiest_agents.return_value = [
+        {
+            "agent_name": "alpha",
+            "lifecycle_state": "discovered",
+            "trust_score": 42.0,
+            "vuln_count": 3,
+            "credential_count": 1,
+            "tenant_id": "default",
+        }
+    ]
+    with patch("agent_bom.api.clickhouse_store.ClickHouseAnalyticsStore", return_value=mock_store):
+        result = runner.invoke(analytics_cmd, ["fleet", "--clickhouse-url", "http://localhost:8123"])
+        assert result.exit_code == 0
+
+
+def test_analytics_compliance():
+    runner = CliRunner()
+    mock_store = MagicMock()
+    mock_store.query_compliance_heatmap.return_value = [{"framework": "owasp-llm-top10", "status": "fail", "cnt": 2, "avg_score": 40.0}]
+    with patch("agent_bom.api.clickhouse_store.ClickHouseAnalyticsStore", return_value=mock_store):
+        result = runner.invoke(analytics_cmd, ["compliance", "--clickhouse-url", "http://localhost:8123"])
         assert result.exit_code == 0
 
 
@@ -127,6 +156,26 @@ def test_graph_cmd_dot_with_output(tmp_path):
         assert out_file.exists()
 
 
+def test_graph_cmd_quiet_suppresses_export_message(tmp_path):
+    runner = CliRunner()
+    scan_file = tmp_path / "scan.json"
+    scan_file.write_text("{}")
+    out_file = tmp_path / "graph.dot"
+
+    mock_graph = MagicMock()
+    mock_graph.node_count.return_value = 2
+    mock_graph.edge_count.return_value = 1
+
+    with (
+        patch("agent_bom.output.graph_export.load_graph_from_scan", return_value=mock_graph),
+        patch("agent_bom.output.graph_export.to_dot", return_value="digraph {}"),
+    ):
+        result = runner.invoke(graph_cmd, [str(scan_file), "-f", "dot", "-o", str(out_file), "--quiet"])
+        assert result.exit_code == 0
+        assert out_file.exists()
+        assert "Graph exported" not in result.output
+
+
 def test_graph_cmd_mermaid(tmp_path):
     runner = CliRunner()
     scan_file = tmp_path / "scan.json"
@@ -135,10 +184,26 @@ def test_graph_cmd_mermaid(tmp_path):
     mock_graph = MagicMock()
     with (
         patch("agent_bom.output.graph_export.load_graph_from_scan", return_value=mock_graph),
-        patch("agent_bom.output.graph_export.to_mermaid", return_value="graph TD"),
+        patch("agent_bom.output.graph_export.to_mermaid", return_value="graph TD") as mermaid_mock,
     ):
         result = runner.invoke(graph_cmd, [str(scan_file), "-f", "mermaid"])
         assert result.exit_code == 0
+        mermaid_mock.assert_called_once_with(mock_graph, max_nodes=80)
+
+
+def test_graph_cmd_mermaid_limit_zero_renders_full_graph(tmp_path):
+    runner = CliRunner()
+    scan_file = tmp_path / "scan.json"
+    scan_file.write_text("{}")
+
+    mock_graph = MagicMock()
+    with (
+        patch("agent_bom.output.graph_export.load_graph_from_scan", return_value=mock_graph),
+        patch("agent_bom.output.graph_export.to_mermaid", return_value="graph TD") as mermaid_mock,
+    ):
+        result = runner.invoke(graph_cmd, [str(scan_file), "-f", "mermaid", "--mermaid-limit", "0"])
+        assert result.exit_code == 0
+        mermaid_mock.assert_called_once_with(mock_graph, max_nodes=None, max_edges=None)
 
 
 def test_graph_cmd_load_error(tmp_path):
@@ -151,6 +216,195 @@ def test_graph_cmd_load_error(tmp_path):
         assert result.exit_code == 1
 
 
+def test_graph_evidence_cmd_exports_manifest_from_local_graph_db(tmp_path):
+    from agent_bom.db.graph_store import open_graph_db, save_graph
+    from agent_bom.graph import EntityType, UnifiedGraph, UnifiedNode
+
+    db_path = tmp_path / "graph.db"
+    old_graph = UnifiedGraph(scan_id="old-scan", tenant_id="tenant-a", created_at="2026-06-01T00:00:00Z")
+    old_graph.add_node(UnifiedNode(id="agent:a", entity_type=EntityType.AGENT, label="Agent A"))
+    new_graph = UnifiedGraph(scan_id="new-scan", tenant_id="tenant-a", created_at="2026-06-02T00:00:00Z")
+    new_graph.add_node(UnifiedNode(id="agent:a", entity_type=EntityType.AGENT, label="Agent A"))
+    new_graph.add_node(UnifiedNode(id="agent:b", entity_type=EntityType.AGENT, label="Agent B"))
+    with open_graph_db(db_path) as conn:
+        save_graph(conn, old_graph)
+        save_graph(conn, new_graph)
+
+    result = CliRunner().invoke(
+        graph_evidence_cmd,
+        ["--graph-db", str(db_path), "--tenant", "tenant-a", "--mode", "manifest", "--scan-id", "new-scan"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["scan_id"] == "new-scan"
+    assert payload["diff_baseline_scan_id"] == "old-scan"
+    assert payload["diff_summary"]["nodes_added"] == 1
+    assert payload["graph_digest"].startswith("sha256:")
+
+
+# ---------------------------------------------------------------------------
+# mesh_cmd
+# ---------------------------------------------------------------------------
+
+
+def test_mesh_cmd_from_scan_file_json(tmp_path):
+    runner = CliRunner()
+    scan_file = tmp_path / "scan.json"
+    scan_file.write_text(
+        json.dumps(
+            {
+                "agents": [
+                    {
+                        "name": "claude",
+                        "mcp_servers": [
+                            {
+                                "name": "filesystem",
+                                "packages": [{"name": "pkg", "version": "1.0.0", "vulnerabilities": []}],
+                                "tools": [{"name": "read_file"}],
+                                "env": {"OPENAI_API_KEY": "x"},
+                            }
+                        ],
+                    }
+                ],
+                "blast_radius": [],
+            }
+        )
+    )
+
+    result = runner.invoke(mesh_cmd, [str(scan_file), "--format", "json"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["stats"]["total_agents"] == 1
+    assert data["stats"]["total_tools"] == 1
+
+
+def test_mesh_cmd_live_summary():
+    runner = CliRunner()
+    server = MagicMock()
+    server.name = "filesystem"
+    server.packages = []
+    server.tools = [{"name": "read_file"}, {"name": "write_file"}]
+    server.env = {"GITHUB_TOKEN": "x"}
+    agent = MagicMock()
+    agent.mcp_servers = [server]
+
+    with (
+        patch("agent_bom.discovery.discover_all", return_value=[agent]),
+        patch("agent_bom.parsers.extract_packages", return_value=[{"name": "pkg", "version": "1.0.0", "vulnerabilities": []}]),
+        patch(
+            "dataclasses.asdict",
+            return_value={
+                "name": "claude",
+                "mcp_servers": [
+                    {
+                        "name": "filesystem",
+                        "packages": [{"name": "pkg", "version": "1.0.0", "vulnerabilities": []}],
+                        "tools": [{"name": "read_file"}, {"name": "write_file"}],
+                        "env": {"GITHUB_TOKEN": "x"},
+                    }
+                ],
+            },
+        ),
+    ):
+        result = runner.invoke(mesh_cmd, [])
+        assert result.exit_code == 0
+        assert "Mesh" in result.output
+        assert "machine-wide" in result.output
+        assert "claude" in result.output
+        assert "filesystem" in result.output
+
+
+def test_mesh_cmd_summary_writes_output_path(tmp_path):
+    runner = CliRunner()
+    scan_file = tmp_path / "scan.json"
+    scan_file.write_text(
+        json.dumps(
+            {
+                "agents": [
+                    {
+                        "name": "a",
+                        "mcp_servers": [
+                            {
+                                "name": "filesystem",
+                                "packages": [],
+                                "tools": [{"name": "read_file"}],
+                                "env": {},
+                            }
+                        ],
+                    }
+                ],
+                "blast_radius": [],
+            }
+        )
+    )
+    out = tmp_path / "mesh.txt"
+    result = runner.invoke(mesh_cmd, [str(scan_file), "--output", str(out)])
+    assert result.exit_code == 0
+    assert out.exists()
+    text = out.read_text()
+    assert "Mesh" in text
+    assert "saved scan" in text
+    assert "filesystem" in text
+
+
+def test_mesh_cmd_json_error_is_wrapped(tmp_path):
+    runner = CliRunner()
+    scan_file = tmp_path / "scan.json"
+    scan_file.write_text("{bad", encoding="utf-8")
+
+    result = runner.invoke(mesh_cmd, [str(scan_file)])
+
+    assert result.exit_code == 1
+    assert "scan file JSON error" in result.output
+    assert "JSONDecodeError" not in result.output
+
+
+def test_mesh_cmd_quiet_suppresses_summary_heading():
+    runner = CliRunner()
+    server = MagicMock()
+    server.name = "filesystem"
+    server.packages = []
+    server.tools = [{"name": "read_file"}]
+    server.env = {}
+    agent = MagicMock()
+    agent.mcp_servers = [server]
+
+    with (
+        patch("agent_bom.discovery.discover_all", return_value=[agent]),
+        patch("agent_bom.parsers.extract_packages", return_value=[{"name": "pkg", "version": "1.0.0", "vulnerabilities": []}]),
+        patch(
+            "dataclasses.asdict",
+            return_value={
+                "name": "claude",
+                "mcp_servers": [
+                    {
+                        "name": "filesystem",
+                        "packages": [{"name": "pkg", "version": "1.0.0", "vulnerabilities": []}],
+                        "tools": [{"name": "read_file"}],
+                        "env": {},
+                    }
+                ],
+            },
+        ),
+    ):
+        result = runner.invoke(mesh_cmd, ["--quiet"])
+        assert result.exit_code == 0
+        assert "Mesh" not in result.output
+        assert "filesystem" in result.output
+
+
+def test_mesh_cmd_project_scope_empty_message():
+    runner = CliRunner()
+
+    with patch("agent_bom.discovery.discover_all", return_value=[]):
+        result = runner.invoke(mesh_cmd, ["--project", "."])
+
+    assert result.exit_code == 0
+    assert "No project-local agents discovered." in result.output
+    assert "agent-bom mesh" in result.output
+
+
 # ---------------------------------------------------------------------------
 # dashboard_cmd
 # ---------------------------------------------------------------------------
@@ -161,6 +415,15 @@ def test_dashboard_no_streamlit():
     with patch("shutil.which", return_value=None):
         result = runner.invoke(dashboard_cmd, [])
         assert result.exit_code == 1
+
+
+def test_dashboard_invalid_port_is_usage_error():
+    runner = CliRunner()
+    result = runner.invoke(dashboard_cmd, ["--port", "99999"])
+
+    assert result.exit_code == 2
+    assert "Invalid value for '--port'" in result.output
+    assert "1<=x<=65535" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +459,26 @@ def test_introspect_with_command():
     with patch("agent_bom.mcp_introspect.introspect_servers_sync", return_value=[mock_result]):
         result = runner.invoke(introspect_cmd, ["--command", "echo hello"])
         assert result.exit_code == 0
+
+
+def test_introspect_with_command_tolerates_missing_capability_risk_fields():
+    runner = CliRunner()
+    mock_result = MagicMock()
+    mock_result.server_name = "echo"
+    mock_result.success = True
+    mock_result.runtime_tools = []
+    mock_result.runtime_resources = []
+    mock_result.error = None
+    mock_result.protocol_version = "1.0"
+    mock_result.capability_risk_score = MagicMock()
+    mock_result.capability_risk_level = MagicMock()
+    mock_result.dangerous_combinations = MagicMock()
+    mock_result.tool_risk_profiles = MagicMock()
+
+    with patch("agent_bom.mcp_introspect.introspect_servers_sync", return_value=[mock_result]):
+        result = runner.invoke(introspect_cmd, ["--command", "echo hello"])
+        assert result.exit_code == 0
+        assert "Capability Risk:" in result.output
 
 
 def test_introspect_json_output():

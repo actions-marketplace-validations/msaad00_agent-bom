@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.machinery
 import sys
 import types
 from unittest.mock import MagicMock, patch
@@ -39,14 +40,47 @@ from agent_bom.cloud.gcp_cis_benchmark import (
 # ---------------------------------------------------------------------------
 
 
+def _stub_namespace_module(name: str) -> types.ModuleType:
+    """Return the resident stub for *name*, installing a fresh one over any real package.
+
+    The real `google` / `google.cloud` must never be reused here: the callers bind
+    their fakes as ATTRIBUTES of whatever this returns, and an attribute written
+    onto the real namespace package outlives the process. Keeping the fakes on a
+    stub puts them inside the sys.modules snapshot/restore that conftest's
+    `reset_global_test_state` already performs.
+    """
+    resident = sys.modules.get(name)
+    if isinstance(resident, types.ModuleType) and getattr(resident, "__spec__", None) is None:
+        return resident
+    stub = types.ModuleType(name)
+    sys.modules[name] = stub
+    return stub
+
+
 def _ensure_google_namespace() -> tuple:
-    """Ensure google / google.cloud namespace modules exist in sys.modules."""
-    google_mod = sys.modules.get("google") or types.ModuleType("google")
-    google_cloud = sys.modules.get("google.cloud") or types.ModuleType("google.cloud")
+    """Ensure stub google / google.cloud namespace modules exist in sys.modules."""
+    google_mod = _stub_namespace_module("google")
+    google_cloud = _stub_namespace_module("google.cloud")
     google_mod.cloud = google_cloud
-    sys.modules.setdefault("google", google_mod)
-    sys.modules.setdefault("google.cloud", google_cloud)
     return google_mod, google_cloud
+
+
+def test_installers_never_bind_fakes_onto_a_real_google_namespace() -> None:
+    """A fake must not be written as an attribute of the real `google.cloud`.
+
+    conftest snapshots and restores `sys.modules`, but nothing can undo a package
+    ATTRIBUTE write: a fake bound onto the real namespace package outlives the
+    session, and every later `from google.cloud import <name>` resolves to it
+    because the attribute lookup wins before the import machinery is consulted.
+    """
+    real_like = types.ModuleType("google.cloud")
+    real_like.__spec__ = importlib.machinery.ModuleSpec("google.cloud", None)
+    real_like.__path__ = []  # type: ignore[attr-defined]
+
+    with patch.dict(sys.modules, {"google.cloud": real_like}):
+        _install_mock_gcp_storage(buckets=[])
+        assert sys.modules["google.cloud"] is not real_like
+        assert not hasattr(real_like, "storage")
 
 
 def _install_mock_gcp_compute(networks_list=None, firewalls_list=None):
@@ -299,9 +333,12 @@ def _mock_sqladmin_with_instances(instances):
     """Install fake googleapiclient and return a sqladmin mock with given instances."""
     _ensure_googleapiclient_namespace()
     mock_sqladmin = MagicMock()
-    mock_sqladmin.instances.return_value.list.return_value.execute.return_value = {
+    instances_api = mock_sqladmin.instances.return_value
+    instances_api.list.return_value.execute.return_value = {
         "items": instances,
     }
+    # googleapiclient returns None when pagination is exhausted; MagickMock stays truthy.
+    instances_api.list_next.return_value = None
     return mock_sqladmin
 
 
@@ -1036,6 +1073,72 @@ def test_check_7_1_pass_empty_datasets():
     with patch("googleapiclient.discovery.build", return_value=mock_bq):
         result = _check_7_1("my-project")
     assert result.status == CheckStatus.PASS
+
+
+# ---------------------------------------------------------------------------
+# Partial-read / pagination regressions — a misconfigured resource on a
+# second page must not be silently dropped (false PASS). See issue #4120:
+# "expand GCP BigQuery/DNS/KMS ... with pagination ... and partial-read
+# regressions".
+# ---------------------------------------------------------------------------
+
+
+def _paged_resource_api(pages):
+    """Return a MagicMock ``*.list``/``list_next`` resource honoring pages.
+
+    ``pages`` is a list of response dicts; each but the last must carry a
+    ``nextPageToken`` string so :func:`_gcp_paginate_list` advances. ``list``
+    returns the first request; ``list_next`` walks to the next.
+    """
+    requests = [MagicMock(name=f"request_{i}") for i in range(len(pages))]
+    for request, page in zip(requests, pages):
+        request.execute.return_value = page
+    resource_api = MagicMock()
+    resource_api.list.return_value = requests[0]
+
+    def _list_next(previous_request, previous_response):
+        idx = requests.index(previous_request)
+        return requests[idx + 1] if idx + 1 < len(requests) else None
+
+    resource_api.list_next.side_effect = _list_next
+    return resource_api
+
+
+def test_check_3_3_paginates_and_catches_insecure_zone_on_second_page():
+    _ensure_googleapiclient_namespace()
+    mock_dns = MagicMock()
+    mock_dns.managedZones.return_value = _paged_resource_api(
+        [
+            {
+                "managedZones": [{"name": "secure-zone", "visibility": "public", "dnssecConfig": {"state": "on"}}],
+                "nextPageToken": "page-2",
+            },
+            {"managedZones": [{"name": "insecure-zone", "visibility": "public", "dnssecConfig": {"state": "off"}}]},
+        ]
+    )
+    with patch("googleapiclient.discovery.build", return_value=mock_dns):
+        result = _check_3_3("my-project")
+    assert result.status == CheckStatus.FAIL
+    assert "insecure-zone" in result.evidence
+
+
+def test_check_7_1_paginates_and_catches_public_dataset_on_second_page():
+    _ensure_googleapiclient_namespace()
+    mock_bq = MagicMock()
+    mock_bq.datasets.return_value = _paged_resource_api(
+        [
+            {"datasets": [{"datasetReference": {"datasetId": "private_ds"}}], "nextPageToken": "page-2"},
+            {"datasets": [{"datasetReference": {"datasetId": "public_ds"}}]},
+        ]
+    )
+    mock_bq.datasets.return_value.get.return_value.execute.side_effect = [
+        {"access": [{"role": "READER", "userByEmail": "analyst@corp.com"}]},
+        {"access": [{"role": "READER", "specialGroup": "allUsers"}]},
+    ]
+    with patch("googleapiclient.discovery.build", return_value=mock_bq):
+        result = _check_7_1("my-project")
+    assert result.status == CheckStatus.FAIL
+    assert "public_ds" in result.evidence
 
 
 # ---------------------------------------------------------------------------

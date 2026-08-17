@@ -120,7 +120,10 @@ def infer_risk_level(metadata: dict) -> str:
     Returns "high", "medium", or "low".
     """
     score = 0
-    desc = (metadata.get("description", "") + " " + " ".join(metadata.get("keywords", []))).lower()
+    description = str(metadata.get("description") or "")
+    raw_keywords = metadata.get("keywords") or []
+    keywords = [raw_keywords] if isinstance(raw_keywords, str) else [str(value) for value in raw_keywords]
+    desc = (description + " " + " ".join(keywords)).lower()
 
     # Capability signals from description/keywords
     if any(kw in desc for kw in _HIGH_RISK_KEYWORDS):
@@ -138,10 +141,10 @@ def infer_risk_level(metadata: dict) -> str:
 
     # Dependencies amplify risk
     dep_count = metadata.get("dependencies_count", 0)
-    if dep_count > 20:
-        score += 1
-    elif dep_count > 50:
+    if dep_count > 50:
         score += 2
+    elif dep_count > 20:
+        score += 1
 
     if score >= 5:
         return "high"
@@ -153,11 +156,14 @@ def infer_risk_level(metadata: dict) -> str:
 def generate_risk_justification(metadata: dict, risk_level: str) -> str:
     """Generate human-readable risk justification from metadata signals."""
     parts: list[str] = []
-    desc = (metadata.get("description", "") + " " + " ".join(metadata.get("keywords", []))).lower()
+    description = str(metadata.get("description") or "")
+    raw_keywords = metadata.get("keywords") or []
+    keywords = [raw_keywords] if isinstance(raw_keywords, str) else [str(value) for value in raw_keywords]
+    desc = (description + " " + " ".join(keywords)).lower()
 
     # What it does
-    if metadata.get("description"):
-        parts.append(metadata["description"].rstrip(".") + ".")
+    if description:
+        parts.append(description.rstrip(".") + ".")
 
     # Capability signals
     high_kws = [kw for kw in _HIGH_RISK_KEYWORDS if kw in desc]
@@ -210,11 +216,15 @@ async def autodiscover_package(
     }
 
 
-async def enrich_unknown_packages(packages: list[Package]) -> int:
+async def enrich_unknown_packages(packages: list[Package], *, global_timeout: float | None = 30.0) -> int:
     """Batch-enrich packages not found in the bundled registry.
 
     Updates Package objects in-place with auto_risk_level,
     auto_risk_justification, maintainer_count, and source_repo.
+
+    The global timeout bounds the whole enrichment pass. Individual requests
+    already have request timeouts, but large inventories can otherwise wait for
+    many slow registry calls in sequence across semaphore batches.
 
     Returns the number of packages successfully enriched.
     """
@@ -248,8 +258,21 @@ async def enrich_unknown_packages(packages: list[Package]) -> int:
                     return True
                 return False
 
-        tasks = [_enrich_one(pkg) for pkg in to_enrich]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [asyncio.create_task(_enrich_one(pkg)) for pkg in to_enrich]
+        done, pending = await asyncio.wait(tasks, timeout=global_timeout)
+        for task in pending:
+            task.cancel()
+        if pending:
+            # Do not block the scan path waiting for slow registry tasks to finish
+            # after cancellation; honor global_timeout wall-clock.
+            await asyncio.wait(pending, timeout=0.05)
+            logger.warning(
+                "Auto-discovery metadata enrichment timed out after %.1fs; enriched %s/%s package(s)",
+                global_timeout or 0.0,
+                sum(1 for task in done if task.done() and not task.cancelled() and task.exception() is None and task.result() is True),
+                len(to_enrich),
+            )
+        results = [task.result() if task.exception() is None else task.exception() for task in done if not task.cancelled()]
         enriched = sum(1 for r in results if r is True)
 
     return enriched

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
+
+import pytest
 
 from agent_bom.models import (
     Agent,
+    AgentType,
     AIBOMReport,
     BlastRadius,
     MCPServer,
@@ -18,11 +22,13 @@ from agent_bom.vex import (
     VexJustification,
     VexStatement,
     VexStatus,
+    active_blast_radii,
     apply_vex,
     export_openvex,
     generate_vex,
     is_vex_suppressed,
     load_vex,
+    parse_vex,
     to_serializable,
 )
 
@@ -140,6 +146,54 @@ class TestVexStatus:
 
 
 class TestVexLoad:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {
+                "bomFormat": "CycloneDX",
+                "vulnerabilities": [
+                    {
+                        "id": "CVE-2024-0001",
+                        "analysis": {
+                            "state": "not_affected",
+                            "justification": "unknown\r\nforged https://user:supersecretvalue123@example.invalid/db",
+                        },
+                    }
+                ],
+            },
+            {
+                "document": {"category": "csaf_vex"},
+                "vulnerabilities": [
+                    {
+                        "cve": "CVE-2024-0001",
+                        "product_status": {"unknown\nforged\tstatus": ["product-1"]},
+                    }
+                ],
+            },
+            {
+                "@context": "https://openvex.dev/ns/v0.2.0",
+                "statements": [
+                    {
+                        "vulnerability": "CVE-2024-0001",
+                        "status": "not_affected",
+                        "justification": "unknown\x1b[31m\nforged",
+                    }
+                ],
+            },
+        ],
+    )
+    def test_unknown_vex_values_are_sanitized_before_logging(self, payload, caplog):
+        with caplog.at_level(logging.WARNING, logger="agent_bom.vex"):
+            parse_vex(payload)
+
+        assert len(caplog.messages) == 1
+        message = caplog.messages[0]
+        assert "\r" not in message
+        assert "\n" not in message
+        assert "\t" not in message
+        assert "\x1b" not in message
+        assert "supersecretvalue123" not in message
+
     def test_load_openvex_format(self, tmp_path):
         data = {
             "@context": "https://openvex.dev/ns/v0.2.0",
@@ -169,6 +223,32 @@ class TestVexLoad:
         assert doc.metadata["id"] == "urn:uuid:test-doc"
         assert doc.metadata["author"] == "test-author"
 
+    def test_parse_vex_from_dict_roundtrips_openvex(self):
+        """parse_vex ingests an already-decoded OpenVEX document (no file I/O)."""
+        exported = export_openvex(
+            VexDocument(
+                statements=[
+                    VexStatement(
+                        vulnerability_id="CVE-2026-9999",
+                        status=VexStatus.NOT_AFFECTED,
+                        justification=VexJustification.VULNERABLE_CODE_NOT_IN_EXECUTE_PATH,
+                        products=["pkg:pypi/flask@3.0.0"],
+                    )
+                ]
+            )
+        )
+        doc = parse_vex(exported)
+        assert len(doc.statements) == 1
+        stmt = doc.statements[0]
+        assert stmt.vulnerability_id == "CVE-2026-9999"
+        assert stmt.status == VexStatus.NOT_AFFECTED
+        assert stmt.justification == VexJustification.VULNERABLE_CODE_NOT_IN_EXECUTE_PATH
+        assert stmt.products == ["pkg:pypi/flask@3.0.0"]
+
+    def test_parse_vex_rejects_non_object(self):
+        with pytest.raises(ValueError):
+            parse_vex([])  # type: ignore[arg-type]
+
     def test_load_simplified_format(self, tmp_path):
         data = {
             "statements": [
@@ -187,12 +267,19 @@ class TestVexLoad:
         assert doc.statements[0].status == VexStatus.AFFECTED
         assert doc.statements[0].action_statement == "Upgrade to 2.0.0"
 
-    def test_load_unknown_status_defaults(self, tmp_path):
+    def test_load_unknown_status_raises(self, tmp_path):
         data = {"statements": [{"vulnerability_id": "CVE-2024-0001", "status": "bogus_status"}]}
         path = tmp_path / "vex.json"
         path.write_text(json.dumps(data))
-        doc = load_vex(str(path))
-        assert doc.statements[0].status == VexStatus.UNDER_INVESTIGATION
+        with pytest.raises(ValueError, match="Unknown VEX status"):
+            load_vex(str(path))
+
+    def test_load_malformed_json_raises_cli_safe_error(self, tmp_path):
+        path = tmp_path / "vex.json"
+        path.write_text("{bad json", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="VEX JSON error.*line 1, column 2"):
+            load_vex(str(path))
 
     def test_load_unknown_justification_ignored(self, tmp_path):
         data = {
@@ -245,10 +332,96 @@ class TestVexLoad:
         doc = load_vex(str(path))
         assert doc.statements[0].vulnerability_id == "GHSA-abcd-efgh"
 
+    def test_load_cyclonedx_vex_format(self, tmp_path):
+        data = {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.5",
+            "version": 1,
+            "vulnerabilities": [
+                {
+                    "id": "CVE-2020-8911",
+                    "analysis": {
+                        "state": "not_affected",
+                        "justification": "code_not_reachable",
+                        "response": ["will_not_fix", "update"],
+                        "detail": "The vulnerable function is not called",
+                    },
+                    "affects": [{"ref": "urn:cdx:3e671687-395b-41f5-a30f-a58921a69b79/1#pkg:golang/github.com/aws/aws-sdk-go@1.44.234"}],
+                }
+            ],
+        }
+        path = tmp_path / "vex.cdx.json"
+        path.write_text(json.dumps(data))
+        doc = load_vex(str(path))
+        assert doc.metadata["format"] == "cyclonedx"
+        assert len(doc.statements) == 1
+        stmt = doc.statements[0]
+        assert stmt.vulnerability_id == "CVE-2020-8911"
+        assert stmt.status == VexStatus.NOT_AFFECTED
+        assert stmt.justification == VexJustification.VULNERABLE_CODE_NOT_IN_EXECUTE_PATH
+        assert stmt.products == ["pkg:golang/github.com/aws/aws-sdk-go@1.44.234"]
+        assert stmt.impact_statement == "The vulnerable function is not called"
+        assert "will_not_fix" in stmt.action_statement
 
-# ---------------------------------------------------------------------------
-# TestVexGenerate
-# ---------------------------------------------------------------------------
+    def test_load_csaf_vex_format(self, tmp_path):
+        data = {
+            "document": {
+                "category": "csaf_vex",
+                "csaf_version": "2.0",
+                "publisher": {"category": "vendor", "name": "Example Company ProductCERT"},
+                "tracking": {
+                    "id": "2022-EVD-UC-01-NA-001",
+                    "current_release_date": "2022-03-03T11:00:00.000Z",
+                    "version": "1",
+                },
+            },
+            "vulnerabilities": [
+                {
+                    "cve": "CVE-2021-44228",
+                    "product_status": {"known_not_affected": ["CSAFPID-0001"]},
+                    "threats": [
+                        {
+                            "category": "impact",
+                            "details": "Class with vulnerable code was removed before shipping.",
+                            "product_ids": ["CSAFPID-0001"],
+                        }
+                    ],
+                }
+            ],
+        }
+        path = tmp_path / "vex.csaf.json"
+        path.write_text(json.dumps(data))
+        doc = load_vex(str(path))
+        assert doc.metadata["format"] == "csaf"
+        assert len(doc.statements) == 1
+        stmt = doc.statements[0]
+        assert stmt.vulnerability_id == "CVE-2021-44228"
+        assert stmt.status == VexStatus.NOT_AFFECTED
+        assert stmt.products == ["CSAFPID-0001"]
+        assert "removed before shipping" in stmt.impact_statement
+
+    def test_cyclonedx_vex_applies_to_report(self, tmp_path):
+        vuln = _vuln("CVE-2020-8911")
+        pkg = _pkg(vulns=[vuln])
+        report = _report([(vuln, pkg)])
+        data = {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.5",
+            "version": 1,
+            "vulnerabilities": [
+                {
+                    "id": "CVE-2020-8911",
+                    "analysis": {"state": "not_affected", "justification": "code_not_reachable"},
+                }
+            ],
+        }
+        path = tmp_path / "vex.cdx.json"
+        path.write_text(json.dumps(data))
+        doc = load_vex(str(path))
+        count = apply_vex(report, doc)
+        assert count == 1
+        assert vuln.vex_status == "not_affected"
+        assert is_vex_suppressed(vuln)
 
 
 class TestVexGenerate:
@@ -589,3 +762,103 @@ class TestIsVexSuppressed:
         active = [v for v in all_vulns if not is_vex_suppressed(v)]
         assert len(active) == 1
         assert active[0].id == "CVE-2024-B"
+
+    def test_apply_vex_zeros_suppressed_blast_radius_risk(self):
+        """VEX not_affected is enforced in blast-radius scoring, not just labels."""
+        vuln = _vuln("CVE-2024-2000", severity=Severity.CRITICAL)
+        report = _report([(vuln, _pkg(vulns=[vuln]))])
+        br = report.blast_radii[0]
+        br.risk_score = 9.8
+        br.transitive_risk_score = 8.0
+
+        doc = VexDocument(
+            statements=[
+                VexStatement(
+                    vulnerability_id="CVE-2024-2000",
+                    status=VexStatus.NOT_AFFECTED,
+                    justification=VexJustification.VULNERABLE_CODE_NOT_PRESENT,
+                ),
+            ]
+        )
+
+        assert apply_vex(report, doc) == 1
+        assert br.risk_score == 0.0
+        assert br.transitive_risk_score == 0.0
+        assert br.is_actionable is False
+        assert active_blast_radii(report.blast_radii) == []
+
+    def test_suppressed_vex_does_not_trigger_policy_or_posture_penalty(self):
+        from agent_bom.policy import evaluate_policy
+        from agent_bom.posture import compute_posture_scorecard
+
+        suppressed = _vuln("CVE-2024-3000", severity=Severity.CRITICAL)
+        suppressed.vex_status = "not_affected"
+        active = _vuln("CVE-2024-3001", severity=Severity.LOW)
+        report = _report([(suppressed, _pkg(name="suppressed", vulns=[suppressed])), (active, _pkg(name="active", vulns=[active]))])
+        for br in report.blast_radii:
+            br.calculate_risk_score()
+
+        policy_result = evaluate_policy(
+            {"rules": [{"id": "no-critical", "severity_gte": "critical", "action": "fail"}]},
+            report.blast_radii,
+        )
+        assert policy_result["passed"] is True
+        assert policy_result["violations"] == []
+
+        scorecard = compute_posture_scorecard(report)
+        assert scorecard.dimensions["vulnerability_posture"].details == "1 vulns (1 low), 0 fixable"
+
+    def test_json_marks_vex_suppressed_blast_radius(self):
+        from agent_bom.output import to_json
+
+        vuln = _vuln("CVE-2024-4000", severity=Severity.HIGH)
+        vuln.vex_status = "fixed"
+        report = _report([(vuln, _pkg(vulns=[vuln]))])
+        report.agents[0].agent_type = AgentType.CLAUDE_DESKTOP
+        report.blast_radii[0].calculate_risk_score()
+
+        item = to_json(report)["blast_radius"][0]
+        assert item["risk_score"] == 0.0
+        assert item["vex_status"] == "fixed"
+        assert item["vex_suppressed"] is True
+
+
+class TestBlastRadiusToFindingVex:
+    def test_blast_radius_to_finding_carries_vex_evidence_and_suppressed(self):
+        from agent_bom.finding import blast_radius_to_finding
+
+        vuln = _vuln("CVE-2024-8888", severity=Severity.HIGH)
+        vuln.vex_status = "not_affected"
+        vuln.vex_justification = "component_not_present"
+        pkg = _pkg(vulns=[vuln])
+        br = BlastRadius(
+            vulnerability=vuln,
+            package=pkg,
+            affected_servers=[],
+            affected_agents=[],
+            exposed_credentials=[],
+            exposed_tools=[],
+        )
+        finding = blast_radius_to_finding(br)
+        assert finding.evidence["vex_status"] == "not_affected"
+        assert finding.evidence["vex_justification"] == "component_not_present"
+        assert finding.suppressed is True
+
+    def test_blast_radius_to_finding_preserves_existing_suppression(self):
+        from agent_bom.finding import blast_radius_to_finding
+
+        vuln = _vuln("CVE-2024-8889", severity=Severity.MEDIUM)
+        pkg = _pkg(vulns=[vuln])
+        br = BlastRadius(
+            vulnerability=vuln,
+            package=pkg,
+            affected_servers=[],
+            affected_agents=[],
+            exposed_credentials=[],
+            exposed_tools=[],
+            suppressed=True,
+            suppression_id="sup-1",
+        )
+        finding = blast_radius_to_finding(br)
+        assert finding.suppressed is True
+        assert finding.suppression_id == "sup-1"

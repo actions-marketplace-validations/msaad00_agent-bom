@@ -1,0 +1,342 @@
+"""Contract tests for durable, provider-neutral side-scan lifecycle state."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from agent_bom.cloud.side_scan_lifecycle import (
+    CleanupStatus,
+    ExecutionStatus,
+    InMemorySideScanStateStore,
+    PostgresSideScanStateStore,
+    SideScanStateConflictError,
+    SideScanTemporaryResource,
+    SQLiteSideScanStateStore,
+    TemporaryResourceStatus,
+    get_side_scan_state_store,
+    new_side_scan_execution,
+    reset_side_scan_state_store,
+    side_scan_provider_capabilities,
+)
+
+
+def _execution(
+    *,
+    tenant_id: str = "tenant-a",
+    idempotency_key: str = "scan-request-1",
+    provider: str = "azure",
+    account_id: str = "subscription-1",
+    target_id: str = "/subscriptions/subscription-1/disks/os-disk",
+    now: str = "2026-07-17T20:00:00Z",
+):
+    return new_side_scan_execution(
+        tenant_id=tenant_id,
+        provider=provider,
+        account_id=account_id,
+        target_id=target_id,
+        collector_id="collector-1",
+        idempotency_key=idempotency_key,
+        now=now,
+    )
+
+
+def test_provider_capabilities_ship_cli_executors_with_smoke_pending() -> None:
+    capabilities = side_scan_provider_capabilities()
+
+    # AWS, Azure Managed Disk, and GCP Persistent Disk all ship a CLI executor.
+    for provider in ("aws", "azure", "gcp"):
+        assert capabilities[provider].executor == "shipped", provider
+        assert capabilities[provider].cli_available is True, provider
+        assert capabilities[provider].target_discovery is True, provider
+        assert capabilities[provider].lifecycle_contract is True, provider
+
+    # Live-cloud proof is honest: AWS EBS has none claimed either, and Azure/GCP
+    # stay smoke-pending until an owner supplies scoped lifecycle credentials.
+    assert capabilities["aws"].credentialed_smoke is False
+    assert capabilities["azure"].credentialed_smoke is False
+    assert capabilities["gcp"].credentialed_smoke is False
+
+
+def test_in_memory_store_preserves_tenant_and_cas_contracts() -> None:
+    store = InMemorySideScanStateStore()
+    original = store.create_or_get(_execution())
+    assert store.create_or_get(_execution()) == original
+    assert store.get(tenant_id="tenant-b", execution_id=original.execution_id) is None
+
+    running = original.transition(status=ExecutionStatus.RUNNING, phase="snapshot")
+    store.save(running, expected_version=original.state_version)
+    with pytest.raises(SideScanStateConflictError):
+        store.save(running, expected_version=original.state_version)
+
+
+def test_store_factory_uses_ephemeral_backend_only_when_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AGENT_BOM_SIDE_SCAN_STATE_DB", raising=False)
+    monkeypatch.delenv("AGENT_BOM_POSTGRES_URL", raising=False)
+    monkeypatch.delenv("AGENT_BOM_DB", raising=False)
+    monkeypatch.setenv("AGENT_BOM_EPHEMERAL_STORE", "1")
+    reset_side_scan_state_store()
+    try:
+        first = get_side_scan_state_store()
+        assert isinstance(first, InMemorySideScanStateStore)
+        assert get_side_scan_state_store() is first
+    finally:
+        reset_side_scan_state_store()
+
+
+def test_postgres_store_enables_tenant_rls(monkeypatch: pytest.MonkeyPatch) -> None:
+    statements: list[str] = []
+    rls_calls: list[tuple[str, str]] = []
+
+    class Connection:
+        def execute(self, sql, params=None):
+            statements.append(" ".join(str(sql).split()))
+            return self
+
+        def commit(self):
+            return None
+
+    class ConnectionContext:
+        def __enter__(self):
+            return Connection()
+
+        def __exit__(self, *_args):
+            return False
+
+    class Pool:
+        def connection(self):
+            return ConnectionContext()
+
+    monkeypatch.setattr(
+        "agent_bom.api.postgres_common._ensure_tenant_rls",
+        lambda _connection, table, column: rls_calls.append((table, column)),
+    )
+    PostgresSideScanStateStore(pool=Pool())
+
+    assert any("CREATE TABLE IF NOT EXISTS side_scan_execution_state" in sql for sql in statements)
+    assert rls_calls == [("side_scan_execution_state", "tenant_id")]
+
+
+@pytest.mark.parametrize("status", [ExecutionStatus.DISABLED, ExecutionStatus.DENIED, ExecutionStatus.FAILED])
+def test_non_execution_states_are_unevaluable_not_clean(status: ExecutionStatus) -> None:
+    record = _execution().transition(status=status, phase="finished", now="2026-07-17T20:01:00Z")
+    evidence = record.to_evidence_dict()
+
+    assert evidence["schema_version"] == "agent-bom.cwpp.side_scan.evidence.v1"
+    assert evidence["execution_status"] == status.value
+    assert evidence["disposition"] == "unevaluable"
+    assert evidence["negative_result_scope"] == "unavailable"
+    assert evidence["clean_workload_assertion"] is False
+
+
+def test_scan_is_complete_only_after_cleanup_completes() -> None:
+    running = _execution().transition(
+        status=ExecutionStatus.RUNNING,
+        phase="scanning",
+        now="2026-07-17T20:00:30Z",
+    )
+    record = running.transition(
+        status=ExecutionStatus.SCAN_COMPLETE,
+        phase="cleanup",
+        cleanup_status=CleanupStatus.PENDING,
+        now="2026-07-17T20:01:00Z",
+    )
+
+    assert record.to_evidence_dict()["disposition"] == "partial"
+
+    cleaned = record.transition(
+        phase="finished",
+        cleanup_status=CleanupStatus.COMPLETE,
+        package_count=12,
+        vulnerability_count=2,
+        now="2026-07-17T20:02:00Z",
+    )
+    evidence = cleaned.to_evidence_dict()
+
+    assert evidence["disposition"] == "complete"
+    assert evidence["negative_result_scope"] == "scanned_disk_only"
+    assert evidence["package_count"] == 12
+    assert evidence["vulnerability_count"] == 2
+    assert evidence["clean_workload_assertion"] is False
+
+
+def test_cleanup_ownership_is_deterministic_and_scope_bound() -> None:
+    first = _execution()
+    duplicate = _execution()
+
+    assert first.execution_id == duplicate.execution_id
+    assert first.cleanup_ownership == duplicate.cleanup_ownership
+    tags = first.cleanup_ownership.required_tags()
+    assert first.cleanup_ownership.owns(tags)
+    assert not first.cleanup_ownership.owns({**tags, "agent-bom-sidescan-owner": "other"})
+    assert not first.cleanup_ownership.owns({"agent-bom-sidescan": "true"})
+
+
+def test_resource_registration_and_cleanup_are_retry_safe() -> None:
+    record = _execution()
+    snapshot = SideScanTemporaryResource(
+        kind="snapshot",
+        resource_id="snap-1",
+        status=TemporaryResourceStatus.CREATED,
+        ownership_tags=record.cleanup_ownership.required_tags(),
+    )
+
+    registered = record.register_resource(snapshot, now="2026-07-17T20:01:00Z")
+    assert registered.register_resource(snapshot, now="2026-07-17T20:02:00Z") == registered
+    assert registered.cleanup_candidates() == (snapshot,)
+
+    wrong_owner = SideScanTemporaryResource(
+        kind="disk",
+        resource_id="disk-foreign",
+        status=TemporaryResourceStatus.CREATED,
+        ownership_tags={"agent-bom-sidescan": "true", "agent-bom-sidescan-owner": "foreign"},
+    )
+    with pytest.raises(ValueError, match="cleanup ownership"):
+        registered.register_resource(wrong_owner, now="2026-07-17T20:02:00Z")
+
+    deleted = registered.mark_resource_cleanup(
+        "snap-1",
+        status=TemporaryResourceStatus.DELETED,
+        now="2026-07-17T20:03:00Z",
+    )
+    assert deleted.cleanup_candidates() == ()
+    assert (
+        deleted.mark_resource_cleanup(
+            "snap-1",
+            status=TemporaryResourceStatus.DELETED,
+            now="2026-07-17T20:04:00Z",
+        )
+        == deleted
+    )
+    with pytest.raises(ValueError, match="invalid resource cleanup transition"):
+        deleted.mark_resource_cleanup(
+            "snap-1",
+            status=TemporaryResourceStatus.CLEANUP_FAILED,
+            now="2026-07-17T20:05:00Z",
+        )
+
+
+def test_cleanup_cannot_complete_while_owned_resource_remains() -> None:
+    record = _execution()
+    snapshot = SideScanTemporaryResource(
+        kind="snapshot",
+        resource_id="snap-1",
+        status=TemporaryResourceStatus.CREATED,
+        ownership_tags=record.cleanup_ownership.required_tags(),
+    )
+    registered = record.register_resource(snapshot, now="2026-07-17T20:01:00Z")
+
+    with pytest.raises(ValueError, match="temporary resources remain"):
+        registered.transition(
+            cleanup_status=CleanupStatus.COMPLETE,
+            now="2026-07-17T20:02:00Z",
+        )
+
+
+def test_sqlite_store_survives_restart_and_deduplicates_jobs(tmp_path: Path) -> None:
+    db_path = tmp_path / "side-scan-state.db"
+    record = _execution()
+    store = SQLiteSideScanStateStore(db_path)
+
+    assert store.create_or_get(record) == record
+    assert store.create_or_get(_execution()) == record
+
+    restarted = SQLiteSideScanStateStore(db_path)
+    assert restarted.get(tenant_id="tenant-a", execution_id=record.execution_id) == record
+    assert restarted.get(tenant_id="tenant-b", execution_id=record.execution_id) is None
+
+    other_tenant = _execution(tenant_id="tenant-b")
+    assert restarted.create_or_get(other_tenant).execution_id != record.execution_id
+
+
+def test_sqlite_store_rejects_stale_worker_update(tmp_path: Path) -> None:
+    store = SQLiteSideScanStateStore(tmp_path / "side-scan-state.db")
+    original = store.create_or_get(_execution())
+    running = original.transition(status=ExecutionStatus.RUNNING, phase="snapshot", now="2026-07-17T20:01:00Z")
+    store.save(running, expected_version=original.state_version)
+
+    stale = original.transition(status=ExecutionStatus.DENIED, phase="finished", now="2026-07-17T20:02:00Z")
+    with pytest.raises(SideScanStateConflictError):
+        store.save(stale, expected_version=original.state_version)
+
+
+def test_sqlite_store_returns_only_tenant_scoped_cleanup_retries(tmp_path: Path) -> None:
+    store = SQLiteSideScanStateStore(tmp_path / "side-scan-state.db")
+    original = store.create_or_get(_execution())
+    pending = original.transition(
+        status=ExecutionStatus.FAILED,
+        phase="cleanup",
+        cleanup_status=CleanupStatus.PENDING,
+        failure_code="mount_failed",
+        now="2026-07-17T20:01:00Z",
+    )
+    store.save(pending, expected_version=original.state_version)
+
+    assert store.list_cleanup_due(tenant_id="tenant-a") == [pending]
+    assert store.list_cleanup_due(tenant_id="tenant-b") == []
+
+    retrying = pending.transition(
+        phase="cleanup",
+        cleanup_status=CleanupStatus.IN_PROGRESS,
+        now="2026-07-17T20:02:00Z",
+    )
+    store.save(retrying, expected_version=pending.state_version)
+    cleaned = retrying.transition(
+        phase="finished",
+        cleanup_status=CleanupStatus.COMPLETE,
+        now="2026-07-17T20:03:00Z",
+    )
+    store.save(cleaned, expected_version=retrying.state_version)
+
+    restarted = SQLiteSideScanStateStore(tmp_path / "side-scan-state.db")
+    assert restarted.get(tenant_id="tenant-a", execution_id=cleaned.execution_id) == cleaned
+    assert restarted.list_cleanup_due(tenant_id="tenant-a") == []
+
+
+def test_sqlite_store_pages_and_filters_full_execution_history(tmp_path: Path) -> None:
+    store = SQLiteSideScanStateStore(tmp_path / "side-scan-state.db")
+    azure = store.create_or_get(
+        _execution(
+            idempotency_key="azure-1",
+            target_id="/subscriptions/subscription-1/disks/payments-db",
+            now="2026-07-17T20:00:00Z",
+        )
+    )
+    gcp = store.create_or_get(
+        _execution(
+            idempotency_key="gcp-1",
+            provider="gcp",
+            account_id="project-1",
+            target_id="projects/project-1/zones/us-central1-a/disks/agent-api",
+            now="2026-07-17T20:01:00Z",
+        )
+    )
+    failed = gcp.transition(status=ExecutionStatus.FAILED, phase="finished", now="2026-07-17T20:02:00Z")
+    store.save(failed, expected_version=gcp.state_version)
+
+    assert store.count(tenant_id="tenant-a") == 2
+    page, total = store.list_page_with_total(tenant_id="tenant-a", limit=1, offset=0)
+    assert page == [failed]
+    assert total == 2
+    assert store.list_page(tenant_id="tenant-a", limit=1, offset=1) == [azure]
+    assert store.count(tenant_id="tenant-a", provider="gcp", status="failed", query="agent-api") == 1
+    assert store.list_page(
+        tenant_id="tenant-a",
+        limit=25,
+        offset=0,
+        provider="gcp",
+        status="failed",
+        query="agent-api",
+    ) == [failed]
+    assert store.count(tenant_id="tenant-b") == 0
+
+
+def test_serialized_state_contains_metadata_only() -> None:
+    payload = _execution().to_dict()
+
+    assert payload["schema_version"] == "agent-bom.cwpp.side_scan.lifecycle.v1"
+    assert payload["cleanup_ownership"]["required_tags"]["agent-bom-sidescan"] == "true"
+    assert "credential" not in payload
+    assert "content" not in payload
+    assert "secret_value" not in payload

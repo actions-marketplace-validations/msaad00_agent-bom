@@ -1,0 +1,491 @@
+"use client";
+
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Background,
+  Controls,
+  MiniMap,
+  ReactFlow,
+  ReactFlowProvider,
+  useReactFlow,
+  type Edge,
+  type Node,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
+import { Focus, GitBranch, Loader2 } from "lucide-react";
+
+import { GraphEntityDrawer } from "@/components/graph-entity-drawer";
+import { FullscreenButton, GraphInteractionToolbar, GraphLegend } from "@/components/graph-chrome";
+import { useAuthState } from "@/components/auth-provider";
+import { lineageNodeTypes, type LineageNodeData } from "@/components/lineage-nodes";
+import { api } from "@/lib/api";
+import type { AttackPath, UnifiedGraphData } from "@/lib/graph-schema";
+import {
+  BACKGROUND_COLOR,
+  BACKGROUND_GAP,
+  CONTROLS_CLASS,
+  graphNodeDisplayLabels,
+  MINIMAP_BG,
+  MINIMAP_CLASS,
+  MINIMAP_MASK,
+  legendItemsForVisibleGraph,
+  minimapNodeColor,
+  readableGraphEdges,
+} from "@/lib/graph-utils";
+import { graphFitViewOptions, shouldShowGraphMiniMap } from "@/lib/graph-viewport";
+import { mergeGraphNodeDetail } from "@/lib/graph-entity-detail";
+import { buildFocusedGraphData } from "@/lib/security-graph-focus";
+import { buildUnifiedFlowGraph } from "@/lib/unified-graph-flow";
+import { useGraphLayout } from "@/lib/use-graph-layout";
+import { useGraphPresentation } from "@/hooks/use-graph-presentation";
+import { graphTopologyKey, type GraphPresentationScope } from "@/lib/graph-presentation";
+
+const INVESTIGATION_LAYERS = {
+  provider: false,
+  agent: true,
+  org: false,
+  account: false,
+  user: false,
+  group: false,
+  role: false,
+  policy: false,
+  serviceAccount: false,
+  servicePrincipal: false,
+  federatedIdentity: false,
+  environment: true,
+  fleet: false,
+  cluster: true,
+  server: true,
+  sharedServer: true,
+  package: true,
+  vulnerability: true,
+  credential: true,
+  tool: true,
+  model: false,
+  framework: true,
+  dataset: false,
+  container: true,
+  cloudResource: true,
+  misconfiguration: true,
+  managedIdentity: false,
+  accessGrant: false,
+  accessPolicy: false,
+  driftIncident: false,
+  dataStore: false,
+  directory: false,
+  sourceFile: false,
+  configFile: false,
+  codeModule: false,
+  ciJob: false,
+  blueprint: false,
+  // A gateway PROTECTS edge is what downgrades an exposure verdict, and a tool
+  // call is the runtime evidence for a path hop — both belong in an
+  // investigation even though the rest of the estate context is trimmed out.
+  apiGateway: true,
+  toolCall: true,
+} as const;
+
+/**
+ * ReactFlow subtree with an imperative re-fit. ReactFlow's `fitView` prop only
+ * runs once, at first mount — but the dagre layout positions nodes on a later
+ * tick, and lens/focus/snapshot switches swap in an entirely new node set. When
+ * the one-shot fit ran against the pre-layout (0,0) positions the canvas ended
+ * up zoomed/panned off its content and rendered blank. Re-fitting whenever the
+ * laid-out node set changes keeps the bounding box in view every time.
+ */
+function InvestigationFlow({
+  nodes,
+  edges,
+  viewportInput,
+  onNodeSelect,
+  selectedNodeId,
+  presentationScope,
+  persistenceEnabled,
+  ownerActive,
+  localMode,
+}: {
+  nodes: Node<LineageNodeData>[];
+  edges: Edge[];
+  viewportInput: {
+    nodeCount: number;
+    edgeCount: number;
+    selectedNode: boolean;
+    mode: "lineage" | "context";
+  };
+  onNodeSelect: (id: string) => void;
+  selectedNodeId: string | null;
+  presentationScope: GraphPresentationScope;
+  persistenceEnabled: boolean;
+  ownerActive: boolean;
+  localMode: boolean;
+}) {
+  const reactFlow = useReactFlow<Node<LineageNodeData>, Edge>();
+  const { fitView } = reactFlow;
+  const fitOptions = useMemo(() => graphFitViewOptions(viewportInput), [viewportInput]);
+  const fitOptionsRef = useRef(fitOptions);
+  fitOptionsRef.current = fitOptions;
+
+  const presentation = useGraphPresentation({
+    nodes,
+    scope: presentationScope,
+    layout: "dagre-lr",
+    enabled: persistenceEnabled,
+    ownerActive,
+    localMode,
+  });
+  const presentedEdges = useMemo(
+    () => readableGraphEdges(edges, undefined, {
+      zoom: presentation.viewport.zoom,
+      nodeLabels: graphNodeDisplayLabels(nodes),
+    }),
+    [edges, nodes, presentation.viewport.zoom],
+  );
+  useEffect(() => {
+    if (nodes.length === 0 || presentation.hasSavedState) return;
+    const raf = requestAnimationFrame(() => {
+      void fitView(fitOptionsRef.current);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [fitView, nodes, presentation.hasSavedState]);
+  const fitVisible = useCallback(() => {
+    void fitView({ ...fitOptions, duration: 240 });
+  }, [fitOptions, fitView]);
+  const fitSelection = useCallback(() => {
+    if (!selectedNodeId) return;
+    const node = reactFlow.getNode(selectedNodeId);
+    if (node) void fitView({ nodes: [node], padding: 0.7, duration: 240, maxZoom: 1.4 });
+  }, [fitView, reactFlow, selectedNodeId]);
+  const autoLayout = useCallback(() => {
+    presentation.autoLayout();
+    window.setTimeout(fitVisible, 0);
+  }, [fitVisible, presentation]);
+  const resetLayout = useCallback(() => {
+    presentation.reset();
+    window.setTimeout(fitVisible, 0);
+  }, [fitVisible, presentation]);
+
+  return (
+    <div className="relative h-full">
+      {presentation.enabled && nodes.length > 0 && <div className="absolute right-3 top-3 z-20">
+        <GraphInteractionToolbar
+          editing={presentation.editing}
+          hasSelection={Boolean(selectedNodeId)}
+          onFitVisible={fitVisible}
+          onFitSelection={fitSelection}
+          onAutoLayout={autoLayout}
+          onReset={resetLayout}
+          onToggleEditing={presentation.toggleEditing}
+        />
+      </div>}
+      <ReactFlow
+        key={presentation.storageKey}
+        nodes={presentation.nodes}
+        edges={presentedEdges}
+        nodeTypes={lineageNodeTypes}
+        fitView={!presentation.hasSavedState}
+        fitViewOptions={fitOptions}
+        minZoom={0.2}
+        maxZoom={2.5}
+        defaultViewport={presentation.viewport}
+        zoomOnScroll
+        zoomOnPinch
+        panOnDrag
+        preventScrolling
+        nodesDraggable={presentation.editing}
+        nodesConnectable={false}
+        nodesFocusable
+        edgesFocusable
+        elementsSelectable
+        deleteKeyCode={null}
+        onNodesChange={presentation.onNodesChange}
+        onNodeDragStop={presentation.onNodeDragStop}
+        onMoveEnd={presentation.onMoveEnd}
+        onNodeClick={(_, node) => onNodeSelect(node.id)}
+        proOptions={{ hideAttribution: true }}
+      >
+        <Background color={BACKGROUND_COLOR} gap={BACKGROUND_GAP} />
+        <Controls className={CONTROLS_CLASS} showInteractive={false} />
+        {shouldShowGraphMiniMap(viewportInput) && (
+          <MiniMap
+            className={MINIMAP_CLASS}
+            style={{ background: MINIMAP_BG }}
+            maskColor={MINIMAP_MASK}
+            nodeColor={minimapNodeColor}
+          />
+        )}
+      </ReactFlow>
+    </div>
+  );
+}
+
+export function SecurityGraphInvestigation({
+  graph,
+  attackPath,
+  focusMode,
+  onFocusModeChange,
+  fullGraphHref,
+  loading = false,
+  scanId,
+  onPinnedNodeChange,
+  onStepHint,
+}: {
+  graph: UnifiedGraphData | null;
+  attackPath: AttackPath | null;
+  focusMode: boolean;
+  onFocusModeChange: (next: boolean) => void;
+  fullGraphHref: string;
+  loading?: boolean;
+  scanId?: string | undefined;
+  onPinnedNodeChange?: ((nodeId: string | null) => void) | undefined;
+  /** Notify parent when expand/impact actions advance the investigation step. */
+  onStepHint?: ((step: "expand" | "impact" | "fix") => void) | undefined;
+}) {
+  const { session, loading: authLoading } = useAuthState();
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [drawerData, setDrawerData] = useState<LineageNodeData | null>(null);
+  const [blastLoading, setBlastLoading] = useState(false);
+  const [blastActive, setBlastActive] = useState(false);
+  const lastPinnedRef = useRef<string | null>(null);
+
+  const activeGraph = useMemo(() => {
+    if (!graph) return null;
+    if (focusMode && attackPath) {
+      return buildFocusedGraphData(graph, attackPath) ?? graph;
+    }
+    return graph;
+  }, [attackPath, focusMode, graph]);
+
+  const flow = useMemo(() => {
+    if (!activeGraph) {
+      return { nodes: [] as Node<LineageNodeData>[], edges: [] as Edge[], legend: [] };
+    }
+    return buildUnifiedFlowGraph(activeGraph, {
+      layers: { ...INVESTIGATION_LAYERS },
+      severity: null,
+      agentName: null,
+      vulnOnly: false,
+      maxDepth: 12,
+    });
+  }, [activeGraph]);
+
+  const layout = useGraphLayout("dagre-lr", flow.nodes, flow.edges, {
+    dagreLr: { rankSep: 128, nodeSep: 48 },
+  });
+  const displayEdges = useMemo(
+    () => readableGraphEdges(layout.edges, undefined, { nodeLabels: graphNodeDisplayLabels(layout.nodes) }),
+    [layout.edges, layout.nodes],
+  );
+  const legendItems = useMemo(
+    () => legendItemsForVisibleGraph(layout.nodes, displayEdges),
+    [displayEdges, layout.nodes],
+  );
+  const viewportInput = useMemo(
+    () => ({
+      nodeCount: layout.nodes.length,
+      edgeCount: displayEdges.length,
+      selectedNode: Boolean(selectedNodeId),
+      // Focused attack paths are short chains — use context framing so fitView
+      // fills the investigation canvas instead of parking a tiny path mid-pane.
+      mode: (focusMode ? "context" : "lineage") as "context" | "lineage",
+    }),
+    [displayEdges.length, focusMode, layout.nodes.length, selectedNodeId],
+  );
+  const presentationScope = useMemo(
+    () => ({
+      tenantId: session?.tenant_id || "local",
+      subject: session?.subject || session?.auth_method || "local-viewer",
+      snapshotId: scanId || "unselected",
+      lens: "investigation",
+      scope: JSON.stringify({
+        focus: focusMode && attackPath ? attackPath.hops.join("=>") : "full-snapshot",
+        topology: graphTopologyKey(layout.nodes, displayEdges),
+      }),
+    }),
+    [attackPath, displayEdges, focusMode, layout.nodes, scanId, session?.auth_method, session?.subject, session?.tenant_id],
+  );
+
+  const selectedNode = useMemo(
+    () => layout.nodes.find((node) => node.id === selectedNodeId) ?? null,
+    [layout.nodes, selectedNodeId],
+  );
+
+  useEffect(() => {
+    if (!selectedNodeId) {
+      setDrawerData(null);
+      lastPinnedRef.current = null;
+      onPinnedNodeChange?.(null);
+      return;
+    }
+    if (!layout.nodes.some((node) => node.id === selectedNodeId)) {
+      setSelectedNodeId(null);
+      return;
+    }
+    if (!selectedNode) return;
+    const base = {
+      ...(selectedNode.data as LineageNodeData),
+      attributes: {
+        ...((selectedNode.data as LineageNodeData).attributes ?? {}),
+        node_id: selectedNode.id,
+      },
+    };
+    setDrawerData(base);
+    const isNewPin = lastPinnedRef.current !== selectedNode.id;
+    lastPinnedRef.current = selectedNode.id;
+    if (isNewPin) {
+      onPinnedNodeChange?.(selectedNode.id);
+      // Pinning a node advances the operator into Expand — parent owns step URL.
+      onStepHint?.("expand");
+    }
+    // Intentionally omit callback identities from deps to avoid re-notify loops.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layout.nodes, selectedNode, selectedNodeId]);
+
+  async function handleExpandNeighbors() {
+    if (!selectedNodeId || !scanId) return;
+    onStepHint?.("expand");
+    try {
+      const neighbors = await api.getGraphNodeNeighbors(selectedNodeId, {
+        scanId,
+        limit: 24,
+        direction: "both",
+      });
+      setDrawerData((current) =>
+        current
+          ? {
+              ...current,
+              neighborCount: neighbors.total_neighbors,
+              attributes: {
+                ...(current.attributes ?? {}),
+                node_id: selectedNodeId,
+                expanded_neighbor_ids: neighbors.neighbors.map((node) => node.id),
+              },
+            }
+          : current,
+      );
+    } catch {
+      /* keep prior drawer state */
+    }
+  }
+
+  async function handleShowImpact() {
+    if (!selectedNodeId || !scanId) return;
+    onStepHint?.("impact");
+    setBlastLoading(true);
+    try {
+      const [detail, impact] = await Promise.all([
+        api.getGraphNode(selectedNodeId, scanId),
+        api.getGraphImpact(selectedNodeId, scanId),
+      ]);
+      setDrawerData((current) => {
+        if (!current) return current;
+        const merged = mergeGraphNodeDetail(current, detail);
+        return {
+          ...merged,
+          impactCount: impact.affected_count,
+          maxImpactDepth: impact.max_depth_reached,
+          impactByType: impact.affected_by_type,
+        };
+      });
+      setBlastActive(true);
+    } catch {
+      setBlastActive(false);
+    } finally {
+      setBlastLoading(false);
+    }
+  }
+
+  return (
+    <section className="overflow-hidden rounded-2xl border border-[color:var(--border-subtle)] bg-[color:var(--surface)]">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[color:var(--border-subtle)] px-4 py-3">
+        <div>
+          <h2 className="text-sm font-semibold text-[color:var(--foreground)]">Live investigation</h2>
+          <p className="mt-0.5 text-xs text-[color:var(--text-secondary)]">
+            {focusMode
+              ? "Focus mode highlights the selected exposure path. Pin a node to expand neighbors and impact."
+              : "Full snapshot mode shows the persisted subgraph for this scan."}
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => onFocusModeChange(!focusMode)}
+            className={`inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-medium transition ${
+              focusMode
+                ? "border-emerald-600/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200"
+                : "border-[color:var(--border-subtle)] bg-[color:var(--surface-muted)] text-[color:var(--text-secondary)]"
+            }`}
+          >
+            <Focus className="h-3.5 w-3.5" />
+            {focusMode ? "Focus on path" : "Full snapshot"}
+          </button>
+          <Link
+            href={fullGraphHref}
+            className="inline-flex items-center gap-2 rounded-lg border border-[color:var(--border-subtle)] bg-[color:var(--surface-muted)] px-3 py-1.5 text-xs font-medium text-[color:var(--foreground)] transition hover:border-[color:var(--border-strong)]"
+          >
+            Open lineage
+            <GitBranch className="h-3.5 w-3.5" />
+          </Link>
+          <FullscreenButton />
+        </div>
+      </div>
+
+      <div
+        id="security-graph-investigation-canvas"
+        className="relative min-h-[40rem] h-[min(56vh,42rem)] bg-[color:var(--surface-muted)]"
+        data-testid="security-graph-investigation"
+      >
+        {loading ? (
+          <div className="flex h-full min-h-[40rem] items-center justify-center gap-2 text-sm text-[color:var(--text-secondary)]">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Loading graph evidence…
+          </div>
+        ) : layout.nodes.length === 0 ? (
+          <div className="flex h-full min-h-[40rem] items-center justify-center px-6 text-center text-sm text-[color:var(--text-secondary)]">
+            No graph nodes matched this path. Run a fresh scan or clear focus to inspect the full snapshot.
+          </div>
+        ) : (
+          <ReactFlowProvider>
+            <InvestigationFlow
+              nodes={layout.nodes as Node<LineageNodeData>[]}
+              edges={displayEdges}
+              viewportInput={viewportInput}
+              onNodeSelect={setSelectedNodeId}
+              selectedNodeId={selectedNodeId}
+              presentationScope={presentationScope}
+              persistenceEnabled={!authLoading && Boolean(session)}
+              ownerActive={Boolean(session)}
+              localMode={session?.recommended_ui_mode === "no_auth"}
+            />
+          </ReactFlowProvider>
+        )}
+
+        <div className="pointer-events-auto absolute left-3 top-3 max-w-[min(24rem,calc(100vw-2rem))]">
+          <GraphLegend items={legendItems} />
+        </div>
+      </div>
+
+      {drawerData && (
+        <div className="border-t border-[color:var(--border-subtle)] p-4">
+          <GraphEntityDrawer
+            data={drawerData}
+            scanId={scanId}
+            variant="inline"
+            onClose={() => {
+              setSelectedNodeId(null);
+              setDrawerData(null);
+              setBlastActive(false);
+              onPinnedNodeChange?.(null);
+            }}
+            blastRadiusActive={blastActive}
+            blastRadiusLoading={blastLoading}
+            onShowBlastRadius={() => void handleShowImpact()}
+            onExpandNeighbors={() => void handleExpandNeighbors()}
+            onShowImpact={() => void handleShowImpact()}
+            remediationHref="/remediation"
+          />
+        </div>
+      )}
+    </section>
+  );
+}

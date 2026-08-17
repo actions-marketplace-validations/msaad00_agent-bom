@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import UTC, datetime
 
 import httpx
 
@@ -147,6 +148,13 @@ def get_nvidia_products_for_package(pkg_name: str) -> list[str]:
     return _PYPI_TO_NVIDIA.get(_normalise(pkg_name), [])
 
 
+def default_nvidia_advisory_years(now: datetime | None = None) -> list[str]:
+    """Return recent advisory years without pinning the scanner to a release year."""
+
+    current_year = (now or datetime.now(UTC)).year
+    return [str(current_year), str(current_year - 1)]
+
+
 def _parse_csaf_severity(scores: list[dict]) -> tuple[Severity, float | None]:
     """Extract severity and CVSS score from CSAF scores array."""
     for score_entry in scores:
@@ -187,7 +195,7 @@ async def fetch_nvidia_advisory_index(
     Only fetches recent years by default.
     """
     if years is None:
-        years = ["2025", "2026"]
+        years = default_nvidia_advisory_years()
 
     close_client = False
     if client is None:
@@ -240,23 +248,29 @@ def _word_boundary_match(product: str, text: str) -> bool:
 
 
 def _csaf_affects_product(csaf: dict, product_names: set[str]) -> bool:
-    """Check if a CSAF advisory affects any of the given NVIDIA product names."""
+    """Check if a CSAF advisory affects any of the given NVIDIA product names.
+
+    Recursively traverses product_tree.branches at any depth — NVIDIA CSAF documents
+    can nest product entries more than 2 levels deep.
+    """
     title = (csaf.get("document", {}).get("title", "") or "").lower()
     for product in product_names:
         if _word_boundary_match(product, title):
             return True
-    # Also check product_tree branches
-    for branch in csaf.get("product_tree", {}).get("branches", []):
-        _name = (branch.get("name", "") or "").lower()
-        for product in product_names:
-            if _word_boundary_match(product, _name):
-                return True
-        for sub in branch.get("branches", []):
-            _sname = (sub.get("name", "") or "").lower()
+
+    def _search_branches(branches: list, depth: int = 0) -> bool:
+        if depth > 8:  # safety cap — CSAF docs are never this deep
+            return False
+        for branch in branches:
+            _name = (branch.get("name", "") or "").lower()
             for product in product_names:
-                if _word_boundary_match(product, _sname):
+                if _word_boundary_match(product, _name):
                     return True
-    return False
+            if _search_branches(branch.get("branches", []), depth + 1):
+                return True
+        return False
+
+    return _search_branches(csaf.get("product_tree", {}).get("branches", []))
 
 
 def extract_vulns_from_csaf(csaf: dict) -> list[Vulnerability]:
@@ -294,6 +308,7 @@ def extract_vulns_from_csaf(csaf: dict) -> list[Vulnerability]:
                 fixed_version=fixed_version,
                 references=refs,
                 cwe_ids=cwe_ids,
+                advisory_sources=["nvidia_csaf"],
             )
         )
     return vulns
@@ -366,10 +381,18 @@ async def check_nvidia_advisories(
                     for v in pkg.vulnerabilities:
                         existing_ids.update(v.aliases)
                     for vuln in csaf_vulns:
-                        if vuln.id not in existing_ids:
-                            pkg.vulnerabilities.append(vuln)
-                            existing_ids.add(vuln.id)
-                            total_new += 1
+                        if vuln.id in existing_ids:
+                            continue
+                        # Skip if the installed version is already at or beyond
+                        # the fix — same guard as ghsa_advisory.py.
+                        if vuln.fixed_version and pkg.version:
+                            from agent_bom.version_utils import compare_versions
+
+                            if not compare_versions(pkg.version, vuln.fixed_version, pkg.ecosystem):
+                                continue
+                        pkg.vulnerabilities.append(vuln)
+                        existing_ids.add(vuln.id)
+                        total_new += 1
 
     if total_new:
         logger.info("NVIDIA advisories: found %d new CVE(s)", total_new)

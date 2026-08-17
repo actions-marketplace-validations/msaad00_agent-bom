@@ -19,12 +19,17 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from agent_bom.otel_ingest import ToolCallTrace
 
 logger = logging.getLogger(__name__)
+_VALID_PROXY_POLICIES = {"allowed", "blocked"}
 
 
 @dataclass
@@ -140,22 +145,58 @@ def load_audit_log(path: str | Path) -> list[ToolCallRecord]:
             logger.warning("Skipping invalid JSON at line %d", line_num)
             continue
 
+        if not isinstance(data, dict):
+            logger.warning("Skipping non-object JSONL record at line %d", line_num)
+            continue
+
         if data.get("type") != "tools/call":
             continue
 
-        records.append(
-            ToolCallRecord(
-                timestamp=data.get("ts", ""),
-                tool_name=data.get("tool", ""),
-                arguments=data.get("args", {}),
-                policy_result=data.get("policy", "allowed"),
-                reason=data.get("reason", ""),
-                payload_sha256=data.get("payload_sha256", ""),
-                message_id=data.get("message_id"),
-            )
-        )
+        record = _parse_proxy_tool_call_record(data, line_num=line_num)
+        if record is not None:
+            records.append(record)
 
     return records
+
+
+def _parse_proxy_tool_call_record(data: dict[str, Any], *, line_num: int) -> ToolCallRecord | None:
+    """Parse a proxy ``tools/call`` audit record, rejecting malformed records."""
+    ts = data.get("ts")
+    tool = data.get("tool")
+    args = data.get("args")
+    policy = data.get("policy")
+    invalid_fields: list[str] = []
+    if not isinstance(ts, str) or not ts.strip():
+        invalid_fields.append("ts")
+    if not isinstance(tool, str) or not tool.strip():
+        invalid_fields.append("tool")
+    if not isinstance(args, dict):
+        invalid_fields.append("args")
+    if policy not in _VALID_PROXY_POLICIES:
+        invalid_fields.append("policy")
+    if invalid_fields:
+        logger.warning(
+            "Skipping invalid proxy tools/call audit record at line %d: %s",
+            line_num,
+            ", ".join(invalid_fields),
+        )
+        return None
+
+    ts_str = cast(str, ts)
+    tool_name = cast(str, tool)
+    args_dict = cast(dict[str, Any], args)
+    policy_str = cast(str, policy)
+    reason = data.get("reason", "")
+    payload_sha256 = data.get("payload_sha256", "")
+    return ToolCallRecord(
+        timestamp=ts_str,
+        tool_name=tool_name.strip(),
+        arguments=args_dict,
+        policy_result=policy_str,
+        reason=reason if isinstance(reason, str) else "",
+        payload_sha256=payload_sha256 if isinstance(payload_sha256, str) else "",
+        message_id=data.get("message_id"),
+    )
 
 
 def _aggregate_calls(
@@ -327,3 +368,199 @@ def correlate(
         correlated_findings=correlated,
         uncalled_vulnerable_tools=uncalled,
     )
+
+
+# ─── Per-span attack-path correlation (span identity) ──────────────────────
+#
+# The aggregate ``correlate`` above answers "which vulnerable tools were called,
+# and how often". It joins on tool *name* and collapses every call of a tool
+# into one row — it cannot say *which traced call* hit a CVE.
+#
+# ``correlate_spans_to_attack_paths`` is the span-aware companion: it consumes
+# OTel/Langfuse tool-call spans (each carrying a trace_id + span_id from
+# ``agent_bom.otel_ingest``) and resolves *each span* to the exact BlastRadius it
+# touched — the precise reachable CVE, the credentials that row exposes, the
+# non-human identities holding those credentials, and the blast radius (agents,
+# servers, score). This unifies the span-name flagging in
+# ``otel_ingest.flag_vulnerable_tool_calls`` with the scan-side blast radius so
+# one correlation carries span identity end-to-end.
+
+
+@dataclass
+class SpanAttackPath:
+    """One traced tool-call span resolved to the exact attack path it hit."""
+
+    trace_id: str
+    span_id: str
+    tool_name: str
+    server_name: str
+    package_name: str
+    match_basis: str  # "tool" | "server" | "package"
+
+    # Exact vulnerability this span reached
+    vulnerability_id: str
+    severity: str
+    cvss_score: float
+    epss_score: float
+    is_kev: bool
+
+    # Resolved attack path
+    exposed_credentials: list[str]
+    exposed_nhi: list[dict[str, Any]]
+    affected_agents: list[str]
+    affected_servers: list[str]
+    blast_radius_score: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "trace_id": self.trace_id,
+            "span_id": self.span_id,
+            "tool_name": self.tool_name,
+            "server_name": self.server_name,
+            "package_name": self.package_name,
+            "match_basis": self.match_basis,
+            "vulnerability_id": self.vulnerability_id,
+            "severity": self.severity,
+            "cvss_score": self.cvss_score,
+            "epss_score": self.epss_score,
+            "is_kev": self.is_kev,
+            "exposed_credentials": list(self.exposed_credentials),
+            "exposed_nhi": [dict(nhi) for nhi in self.exposed_nhi],
+            "affected_agents": list(self.affected_agents),
+            "affected_servers": list(self.affected_servers),
+            "blast_radius_score": self.blast_radius_score,
+        }
+
+
+def _entity_name(value: Any) -> str:
+    name = getattr(value, "name", None)
+    if name:
+        return str(name)
+    return str(value)
+
+
+def _br_tool_names(br: Any) -> set[str]:
+    return {_entity_name(t).lower() for t in getattr(br, "exposed_tools", []) if _entity_name(t)}
+
+
+def _br_server_names(br: Any) -> set[str]:
+    return {_entity_name(s).lower() for s in getattr(br, "affected_servers", []) if _entity_name(s)}
+
+
+def _match_basis(
+    *,
+    tool_l: str,
+    server_l: str,
+    pkg_l: str,
+    tool_names: set[str],
+    server_names: set[str],
+    br_pkg_l: str,
+) -> str | None:
+    """Decide how (if at all) a span joins to a blast radius, strongest first.
+
+    ``tool`` (the exact call is a confirmed tool on the impacted path) is the
+    most precise signal, then ``server``, then ``package``.
+    """
+    if tool_l and tool_l in tool_names:
+        return "tool"
+    if server_l and server_l in server_names:
+        return "server"
+    if br_pkg_l:
+        if pkg_l and pkg_l == br_pkg_l:
+            return "package"
+        # Fuzzy tool<->package parity with otel flag_vulnerable_tool_calls, but
+        # only when the span carried no explicit package that already missed.
+        if not pkg_l and tool_l and (br_pkg_l in tool_l or tool_l in br_pkg_l):
+            return "package"
+    return None
+
+
+def _resolve_span_nhi(
+    credentials: Sequence[str],
+    nhi_map: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Resolve exposed credential names to the NHIs that hold them (deduped)."""
+    resolved: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for cred in credentials:
+        for identity in nhi_map.get(str(cred).lower(), []):
+            key = str(identity.get("node_id") or identity.get("identity_id") or identity.get("name") or id(identity))
+            if key in seen:
+                continue
+            seen.add(key)
+            resolved.append(dict(identity))
+    return resolved
+
+
+def correlate_spans_to_attack_paths(
+    traces: "Sequence[ToolCallTrace]",
+    blast_radii: Sequence[Any],
+    *,
+    nhi_by_credential: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+) -> list[SpanAttackPath]:
+    """Resolve each traced tool-call span to the exact attack path it hit.
+
+    Args:
+        traces: Parsed OTel/Langfuse tool-call spans (``ToolCallTrace``), each
+            carrying trace_id + span_id.
+        blast_radii: ``BlastRadius`` rows from a scan (the CVE + exposed
+            credentials + affected agents/servers + risk score).
+        nhi_by_credential: Optional map of credential env-var name -> the NHIs
+            that hold it, used to resolve a span's exposed credentials to the
+            exact non-human identities. Never carries secret material.
+
+    Returns:
+        One ``SpanAttackPath`` per (span, matched blast radius). A span that hit
+        several CVEs yields one row per CVE, each carrying the full attack path.
+    """
+    nhi_map: dict[str, Sequence[Mapping[str, Any]]] = {}
+    if nhi_by_credential:
+        for cred, identities in nhi_by_credential.items():
+            nhi_map[str(cred).lower()] = list(identities)
+
+    # Pre-index blast radii so the join is O(spans * radii) with cheap set hits.
+    indexed: list[tuple[Any, set[str], set[str], str]] = []
+    for br in blast_radii:
+        pkg = getattr(br, "package", None)
+        br_pkg_l = (getattr(pkg, "name", "") or "").lower()
+        indexed.append((br, _br_tool_names(br), _br_server_names(br), br_pkg_l))
+
+    results: list[SpanAttackPath] = []
+    for trace in traces:
+        tool_l = (getattr(trace, "tool_name", "") or "").lower()
+        server_l = (getattr(trace, "server_name", "") or "").lower()
+        pkg_l = (getattr(trace, "package_name", "") or "").lower()
+        for br, tool_names, server_names, br_pkg_l in indexed:
+            basis = _match_basis(
+                tool_l=tool_l,
+                server_l=server_l,
+                pkg_l=pkg_l,
+                tool_names=tool_names,
+                server_names=server_names,
+                br_pkg_l=br_pkg_l,
+            )
+            if basis is None:
+                continue
+            vuln = br.vulnerability
+            credentials = list(getattr(br, "exposed_credentials", []) or [])
+            results.append(
+                SpanAttackPath(
+                    trace_id=getattr(trace, "trace_id", ""),
+                    span_id=getattr(trace, "span_id", ""),
+                    tool_name=getattr(trace, "tool_name", ""),
+                    server_name=getattr(trace, "server_name", ""),
+                    package_name=getattr(trace, "package_name", "") or br_pkg_l,
+                    match_basis=basis,
+                    vulnerability_id=vuln.id,
+                    severity=vuln.severity.value if hasattr(vuln.severity, "value") else str(vuln.severity),
+                    cvss_score=vuln.cvss_score or 0.0,
+                    epss_score=vuln.epss_score or 0.0,
+                    is_kev=bool(vuln.is_kev),
+                    exposed_credentials=credentials,
+                    exposed_nhi=_resolve_span_nhi(credentials, nhi_map),
+                    affected_agents=[_entity_name(a) for a in getattr(br, "affected_agents", [])],
+                    affected_servers=[_entity_name(s) for s in getattr(br, "affected_servers", [])],
+                    blast_radius_score=round(float(getattr(br, "risk_score", 0.0) or 0.0), 2),
+                )
+            )
+    return results

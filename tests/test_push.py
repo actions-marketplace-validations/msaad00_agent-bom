@@ -1,9 +1,14 @@
 """Tests for hybrid push-to-dashboard."""
 
+import asyncio
 from unittest.mock import AsyncMock, patch
+
+import pytest
 
 from agent_bom.push import (
     _looks_like_secret,
+    _push_async,
+    _push_retry_delay,
     generate_source_id,
     push_results,
     sanitize_results,
@@ -13,6 +18,10 @@ from agent_bom.push import (
 
 
 class TestGenerateSourceId:
+    def test_env_override_takes_priority(self, monkeypatch):
+        monkeypatch.setenv("AGENT_BOM_PUSH_SOURCE_ID", "device-acme-001")
+        assert generate_source_id() == "device-acme-001"
+
     def test_stable(self):
         """Same machine produces same source_id."""
         id1 = generate_source_id()
@@ -66,11 +75,68 @@ class TestSanitizeResults:
         assert meta["api_key"] == "***REDACTED***"
         assert meta["display_name"] == "My Bot"
 
+    def test_redacts_nested_secret_fields(self):
+        results = {
+            "agents": [
+                {
+                    "name": "agent-1",
+                    "metadata": {
+                        "nested": {
+                            "api_key": "key-xyz",
+                            "safe": "visible",
+                        },
+                        "tools": [{"auth_token": "tok-123", "name": "search"}],
+                    },
+                }
+            ]
+        }
+        sanitized = sanitize_results(results)
+        meta = sanitized["agents"][0]["metadata"]
+        assert meta["nested"]["api_key"] == "***REDACTED***"
+        assert meta["nested"]["safe"] == "visible"
+        assert meta["tools"][0]["auth_token"] == "***REDACTED***"
+        assert meta["tools"][0]["name"] == "search"
+
+    def test_redacts_mcp_launch_fields(self):
+        token = "ghp_" + "A" * 36
+        results = {
+            "agents": [
+                {
+                    "name": "agent-1",
+                    "mcp_servers": [
+                        {
+                            "name": "srv",
+                            "command": "npx",
+                            "args": ["server", "--token", token],
+                            "url": f"https://user:pass@example.com/sse?token={token}",
+                            "env": {"API_KEY": token, "DEBUG": "1"},
+                            "security_warnings": [f"token {token}"],
+                        }
+                    ],
+                }
+            ]
+        }
+
+        sanitized = sanitize_results(results)
+        payload = sanitized["agents"][0]["mcp_servers"][0]
+
+        assert token not in str(sanitized)
+        assert payload["args"] == ["server", "--token", "<redacted>"]
+        assert payload["url"] == "https://example.com/sse"
+        assert payload["env"] == {"API_KEY": "***REDACTED***", "DEBUG": "1"}
+        assert payload["security_warnings"] == ["token <redacted>"]
+
     def test_adds_source_id(self):
         results = {"agents": []}
         sanitized = sanitize_results(results)
         assert "source_id" in sanitized
         assert len(sanitized["source_id"]) == 12
+
+    def test_adds_idempotency_key(self):
+        results = {"agents": []}
+        sanitized = sanitize_results(results)
+        assert "idempotency_key" in sanitized
+        assert len(sanitized["idempotency_key"]) >= 32
 
     def test_does_not_mutate_original(self):
         results = {"agents": [{"name": "a", "config_path": "/x"}]}
@@ -88,6 +154,23 @@ class TestSanitizeResults:
         sanitized = sanitize_results(results)
         assert sanitized["summary"] == "ok"
         assert "source_id" in sanitized
+
+    def test_adds_endpoint_identity_metadata_from_env(self, monkeypatch):
+        monkeypatch.setenv("AGENT_BOM_PUSH_SOURCE_ID", "device-acme-001")
+        monkeypatch.setenv("AGENT_BOM_PUSH_ENROLLMENT_NAME", "corp-laptop-rollout")
+        monkeypatch.setenv("AGENT_BOM_PUSH_OWNER", "platform-security")
+        monkeypatch.setenv("AGENT_BOM_PUSH_ENVIRONMENT", "production")
+        monkeypatch.setenv("AGENT_BOM_PUSH_MDM_PROVIDER", "jamf")
+        monkeypatch.setenv("AGENT_BOM_PUSH_TAGS", "developer-endpoint, mdm")
+        results = {"agents": [{"name": "cursor"}]}
+        sanitized = sanitize_results(results)
+        agent = sanitized["agents"][0]
+        assert agent["source_id"] == "device-acme-001"
+        assert agent["enrollment_name"] == "corp-laptop-rollout"
+        assert agent["owner"] == "platform-security"
+        assert agent["environment"] == "production"
+        assert agent["mdm_provider"] == "jamf"
+        assert agent["tags"] == ["developer-endpoint", "mdm"]
 
 
 # ─── _looks_like_secret ──────────────────────────────────────────────────────
@@ -120,11 +203,15 @@ class TestPushResults:
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("agent_bom.http_client.create_client", return_value=mock_client):
+        with (
+            patch("agent_bom.http_client.create_client", return_value=mock_client),
+            patch("agent_bom.security.validate_url", return_value=None),
+        ):
             result = push_results("https://dashboard.example.com/v1/results/push", {"agents": []})
         assert result is True
 
     def test_push_failure(self):
+        """A 500 is retryable; the final result is False after max attempts."""
         mock_resp = AsyncMock()
         mock_resp.status_code = 500
         mock_resp.text = "Internal server error"
@@ -134,9 +221,15 @@ class TestPushResults:
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("agent_bom.http_client.create_client", return_value=mock_client):
+        with (
+            patch("agent_bom.http_client.create_client", return_value=mock_client),
+            patch("agent_bom.push.asyncio.sleep", new=AsyncMock()),
+            patch("agent_bom.security.validate_url", return_value=None),
+        ):
             result = push_results("https://dashboard.example.com/v1/results/push", {"agents": []})
         assert result is False
+        # 3 retry attempts by default
+        assert mock_client.post.call_count == 3
 
     def test_push_with_api_key(self):
         mock_resp = AsyncMock()
@@ -147,7 +240,10 @@ class TestPushResults:
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("agent_bom.http_client.create_client", return_value=mock_client):
+        with (
+            patch("agent_bom.http_client.create_client", return_value=mock_client),
+            patch("agent_bom.security.validate_url", return_value=None),
+        ):
             result = push_results(
                 "https://dashboard.example.com/v1/results/push",
                 {"agents": []},
@@ -159,12 +255,224 @@ class TestPushResults:
         headers = call_kwargs.kwargs.get("headers", {})
         assert headers.get("Authorization") == "Bearer test-key-123"
 
+    def test_push_url_private_egress_override_allows_http_localhost(self, monkeypatch):
+        monkeypatch.setenv("AGENT_BOM_ALLOW_PRIVATE_EGRESS_URLS", "true")
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("agent_bom.http_client.create_client", return_value=mock_client):
+            result = push_results("http://localhost:8422/v1/results/push", {"agents": []})
+
+        assert result is True
+        assert mock_client.post.call_args.args[0] == "http://localhost:8422/v1/results/push"
+
+    def test_push_url_loopback_http_allowed_without_private_egress_override(self):
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("agent_bom.http_client.create_client", return_value=mock_client):
+            result = push_results("http://127.0.0.1:8422/v1/fleet/sync", {"agents": []})
+
+        assert result is True
+        assert mock_client.post.call_args.args[0] == "http://127.0.0.1:8422/v1/fleet/sync"
+
     def test_push_network_error(self):
+        """Network errors retry up to max attempts then return False."""
         mock_client = AsyncMock()
         mock_client.post = AsyncMock(side_effect=OSError("Connection refused"))
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("agent_bom.http_client.create_client", return_value=mock_client):
+        with (
+            patch("agent_bom.http_client.create_client", return_value=mock_client),
+            patch("agent_bom.push.asyncio.sleep", new=AsyncMock()),
+            patch("agent_bom.security.validate_url", return_value=None),
+        ):
             result = push_results("https://unreachable.example.com/push", {"agents": []})
         assert result is False
+        assert mock_client.post.call_count == 3
+
+
+# ─── push retry contract ──────────────────────────────────────────────────────
+
+
+class TestPushRetry:
+    def test_retryable_status_then_success(self):
+        """503 then 200 ⇒ single retry, final True."""
+        resp_fail = AsyncMock(status_code=503)
+        resp_fail.text = "Service unavailable"
+        resp_ok = AsyncMock(status_code=200)
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=[resp_fail, resp_ok])
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("agent_bom.http_client.create_client", return_value=mock_client),
+            patch("agent_bom.push.asyncio.sleep", new=AsyncMock()),
+            patch("agent_bom.security.validate_url", return_value=None),
+        ):
+            result = asyncio.run(_push_async("https://dashboard.example.com/push", {"agents": []}, max_attempts=3))
+        assert result is True
+        assert mock_client.post.call_count == 2
+
+    def test_non_retryable_status_short_circuits(self):
+        """4xx that isn't 408/425/429 returns False without retrying."""
+        resp = AsyncMock(status_code=400)
+        resp.text = "Bad request"
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("agent_bom.http_client.create_client", return_value=mock_client),
+            patch("agent_bom.push.asyncio.sleep", new=AsyncMock()),
+            patch("agent_bom.security.validate_url", return_value=None),
+        ):
+            result = asyncio.run(_push_async("https://dashboard.example.com/push", {"agents": []}, max_attempts=3))
+        assert result is False
+        assert mock_client.post.call_count == 1
+
+    def test_429_is_retryable(self):
+        resp_429 = AsyncMock(status_code=429)
+        resp_429.text = "rate limited"
+        resp_ok = AsyncMock(status_code=200)
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=[resp_429, resp_ok])
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("agent_bom.http_client.create_client", return_value=mock_client),
+            patch("agent_bom.push.asyncio.sleep", new=AsyncMock()),
+            patch("agent_bom.security.validate_url", return_value=None),
+        ):
+            result = asyncio.run(_push_async("https://dashboard.example.com/push", {"agents": []}, max_attempts=3))
+        assert result is True
+        assert mock_client.post.call_count == 2
+
+    @pytest.mark.parametrize(
+        "attempt,expected_floor,cap",
+        [
+            (1, 1.0, 30.0),
+            (2, 2.0, 30.0),
+            (3, 4.0, 30.0),
+            (10, 30.0, 30.0),  # capped
+        ],
+    )
+    def test_retry_delay_exponential_and_capped(self, attempt, expected_floor, cap):
+        delay = _push_retry_delay(attempt, base=1.0, cap=cap)
+        assert expected_floor <= delay <= cap + 0.01
+
+
+def test_push_async_uses_collector_client_tls_material(monkeypatch, tmp_path) -> None:
+    cert = tmp_path / "client.crt"
+    key = tmp_path / "client.key"
+    ca = tmp_path / "ca.crt"
+    cert.write_text("cert")
+    key.write_text("key")
+    ca.write_text("ca")
+
+    monkeypatch.setenv("AGENT_BOM_PUSH_TLS_CERT_FILE", str(cert))
+    monkeypatch.setenv("AGENT_BOM_PUSH_TLS_KEY_FILE", str(key))
+    monkeypatch.setenv("AGENT_BOM_PUSH_TLS_CA_FILE", str(ca))
+
+    captured: dict[str, object] = {}
+
+    def _fake_create_client(*, cert=None, verify=True, timeout=None):
+        captured["cert"] = cert
+        captured["verify"] = verify
+        captured["timeout"] = timeout
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, *args, **kwargs):
+                response = AsyncMock()
+                response.status_code = 200
+                return response
+
+        return _Client()
+
+    with (
+        patch("agent_bom.http_client.create_client", side_effect=_fake_create_client),
+        patch("agent_bom.security.validate_url", return_value=None),
+    ):
+        assert asyncio.run(_push_async("https://dashboard.example.com/v1/fleet/sync", {"agents": []})) is True
+
+    assert captured["cert"] == (str(cert), str(key))
+    assert captured["verify"] == str(ca)
+
+
+# ─── normalize_scan_push_url ─────────────────────────────────────────────────
+
+
+class TestNormalizeScanPushUrl:
+    """`scan --push-url` accepts a control-plane base URL, not only the endpoint."""
+
+    @pytest.mark.parametrize(
+        ("given", "expected"),
+        [
+            # Bare base URL — the obvious input, previously POSTed to `/` and 405'd.
+            ("http://127.0.0.1:8422", "http://127.0.0.1:8422/v1/results/push"),
+            ("http://127.0.0.1:8422/", "http://127.0.0.1:8422/v1/results/push"),
+            ("https://agent-bom.example.com///", "https://agent-bom.example.com/v1/results/push"),
+            # Already explicit — must not be double-suffixed.
+            ("http://127.0.0.1:8422/v1/results/push", "http://127.0.0.1:8422/v1/results/push"),
+            ("http://127.0.0.1:8422/v1/results/push/", "http://127.0.0.1:8422/v1/results/push"),
+            # A versioned base URL grows only the endpoint tail.
+            ("https://agent-bom.example.com/v1", "https://agent-bom.example.com/v1/results/push"),
+            # Fleet inventory sync stays where the operator pointed it.
+            ("https://agent-bom.example.com/v1/fleet/sync", "https://agent-bom.example.com/v1/fleet/sync"),
+            # Reverse proxy mounting the control plane under a path prefix.
+            ("https://corp.example.com/agent-bom", "https://corp.example.com/agent-bom/v1/results/push"),
+            ("https://corp.example.com/agent-bom/", "https://corp.example.com/agent-bom/v1/results/push"),
+            (
+                "https://corp.example.com/agent-bom/v1/results/push",
+                "https://corp.example.com/agent-bom/v1/results/push",
+            ),
+            # Query strings survive normalization.
+            ("http://127.0.0.1:8422?tenant=acme", "http://127.0.0.1:8422/v1/results/push?tenant=acme"),
+            (
+                "http://127.0.0.1:8422/v1/results/push?tenant=acme",
+                "http://127.0.0.1:8422/v1/results/push?tenant=acme",
+            ),
+            # Surrounding whitespace from shell/env plumbing.
+            ("  http://127.0.0.1:8422  ", "http://127.0.0.1:8422/v1/results/push"),
+        ],
+    )
+    def test_normalizes(self, given, expected):
+        from agent_bom.push import normalize_scan_push_url
+
+        assert normalize_scan_push_url(given) == expected
+
+    @pytest.mark.parametrize("given", ["", "   ", "not-a-url", "/v1/results/push"])
+    def test_leaves_non_absolute_input_for_url_validation(self, given):
+        """A malformed value is returned untouched so the URL policy reports on it."""
+        from agent_bom.push import normalize_scan_push_url
+
+        assert normalize_scan_push_url(given) == given.strip()
+
+    def test_is_idempotent(self):
+        from agent_bom.push import normalize_scan_push_url
+
+        once = normalize_scan_push_url("http://127.0.0.1:8422")
+        assert normalize_scan_push_url(once) == once

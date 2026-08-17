@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
@@ -122,6 +123,24 @@ class TestLoadAuditLog:
         log.write_text("not json\n" + _make_audit_line("read_file") + "\n")
         records = load_audit_log(log)
         assert len(records) == 1
+
+    def test_skips_invalid_tools_call_records_with_warning(self, tmp_path, caplog):
+        log = tmp_path / "audit.jsonl"
+        valid = json.loads(_make_audit_line("read_file"))
+        invalid_records = [
+            {"type": "tools/call", "tool": "missing_ts", "args": {}, "policy": "allowed"},
+            {"type": "tools/call", "ts": "2026-04-25T00:00:00Z", "tool": "", "args": {}, "policy": "allowed"},
+            {"type": "tools/call", "ts": "2026-04-25T00:00:01Z", "tool": "bad_args", "args": [], "policy": "allowed"},
+            {"type": "tools/call", "ts": "2026-04-25T00:00:02Z", "tool": "bad_policy", "args": {}, "policy": "warn"},
+        ]
+        log.write_text("\n".join(json.dumps(record) for record in [*invalid_records, valid]) + "\n")
+
+        with caplog.at_level(logging.WARNING, logger="agent_bom.runtime_correlation"):
+            records = load_audit_log(log)
+
+        assert len(records) == 1
+        assert records[0].tool_name == "read_file"
+        assert caplog.text.count("Skipping invalid proxy tools/call audit record") == 4
 
     def test_file_not_found(self):
         with pytest.raises(FileNotFoundError):

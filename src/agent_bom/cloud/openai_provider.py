@@ -12,9 +12,11 @@ from __future__ import annotations
 import logging
 import os
 
+from agent_bom.discovery_envelope import RedactionStatus, ScanMode, attach_envelope_to_agents
 from agent_bom.models import Agent, AgentType, MCPServer, MCPTool, Package, TransportType
 
 from .base import CloudDiscoveryError
+from .normalization import build_cloud_origin
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,22 @@ def discover(
     except Exception as exc:
         warnings.append(f"OpenAI fine-tune discovery error: {exc}")
 
+    # Per-run discovery envelope (#2083 PR B).
+    scope: list[str] = []
+    if resolved_org:
+        scope.append(f"openai:organization/{resolved_org}")
+    attach_envelope_to_agents(
+        agents,
+        scan_mode=ScanMode.SAAS_READ_ONLY,
+        discovery_scope=tuple(scope),
+        permissions_used=(
+            "openai:assistants:list",
+            "openai:assistants:retrieve",
+            "openai:fine_tuning.jobs:list",
+            "openai:models:list",
+        ),
+        redaction_status=RedactionStatus.CENTRAL_SANITIZER_APPLIED,
+    )
     return agents, warnings
 
 
@@ -152,6 +170,17 @@ def _discover_assistants(
                     source="openai-assistant",
                     version=model,
                     mcp_servers=[server],
+                    metadata={
+                        "cloud_origin": build_cloud_origin(
+                            provider="openai",
+                            service="assistants",
+                            resource_type="assistant",
+                            resource_id=asst_id,
+                            resource_name=asst_name,
+                            account_id=organization or None,
+                            raw_identity={"id": asst_id, "name": asst_name, "model": model},
+                        )
+                    },
                 )
                 agents.append(agent)
 
@@ -230,6 +259,23 @@ def _discover_fine_tunes(
                     source="openai-fine-tune",
                     version=f"{status} (base: {model})",
                     mcp_servers=[server],
+                    metadata={
+                        "cloud_origin": build_cloud_origin(
+                            provider="openai",
+                            service="fine-tuning",
+                            resource_type="job",
+                            resource_id=job_id,
+                            resource_name=fine_tuned_model,
+                            account_id=organization or None,
+                            raw_identity={
+                                "id": job_id,
+                                "model": model,
+                                "fine_tuned_model": fine_tuned_model,
+                                "status": status,
+                                "training_file": training_file,
+                            },
+                        )
+                    },
                 )
                 agents.append(agent)
 

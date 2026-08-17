@@ -4,12 +4,52 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import Optional
+from contextlib import nullcontext
+from hashlib import sha256
+from pathlib import Path
+from typing import Any, Optional
 
 import click
 from rich.console import Console
 
 from agent_bom import __version__
+from agent_bom.cli._common import _sync_runtime_consoles
+from agent_bom.ecosystems import SUPPORTED_PACKAGE_ECOSYSTEMS
+from agent_bom.graph.severity import severity_at_or_above
+
+
+def _response_has_version(response, ecosystem: str, version: str) -> bool:
+    """Return True when a registry response contains the requested version."""
+    if response is None or response.status_code != 200:
+        return False
+    if version in {"unknown", "", "latest"}:
+        return True
+    try:
+        payload = response.json()
+    except Exception:
+        return False
+    if ecosystem == "pypi":
+        return version in (payload.get("releases") or {})
+    return version in (payload.get("versions") or {})
+
+
+def _detect_ecosystem(name: str, version: str = "unknown") -> Optional[str]:
+    """Detect ecosystem by checking package and version presence on PyPI or npm."""
+    try:
+        from agent_bom.http_client import sync_get
+
+        pypi_resp = sync_get(f"https://pypi.org/pypi/{name}/json", timeout=3)
+        npm_resp = sync_get(f"https://registry.npmjs.org/{name}", timeout=3)
+        on_pypi = _response_has_version(pypi_resp, "pypi", version)
+        on_npm = _response_has_version(npm_resp, "npm", version)
+
+        if on_pypi and not on_npm:
+            return "pypi"
+        if on_npm and not on_pypi:
+            return "npm"
+        return None
+    except Exception:
+        return None
 
 
 def _parse_package_spec(
@@ -19,8 +59,12 @@ def _parse_package_spec(
     """Parse a package spec into (name, version, ecosystem).
 
     Handles npx/uvx prefixes, scoped npm packages, and name@version.
+    Auto-detects ecosystem when not specified.
     """
     spec = package_spec.strip()
+    # Accept both pip (pkg==1.0) and universal (pkg@1.0) syntax
+    if "==" in spec and "@" not in spec:
+        spec = spec.replace("==", "@", 1)
     if spec.startswith("npx ") or spec.startswith("uvx "):
         parts = spec.split()
         pkg_args = [p for p in parts[1:] if not p.startswith("-")]
@@ -37,12 +81,485 @@ def _parse_package_spec(
         name, version = spec, "unknown"
 
     if not ecosystem:
-        if name.startswith("@") or "-" in name and "." not in name:
+        if name.startswith("@"):
             ecosystem = "npm"
-        else:
+        elif "." in name or "_" in name:
             ecosystem = "pypi"
+        else:
+            ecosystem = _detect_ecosystem(name, version) or "pypi"
 
     return name, version, ecosystem
+
+
+def _write_json_output(payload: dict, output_path: str | None) -> None:
+    """Write JSON to stdout or a file."""
+    text = json.dumps(payload, indent=2)
+    if output_path and output_path != "-":
+        Path(output_path).write_text(text, encoding="utf-8")
+        return
+    click.echo(text)
+
+
+def _write_sarif_output(payload: dict, output_path: str | None) -> None:
+    """Write package-check SARIF to stdout or a file."""
+    text = json.dumps(_check_payload_to_sarif(payload), indent=2)
+    if output_path and output_path != "-":
+        Path(output_path).write_text(text, encoding="utf-8")
+        return
+    click.echo(text)
+
+
+def _check_severity_counts(vulnerabilities: list | None) -> dict[str, int]:
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "unknown": 0}
+    for vuln in vulnerabilities or []:
+        if isinstance(vuln, dict):
+            severity = str(vuln.get("severity") or "unknown").lower()
+        else:
+            severity = str(getattr(getattr(vuln, "severity", None), "value", "unknown")).lower()
+        counts[severity if severity in counts else "unknown"] += 1
+    return counts
+
+
+def _check_agent_summary(payload: dict) -> dict:
+    return {
+        "agents": 0,
+        "servers": None,
+        "packages": 1 if payload.get("package") else 0,
+        "vulnerabilities": int(payload.get("vulnerability_count") or 0),
+        "findings": 0,
+        "severity_counts": _check_severity_counts(payload.get("vulnerabilities")),
+        "posture_grade": None,
+        "verdict": payload.get("verdict"),
+        "package": payload.get("package"),
+        "version": payload.get("version"),
+    }
+
+
+def _check_agent_confidence(payload: dict) -> dict:
+    vulnerabilities = payload.get("vulnerabilities") or []
+    signals = [
+        {"name": "package_version", "present": bool(payload.get("version") and payload.get("version") != "unknown")},
+        {"name": "ecosystem", "present": bool(payload.get("ecosystems"))},
+        {"name": "advisory_backing", "present": bool(vulnerabilities)},
+        {"name": "external_enrichment", "present": any(bool(item.get("advisory_sources")) for item in vulnerabilities)},
+    ]
+    present = sum(1 for signal in signals if signal["present"])
+    level = "high" if present >= 3 else "medium" if present >= 2 else "low"
+    return {"level": level, "signals": signals}
+
+
+def _check_payload_to_sarif(payload: dict) -> dict:
+    """Convert a package-check payload to SARIF 2.1.0."""
+    package = payload.get("package") or "unknown"
+    version = payload.get("version") or "unknown"
+    ecosystems = payload.get("ecosystems") or []
+    package_ref = f"{package}@{version}"
+    rules: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
+    severity_level = {
+        "critical": "error",
+        "high": "error",
+        "medium": "warning",
+        "low": "note",
+        "none": "none",
+        "unknown": "note",
+    }
+
+    for vuln in payload.get("vulnerabilities") or []:
+        vuln_id = str(vuln.get("id") or "unknown")
+        severity = str(vuln.get("severity") or "unknown").lower()
+        level = severity_level.get(severity, "warning")
+        cvss_score = vuln.get("cvss_score")
+        properties = {
+            "package": package,
+            "version": version,
+            "ecosystems": ecosystems,
+            "severity": severity,
+            "fixed_version": vuln.get("fixed_version"),
+            "is_kev": bool(vuln.get("is_kev")),
+            "kev_date_added": vuln.get("kev_date_added"),
+            "kev_due_date": vuln.get("kev_due_date"),
+            "cvss_vector": vuln.get("cvss_vector"),
+            "attack_vector": vuln.get("attack_vector"),
+            "attack_complexity": vuln.get("attack_complexity"),
+            "privileges_required": vuln.get("privileges_required"),
+            "user_interaction": vuln.get("user_interaction"),
+            "network_exploitable": bool(vuln.get("network_exploitable")),
+            "epss_score": vuln.get("epss_score"),
+            "epss_percentile": vuln.get("epss_percentile"),
+            "cwe_ids": vuln.get("cwe_ids") or [],
+            "aliases": vuln.get("aliases") or [],
+            "advisory_sources": vuln.get("advisory_sources") or [],
+        }
+        if cvss_score is not None:
+            properties["security-severity"] = str(cvss_score)
+
+        rules.append(
+            {
+                "id": vuln_id,
+                "shortDescription": {"text": f"{severity.upper()}: {vuln_id} in {package_ref}"},
+                "fullDescription": {"text": str(vuln.get("summary") or f"Vulnerability {vuln_id}")},
+                "helpUri": f"https://osv.dev/vulnerability/{vuln_id}",
+                "defaultConfiguration": {"level": level},
+                "properties": properties,
+            }
+        )
+        fingerprint = sha256(f"check:{package}:{version}:{vuln_id}".encode("utf-8")).hexdigest()
+        message = f"{vuln_id} ({severity}) in {package_ref}."
+        if vuln.get("fixed_version"):
+            message += f" Fix: upgrade to {vuln['fixed_version']}."
+        results.append(
+            {
+                "ruleId": vuln_id,
+                "level": level,
+                "kind": "fail",
+                "message": {"text": message},
+                "fingerprints": {"agent-bom/check/v1": fingerprint},
+                "locations": [
+                    {
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": f"pkg:{ecosystems[0] if ecosystems else 'generic'}/{package}@{version}"},
+                            "region": {"startLine": 1, "startColumn": 1},
+                        }
+                    }
+                ],
+                "properties": properties,
+            }
+        )
+
+    return {
+        "version": "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "agent-bom check",
+                        "informationUri": "https://github.com/msaad00/agent-bom",
+                        "semanticVersion": __version__,
+                        "rules": rules,
+                    }
+                },
+                "results": results,
+                "properties": {
+                    "schema_version": payload.get("schema_version"),
+                    "document_type": payload.get("document_type"),
+                    "verdict": payload.get("verdict"),
+                    "exit_code": payload.get("exit_code"),
+                    "package": package,
+                    "version": version,
+                    "ecosystems": ecosystems,
+                    "vulnerability_count": payload.get("vulnerability_count"),
+                },
+            }
+        ],
+    }
+
+
+def _write_check_output(
+    payload: dict,
+    output_path: str | None,
+    *,
+    agent_mode: bool,
+    exit_code: int,
+    output_format: str = "json",
+) -> None:
+    """Write package-check output in plain JSON or agent-mode envelope form."""
+    if not agent_mode:
+        if output_format == "sarif":
+            _write_sarif_output(payload, output_path)
+            return
+        _write_json_output(payload, output_path)
+        return
+
+    from agent_bom.cli._agent_mode import command_success_envelope, dumps_envelope
+
+    error_type = None
+    if exit_code == 1:
+        error_type = "unsafe_package"
+    elif exit_code == 2:
+        error_type = "incomplete_scan"
+    envelope = command_success_envelope(
+        command="check",
+        data=payload,
+        exit_code=exit_code,
+        summary=_check_agent_summary(payload),
+        confidence=_check_agent_confidence(payload),
+        error_type=error_type,
+    )
+    text = dumps_envelope(envelope)
+    if output_path and output_path != "-":
+        Path(output_path).write_text(text, encoding="utf-8")
+        return
+    click.echo(text)
+
+
+def _render_provenance_check(provenance: dict | None) -> dict[str, str]:
+    """Normalize provenance verification into a stable CLI-facing status."""
+    if provenance and provenance.get("has_provenance"):
+        att_count = provenance.get("attestation_count", 0)
+        files = provenance.get("files") or []
+        if files:
+            file_count = len(files) if isinstance(files, list) else 0
+            detail = f"Release provenance present for all {file_count} file(s) ({att_count} attestation(s))"
+        else:
+            detail = f"Provenance attestation found ({att_count} attestation(s))"
+        return {
+            "status": "pass",
+            "detail": detail,
+        }
+
+    status = str((provenance or {}).get("status") or "")
+    if status == "not_published":
+        return {
+            "status": "missing",
+            "detail": "No registry provenance attestation found for this release",
+        }
+    if status == "not_provenance":
+        return {
+            "status": "missing",
+            "detail": "Attestations found, but none were SLSA/provenance attestations",
+        }
+    if status == "partial":
+        att_count = (provenance or {}).get("attestation_count", 0)
+        missing = (provenance or {}).get("missing_files") or []
+        suffix = f"; missing: {', '.join(missing[:3])}" if missing else ""
+        return {
+            "status": "fail",
+            "detail": f"Only partial release provenance found ({att_count} attestation(s)){suffix}",
+        }
+    if status == "unavailable":
+        return {
+            "status": "unavailable",
+            "detail": "Provenance service unavailable",
+        }
+    return {
+        "status": "unknown",
+        "detail": "Could not determine provenance status",
+    }
+
+
+def _check_result_payload(
+    *,
+    name: str,
+    version: str,
+    ecosystems: list[str],
+    verdict: str,
+    message: str,
+    exit_code: int,
+    vulnerabilities: list | None = None,
+    warnings: list[str] | None = None,
+    exit_zero: bool = False,
+    fail_on_severity: str | None = None,
+    fail_on_severity_count: int | None = None,
+) -> dict:
+    """Build machine-readable check output."""
+    serialized_vulns = []
+    for vuln in vulnerabilities or []:
+        serialized_vulns.append(
+            {
+                "id": vuln.id,
+                "summary": vuln.summary,
+                "severity": vuln.severity.value,
+                "fixed_version": vuln.fixed_version,
+                "is_kev": vuln.is_kev,
+                "kev_date_added": vuln.kev_date_added,
+                "kev_due_date": vuln.kev_due_date,
+                "cvss_score": vuln.cvss_score,
+                "cvss_vector": vuln.cvss_vector,
+                "attack_vector": vuln.attack_vector,
+                "attack_complexity": vuln.attack_complexity,
+                "privileges_required": vuln.privileges_required,
+                "user_interaction": vuln.user_interaction,
+                "network_exploitable": vuln.network_exploitable,
+                "epss_score": vuln.epss_score,
+                "epss_percentile": vuln.epss_percentile,
+                "nvd_status": vuln.nvd_status,
+                "published_at": vuln.published_at,
+                "modified_at": vuln.modified_at,
+                "cwe_ids": list(vuln.cwe_ids),
+                "aliases": list(vuln.aliases),
+                "references": list(vuln.references),
+                "advisory_sources": list(vuln.advisory_sources),
+            }
+        )
+
+    return {
+        "schema_version": "1.0",
+        "document_type": "PACKAGE-CHECK",
+        "spec_version": "1.0",
+        "package": name,
+        "version": version,
+        "ecosystems": ecosystems,
+        "verdict": verdict,
+        "message": message,
+        "exit_code": exit_code,
+        "exit_zero": exit_zero,
+        "fail_on_severity": fail_on_severity,
+        "fail_on_severity_count": fail_on_severity_count,
+        "vulnerability_count": len(serialized_vulns),
+        "scan_warnings": warnings or [],
+        "vulnerabilities": serialized_vulns,
+    }
+
+
+def _format_vulnerability_count(count: int) -> str:
+    return f"{count} vulnerability found" if count == 1 else f"{count} vulnerabilities found"
+
+
+def _vulns_at_or_above(vulnerabilities: list, threshold: str | None) -> list:
+    if not threshold:
+        return list(vulnerabilities)
+    return [vuln for vuln in vulnerabilities if severity_at_or_above(str(vuln.severity.value), threshold)]
+
+
+def _resolve_check_ecosystems(name: str, version: str, ecosystem: Optional[str], detected_eco: str) -> list[str]:
+    """Return the ecosystems that `check` should scan."""
+    if ecosystem:
+        return [detected_eco]
+    if name.startswith("@") or "." in name or "_" in name:
+        return [detected_eco]
+
+    resolved = _detect_ecosystem(name, version)
+    if resolved:
+        return [resolved]
+
+    raise click.UsageError(f"Ambiguous package name '{name}'. Specify --ecosystem pypi or --ecosystem npm for a trustworthy verdict.")
+
+
+def _maven_coordinate_error(name: str, ecosystem: str) -> str | None:
+    """Return a fail-closed message when a Maven package lacks its namespace.
+
+    OSV identifies Maven artifacts by ``group:artifact``. Querying a bare
+    artifact name can return no rows and must never be presented as a clean
+    result, because another group may own the vulnerable artifact.
+    """
+    if ecosystem.lower() != "maven":
+        return None
+    parts = name.split(":")
+    if len(parts) == 2 and all(part.strip() for part in parts):
+        return None
+    return (
+        f"Maven package '{name}' is missing its group:artifact coordinate. "
+        "Use --ecosystem maven with a fully qualified coordinate, for example "
+        "org.apache.logging.log4j:log4j-core@2.14.1; a bare artifact name "
+        "cannot produce a trustworthy clean verdict."
+    )
+
+
+def _package_spec_error(name: str, ecosystem: str) -> str | None:
+    """Return a fail-closed message for syntactically invalid package names."""
+    maven_error = _maven_coordinate_error(name, ecosystem)
+    if maven_error:
+        return maven_error
+
+    try:
+        from agent_bom.security import SecurityError, validate_package_name
+
+        if ecosystem.lower() in {"npm", "pypi", "go", "cargo"}:
+            validate_package_name(name, ecosystem.lower())
+            return None
+    except SecurityError:
+        pass
+
+    # Other ecosystems do not share one package-name grammar, but shell and
+    # requirement operators are never part of a package name after parsing.
+    if not name.strip() or any(char in name for char in "\r\n=<>!"):
+        return f"Invalid {ecosystem} package name '{name}'. Provide a package name followed by an explicit version."
+    return None
+
+
+def _exit_model_verification(
+    model_dir: Path,
+    repo_id: str | None,
+    hf_token: str | None,
+    as_json: bool,
+    quiet: bool,
+) -> None:
+    """Verify local model weight files against upstream metadata."""
+    from agent_bom.model_hash import verify_model_hashes
+
+    console = Console()
+    report = verify_model_hashes(model_dir, token=hf_token, repo_id=repo_id)
+    summary = report.summary()
+
+    if report.scanned == 0:
+        if as_json:
+            click.echo(
+                json.dumps(
+                    {
+                        "scan_root": str(model_dir),
+                        "repo_id": repo_id or "",
+                        "verdict": "error",
+                        "error": "No model weight files found",
+                        "summary": summary,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            console.print(f"[red]Error: no model weight files found under {model_dir}[/red]")
+        sys.exit(2)
+
+    exit_code = 0 if report.verified == report.scanned else 1
+    verdict = "verified" if exit_code == 0 else "unverified"
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "scan_root": str(model_dir),
+                    "repo_id": repo_id or "",
+                    "verdict": verdict,
+                    "summary": summary,
+                    "has_tampering": report.has_tampering,
+                    "results": [result.to_dict() for result in report.results],
+                },
+                indent=2,
+            )
+        )
+        sys.exit(exit_code)
+
+    if quiet:
+        console.print(
+            f"{model_dir}: {'VERIFIED' if exit_code == 0 else 'UNVERIFIED'} "
+            f"({report.verified}/{report.scanned} verified, {report.tampered} tampered, "
+            f"{report.unverified} unverified, {report.offline} offline)"
+        )
+        sys.exit(exit_code)
+
+    from rich.table import Table
+
+    console.print(f"\n[bold blue]Verifying model weight files in {model_dir}[/bold blue]\n")
+    table = Table(title=f"{model_dir} ({repo_id or 'repo auto-detect'})", show_header=True)
+    table.add_column("Check", width=26)
+    table.add_column("Status", width=10, justify="center")
+    table.add_column("Detail", max_width=72)
+    table.add_row(
+        "Model hash verification",
+        "[green]PASS[/green]" if exit_code == 0 else "[red]FAIL[/red]",
+        (
+            f"{report.verified}/{report.scanned} verified · "
+            f"{report.tampered} tampered · "
+            f"{report.unverified} unverified · "
+            f"{report.offline} offline"
+        ),
+    )
+    if report.has_tampering:
+        tampered = [result.filename for result in report.results if result.status == "tampered"]
+        table.add_row("Tampered files", "[red]FAIL[/red]", ", ".join(tampered[:3]))
+    elif report.offline:
+        table.add_row("Hub reachability", "[yellow]UNKNOWN[/yellow]", "HuggingFace Hub unreachable during verification")
+    elif report.unverified:
+        unverified = [result.filename for result in report.results if result.status == "unverified"]
+        table.add_row("Missing metadata", "[yellow]UNKNOWN[/yellow]", ", ".join(unverified[:3]))
+    console.print(table)
+
+    if exit_code == 0:
+        console.print(f"\n  [bold green]VERIFIED[/bold green] — {report.verified} model file(s) matched expected hashes\n")
+    else:
+        console.print("\n  [bold red]UNVERIFIED[/bold red] — one or more model files could not be trusted\n")
+    sys.exit(exit_code)
 
 
 @click.command()
@@ -50,111 +567,566 @@ def _parse_package_spec(
 @click.option(
     "--ecosystem",
     "-e",
-    type=click.Choice(["npm", "pypi", "go", "cargo", "maven", "nuget"]),
+    type=click.Choice(SUPPORTED_PACKAGE_ECOSYSTEMS),
     help="Package ecosystem (inferred from name/command if omitted)",
 )
-@click.option("--quiet", "-q", is_flag=True, help="Only print vuln count, no details")
+@click.option("--quiet", "-q", is_flag=True, help="Only print the final verdict, no details")
 @click.option("--no-color", is_flag=True, help="Disable colored output")
-def check(package_spec: str, ecosystem: Optional[str], quiet: bool, no_color: bool):
+@click.option(
+    "--format",
+    "-f",
+    "output_format",
+    type=click.Choice(["console", "json", "sarif"], case_sensitive=False),
+    default="console",
+    show_default=True,
+    help="Output format.",
+)
+@click.option("--output", "-o", "output_path", type=str, default=None, help="Write machine-readable output to a file (use '-' for stdout).")
+@click.option(
+    "--exit-zero",
+    is_flag=True,
+    help="Exit 0 even when vulnerabilities are found (useful for exploratory or parallel checks)",
+)
+@click.option("--enrich", is_flag=True, help="Add NVD CVSS, EPSS, and CISA KEV enrichment to matched vulnerabilities.")
+@click.option("--offline", is_flag=True, help="Scan against the local vulnerability database only.")
+@click.option(
+    "--fail-on-severity",
+    type=click.Choice(["critical", "high", "medium", "low"], case_sensitive=False),
+    default=None,
+    help="Exit 1 only when vulnerabilities at this severity or higher are found.",
+)
+@click.option("--nvd-api-key", envvar="NVD_API_KEY", default=None, help="NVD API key for higher rate limits when using --enrich.")
+@click.pass_context
+def check(
+    ctx: click.Context,
+    package_spec: str,
+    ecosystem: Optional[str],
+    quiet: bool,
+    no_color: bool,
+    output_format: str,
+    output_path: str | None,
+    exit_zero: bool,
+    enrich: bool,
+    offline: bool,
+    fail_on_severity: str | None,
+    nvd_api_key: str | None,
+):
     """Check a package for known vulnerabilities before installing.
 
     \b
     Examples:
       agent-bom check express@4.18.2 --ecosystem npm
       agent-bom check requests@2.28.0 --ecosystem pypi
+      agent-bom check ncurses-bin@6.5+20250216-2 --ecosystem deb
       agent-bom check "npx @modelcontextprotocol/server-filesystem"
 
     \b
     Exit codes:
       0  Clean — no known vulnerabilities
-      1  Unsafe — vulnerabilities found
+      1  Unsafe — vulnerabilities found, or package flagged as malicious
+      2  Incomplete — insufficient context for a trustworthy clean verdict
+         (missing version, OS package metadata, or offline scan of an
+         ecosystem the local DB carries no advisories for)
+
+    \b
+    Notes:
+      `check` supports terminal output by default and `--format json`
+      or `--format sarif` for machine-readable pre-install verdicts.
+      Use `--enrich` when the verdict needs CVSS, EPSS, KEV, or NVD
+      status evidence for triage or CI policy.
+      For HTML, PDF, or SBOM output, use `agent-bom agents` (or
+      `agent-bom scan`) with `--format/--output`.
+      Use --exit-zero for exploratory or parallel workflows where findings
+      should be reported without failing the command.
+      Use --fail-on-severity to make CI fail only at the selected threshold.
     """
-    import asyncio
+    from agent_bom.cli._agent_mode import agent_mode_requested
 
-    console = Console(no_color=no_color)
+    parent_params = getattr(getattr(ctx, "parent", None), "params", {}) or {}
+    root_params = getattr(ctx.find_root(), "params", {}) or {}
+    agent_mode = bool(parent_params.get("agent_mode") or root_params.get("agent_mode") or agent_mode_requested())
+    output_format = output_format.lower()
+    if output_path and output_format not in {"json", "sarif"}:
+        raise click.ClickException("`check --output` requires `--format json` or `--format sarif`.")
+    if agent_mode and output_format == "sarif":
+        raise click.ClickException("--agent-mode requires `--format json`.")
+    structured_output = output_format in {"json", "sarif"} or agent_mode
+    console = Console(no_color=no_color, stderr=structured_output or output_path is not None)
+    runtime_console = Console(stderr=True, quiet=quiet or structured_output or output_path is not None, no_color=no_color)
+    _sync_runtime_consoles(runtime_console)
 
-    name, version, ecosystem = _parse_package_spec(package_spec, ecosystem)
+    name, version, detected_eco = _parse_package_spec(package_spec, ecosystem)
+
+    package_error = _package_spec_error(name, detected_eco)
+    if package_error:
+        if structured_output:
+            _write_check_output(
+                _check_result_payload(
+                    name=name,
+                    version=version,
+                    ecosystems=[detected_eco],
+                    verdict="incomplete",
+                    message=package_error,
+                    exit_code=2,
+                ),
+                output_path,
+                agent_mode=agent_mode,
+                exit_code=2,
+                output_format=output_format,
+            )
+        else:
+            raise click.UsageError(package_error)
+        sys.exit(2)
 
     from agent_bom.models import Package
-    from agent_bom.scanners import build_vulnerabilities, query_osv_batch
-
-    pkg = Package(name=name, version=version, ecosystem=ecosystem)
+    from agent_bom.parsers.os_parsers import enrich_os_package_context
 
     if version == "unknown":
-        console.print(f"[yellow]⚠ No version specified for {name} — skipping OSV lookup.[/yellow]")
-        console.print("  Provide a version: agent-bom check name@version --ecosystem ecosystem")
-        sys.exit(0)
+        # Without a version we cannot query OSV, so NOTHING was actually
+        # checked. This is an incomplete scan, not a clean pass — exit
+        # non-zero (rc=2) so a CI pre-install gate does not treat an
+        # unscanned package as safe.
+        message = f"No version specified for {name}; skipping OSV lookup."
+        if structured_output:
+            _write_check_output(
+                _check_result_payload(
+                    name=name,
+                    version=version,
+                    ecosystems=[detected_eco],
+                    verdict="skipped",
+                    message=message,
+                    exit_code=2,
+                ),
+                output_path,
+                agent_mode=agent_mode,
+                exit_code=2,
+                output_format=output_format,
+            )
+        else:
+            # Route the skip notice to stderr with a loud WARNING banner so it
+            # is not mistaken for a clean result. Without a version we cannot
+            # query OSV, so NOTHING was actually checked — that must be
+            # unmistakable even when stdout is piped or scanned by a wrapper.
+            warn_console = Console(stderr=True, no_color=no_color)
+            warn_console.print(f"[bold yellow]⚠ WARNING: no version given for '{name}' — NOT scanned (OSV lookup skipped).[/bold yellow]")
+            warn_console.print(f"  This is not a clean result. Re-run with a version: agent-bom check {name}@<version>")
+        sys.exit(2)
 
-    # Resolve "latest" / empty version from npm/PyPI registry
+    ecosystems = _resolve_check_ecosystems(name, version, ecosystem, detected_eco)
+    pkgs = [Package(name=name, version=version, ecosystem=eco) for eco in ecosystems]
+    os_context_complete = True
+    for pkg in pkgs:
+        if pkg.ecosystem in {"deb", "apk", "rpm"}:
+            os_context_complete = enrich_os_package_context(pkg) and os_context_complete
+
+    # Resolve "latest" / empty version from registry
     if version in ("latest", ""):
         from agent_bom.http_client import create_client
         from agent_bom.resolver import resolve_package_version
 
         async def _resolve() -> bool:
             async with create_client(timeout=15.0) as client:
-                return await resolve_package_version(pkg, client)
+                for p in pkgs:
+                    if await resolve_package_version(p, client):
+                        return True
+                return False
 
-        with console.status("[bold]Resolving version from registry...[/bold]", spinner="dots"):
+        import asyncio
+
+        if quiet:
             resolved = asyncio.run(_resolve())
-        if resolved:
-            console.print(f"  [green]✓ Resolved @latest → {pkg.version}[/green]")
-            version = pkg.version
         else:
-            console.print(f"[yellow]⚠ Could not resolve latest version for {name} ({ecosystem})[/yellow]")
-            console.print("  Provide an explicit version: agent-bom check name@1.2.3 -e ecosystem")
+            with console.status("[bold]Resolving version from registry...[/bold]", spinner="dots"):
+                resolved = asyncio.run(_resolve())
+        if resolved:
+            version = next((p.version for p in pkgs if p.version not in ("unknown", "latest", "")), version)
+            for p in pkgs:
+                p.version = version
+            if not quiet and not structured_output:
+                console.print(f"  [green]✓ Resolved @latest → {version}[/green]")
+        else:
+            eco_str = "/".join(ecosystems)
+            message = f"Could not resolve latest version for {name} ({eco_str})."
+            if structured_output:
+                _write_check_output(
+                    _check_result_payload(
+                        name=name,
+                        version=version,
+                        ecosystems=ecosystems,
+                        verdict="skipped",
+                        message=message,
+                        exit_code=0,
+                    ),
+                    output_path,
+                    agent_mode=agent_mode,
+                    exit_code=0,
+                    output_format=output_format,
+                )
+            else:
+                console.print(f"[yellow]⚠ Could not resolve latest version for {name} ({eco_str})[/yellow]")
+                console.print("  Provide an explicit version: agent-bom check name@1.2.3 -e ecosystem")
             sys.exit(0)
 
-    console.print(f"\n[bold blue]🔍 Checking {name}@{version} ({ecosystem})[/bold blue]\n")
+    eco_display = "/".join(ecosystems)
+    if not quiet and not structured_output:
+        console.print(f"\n[bold blue]🔍 Checking {name}@{version} ({eco_display})[/bold blue]\n")
 
-    with console.status("[bold]Querying OSV...[/bold]", spinner="dots"):
-        results = asyncio.run(query_osv_batch([pkg]))
-    from agent_bom.models import normalize_package_name
+    import asyncio
 
-    key = f"{ecosystem}:{normalize_package_name(name, ecosystem)}@{version}"
-    vuln_data = results.get(key, [])
+    status_context: Any
+    if not quiet and not structured_output:
+        status_context = console.status("[bold]Scanning package risk...[/bold]", spinner="dots")
+    else:
+        status_context = nullcontext()
 
-    if not vuln_data:
-        console.print(f"  [green]✓ No known vulnerabilities in {name}@{version}[/green]\n")
+    with status_context:
+        from agent_bom.scanners import (
+            IncompleteScanError,
+            ScanOptions,
+            consume_coverage_warnings,
+            consume_scan_warnings,
+            reset_scan_warnings,
+            scan_packages,
+        )
+
+        # A CLI invocation owns a fresh warning boundary. Long-lived callers
+        # and tests can invoke Click commands repeatedly in one process, while
+        # scanner warnings are thread-local and otherwise survive until they
+        # are consumed. Clear prior state before calling the replaceable scan
+        # implementation so an earlier partial scan cannot turn this clean
+        # offline verdict into an unrelated incomplete result.
+        reset_scan_warnings()
+        try:
+            asyncio.run(scan_packages(pkgs, options=ScanOptions(offline=offline)))
+        except IncompleteScanError as exc:
+            if structured_output:
+                _write_check_output(
+                    _check_result_payload(
+                        name=name,
+                        version=version,
+                        ecosystems=ecosystems,
+                        verdict="incomplete",
+                        message=str(exc),
+                        exit_code=2,
+                    ),
+                    output_path,
+                    agent_mode=agent_mode,
+                    exit_code=2,
+                    output_format=output_format,
+                )
+            else:
+                console.print(f"  [yellow]⚠[/yellow] {exc}")
+            sys.exit(2)
+
+    scan_warnings = consume_scan_warnings()
+    coverage_warnings = consume_coverage_warnings()
+    offline_coverage_gap = offline and any(w.get("kind") == "offline_ecosystem_gap" for w in coverage_warnings)
+    # Same failure, over the network: the local DB carried no advisories for the
+    # ecosystem AND the remote lookup errored, so nothing was consulted. Exit 2
+    # ("insufficient context for a trustworthy clean verdict") rather than
+    # reporting a clean that no source actually supports.
+    remote_lookup_gap = not offline and any(w.get("kind") == "remote_lookup_gap" for w in coverage_warnings)
+    if scan_warnings and not quiet and not structured_output:
+        console.print(f"  [yellow]⚠[/yellow] Scan completed with {len(scan_warnings)} warning(s); results may be incomplete.")
+
+    matched_pkg = next((p for p in pkgs if p.vulnerabilities), pkgs[0])
+    vulns = matched_pkg.vulnerabilities
+    fail_threshold = fail_on_severity.lower() if fail_on_severity else None
+
+    # ── Malicious-package gate (fail closed) ─────────────────────────────────
+    # A package flagged as malicious (typosquat, dependency-confusion, or a
+    # known-malicious MAL- advisory) is a BLOCK regardless of CVE rows. Reading
+    # only vuln rows let such a package report "No known vulnerabilities" and
+    # exit 0 — a pre-install gate must never install a malicious package, and
+    # this decision is independent of --exit-zero / --fail-on-severity, which
+    # only govern vulnerability triage.
+    malicious_pkg = next((p for p in pkgs if getattr(p, "is_malicious", False)), None)
+    if malicious_pkg is not None:
+        reason = malicious_pkg.malicious_reason or "flagged as malicious (typosquat / dependency confusion / known-malicious advisory)"
+        message = f"MALICIOUS package {malicious_pkg.name}@{malicious_pkg.version} — {reason}. Do not install."
+        if structured_output:
+            _write_check_output(
+                _check_result_payload(
+                    name=name,
+                    version=version,
+                    ecosystems=ecosystems,
+                    verdict="malicious",
+                    message=message,
+                    exit_code=1,
+                    vulnerabilities=vulns,
+                    warnings=scan_warnings,
+                ),
+                output_path,
+                agent_mode=agent_mode,
+                exit_code=1,
+                output_format=output_format,
+            )
+            sys.exit(1)
+        if quiet:
+            click.echo(f"{name}@{version}: MALICIOUS — {reason}")
+        else:
+            console.print(f"  [red]✗ MALICIOUS: {message}[/red]\n")
+        sys.exit(1)
+
+    if enrich and any(pkg.vulnerabilities for pkg in pkgs):
+        from agent_bom.enrichment import enrich_vulnerabilities
+
+        all_vulns = [vuln for pkg in pkgs for vuln in pkg.vulnerabilities]
+        try:
+            asyncio.run(
+                enrich_vulnerabilities(
+                    all_vulns,
+                    nvd_api_key=nvd_api_key,
+                    enable_nvd=True,
+                    enable_epss=True,
+                    enable_kev=True,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            scan_warnings.append(f"External enrichment skipped: {exc}")
+            if not quiet and not structured_output:
+                console.print(f"  [yellow]⚠[/yellow] External enrichment skipped: {exc}")
+
+    if not vulns and (offline_coverage_gap or remote_lookup_gap):
+        # An offline scan of an ecosystem the local DB carries no advisories
+        # for — or an online one whose remote lookup errored with the same
+        # empty DB behind it — produced no vulns because nothing could be
+        # matched, NOT because the package is clean. Fail closed (rc=2) so a
+        # pre-install gate isn't silently green. Re-run, `agent-bom db update`
+        # for coverage, or --exit-zero to force an exploratory result.
+        if remote_lookup_gap:
+            message = (
+                f"Incomplete scan for {name}@{version} ({eco_display}). "
+                "The remote advisory lookup failed and the local vulnerability DB carries no advisories "
+                "for this ecosystem, so a clean result cannot be trusted. Retry, or run "
+                "`agent-bom db update` for local coverage."
+            )
+        else:
+            message = (
+                f"Incomplete offline coverage for {name}@{version} ({eco_display}). "
+                "The local vulnerability DB carries no advisories for this ecosystem, so a clean result "
+                "cannot be trusted. Run `agent-bom db update` (online) for full coverage."
+            )
+        if structured_output:
+            _write_check_output(
+                _check_result_payload(
+                    name=name,
+                    version=version,
+                    ecosystems=ecosystems,
+                    verdict="incomplete",
+                    message=message,
+                    exit_code=2,
+                    warnings=scan_warnings,
+                ),
+                output_path,
+                agent_mode=agent_mode,
+                exit_code=2,
+                output_format=output_format,
+            )
+            sys.exit(2)
+        if quiet:
+            gap_label = "incomplete scan (remote lookup failed)" if remote_lookup_gap else "incomplete offline coverage"
+            click.echo(f"{name}@{version}: {gap_label} ({eco_display})")
+        else:
+            console.print(f"  [yellow]⚠ {message}[/yellow]\n")
+        sys.exit(2)
+
+    if not vulns and matched_pkg.ecosystem in {"deb", "apk", "rpm"} and not os_context_complete:
+        message = (
+            f"Incomplete OS package context for {name}@{version}. "
+            "Best-effort matching found no vulnerabilities, but distro metadata was insufficient for a trustworthy clean verdict."
+        )
+        if structured_output:
+            _write_check_output(
+                _check_result_payload(
+                    name=name,
+                    version=version,
+                    ecosystems=ecosystems,
+                    verdict="incomplete",
+                    message=message,
+                    exit_code=2,
+                    warnings=scan_warnings,
+                ),
+                output_path,
+                agent_mode=agent_mode,
+                exit_code=2,
+                output_format=output_format,
+            )
+            sys.exit(2)
+        if quiet:
+            click.echo(f"{name}@{version}: incomplete OS package context")
+        else:
+            console.print(f"  [yellow]⚠ Incomplete OS package context for {name}@{version}[/yellow]")
+            console.print(
+                "  Best-effort matching found no vulnerabilities, but source/distro metadata was "
+                "insufficient for a trustworthy clean verdict.\n"
+            )
+        sys.exit(2)
+
+    if not vulns:
+        if structured_output:
+            _write_check_output(
+                _check_result_payload(
+                    name=name,
+                    version=version,
+                    ecosystems=ecosystems,
+                    verdict="clean",
+                    message=f"No known vulnerabilities in {name}@{version}.",
+                    exit_code=0,
+                    warnings=scan_warnings,
+                ),
+                output_path,
+                agent_mode=agent_mode,
+                exit_code=0,
+                output_format=output_format,
+            )
+            sys.exit(0)
+        if quiet:
+            click.echo(f"{name}@{version}: CLEAN")
+        else:
+            console.print(f"  [green]✓ No known vulnerabilities in {name}@{version}[/green]\n")
         sys.exit(0)
 
-    vulns = build_vulnerabilities(vuln_data, pkg)
-
-    if not quiet:
+    if not quiet and not structured_output:
         from rich.table import Table
 
-        table = Table(title=f"{name}@{version} — {len(vulns)} vulnerability/ies found")
-        table.add_column("ID", width=20)
-        table.add_column("Severity", width=10)
-        table.add_column("CVSS", width=6, justify="right")
-        table.add_column("Fix", width=15)
-        table.add_column("Summary", max_width=50)
+        from agent_bom.cwe_impact import classify_cwe_impact
+
+        vuln_count_text = _format_vulnerability_count(len(vulns))
+        table = Table(title=f"{name}@{version} — {vuln_count_text}")
+        table.add_column("Sev", width=10, no_wrap=True)
+        table.add_column("ID", width=20, no_wrap=True)
+        table.add_column("Impact", width=14, no_wrap=True)
+        table.add_column("Fix", width=10)
+        table.add_column("Summary", max_width=38)
 
         severity_styles = {
             "critical": "red bold",
-            "high": "red",
+            "high": "#e67e22 bold",
             "medium": "yellow",
             "low": "dim",
+        }
+        _impact_styles = {
+            "code-execution": "red",
+            "credential-access": "red",
+            "file-access": "#e67e22",
+            "injection": "#e67e22",
+            "ssrf": "#e67e22",
+            "data-leak": "yellow",
+            "availability": "dim",
+            "client-side": "dim",
         }
         for v in vulns:
             sev = v.severity.value.lower()
             style = severity_styles.get(sev, "white")
-            fix_display = f"[green]✓ {v.fixed_version}[/green]" if v.fixed_version else "[red dim]No fix[/red dim]"
-            # Show summary; fall back to aliases list if empty
+            fix_display = f"[green]{v.fixed_version}[/green]" if v.fixed_version else "[dim]no fix[/dim]"
+            # CWE impact category
+            impact = classify_cwe_impact(v.cwe_ids)
+            impact_style = _impact_styles.get(impact, "dim")
+            impact_label = impact.replace("-", " ").replace("code execution", "RCE")
+            # KEV badge
+            kev = " [red bold]KEV[/red bold]" if v.is_kev else ""
+            # Concise summary — truncate to keep table compact
             summary_text = v.summary or ""
             if not summary_text or summary_text == "No description available":
                 aliases_str = ", ".join(v.aliases[:3]) if v.aliases else ""
-                summary_text = f"[dim]See {aliases_str}[/dim]" if aliases_str else "[dim]No description[/dim]"
+                summary_text = f"[dim]See {aliases_str}[/dim]" if aliases_str else "[dim]—[/dim]"
+            elif len(summary_text) > 50:
+                summary_text = summary_text[:47] + "..."
             table.add_row(
+                f"[{style}]{v.severity.value.upper()}[/{style}]{kev}",
                 v.id,
-                f"[{style} reverse] {v.severity.value.upper()} [/{style} reverse]",
-                f"{v.cvss_score:.1f}" if v.cvss_score else "—",
+                f"[{impact_style}]{impact_label}[/{impact_style}]",
                 fix_display,
-                summary_text[:100],
+                summary_text,
             )
         console.print(table)
         console.print()
 
-    console.print(f"  [red]✗ {len(vulns)} vulnerability/ies found — do not install without review.[/red]\n")
+    if exit_zero:
+        if structured_output:
+            _write_check_output(
+                _check_result_payload(
+                    name=name,
+                    version=version,
+                    ecosystems=ecosystems,
+                    verdict="unsafe",
+                    message=f"{_format_vulnerability_count(len(vulns))} in {name}@{version}; reported without failing due to --exit-zero.",
+                    exit_code=0,
+                    vulnerabilities=vulns,
+                    warnings=scan_warnings,
+                    exit_zero=True,
+                    fail_on_severity=fail_threshold,
+                    fail_on_severity_count=len(_vulns_at_or_above(vulns, fail_threshold)),
+                ),
+                output_path,
+                agent_mode=agent_mode,
+                exit_code=0,
+                output_format=output_format,
+            )
+            sys.exit(0)
+        if quiet:
+            click.echo(f"{name}@{version}: {_format_vulnerability_count(len(vulns))} (exit-zero)")
+        else:
+            console.print(
+                f"  [yellow]⚠ {_format_vulnerability_count(len(vulns))} — reported without failing due to --exit-zero.[/yellow]\n"
+            )
+        sys.exit(0)
+
+    failing_vulns = _vulns_at_or_above(vulns, fail_threshold)
+    if fail_threshold and not failing_vulns:
+        message = f"{_format_vulnerability_count(len(vulns))} in {name}@{version}; none at or above {fail_threshold}."
+        if structured_output:
+            _write_check_output(
+                _check_result_payload(
+                    name=name,
+                    version=version,
+                    ecosystems=ecosystems,
+                    verdict="unsafe",
+                    message=message,
+                    exit_code=0,
+                    vulnerabilities=vulns,
+                    warnings=scan_warnings,
+                    fail_on_severity=fail_threshold,
+                    fail_on_severity_count=0,
+                ),
+                output_path,
+                agent_mode=agent_mode,
+                exit_code=0,
+                output_format=output_format,
+            )
+            sys.exit(0)
+        if quiet:
+            click.echo(f"{name}@{version}: {_format_vulnerability_count(len(vulns))} (below {fail_threshold})")
+        else:
+            console.print(f"  [yellow]⚠ {message}[/yellow]\n")
+        sys.exit(0)
+
+    if structured_output:
+        _write_check_output(
+            _check_result_payload(
+                name=name,
+                version=version,
+                ecosystems=ecosystems,
+                verdict="unsafe",
+                message=f"{_format_vulnerability_count(len(vulns))} in {name}@{version}.",
+                exit_code=1,
+                vulnerabilities=vulns,
+                warnings=scan_warnings,
+                fail_on_severity=fail_threshold,
+                fail_on_severity_count=len(failing_vulns),
+            ),
+            output_path,
+            agent_mode=agent_mode,
+            exit_code=1,
+            output_format=output_format,
+        )
+        sys.exit(1)
+
+    if quiet:
+        click.echo(f"{name}@{version}: {_format_vulnerability_count(len(vulns))}")
+    else:
+        console.print(f"  [red]✗ {_format_vulnerability_count(len(vulns))} — do not install without review.[/red]\n")
     sys.exit(1)
 
 
@@ -166,19 +1138,43 @@ def check(package_spec: str, ecosystem: Optional[str], quiet: bool, no_color: bo
     type=click.Choice(["npm", "pypi"]),
     help="Package ecosystem (default: pypi for self-verify)",
 )
+@click.option(
+    "--model-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Verify local model weight files under this directory",
+)
+@click.option(
+    "--repo-id",
+    help="HuggingFace repo ID override for model verification, e.g. mistralai/Mistral-7B-v0.1",
+)
+@click.option(
+    "--hf-token",
+    envvar="HF_TOKEN",
+    help="Optional HuggingFace token for private model metadata",
+)
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 @click.option("--quiet", "-q", is_flag=True, help="Only print verdict, no details")
-def verify(package_spec: Optional[str], ecosystem: Optional[str], as_json: bool, quiet: bool):
+def verify(
+    package_spec: Optional[str],
+    ecosystem: Optional[str],
+    model_dir: Path | None,
+    repo_id: str | None,
+    hf_token: str | None,
+    as_json: bool,
+    quiet: bool,
+):
     """Verify package integrity and provenance against registries.
 
     \b
-    Self-verify (no arguments):
+    Self-verify (no arguments or explicit package name):
       agent-bom verify              check THIS installation of agent-bom
+      agent-bom verify agent-bom    same as above
 
     \b
     Verify any package:
       agent-bom verify requests@2.28.0 -e pypi
       agent-bom verify @modelcontextprotocol/server-filesystem@2025.1.14 -e npm
+      agent-bom verify --model-dir ./models --repo-id org/model
 
     \b
     Exit codes:
@@ -186,6 +1182,13 @@ def verify(package_spec: Optional[str], ecosystem: Optional[str], as_json: bool,
       1  Unverified — one or more checks failed
       2  Error — could not complete verification
     """
+    if model_dir is not None:
+        if package_spec is not None:
+            console = Console()
+            console.print("[red]Error: choose either package verification or --model-dir, not both.[/red]")
+            sys.exit(2)
+        _exit_model_verification(model_dir, repo_id, hf_token, as_json, quiet)
+
     import asyncio
 
     from agent_bom.http_client import create_client
@@ -200,19 +1203,33 @@ def verify(package_spec: Optional[str], ecosystem: Optional[str], as_json: bool,
     console = Console()
 
     # Determine target
-    if package_spec is None:
+    self_verify = package_spec is None or (
+        package_spec is not None and package_spec.strip() in {"agent-bom", "agent_bom"} and ecosystem in (None, "pypi")
+    )
+
+    if self_verify:
         name, version, eco = "agent-bom", __version__, "pypi"
-        if not quiet:
+        if not quiet and not as_json:
             console.print(f"\n[bold blue]Verifying agent-bom {version} installation...[/bold blue]\n")
         record_result = verify_installed_record("agent-bom")
     else:
+        assert package_spec is not None
         name, version, eco = _parse_package_spec(package_spec, ecosystem)
         record_result = None
-        if not quiet:
+        if not quiet and not as_json:
             console.print(f"\n[bold blue]Verifying {name}@{version} ({eco})...[/bold blue]\n")
 
     if version in ("unknown", ""):
-        console.print("[red]Error: version required. Use name@version format.[/red]")
+        if name in {"agent-bom", "agent_bom"}:
+            console.print(
+                f"[red]Error: use `agent-bom verify` to self-verify this installation, or pass a version like "
+                f"`agent-bom verify agent-bom@{__version__} -e pypi`.[/red]"
+            )
+        else:
+            console.print(
+                "[red]Error: version required. Use name@version format, "
+                "for example requests@2.33.0 or @modelcontextprotocol/server-filesystem@2025.1.14.[/red]"
+            )
         sys.exit(2)
 
     checks: dict[str, dict] = {}
@@ -272,16 +1289,9 @@ def verify(package_spec: Optional[str], ecosystem: Optional[str], as_json: bool,
         checks["registry_hash"] = {"status": "unknown", "detail": "Could not reach registry"}
 
     # Provenance check
-    if provenance and provenance.get("has_provenance"):
-        att_count = provenance.get("attestation_count", 0)
-        checks["provenance"] = {
-            "status": "pass",
-            "detail": f"Attestation found ({att_count} attestation(s))",
-        }
-    elif provenance:
-        checks["provenance"] = {"status": "unknown", "detail": "No provenance attestation"}
-    else:
-        checks["provenance"] = {"status": "unknown", "detail": "Could not check provenance"}
+    checks["provenance"] = _render_provenance_check(provenance)
+    if checks["provenance"]["status"] != "pass":
+        exit_code = 1
 
     # Metadata consistency (self-verify with pypi_meta only)
     if pypi_meta and record_result:
@@ -326,7 +1336,13 @@ def verify(package_spec: Optional[str], ecosystem: Optional[str], as_json: bool,
     # Rich table output
     from rich.table import Table
 
-    status_icons = {"pass": "[green]PASS[/green]", "fail": "[red]FAIL[/red]", "unknown": "[yellow]UNKNOWN[/yellow]"}
+    status_icons = {
+        "pass": "[green]PASS[/green]",
+        "fail": "[red]FAIL[/red]",
+        "missing": "[dim]MISSING[/dim]",
+        "unavailable": "[yellow]UNAVAILABLE[/yellow]",
+        "unknown": "[yellow]UNKNOWN[/yellow]",
+    }
     check_labels = {
         "record_integrity": "RECORD integrity",
         "registry_hash": "Registry SHA-256",
@@ -352,7 +1368,7 @@ def verify(package_spec: Optional[str], ecosystem: Optional[str], as_json: bool,
         console.print(f"  License: {pypi_meta.get('license', 'N/A')}")
 
     if exit_code == 0:
-        console.print(f"\n  [bold green]VERIFIED[/bold green] — {name}@{version} integrity confirmed\n")
+        console.print(f"\n  [bold green]VERIFIED[/bold green] — {name}@{version} integrity and provenance confirmed\n")
     else:
         console.print("\n  [bold red]UNVERIFIED[/bold red] — one or more checks failed\n")
 

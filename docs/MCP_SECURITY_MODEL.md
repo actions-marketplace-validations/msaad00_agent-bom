@@ -65,7 +65,19 @@ CVE-2025-XXXX (CRITICAL)
                  └── Credentials exposed: DB_URL, ANTHROPIC_API_KEY
 ```
 
-**What agent-bom does:** scans every package in every discovered server against OSV, NVD, EPSS, CISA KEV, and GHSA. Maps CVE → package → server → agent → credentials → tools (blast radius).
+**What agent-bom does:** scans every package in every discovered server against OSV, NVD, EPSS, CISA KEV, and GHSA. Maps package → vulnerability finding → MCP server (exposed tools + credential env names) → connected agents (blast radius). The full contract for the security graph — entity / edge coverage, accuracy guarantees, scaling tiers, and known gaps — is in [docs/graph/CONTRACT.md](graph/CONTRACT.md).
+
+agent-bom also ships bundled MCP intelligence at `src/agent_bom/data/mcp-blocklist.json`
+with a machine-readable contract in `src/agent_bom/data/mcp-intelligence.schema.json`.
+During agent scans, discovered MCP server names, registry IDs, package names, and launch commands
+are checked offline against that file:
+
+- Each entry carries confidence, default recommendation, source type, references, last verification date, affected package/version data, and remediation actions.
+- Confirmed malicious entries with `default_recommendation=block` produce a `critical` `MCP_BLOCKLIST` finding, add structured `security_intelligence`, and mark the server as security-blocked in the report.
+- Pattern matches that are heuristic or suspicious add structured `security_intelligence` and a server security warning, but default to review unless the entry explicitly recommends block.
+- Critical matches found from the initial server identity are marked before dependency extraction, so CLI/API scans skip deeper package extraction for that server.
+- The blocklist is local package data in this phase. Scans do not query a real-time threat-feed API, and agent-bom does not ship a hidden remote kill switch.
+- Endpoint and gateway enforcement stays operator-controlled: teams can use these `security_blocked` signals in fleet policy, MDM rollout, gateway policy, or CI gates, while scan-only runs report the finding without deleting local files or stopping third-party processes.
 
 ### 3.2 Tool poisoning — description injection
 
@@ -126,35 +138,62 @@ An agent operating autonomously can be steered into a multi-step exfiltration se
 
 ---
 
-## 4. The three roles agent-bom plays
+## 4. NSA MCP security design considerations mapping
+
+The NSA Cybersecurity Information Sheet,
+[Model Context Protocol (MCP): Security Design Considerations for AI-Driven Automation](https://www.nsa.gov/Portals/75/documents/Cybersecurity/CSI_MCP_SECURITY.pdf),
+calls out implementation and operational risks around access control, trust
+boundaries, serialization, approval workflows, session handling, audit logs,
+resource exhaustion, dynamic tool discovery, and chained execution. agent-bom
+maps those design considerations to operator controls and evidence surfaces.
+This is an implementation mapping, not an NSA certification or endorsement.
+
+The same machine-readable mapping is exposed to assistants through
+`bestpractices://mcp-hardening`.
+
+| NSA theme | agent-bom surface | Operator evidence |
+|-----------|-------------------|-------------------|
+| Choose supported MCP projects | `registry_lookup`, `marketplace_check`, `fleet_scan`, MCP registry freshness gate | Registry metadata, package provenance, source freshness, advisory matches |
+| Design for boundaries | `context_graph`, `exposure_paths`, `runtime_blueprints`, gateway policy | Graph edges, allowed tool categories, drift decisions, gateway metrics |
+| Validate parameters | 77 strict-args MCP tools, API validation errors, `policy_check` | `tools/list` schemas, `additionalProperties:false`, correlation IDs |
+| Constrain and sandbox execution | `tool_risk_assessment`, proxy, gateway, deployment profiles | Capability classes, block decisions, sandbox posture, Helm/Docker settings |
+| Sign and verify sensitive actions | `audit_integrity`, signed posture outbox, Shield admin-gated tools | HMAC chain status, source-agent labels, audit reasons, posture events |
+| Filter chained outputs | prompt-injection sentinels, `runtime_correlate`, proxy response inspection | Runtime alerts, detector findings, redaction mode, policy decisions |
+| Instrument logs and detection | `runtime_production_index`, `audit_query`, `proxy_alerts`, OCSF/OTLP exports | Production index, OCSF events, OTLP traces, audit chain verification |
+| Track and patch MCP vulnerabilities | `scan`, `check`, `intel_lookup`, `intel_match`, `intel_daily_brief`, SBOM exports | SARIF, CycloneDX, SPDX, KEV/EPSS enrichment, daily brief matches |
+| Scan for unauthorized MCP services | `where`, `inventory`, `fleet_scan`, discovery provenance | Inventory snapshots, differential reports, approved-vs-discovered MCP configs |
+
+---
+
+## 5. The three roles agent-bom plays
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                     agent-bom                                    │
 │                                                                  │
 │  1. SCANNER       Discovers servers, scans packages, maps blast  │
-│     (agent-bom scan)  radius, checks compliance, scores posture  │
+│     (agent-bom scan)    radius, checks compliance, scores posture  │
 │                                                                  │
 │  2. PROXY         Sits between client and server, intercepts     │
 │     (agent-bom proxy) every JSON-RPC message, enforces policy    │
 │                                                                  │
-│  3. MCP SERVER    Exposes 32 scan/governance tools to any agent  │
-│     (agent-bom mcp-server)  — scan, check, registry, compliance  │
+│  3. MCP SERVER    Exposes 77 scan/governance tools to any agent  │
+│     (agent-bom mcp server)  — scan, check, registry, compliance  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.1 Scanner mode
+### 5.1 Scanner mode
 
 ```bash
-agent-bom scan              # auto-discover + full scan
-agent-bom scan --enrich     # + NVD CVSS, EPSS score, CISA KEV flag
-agent-bom scan --enforce    # + static tool poisoning analysis
-agent-bom scan --gpu-scan   # + GPU containers, CUDA versions, DCGM exposure
+agent-bom scan                # auto-discover + full scan
+agent-bom scan --enrich       # + NVD CVSS, EPSS score, CISA KEV flag
+agent-bom scan --enforce      # + static tool poisoning analysis
+agent-bom scan --gpu-scan     # + GPU containers, CUDA versions, DCGM exposure
 ```
 
-Outputs: blast radius tree, compliance mapping (13 frameworks), posture score, SARIF/CycloneDX/SPDX/HTML.
+Outputs: blast radius tree, compliance mapping (curated tag-mapped frameworks plus AISVS benchmark evidence — see [ARCHITECTURE.md § Coverage per framework](./ARCHITECTURE.md#coverage-per-framework)), posture score, SARIF/CycloneDX/SPDX/HTML.
 
-### 4.2 Proxy mode
+### 5.2 Proxy mode
 
 The proxy wraps any MCP server without modifying it. The client connects to `agent-bom proxy` instead of the server directly; the proxy relays traffic and enforces policy:
 
@@ -166,7 +205,7 @@ agent-bom proxy "uvx mcp-server-filesystem /" --policy policy.yml
 agent-bom proxy --url http://localhost:3000 --policy policy.yml
 ```
 
-**7 behavioral detectors running on every message:**
+**7 inline proxy detectors on every message:**
 
 | Detector | What it catches | Framework reference |
 |----------|----------------|---------------------|
@@ -182,7 +221,7 @@ Policy conditions (17 declarative + expression engine):
 
 ```yaml
 # policy.yml
-blocked_tools: [run_shell, exec_command, delete_file]
+block_tools: [run_shell, exec_command, delete_file]
 require_agent_identity: true
 rate_limit:
   threshold: 50
@@ -190,41 +229,53 @@ rate_limit:
 max_response_size_kb: 512
 ```
 
-### 4.3 MCP server mode
+For cross-agent correlation, use the broader runtime protection engine (`agent-bom runtime protect --shield`), which adds `CrossAgentCorrelator` on top of the inline proxy detector set.
+
+### 5.3 MCP server mode
 
 ```bash
-agent-bom mcp-server
+agent-bom mcp server
 ```
 
-Exposes 32 tools to any MCP-compatible AI assistant. Your agent can run scans, check packages, query the registry, and generate compliance reports without leaving the chat:
+Exposes 81 tools to any MCP-compatible AI assistant. Your agent can run scans,
+check packages, query ExposurePaths, ask for deploy decisions, query threat
+intel, inspect runtime posture, run admin-gated Shield actions, and generate
+compliance reports without leaving the chat:
 
 ```
-scan_agents         — full scan, returns JSON report
-check_package       — CVE check for a single package
-registry_search     — search 427+ MCP servers by name/tag
-compliance_report   — generate framework-mapped compliance report
+scan                — full discovery + scan, returns JSON report
+check               — CVE check for a single package
+registry_lookup     — search 1081 MCP servers by name/tag
+compliance          — generate framework-mapped compliance report
 blast_radius        — blast radius for a specific CVE
+should_i_deploy     — allow/warn/block guidance from ExposurePath risk
 ...
 ```
 
 ---
 
-## 5. What agent-bom does NOT do
+## 6. What agent-bom does NOT do
 
-- **Does not run MCP servers.** Read-only. Never starts or restarts a server.
+- **Does not manage upstream MCP server lifecycle.** The explicit `proxy` mode
+  may launch or wrap a configured stdio process, but agent-bom does not discover,
+  restart, or operate arbitrary upstream servers on its own.
 - **Does not store credentials.** Only env var *names* (not values) appear in reports.
 - **Does not modify MCP configs** unless you explicitly run `agent-bom proxy-configure --apply`.
-- **Does not send telemetry.** Only package name + version leaves your machine for CVE lookups (OSV, NVD, EPSS). See [PERMISSIONS.md](../PERMISSIONS.md).
+- **Does not send telemetry.** Only package name + version leaves your machine for CVE lookups (OSV, NVD, EPSS). See [PERMISSIONS.md](PERMISSIONS.md).
 - **Does not replace IAM or network controls.** It is a detection and enforcement layer, not a perimeter.
+- **Does not prove malicious intent from blocklist patterns.** Pattern matches are suspicious-name heuristics and can produce false positives.
+- **Does not catch every malicious server.** Regex and exact-name matching can miss obfuscated payloads, renamed packages, and previously unknown campaigns.
+- **Does not sandbox MCP servers.** Blocklist findings are scan-time detection signals; runtime process isolation must be provided by your OS/container platform or by explicit sandbox configuration.
+- **Does not remove trust-on-first-use risk in proxy mode.** Pre-compromised servers should be scanned before being trusted by a client or wrapped by the proxy.
 
 ---
 
-## 6. Deployment patterns
+## 7. Deployment patterns
 
 ### CI/CD (GitHub Action)
 
 ```yaml
-- uses: msaad00/agent-bom@v0.70.12
+- uses: msaad00/agent-bom@v0.101.0
   with:
     format: sarif
     upload-sarif: 'true'
@@ -233,6 +284,11 @@ blast_radius        — blast radius for a specific CVE
     pr-comment: 'true'       # posts findings summary on the PR
     ignore-file: .agent-bom-ignore.yaml
 ```
+
+If findings are generated but do not appear in GitHub Code Scanning, check
+[`GITHUB_ACTION_SARIF_TROUBLESHOOTING.md`](GITHUB_ACTION_SARIF_TROUBLESHOOTING.md)
+for the required `security-events: write` permission, fork PR limitations,
+SARIF path checks, and category guidance.
 
 ### Local developer workflow
 
@@ -256,14 +312,16 @@ agent-bom proxy-configure --apply
 # Or wrap a single server manually
 agent-bom proxy "uvx mcp-server-filesystem /" \
   --policy policy.yml \
-  --audit-log /var/log/mcp-audit.jsonl
+  --log /var/log/mcp-audit.jsonl
 ```
 
 ---
 
-## 7. Further reading
+## 8. Further reading
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — component diagram, data flow, module boundaries
 - [RUNTIME_MONITORING.md](RUNTIME_MONITORING.md) — proxy internals, detector configuration
+- [CLAUDE_INTEGRATION.md](CLAUDE_INTEGRATION.md) — Claude Desktop / Claude Code setup and proxy flow
+- [CORTEX_CODE.md](CORTEX_CODE.md) — Cortex CoCo / Cortex Code setup, discovery, permissions, and hooks
 - [AI_INFRASTRUCTURE_SCANNING.md](AI_INFRASTRUCTURE_SCANNING.md) — GPU, CUDA, ML framework scanning
 - [PERMISSIONS.md](PERMISSIONS.md) — full trust contract, what data leaves your machine

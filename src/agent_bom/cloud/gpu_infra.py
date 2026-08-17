@@ -24,13 +24,16 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any
 
+from agent_bom.cloud.normalization import build_package_purl
 from agent_bom.http_client import create_client, request_with_retry
 from agent_bom.models import Agent, AgentType, MCPServer, Package, TransportType
+from agent_bom.scanners.firmware_advisory import check_firmware_advisories
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +153,8 @@ class GpuInfraReport:
     dcgm_endpoints: list[DcgmEndpoint]
     gpu_nodes: list[GpuNode]
     warnings: list[str]
+    driver_findings: list[dict] = field(default_factory=list)
+    firmware_findings: list[dict] = field(default_factory=list)
 
     @property
     def total_gpu_containers(self) -> int:
@@ -186,6 +191,8 @@ class GpuInfraReport:
             "dcgm_endpoints": len(self.dcgm_endpoints),
             "unauthenticated_dcgm": self.unauthenticated_dcgm_count,
             "gpu_k8s_nodes": len(self.gpu_nodes),
+            "driver_cve_count": len(self.driver_findings),
+            "firmware_cve_count": len(self.firmware_findings),
         }
 
 
@@ -409,6 +416,213 @@ def _run_kubectl(args: list[str], context: str | None = None, timeout: int = 60)
         return None
 
 
+# NVIDIA driver CVEs that are undetectable without runtime queries.
+# CVE-2024-0090/0091/0092: privilege escalation in drivers < 555.52 (CVSS 8.8)
+_NVIDIA_DRIVER_CVES = [
+    ("CVE-2024-0090", "NVIDIA GPU Display Driver privilege escalation (CVSS 8.8)", "555.52"),
+    ("CVE-2024-0091", "NVIDIA GPU Display Driver privilege escalation (CVSS 8.8)", "555.52"),
+    ("CVE-2024-0092", "NVIDIA GPU Display Driver privilege escalation (CVSS 8.8)", "555.52"),
+]
+
+
+def _query_nvidia_driver_version(node_name: str, kubectl_context: str | None) -> str | None:
+    if not shutil.which("kubectl"):
+        return None
+    try:
+        cmd = ["kubectl"]
+        if kubectl_context:
+            cmd.extend(["--context", kubectl_context])
+        cmd.extend(
+            [
+                "exec",
+                "-n",
+                "default",
+                "--",
+                "sh",
+                "-c",
+                "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1",
+            ]
+        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            version = result.stdout.strip()
+            if version and re.match(r"^\d+\.\d+", version):
+                return version
+    except Exception:  # noqa: BLE001
+        pass
+    logger.debug("Could not query nvidia-smi driver version on node %s", node_name)
+    return None
+
+
+def _driver_lt(version: str, threshold: str) -> bool:
+    """Return True when version < threshold using simple dot-split integer comparison."""
+    try:
+        v_parts = [int(x) for x in version.split(".")[:3]]
+        t_parts = [int(x) for x in threshold.split(".")[:3]]
+        while len(v_parts) < 3:
+            v_parts.append(0)
+        while len(t_parts) < 3:
+            t_parts.append(0)
+        return v_parts < t_parts
+    except (ValueError, TypeError):
+        return False
+
+
+def check_nvidia_driver_cves(node: GpuNode) -> list[dict]:
+    """Return a list of CVE finding dicts for the node when driver version is vulnerable."""
+    driver = node.cuda_driver_version
+    if not driver:
+        return []
+    findings = []
+    for cve_id, summary, fixed in _NVIDIA_DRIVER_CVES:
+        if _driver_lt(driver, fixed):
+            findings.append(
+                {
+                    "cve_id": cve_id,
+                    "summary": summary,
+                    "severity": "high",
+                    "cvss_score": 8.8,
+                    "driver_version": driver,
+                    "fixed_version": fixed,
+                    "node": node.name,
+                }
+            )
+    return findings
+
+
+# AMD ROCm driver CVEs requiring runtime driver version check.
+_AMD_DRIVER_CVES = [
+    ("CVE-2023-31315", "AMD ROCm kernel driver MSR validation bypass allowing SMM config modification (CVSS 7.5)", "6.0"),
+    ("CVE-2024-21944", "AMD ROCm runtime out-of-bounds write via malformed UApp/ABL command (CVSS 7.8)", "6.1"),
+]
+
+
+def _query_amd_driver_version(node_name: str, kubectl_context: str | None) -> str | None:
+    if not shutil.which("kubectl"):
+        return None
+    try:
+        cmd = ["kubectl"]
+        if kubectl_context:
+            cmd.extend(["--context", kubectl_context])
+        cmd.extend(
+            [
+                "exec",
+                "-n",
+                "default",
+                "--",
+                "sh",
+                "-c",
+                "cat /sys/module/amdgpu/version 2>/dev/null "
+                "|| rocm-smi --showdriverversion 2>/dev/null "
+                "| grep -oE '[0-9]+\\.[0-9]+(\\.[0-9]+)?' | head -1",
+            ]
+        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            version = result.stdout.strip()
+            if version and re.match(r"^\d+\.\d+", version):
+                return version
+    except Exception:  # noqa: BLE001
+        pass
+    logger.debug("Could not query AMD driver version on node %s", node_name)
+    return None
+
+
+def check_amd_driver_cves(node: GpuNode) -> list[dict]:
+    """Return CVE finding dicts for the node when AMD ROCm driver version is vulnerable."""
+    driver = node.cuda_driver_version
+    if not driver:
+        return []
+    findings = []
+    for cve_id, summary, fixed in _AMD_DRIVER_CVES:
+        if _driver_lt(driver, fixed):
+            findings.append(
+                {
+                    "cve_id": cve_id,
+                    "summary": summary,
+                    "severity": "high",
+                    "cvss_score": 7.5,
+                    "driver_version": driver,
+                    "fixed_version": fixed,
+                    "node": node.name,
+                }
+            )
+    return findings
+
+
+# Intel i915/xe GPU kernel module CVEs requiring runtime driver version check.
+# Fixed version is a kernel version (major.minor) — checked against the module
+# version string from /sys/module/i915/version or /sys/module/xe/version.
+_INTEL_DRIVER_CVES = [
+    (
+        "CVE-2023-22655",
+        "Intel Graphics i915/xe driver protection mechanism failure — local privilege escalation (CVSS 7.9)",
+        7.9,
+        "6.3",
+    ),
+    (
+        "CVE-2023-25546",
+        "Intel Graphics i915/xe driver out-of-bounds write — local denial of service (CVSS 7.5)",
+        7.5,
+        "6.2",
+    ),
+]
+
+
+def _query_intel_driver_version(node_name: str, kubectl_context: str | None) -> str | None:
+    """Query Intel GPU kernel module version via i915/xe sysfs or uname on a K8s node."""
+    if not shutil.which("kubectl"):
+        return None
+    try:
+        cmd = ["kubectl"]
+        if kubectl_context:
+            cmd.extend(["--context", kubectl_context])
+        cmd.extend(
+            [
+                "exec",
+                "-n",
+                "default",
+                "--",
+                "sh",
+                "-c",
+                "cat /sys/module/i915/version 2>/dev/null "
+                "|| cat /sys/module/xe/version 2>/dev/null "
+                "|| uname -r 2>/dev/null | grep -oE '[0-9]+\\.[0-9]+' | head -1",
+            ]
+        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            version = result.stdout.strip()
+            if version and re.match(r"^\d+\.\d+", version):
+                return version
+    except Exception:  # noqa: BLE001
+        pass
+    logger.debug("Could not query Intel driver version on node %s", node_name)
+    return None
+
+
+def check_intel_driver_cves(node: GpuNode) -> list[dict]:
+    """Return CVE finding dicts for the node when Intel GPU driver version is vulnerable."""
+    driver = node.cuda_driver_version
+    if not driver:
+        return []
+    findings = []
+    for cve_id, summary, cvss_score, fixed in _INTEL_DRIVER_CVES:
+        if _driver_lt(driver, fixed):
+            findings.append(
+                {
+                    "cve_id": cve_id,
+                    "summary": summary,
+                    "severity": "high",
+                    "cvss_score": cvss_score,
+                    "driver_version": driver,
+                    "fixed_version": fixed,
+                    "node": node.name,
+                }
+            )
+    return findings
+
+
 def discover_k8s_gpu_nodes(
     context: str | None = None,
 ) -> tuple[list[GpuNode], list[str]]:
@@ -459,6 +673,14 @@ def discover_k8s_gpu_nodes(
                 cuda_driver = f"{cuda_driver}.{cuda_minor}"
             else:
                 cuda_driver = labels.get("nvidia.com/cuda.driver-version")
+
+            # If label-based version is unavailable, attempt runtime query via nvidia-smi / rocm-smi / i915
+            if not cuda_driver and gpu_vendor == "nvidia":
+                cuda_driver = _query_nvidia_driver_version(name, context)
+            if not cuda_driver and gpu_vendor == "amd":
+                cuda_driver = _query_amd_driver_version(name, context)
+            if not cuda_driver and gpu_vendor == "intel":
+                cuda_driver = _query_intel_driver_version(name, context)
 
             # Collect vendor-relevant labels
             gpu_label_keywords = ("nvidia", "amd", "gpu", "intel", "rocm")
@@ -590,11 +812,26 @@ async def scan_gpu_infra(
             logger.debug("DCGM probe error: %s", exc)
             all_warnings.append(f"DCGM probe skipped: {exc}")
 
+    # Driver CVE checks — runs against every K8s GPU node by vendor
+    all_driver_findings: list[dict] = []
+    for node in k8s_nodes:
+        if node.gpu_vendor == "nvidia":
+            all_driver_findings.extend(check_nvidia_driver_cves(node))
+        elif node.gpu_vendor == "amd":
+            all_driver_findings.extend(check_amd_driver_cves(node))
+        elif node.gpu_vendor == "intel":
+            all_driver_findings.extend(check_intel_driver_cves(node))
+
+    # Firmware/BMC advisory scan — matches GPU model labels against CVE seed
+    all_firmware_findings = [f.to_dict() for f in check_firmware_advisories(k8s_nodes)]
+
     return GpuInfraReport(
         gpu_containers=docker_containers,
         dcgm_endpoints=dcgm_endpoints,
         gpu_nodes=k8s_nodes,
         warnings=all_warnings,
+        driver_findings=all_driver_findings,
+        firmware_findings=all_firmware_findings,
     )
 
 
@@ -605,7 +842,11 @@ def gpu_infra_to_agents(report: GpuInfraReport) -> list[Agent]:
     """Convert GpuInfraReport to Agent objects for inclusion in AIBOMReport.
 
     Each GPU container becomes an Agent with its image name as the MCP server.
-    K8s GPU nodes appear as a synthetic "k8s-gpu-cluster" agent.
+    K8s GPU nodes appear as a synthetic "k8s-gpu-cluster" agent. Both shapes
+    populate ``Agent.metadata["cloud_origin"]`` so the unified-graph builder
+    can promote the underlying GPU asset (vendor, runtime, container/node id)
+    into ``cloud_resource`` lineage nodes via the existing promoter in
+    ``src/agent_bom/graph/builder.py``.
     """
     agents: list[Agent] = []
 
@@ -613,9 +854,23 @@ def gpu_infra_to_agents(report: GpuInfraReport) -> list[Agent]:
         # Build package list from CUDA/cuDNN versions
         packages: list[Package] = []
         if c.cuda_version:
-            packages.append(Package(name="cuda-toolkit", version=c.cuda_version, ecosystem="container"))
+            packages.append(
+                Package(
+                    name="cuda-toolkit",
+                    version=c.cuda_version,
+                    ecosystem="container",
+                    purl=build_package_purl(ecosystem="container", name="cuda-toolkit", version=c.cuda_version),
+                )
+            )
         if c.cudnn_version:
-            packages.append(Package(name="cudnn", version=c.cudnn_version, ecosystem="container"))
+            packages.append(
+                Package(
+                    name="cudnn",
+                    version=c.cudnn_version,
+                    ecosystem="container",
+                    purl=build_package_purl(ecosystem="container", name="cudnn", version=c.cudnn_version),
+                )
+            )
 
         server = MCPServer(
             name=c.image,
@@ -623,24 +878,55 @@ def gpu_infra_to_agents(report: GpuInfraReport) -> list[Agent]:
             transport=TransportType.STDIO,
             packages=packages,
         )
+        cloud_origin = {
+            "provider": "gpu",
+            "service": "container_runtime",
+            "resource_type": c.gpu_vendor or "unknown",
+            "resource_id": c.container_id,
+            "resource_name": c.name or c.container_id,
+            "scope": {
+                "image": c.image,
+                "gpu_requested": c.gpu_requested,
+                "cuda_version": c.cuda_version,
+                "cudnn_version": c.cudnn_version,
+            },
+        }
         agent = Agent(
             name=c.name or c.container_id,
             agent_type=AgentType.CUSTOM,
             config_path=f"docker://{c.container_id}",
             source="gpu_infra",
             mcp_servers=[server],
+            metadata={"cloud_origin": cloud_origin},
         )
         agents.append(agent)
 
-    # Aggregate K8s GPU nodes as a single agent
+    # Aggregate K8s GPU nodes as a single agent. Lineage promotion happens at
+    # the cluster level so dashboards see one cloud_resource per cluster, not
+    # one per GPU node — node-level facts live in the scope envelope.
     if report.gpu_nodes:
         total_gpus = sum(n.gpu_capacity for n in report.gpu_nodes)
+        vendors = sorted({n.gpu_vendor for n in report.gpu_nodes if n.gpu_vendor})
         node_server = MCPServer(
             name=f"k8s-gpu-cluster ({len(report.gpu_nodes)} nodes, {total_gpus} GPUs)",
             command="",
             transport=TransportType.STDIO,
             packages=[],
         )
+        cloud_origin = {
+            "provider": "gpu",
+            "service": "kubernetes",
+            "resource_type": vendors[0] if len(vendors) == 1 else "mixed" if vendors else "unknown",
+            "resource_id": "k8s-gpu-cluster",
+            "resource_name": "k8s-gpu-cluster",
+            "scope": {
+                "node_count": len(report.gpu_nodes),
+                "gpu_capacity_total": total_gpus,
+                "vendors": vendors,
+                "driver_cve_count": len(report.driver_findings),
+                "firmware_cve_count": len(report.firmware_findings),
+            },
+        }
         agents.append(
             Agent(
                 name="k8s-gpu-cluster",
@@ -648,6 +934,7 @@ def gpu_infra_to_agents(report: GpuInfraReport) -> list[Agent]:
                 config_path="k8s://gpu-nodes",
                 source="gpu_infra",
                 mcp_servers=[node_server],
+                metadata={"cloud_origin": cloud_origin},
             )
         )
 

@@ -2,6 +2,16 @@
 
 > Given a CVE or security advisory, find every affected AI agent, map blast radius, and generate a remediation plan.
 
+```yaml
+capabilities:
+  read_findings: true
+  read_inventory: true
+  read_audit_log: false
+  write_findings: false
+  outbound_http: true
+  shell_exec: true
+```
+
 ## Goal
 
 When a new CVE drops or a security advisory is published, quickly determine: **which MCP servers have affected packages, what credentials are exposed, which tools an attacker can reach, and what to fix first.**
@@ -67,7 +77,7 @@ The blast radius shows:
 
 Check which OWASP LLM + MITRE ATLAS categories apply:
 
-- **LLM05 + AML.T0010** — Supply chain vulnerability (always triggered)
+- **LLM05 + AML.T0010** — Supply chain vulnerability on a confirmed agent/MCP path or in a known AI framework
 - **LLM06 + AML.T0062** — If credentials are exposed alongside the CVE
 - **LLM08 + AML.T0061** — If >5 tools reachable through the compromised path
 - **LLM02 + AML.T0043** — If shell/exec tools are in the blast radius

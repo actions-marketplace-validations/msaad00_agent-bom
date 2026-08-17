@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from agent_bom.constants import AI_PACKAGES as _AI_PACKAGES
 from agent_bom.constants import high_risk_severities
-from agent_bom.risk_analyzer import ToolCapability, classify_tool
+from agent_bom.risk_analyzer import ToolCapability, classify_mcp_tool
 
 if TYPE_CHECKING:
     from agent_bom.models import BlastRadius
@@ -23,18 +23,23 @@ _HIGH_RISK = high_risk_severities()
 
 # ─── Catalog ──────────────────────────────────────────────────────────────────
 
+# NOTE — the descriptors below are agent-bom's OWN short wording for each Annex A
+# control area, not the official ISO/IEC 27001:2022 control titles. ISO 27001 is
+# copyrighted, so its control text is NOT reproduced or redistributed here; only
+# the Annex A control **identifier** (the fact) is used. Consult the standard for
+# the official titles: https://www.iso.org/standard/27001
 ISO_27001: dict[str, str] = {
     # A.5 — Organizational controls
-    "A.5.19": "Information security in supplier relationships",
-    "A.5.20": "Addressing information security within supplier agreements",
-    "A.5.21": "Managing information security in the ICT supply chain",
-    "A.5.23": "Information security for use of cloud services",
-    "A.5.28": "Collection of evidence",
+    "A.5.19": "Supplier-relationship information security",
+    "A.5.20": "Security terms in supplier agreements",
+    "A.5.21": "ICT supply-chain security management",
+    "A.5.23": "Cloud-service information security",
+    "A.5.28": "Incident evidence collection",
     # A.8 — Technological controls
-    "A.8.8": "Management of technical vulnerabilities",
-    "A.8.9": "Configuration management",
-    "A.8.24": "Use of cryptography",
-    "A.8.28": "Secure coding",
+    "A.8.8": "Technical vulnerability management",
+    "A.8.9": "System configuration management",
+    "A.8.24": "Use of cryptographic protection",
+    "A.8.28": "Secure development / coding practices",
 }
 
 
@@ -65,7 +70,7 @@ def tag_blast_radius(br: BlastRadius) -> list[str]:
 
     has_exec = False
     for tool in br.exposed_tools:
-        caps = classify_tool(tool.name, tool.description)
+        caps = classify_mcp_tool(tool)
         if ToolCapability.EXECUTE in caps:
             has_exec = True
 
@@ -95,11 +100,9 @@ def tag_blast_radius(br: BlastRadius) -> list[str]:
 
     # CWE-based compliance tagging (applies to all vulns with CWE data)
     if br.vulnerability.cwe_ids:
-        from agent_bom.constants import CWE_COMPLIANCE_MAP
+        from agent_bom.framework_mapping import controls_for_cwes
 
-        for cwe in br.vulnerability.cwe_ids:
-            for tag in CWE_COMPLIANCE_MAP.get(cwe.upper(), {}).get("iso_27001", []):
-                tags.add(tag)
+        tags.update(controls_for_cwes(br.vulnerability.cwe_ids, "iso_27001"))
 
     return sorted(tags)
 

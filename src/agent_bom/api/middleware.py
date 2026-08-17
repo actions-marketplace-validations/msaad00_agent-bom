@@ -3,30 +3,961 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import ipaddress
 import logging
+import os
 import secrets
+import sys
+import threading
 import time
-from collections import defaultdict
-from typing import TYPE_CHECKING
+import uuid
+from collections.abc import Awaitable, Callable, Iterable, Sequence
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, cast
+
+import anyio.to_thread
 
 from agent_bom import __version__
+from agent_bom.api.auth import get_key_store
+from agent_bom.api.browser_session import (
+    CSRF_COOKIE_NAME,
+    CSRF_HEADER_NAME,
+    SESSION_COOKIE_NAME,
+    BrowserSessionError,
+    verify_browser_session_token,
+    verify_csrf,
+)
+from agent_bom.api.tracing import configure_otel_tracing, make_request_trace
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
+    from agent_bom.api.auth import Role
     from agent_bom.api.oidc import OIDCConfig
 
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request as StarletteRequest
-from starlette.responses import JSONResponse
-from starlette.types import ASGIApp
+from starlette.responses import JSONResponse, Response
+from starlette.types import ASGIApp, Message
+
+from agent_bom.api.dashboard_csp import dashboard_csp_header, describe_dashboard_csp_posture
+from agent_bom.security import sanitize_error, sanitize_text
 
 _logger = logging.getLogger(__name__)
+_RATE_LIMIT_FINGERPRINT_FALLBACK = secrets.token_bytes(32)
+_TENANT_SCOPED_AUTH_METHODS = {
+    "api_key",
+    "browser_session",
+    "browser_session_static_api_key",
+    "oidc",
+    "proxy_header",
+    "saml",
+    "scim_bearer",
+    "static_api_key",
+}
+# Auth methods whose ``request.state.tenant_id`` was set from a KeyStore-verified
+# ApiKey. Re-verifying the same raw key can only return the same tenant, so the
+# rate limiter reads the state instead of paying a second scrypt derivation.
+# Deliberately narrow: "static_api_key" is NOT here because the static key never
+# reaches the KeyStore, so its verify returns None and buckets differently.
+_API_KEY_VERIFIED_AUTH_METHODS = {"api_key", "saml"}
+_AUTH_RUNTIME_STATUS: dict[str, object] = {
+    "auth_required": True,
+    "auth_configured": False,
+    "configured_modes": [],
+    "recommended_ui_mode": "configure_auth",
+    "unauthenticated_allowed": False,
+}
+_API_CSP = "default-src 'self'"
+# /docs (Swagger UI) and /redoc serve HTML shells that load swagger-ui /
+# redoc bundles + a favicon from public CDNs (cdn.jsdelivr.net,
+# fastapi.tiangolo.com). The strict default-src 'self' API CSP blocks
+# them, leaving a blank page. We narrowly relax CSP for these two
+# documentation routes — they remain disable-able via
+# AGENT_BOM_DISABLE_DOCS for production deployments per the
+# _EXEMPT_PATHS toggle below.
+_DOCS_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    # Favicon is served from /brand/mark.svg (self); keep jsdelivr for swagger assets.
+    "img-src 'self' data: https://cdn.jsdelivr.net; "
+    "font-src 'self' data: https://cdn.jsdelivr.net; "
+    "worker-src 'self' blob:; "
+    "connect-src 'self'"
+)
+_TRUSTED_PROXY_SECRET_MIN_BYTES = 32
+
+
+def _content_security_policy(path: str, content_type: str) -> str:
+    """Return a route-aware CSP that keeps the API strict and the dashboard usable."""
+    if path in {"/docs", "/redoc"} and "text/html" in content_type:
+        return _DOCS_CSP
+    if "text/html" in content_type and not path.startswith(("/v1/", "/docs", "/redoc", "/openapi.json")):
+        return dashboard_csp_header()
+    return _API_CSP
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def clustered_control_plane_required() -> bool:
+    """Return true when process-local control-plane state is unsafe."""
+    return _env_flag("AGENT_BOM_REQUIRE_SHARED_RATE_LIMIT") or _configured_api_replicas() > 1
+
+
+def static_api_key_allowed() -> bool:
+    """Static API keys are a single-tenant pilot shortcut, not clustered auth."""
+    return not clustered_control_plane_required()
+
+
+def static_api_key_rejection_message() -> str:
+    return (
+        "AGENT_BOM_API_KEY static-key auth is disabled for clustered control planes. "
+        "Use tenant-scoped API keys, OIDC, SAML, or trusted proxy auth instead."
+    )
+
+
+def _secret_min_bytes(secret: str) -> int:
+    return len(secret.encode("utf-8"))
+
+
+def _trusted_proxy_secret_is_strong(secret: str) -> bool:
+    return _secret_min_bytes(secret) >= _TRUSTED_PROXY_SECRET_MIN_BYTES
+
+
+def get_trusted_proxy_auth_status() -> dict[str, object]:
+    """Return trusted-proxy auth posture without exposing secret material."""
+    from agent_bom.api.secret_source import resolve_secret
+
+    enabled = _env_flag("AGENT_BOM_TRUST_PROXY_AUTH")
+    secret = resolve_secret("AGENT_BOM_TRUST_PROXY_AUTH_SECRET")
+    issuer = os.environ.get("AGENT_BOM_TRUST_PROXY_AUTH_ISSUER", "").strip()
+    if not enabled:
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "secret_min_bytes": _TRUSTED_PROXY_SECRET_MIN_BYTES,
+            "issuer_pinned": False,
+            "message": "Trusted reverse-proxy header authentication is disabled.",
+        }
+    if not secret:
+        return {
+            "enabled": True,
+            "status": "misconfigured",
+            "secret_configured": False,
+            "secret_min_bytes": _TRUSTED_PROXY_SECRET_MIN_BYTES,
+            "issuer_pinned": bool(issuer),
+            "message": "AGENT_BOM_TRUST_PROXY_AUTH is enabled but AGENT_BOM_TRUST_PROXY_AUTH_SECRET is not set.",
+        }
+    if not _trusted_proxy_secret_is_strong(secret):
+        return {
+            "enabled": True,
+            "status": "weak_secret",
+            "secret_configured": True,
+            "secret_min_bytes": _TRUSTED_PROXY_SECRET_MIN_BYTES,
+            "issuer_pinned": bool(issuer),
+            "message": (
+                f"AGENT_BOM_TRUST_PROXY_AUTH_SECRET must contain at least {_TRUSTED_PROXY_SECRET_MIN_BYTES} bytes of secret material."
+            ),
+        }
+    return {
+        "enabled": True,
+        "status": "ok" if issuer else "issuer_unpinned",
+        "secret_configured": True,
+        "secret_min_bytes": _TRUSTED_PROXY_SECRET_MIN_BYTES,
+        "issuer_pinned": bool(issuer),
+        "issuer": issuer or None,
+        "message": (
+            "Trusted proxy auth uses strong shared-secret attestation."
+            if issuer
+            else (
+                "Trusted proxy auth uses strong shared-secret attestation; set "
+                "AGENT_BOM_TRUST_PROXY_AUTH_ISSUER to pin the upstream issuer."
+            )
+        ),
+    }
+
+
+def trusted_proxy_auth_usable() -> bool:
+    """Return whether trusted-proxy auth is enabled with a strong resolved secret.
+
+    The feature flag alone is not an authentication mechanism.  Treat unreadable
+    mounted secrets, missing values, and weak values as unusable so startup gates
+    and health posture describe the same boundary enforced by the middleware.
+    """
+    try:
+        status = get_trusted_proxy_auth_status()
+    except (OSError, ValueError):
+        return False
+    return status.get("status") in {"ok", "issuer_unpinned"}
+
+
+_PROXY_CONTROL_PLANE_MTLS_MODES = {"app_native", "delegated", "disabled"}
+
+
+def _is_loopback_listener(host: str | None) -> bool:
+    cleaned = (host or "").strip().lower()
+    if not cleaned:
+        return True
+    if cleaned in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(cleaned).is_loopback
+    except ValueError:
+        return False
+
+
+def _configured_listener_host(host: str | None = None) -> str:
+    return (host or os.environ.get("AGENT_BOM_API_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+
+
+def _production_or_clustered_control_plane() -> bool:
+    from agent_bom.config import resolved_deployment_env
+
+    deployment = resolved_deployment_env()
+    return deployment in {"prod", "production"} or clustered_control_plane_required()
+
+
+def _app_native_mtls_config() -> dict[str, object]:
+    cert_file = os.environ.get("AGENT_BOM_TLS_CERT_FILE", "").strip()
+    key_file = os.environ.get("AGENT_BOM_TLS_KEY_FILE", "").strip()
+    client_ca_file = os.environ.get("AGENT_BOM_TLS_CLIENT_CA_FILE", "").strip()
+    require_client_cert = _env_flag("AGENT_BOM_TLS_REQUIRE_CLIENT_CERT")
+    complete = bool(cert_file and key_file and client_ca_file and require_client_cert)
+    missing = []
+    if not cert_file:
+        missing.append("AGENT_BOM_TLS_CERT_FILE")
+    if not key_file:
+        missing.append("AGENT_BOM_TLS_KEY_FILE")
+    if not client_ca_file:
+        missing.append("AGENT_BOM_TLS_CLIENT_CA_FILE")
+    if not require_client_cert:
+        missing.append("AGENT_BOM_TLS_REQUIRE_CLIENT_CERT")
+    return {
+        "cert_file_configured": bool(cert_file),
+        "key_file_configured": bool(key_file),
+        "client_ca_file_configured": bool(client_ca_file),
+        "require_client_cert": require_client_cert,
+        "complete": complete,
+        "missing_evidence": missing,
+    }
+
+
+def describe_control_plane_direct_listener_posture(
+    *,
+    listener_host: str | None = None,
+    mtls_ok: bool | None = None,
+    trusted_proxy_ok: bool | None = None,
+) -> dict[str, object]:
+    """Return non-secret direct-listener posture for operator policy surfaces."""
+
+    host = _configured_listener_host(listener_host)
+    loopback = _is_loopback_listener(host)
+    production_or_clustered = _production_or_clustered_control_plane()
+    if mtls_ok is None or trusted_proxy_ok is None:
+        mtls = describe_proxy_control_plane_mtls_posture(listener_host=host)
+        if mtls_ok is None:
+            mtls_ok = mtls.get("status") == "ok" and mtls.get("mtls_mode") in {"app_native", "delegated"}
+        if trusted_proxy_ok is None:
+            trusted_proxy_ok = get_trusted_proxy_auth_status().get("status") == "ok"
+    unsafe = bool(production_or_clustered and not loopback and not mtls_ok and not trusted_proxy_ok)
+    return {
+        "host": host,
+        "loopback": loopback,
+        "production_or_clustered": production_or_clustered,
+        "trusted_proxy_attestation": "enabled" if trusted_proxy_ok else "disabled",
+        "mtls_enforced": bool(mtls_ok),
+        "status": "unsafe" if unsafe else "ok",
+        "message": (
+            "Production or clustered control planes must not expose a non-loopback listener without "
+            "trusted-proxy attestation or app-native mTLS."
+            if unsafe
+            else "Direct listener posture is acceptable for the declared deployment mode."
+        ),
+    }
+
+
+def require_safe_control_plane_listener(listener_host: str | None = None) -> None:
+    """Fail closed for unsafe production/clustered direct listener exposure."""
+
+    posture = describe_control_plane_direct_listener_posture(listener_host=listener_host)
+    if posture["status"] == "unsafe":
+        raise RuntimeError(str(posture["message"]))
+
+
+def describe_proxy_control_plane_mtls_posture(*, listener_host: str | None = None) -> dict[str, object]:
+    """Return non-secret proxy-to-control-plane mTLS posture.
+
+    Delegated ingress or service-mesh mTLS remains the production default.
+    App-native mTLS is available as a fallback for non-mesh deployments and is
+    reported here only from non-secret environment posture.
+    """
+
+    raw_mode = os.environ.get("AGENT_BOM_PROXY_CONTROL_PLANE_MTLS_MODE", "disabled").strip().lower() or "disabled"
+    provider = os.environ.get("AGENT_BOM_PROXY_CONTROL_PLANE_MTLS_PROVIDER", "").strip()
+    client_ca_ref = os.environ.get("AGENT_BOM_PROXY_CONTROL_PLANE_MTLS_CLIENT_CA_REF", "").strip()
+    evidence_ref = os.environ.get("AGENT_BOM_PROXY_CONTROL_PLANE_MTLS_EVIDENCE_REF", "").strip()
+    cert_header = os.environ.get("AGENT_BOM_PROXY_CONTROL_PLANE_MTLS_CERT_HEADER", "").strip()
+    trusted_proxy = get_trusted_proxy_auth_status()
+    app_native = _app_native_mtls_config()
+    effective_mode = "app_native" if raw_mode == "app_native" or app_native["complete"] else raw_mode
+    mtls_mode = "none" if effective_mode == "disabled" else effective_mode
+
+    base: dict[str, object] = {
+        "mode": effective_mode,
+        "declared_mode": raw_mode,
+        "mtls_mode": mtls_mode,
+        "supported_modes": sorted(_PROXY_CONTROL_PLANE_MTLS_MODES),
+        "mode_env": "AGENT_BOM_PROXY_CONTROL_PLANE_MTLS_MODE",
+        "provider": provider or None,
+        "client_ca_ref_configured": bool(client_ca_ref),
+        "client_cert_header_configured": bool(cert_header),
+        "evidence_ref": evidence_ref or None,
+        "trusted_proxy_auth_status": trusted_proxy.get("status"),
+        "trusted_proxy_issuer_pinned": bool(trusted_proxy.get("issuer_pinned")),
+        "trusted_proxy_attestation": "enabled" if trusted_proxy.get("status") == "ok" else "disabled",
+        "app_native_mtls": app_native,
+    }
+    if raw_mode not in _PROXY_CONTROL_PLANE_MTLS_MODES:
+        return {
+            **base,
+            "status": "misconfigured",
+            "enforced": False,
+            "message": (
+                "Unsupported AGENT_BOM_PROXY_CONTROL_PLANE_MTLS_MODE. Use disabled or delegated; "
+                "terminate and verify mTLS in ingress, Envoy, or a service mesh, or use app_native with TLS env vars."
+            ),
+        }
+    if effective_mode == "app_native":
+        status = "ok" if app_native["complete"] else "needs_evidence"
+        missing = list(cast(list[str], app_native["missing_evidence"]))
+        direct = describe_control_plane_direct_listener_posture(
+            listener_host=listener_host,
+            mtls_ok=status == "ok",
+            trusted_proxy_ok=trusted_proxy.get("status") == "ok",
+        )
+        return {
+            **base,
+            "status": status,
+            "enforced": status == "ok",
+            "missing_evidence": missing,
+            "direct_listener": direct,
+            "message": (
+                "App-native mTLS is configured for the FastAPI control plane."
+                if status == "ok"
+                else "App-native mTLS was requested, but TLS certificate, key, client CA, or client-cert enforcement is incomplete."
+            ),
+        }
+    if effective_mode == "disabled":
+        direct = describe_control_plane_direct_listener_posture(
+            listener_host=listener_host,
+            mtls_ok=False,
+            trusted_proxy_ok=trusted_proxy.get("status") == "ok",
+        )
+        return {
+            **base,
+            "status": "disabled",
+            "enforced": False,
+            "direct_listener": direct,
+            "message": "Proxy-to-control-plane mTLS posture is disabled or not declared.",
+        }
+
+    trusted_ok = trusted_proxy.get("status") == "ok"
+    status = "ok" if client_ca_ref and evidence_ref and trusted_ok else "needs_evidence"
+    missing = []
+    if not client_ca_ref:
+        missing.append("AGENT_BOM_PROXY_CONTROL_PLANE_MTLS_CLIENT_CA_REF")
+    if not evidence_ref:
+        missing.append("AGENT_BOM_PROXY_CONTROL_PLANE_MTLS_EVIDENCE_REF")
+    if not trusted_ok:
+        missing.append("trusted proxy auth with issuer pinning")
+    direct = describe_control_plane_direct_listener_posture(
+        listener_host=listener_host,
+        mtls_ok=status == "ok",
+        trusted_proxy_ok=trusted_ok,
+    )
+    return {
+        **base,
+        "status": status,
+        "enforced": True,
+        "missing_evidence": missing,
+        "direct_listener": direct,
+        "message": (
+            "Delegated mTLS is declared and backed by client-CA evidence plus trusted-proxy issuer pinning."
+            if status == "ok"
+            else "Delegated mTLS is declared, but operator evidence is incomplete."
+        ),
+    }
+
+
+def _hsts_max_age_seconds() -> int:
+    raw = (os.environ.get("AGENT_BOM_HSTS_MAX_AGE_SECONDS") or "31536000").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 31_536_000
+
+
+def hsts_header_value() -> str:
+    """Return the configured Strict-Transport-Security header value.
+
+    ``preload`` is intentionally opt-in because browser preload enrollment is
+    sticky and must be a deliberate operator decision for the deployment domain.
+    """
+
+    value = f"max-age={_hsts_max_age_seconds()}; includeSubDomains"
+    if _env_flag("AGENT_BOM_HSTS_PRELOAD"):
+        value += "; preload"
+    return value
+
+
+def describe_security_header_posture() -> dict[str, object]:
+    """Return non-secret security-header posture for operator policy surfaces."""
+
+    return {
+        "hsts": {
+            "header": hsts_header_value(),
+            "max_age_seconds": _hsts_max_age_seconds(),
+            "include_subdomains": True,
+            "preload": _env_flag("AGENT_BOM_HSTS_PRELOAD"),
+            "preload_env": "AGENT_BOM_HSTS_PRELOAD",
+            "max_age_env": "AGENT_BOM_HSTS_MAX_AGE_SECONDS",
+            "preload_guidance": ("Only enable preload after confirming HTTPS is permanent for the domain and every subdomain."),
+        },
+        "csp": {"api": _API_CSP, "dashboard": describe_dashboard_csp_posture()},
+    }
+
+
+class AuthPostureError(RuntimeError):
+    """Raised when the derived auth posture is internally contradictory.
+
+    A contradictory posture is a fail-fast startup error (surfaced by the CLI
+    serve/api gate) rather than a silent coexistence that only breaks at request
+    time.
+    """
+
+
+@dataclass(frozen=True)
+class AuthPosture:
+    """The single derived view of control-plane authentication posture.
+
+    Every reader — the CLI serve gate, ``/health``/operator surfaces (via the
+    runtime status), and the middleware — consumes this one object instead of
+    re-deriving the same facts from the environment. The boolean fields are the
+    raw credential-source facts (derived once by ``derive_auth_posture``); the
+    properties express the precedence order and the two aggregate views the
+    readers need.
+    """
+
+    listener_host: str
+    listener_loopback: bool
+    api_key: bool
+    oidc_bearer: bool
+    oidc_browser: bool
+    snowflake_oauth: bool
+    scim_bearer: bool
+    saml: bool
+    trusted_proxy: bool
+    anonymous_allowed: bool
+    oidc_config_invalid: bool = False
+    oidc_config_error: str | None = None
+
+    @property
+    def sources(self) -> tuple[str, ...]:
+        """Effective credential sources in resolver precedence order."""
+        ordered: list[str] = []
+        if self.scim_bearer:
+            ordered.append("scim_bearer")
+        if self.trusted_proxy:
+            ordered.append("trusted_proxy")
+        if self.oidc_bearer:
+            ordered.append("oidc_bearer")
+        if self.api_key:
+            ordered.append("api_key")
+        if self.oidc_browser:
+            ordered.append("oidc_browser")
+        if self.snowflake_oauth:
+            ordered.append("snowflake_oauth")
+        if self.saml:
+            ordered.append("saml_sso")
+        return tuple(ordered)
+
+    @property
+    def auth_configured(self) -> bool:
+        """True when any credential source (including browser SSO) is configured."""
+        return bool(self.sources)
+
+    @property
+    def programmatic_auth_configured(self) -> bool:
+        """The serve-gate view: excludes browser-interactive SSO.
+
+        ``oidc_browser`` / ``snowflake_oauth`` are browser-login flows that do
+        not gate programmatic API access, so the non-loopback serve gate does
+        not treat them as satisfying the auth requirement (unchanged behavior).
+        """
+        return self.api_key or self.oidc_bearer or self.scim_bearer or self.saml or self.trusted_proxy
+
+    @property
+    def configured_modes(self) -> list[str]:
+        """Operator/UI mode list — ordering preserved for existing consumers."""
+        modes: list[str] = []
+        if self.trusted_proxy:
+            modes.append("trusted_proxy")
+        if self.oidc_browser:
+            modes.append("oidc_browser")
+        if self.snowflake_oauth:
+            modes.append("snowflake_oauth")
+        if self.oidc_bearer:
+            modes.append("oidc_bearer")
+        if self.api_key:
+            modes.append("api_key")
+        if self.scim_bearer:
+            modes.append("scim_provisioning")
+        if self.saml:
+            modes.append("saml_sso")
+        return modes
+
+    @property
+    def auth_required(self) -> bool:
+        # An explicit unauthenticated opt-in means anonymous callers are served
+        # as NO_AUTH_ROLE, so authentication is not *required* — even when
+        # credentials are also configured for callers who want to elevate.
+        return not self.anonymous_allowed
+
+    @property
+    def recommended_ui_mode(self) -> str:
+        if self.anonymous_allowed and not self.auth_configured:
+            return "no_auth"
+        if self.trusted_proxy:
+            return "reverse_proxy_oidc"
+        if self.oidc_browser:
+            return "oidc_browser"
+        if self.snowflake_oauth:
+            return "snowflake_oauth"
+        if self.oidc_bearer:
+            return "oidc_bearer"
+        if self.saml or self.api_key:
+            # SAML SSO completes at the IdP and mints a short-lived session API
+            # key, so the dashboard uses the same session-key login surface.
+            return "session_api_key"
+        return "configure_auth"
+
+    def runtime_status(self) -> dict[str, object]:
+        """Project to the operator/UI runtime-status dict (the /health source)."""
+        return {
+            "auth_required": self.auth_required,
+            "auth_configured": self.auth_configured,
+            "configured_modes": self.configured_modes,
+            "recommended_ui_mode": self.recommended_ui_mode,
+            "unauthenticated_allowed": self.anonymous_allowed,
+        }
+
+    def summary_line(self) -> str:
+        """One structured line summarizing the posture for the startup log."""
+        sources = ">".join(self.sources) if self.sources else "none"
+        scope = "loopback" if self.listener_loopback else "non-loopback"
+        return (
+            f"auth posture: sources=[{sources}] "
+            f"anonymous={'on' if self.anonymous_allowed else 'off'} "
+            f"listener={self.listener_host}({scope}) "
+            f"trusted_proxy={'usable' if self.trusted_proxy else 'off'} "
+            f"oidc={'invalid' if self.oidc_config_invalid else ('configured' if self.oidc_bearer else 'off')}"
+        )
+
+
+_EMPTY_AUTH_POSTURE = AuthPosture(
+    listener_host="127.0.0.1",
+    listener_loopback=True,
+    api_key=False,
+    oidc_bearer=False,
+    oidc_browser=False,
+    snowflake_oauth=False,
+    scim_bearer=False,
+    saml=False,
+    trusted_proxy=False,
+    anonymous_allowed=False,
+)
+_AUTH_POSTURE: AuthPosture = _EMPTY_AUTH_POSTURE
+
+
+def derive_auth_posture(
+    *,
+    api_key_configured: bool,
+    allow_unauthenticated: bool,
+    listener_host: str | None = None,
+) -> AuthPosture:
+    """Derive the auth posture from the environment plus caller-known facts.
+
+    This is the single derivation of the env-based credential-source facts
+    (OIDC bearer/browser, Snowflake OAuth, SCIM, SAML, trusted proxy). The
+    caller supplies the two facts it uniquely knows — whether an API key source
+    is configured (static key flag / env keys / runtime key store) and whether
+    the unauthenticated opt-in is on — and the listener host being bound.
+    """
+    from agent_bom.api.oidc import OIDCConfig, OIDCError, oidc_enabled_from_env
+    from agent_bom.api.oidc_browser import oidc_browser_enabled_from_env
+    from agent_bom.api.saml import saml_enabled_from_env
+    from agent_bom.api.scim import scim_enabled_from_env
+    from agent_bom.api.snowflake_oauth import snowflake_oauth_enabled_from_env
+
+    oidc_bearer = oidc_enabled_from_env()
+    oidc_config_invalid = False
+    oidc_config_error: str | None = None
+    if oidc_bearer:
+        try:
+            OIDCConfig.from_env()
+        except OIDCError as exc:
+            from agent_bom.security import sanitize_error
+
+            oidc_config_invalid = True
+            oidc_config_error = sanitize_error(exc)
+
+    host = _configured_listener_host(listener_host)
+    return AuthPosture(
+        listener_host=host,
+        listener_loopback=_is_loopback_listener(host),
+        api_key=bool(api_key_configured),
+        oidc_bearer=oidc_bearer,
+        oidc_browser=oidc_browser_enabled_from_env(),
+        snowflake_oauth=snowflake_oauth_enabled_from_env(),
+        scim_bearer=scim_enabled_from_env(),
+        saml=saml_enabled_from_env(),
+        trusted_proxy=trusted_proxy_auth_usable(),
+        anonymous_allowed=bool(allow_unauthenticated),
+        oidc_config_invalid=oidc_config_invalid,
+        oidc_config_error=oidc_config_error,
+    )
+
+
+def validate_auth_posture(posture: AuthPosture) -> None:
+    """Raise ``AuthPostureError`` for an internally contradictory posture.
+
+    Consolidation, not policy change: this only rejects combinations that are
+    already broken today (a malformed/contradictory OIDC configuration currently
+    500s on the first OIDC request). Every combination that boots and serves
+    today keeps working — including trusted-proxy alongside direct OIDC on one
+    listener, which stays allowed.
+    """
+    if posture.oidc_config_invalid:
+        detail = posture.oidc_config_error or "OIDC configuration is invalid"
+        raise AuthPostureError(f"Invalid OIDC configuration: {detail}")
+
+
+def apply_auth_posture(posture: AuthPosture) -> None:
+    """Store the derived posture and project it into the runtime-status dict."""
+    global _AUTH_POSTURE
+    _AUTH_POSTURE = posture
+    _AUTH_RUNTIME_STATUS.clear()
+    _AUTH_RUNTIME_STATUS.update(posture.runtime_status())
+
+
+def get_auth_posture() -> AuthPosture:
+    """Return the last-applied derived auth posture (the single source of truth)."""
+    return _AUTH_POSTURE
+
+
+def configure_auth_runtime(
+    *,
+    api_key_configured: bool,
+    oidc_enabled: bool,
+    trusted_proxy_enabled: bool,
+    scim_enabled: bool = False,
+    saml_enabled: bool = False,
+    oidc_browser_enabled: bool = False,
+    snowflake_oauth_enabled: bool = False,
+    unauthenticated_allowed: bool = False,
+) -> None:
+    """Build and apply an :class:`AuthPosture` from already-derived source facts.
+
+    Backward-compatible entry point: callers that have already resolved the
+    per-source booleans (notably ``configure_api``) hand them here, and the
+    posture object becomes the single stored source the runtime status,
+    ``/health``, and the startup log all read.
+    """
+    host = _configured_listener_host(None)
+    posture = AuthPosture(
+        listener_host=host,
+        listener_loopback=_is_loopback_listener(host),
+        api_key=bool(api_key_configured),
+        oidc_bearer=bool(oidc_enabled),
+        oidc_browser=bool(oidc_browser_enabled),
+        snowflake_oauth=bool(snowflake_oauth_enabled),
+        scim_bearer=bool(scim_enabled),
+        saml=bool(saml_enabled),
+        trusted_proxy=bool(trusted_proxy_enabled),
+        anonymous_allowed=bool(unauthenticated_allowed),
+    )
+    apply_auth_posture(posture)
+
+
+def get_auth_runtime_status() -> dict[str, object]:
+    """Return the configured auth modes for UI and operator surfaces."""
+    return dict(_AUTH_RUNTIME_STATUS)
+
+
+class InMemoryRateLimitStore:
+    """Process-local sliding-window limiter state."""
+
+    _MAX_ENTRIES = 10_000
+
+    def __init__(self, window_seconds: int = 60) -> None:
+        self._window = window_seconds
+        self._hits: dict[str, list[float]] = {}
+        self._last_cleanup = time.time()
+        self._lock = threading.RLock()
+
+    def _cleanup(self, now: float) -> None:
+        """Prune stale entries to prevent unbounded memory growth."""
+        with self._lock:
+            if now - self._last_cleanup < self._window:
+                return
+            self._last_cleanup = now
+            stale = [k for k, v in self._hits.items() if not v or v[-1] < now - self._window]
+            for k in stale:
+                del self._hits[k]
+            if len(self._hits) > self._MAX_ENTRIES:
+                overflow = len(self._hits) - self._MAX_ENTRIES
+                oldest_keys = sorted(self._hits, key=lambda key: self._hits[key][-1] if self._hits[key] else 0.0)[:overflow]
+                for key in oldest_keys:
+                    del self._hits[key]
+                _logger.warning(
+                    "In-memory rate limiter pruned %s oldest buckets to stay under %s entries",
+                    overflow,
+                    self._MAX_ENTRIES,
+                )
+
+    def hit(self, key: str, now: float) -> tuple[int, int]:
+        """Record a request and return (hit_count, reset_epoch)."""
+        with self._lock:
+            self._cleanup(now)
+            timestamps = [t for t in self._hits.get(key, []) if now - t < self._window]
+            timestamps.append(now)
+            self._hits[key] = timestamps
+            reset_at = int((timestamps[0] if timestamps else now) + self._window)
+            return len(timestamps), reset_at
+
+    def consume_if_below(self, key: str, now: float, limit: int) -> tuple[bool, int, int]:
+        """Atomically consume one sliding-window unit when below ``limit``."""
+
+        with self._lock:
+            self._cleanup(now)
+            timestamps = [timestamp for timestamp in self._hits.get(key, []) if now - timestamp < self._window]
+            accepted = len(timestamps) < limit
+            if accepted:
+                timestamps.append(now)
+                self._hits[key] = timestamps
+            reset_at = int((timestamps[0] if timestamps else now) + self._window)
+            return accepted, len(timestamps), reset_at
+
+    def count(self, key: str, now: float) -> int:
+        """Return current sliding-window usage without consuming a unit."""
+
+        with self._lock:
+            self._cleanup(now)
+            timestamps = [timestamp for timestamp in self._hits.get(key, []) if now - timestamp < self._window]
+            if timestamps:
+                self._hits[key] = timestamps
+            else:
+                self._hits.pop(key, None)
+            return len(timestamps)
+
+
+class PostgresRateLimitStore:
+    """Shared sliding-window limiter backed by Postgres for horizontal scaling."""
+
+    def __init__(self, window_seconds: int = 60, pool: Any = None) -> None:
+        self._window = window_seconds
+        if pool is None:
+            from agent_bom.api.postgres_store import _get_pool
+
+            pool = _get_pool()
+        self._pool = pool
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        from agent_bom.api.storage_schema import ensure_postgres_schema_version
+
+        with self._pool.connection() as conn:
+            if not ensure_postgres_schema_version(conn, "rate_limits"):
+                return
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS api_rate_limit_hits (
+                    bucket_key TEXT NOT NULL,
+                    hit_at DOUBLE PRECISION NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_api_rate_limit_hits_bucket_hit_at ON api_rate_limit_hits (bucket_key, hit_at)")
+
+    def hit(self, key: str, now: float) -> tuple[int, int]:
+        """Record a request and return (hit_count, reset_epoch)."""
+        window_start = now - self._window
+        with self._pool.connection() as conn:
+            # Trim stale hits opportunistically to keep the table bounded.
+            conn.execute(
+                "DELETE FROM api_rate_limit_hits WHERE hit_at < %s",
+                (window_start,),
+            )
+            conn.execute(
+                "INSERT INTO api_rate_limit_hits (bucket_key, hit_at) VALUES (%s, %s)",
+                (key, now),
+            )
+            row = conn.execute(
+                """
+                SELECT COUNT(*), MIN(hit_at)
+                FROM api_rate_limit_hits
+                WHERE bucket_key = %s AND hit_at >= %s
+                """,
+                (key, window_start),
+            ).fetchone()
+        count = int(row[0]) if row and row[0] is not None else 1
+        oldest = float(row[1]) if row and row[1] is not None else now
+        reset_at = int(oldest + self._window)
+        return count, reset_at
+
+    @staticmethod
+    def _advisory_key(key: str) -> int:
+        digest = hashlib.sha256(f"rate-limit:{key}".encode()).digest()
+        return int.from_bytes(digest[:8], "big", signed=True)
+
+    def consume_if_below(self, key: str, now: float, limit: int) -> tuple[bool, int, int]:
+        """Atomically consume one unit using a transaction advisory lock."""
+
+        window_start = now - self._window
+        with self._pool.connection() as conn:
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (self._advisory_key(key),))
+            conn.execute("DELETE FROM api_rate_limit_hits WHERE bucket_key = %s AND hit_at < %s", (key, window_start))
+            row = conn.execute(
+                "SELECT COUNT(*), MIN(hit_at) FROM api_rate_limit_hits WHERE bucket_key = %s AND hit_at >= %s",
+                (key, window_start),
+            ).fetchone()
+            current = int(row[0]) if row and row[0] is not None else 0
+            oldest = float(row[1]) if row and row[1] is not None else now
+            accepted = current < limit
+            if accepted:
+                conn.execute("INSERT INTO api_rate_limit_hits (bucket_key, hit_at) VALUES (%s, %s)", (key, now))
+                current += 1
+                if current == 1:
+                    oldest = now
+        return accepted, current, int(oldest + self._window)
+
+    def count(self, key: str, now: float) -> int:
+        """Return current sliding-window usage without consuming a unit."""
+
+        window_start = now - self._window
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM api_rate_limit_hits WHERE bucket_key = %s AND hit_at >= %s",
+                (key, window_start),
+            ).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
 
 
 class TrustHeadersMiddleware(BaseHTTPMiddleware):
     """Add trust + standard security headers to every response."""
 
-    async def dispatch(self, request: StarletteRequest, call_next):
-        response = await call_next(request)
+    async def dispatch(self, request: StarletteRequest, call_next: RequestResponseEndpoint) -> Response:
+        trace_meta = make_request_trace(dict(request.headers))
+        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+        request.state.request_id = request_id
+        # A percent-encoded NUL in a path parameter is decoded before routing and
+        # then handed to psycopg as a text value, which raises `DataError:
+        # PostgreSQL text fields cannot contain NUL (0x00) bytes` deep inside a
+        # store and surfaces as a bare 500. Reject the whole request here so the
+        # class is closed for every route rather than one path id at a time.
+        if "\x00" in request.url.path:
+            return _build_error_envelope(
+                status_code=400,
+                detail="Request path contains a NUL (0x00) byte",
+                correlation_id=request_id,
+            )
+        request.state.trace_id = trace_meta["trace_id"]
+        request.state.span_id = trace_meta["span_id"]
+        request.state.parent_span_id = trace_meta["parent_span_id"]
+        request.state.traceparent = trace_meta["traceparent"]
+        request.state.tracestate = trace_meta["tracestate"]
+        request.state.baggage = trace_meta["baggage"]
+        if not hasattr(request.state, "tenant_id"):
+            request.state.tenant_id = "default"
+        tenant_token = None
+        otel_cm = None
+        span = None
+        start = time.perf_counter()
+        try:
+            if configure_otel_tracing():
+                from opentelemetry import trace
+
+                tracer = trace.get_tracer("agent_bom.api")
+                otel_cm = tracer.start_as_current_span(f"{request.method} {request.url.path}")
+                span = otel_cm.__enter__()
+                span.set_attribute("http.request.method", request.method)
+                span.set_attribute("url.path", request.url.path)
+                span.set_attribute("agent_bom.request_id", request_id)
+                span.set_attribute("agent_bom.trace_id", str(trace_meta["trace_id"]))
+                span.set_attribute("agent_bom.span_id", str(trace_meta["span_id"]))
+                span.set_attribute("agent_bom.incoming_traceparent", bool(trace_meta["incoming_traceparent"]))
+                if trace_meta["parent_span_id"]:
+                    span.set_attribute("agent_bom.parent_span_id", str(trace_meta["parent_span_id"]))
+                if trace_meta["tracestate"]:
+                    span.set_attribute("agent_bom.tracestate_present", True)
+                if trace_meta["baggage"]:
+                    span.set_attribute("agent_bom.baggage_present", True)
+            if os.environ.get("AGENT_BOM_POSTGRES_URL"):
+                from agent_bom.api.postgres_store import set_current_tenant
+
+                tenant_token = set_current_tenant(getattr(request.state, "tenant_id", "default"))
+            response = await call_next(request)
+            elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+            _logger.info(
+                "api request complete method=%s path=%s status=%s request_id=%s trace_id=%s span_id=%s tenant_id=%s duration_ms=%s",
+                request.method,
+                request.url.path,
+                getattr(response, "status_code", "unknown"),
+                request_id,
+                trace_meta["trace_id"],
+                trace_meta["span_id"],
+                getattr(request.state, "tenant_id", "default"),
+                elapsed_ms,
+            )
+            if span is not None:
+                span.set_attribute("http.response.status_code", int(getattr(response, "status_code", 500)))
+                span.set_attribute("agent_bom.tenant_id", str(getattr(request.state, "tenant_id", "default")))
+                span.set_attribute("agent_bom.duration_ms", elapsed_ms)
+                span.set_attribute("http.route", str(request.scope.get("path", request.url.path)))
+                if getattr(request.state, "api_key_role", None):
+                    span.set_attribute("agent_bom.auth.role", str(request.state.api_key_role))
+                if getattr(request.state, "api_key_name", None):
+                    span.set_attribute("agent_bom.auth.subject", str(request.state.api_key_name))
+                if request.client and request.client.host:
+                    span.set_attribute("client.address", str(request.client.host))
+        except Exception as exc:
+            if span is not None:
+                from opentelemetry.trace import Status, StatusCode
+
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR, str(exc)))
+            raise
+        finally:
+            if tenant_token is not None:
+                from agent_bom.api.postgres_store import reset_current_tenant
+
+                reset_current_tenant(tenant_token)
+            if otel_cm is not None:
+                otel_cm.__exit__(*sys.exc_info())
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Trace-ID"] = str(trace_meta["trace_id"])
+        response.headers["X-Span-ID"] = str(trace_meta["span_id"])
+        response.headers["traceparent"] = str(trace_meta["traceparent"])
+        if trace_meta["parent_span_id"]:
+            response.headers["X-Parent-Span-ID"] = str(trace_meta["parent_span_id"])
+        if trace_meta["tracestate"]:
+            response.headers["tracestate"] = str(trace_meta["tracestate"])
+        if trace_meta["baggage"]:
+            response.headers["baggage"] = str(trace_meta["baggage"])
         response.headers["X-Agent-Bom-Read-Only"] = "true"
         response.headers["X-Agent-Bom-No-Credential-Storage"] = "true"
         response.headers["X-Agent-Bom-Version"] = __version__
@@ -34,8 +965,112 @@ class TrustHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Cache-Control"] = "no-store"
-        response.headers["Content-Security-Policy"] = "default-src 'self'"
+        response.headers["Content-Security-Policy"] = _content_security_policy(
+            request.url.path,
+            response.headers.get("content-type", ""),
+        )
+        response.headers["Strict-Transport-Security"] = hsts_header_value()
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["X-API-Version"] = "v1"
         return response
+
+
+@dataclass(frozen=True)
+class Resolved:
+    """A resolver authenticated a principal; ``response`` is the downstream result.
+
+    The resolver has already applied the per-route authorization/tenant policy
+    and dispatched (or produced the terminal authz rejection for) the request.
+    """
+
+    response: Response
+
+
+@dataclass(frozen=True)
+class Invalid:
+    """A resolver saw a credential it could not accept.
+
+    Terminal: a presented-but-invalid credential is returned as-is and never
+    falls through to a later resolver or the anonymous fallback.
+    """
+
+    response: Response
+
+
+@dataclass(frozen=True)
+class Absent:
+    """No credential this resolver can act on — the pipeline tries the next one."""
+
+
+Resolution = Resolved | Invalid | Absent
+
+
+async def run_resolver_chain(resolvers: Iterable[Callable[[], Awaitable[Resolution]]]) -> Response | None:
+    """Run an ordered authentication resolver chain: first non-Absent result wins.
+
+    This is the single place that expresses the pipeline's control-flow
+    invariant — ``Absent`` continues to the next resolver, while both
+    ``Resolved`` and ``Invalid`` are terminal and return their response
+    immediately. Returns ``None`` only when every resolver is ``Absent`` (the
+    production chain ends in a terminal resolver, so that never happens there;
+    it is meaningful for unit tests exercising the loop directly).
+    """
+    for resolver in resolvers:
+        result = await resolver()
+        if isinstance(result, Absent):
+            continue
+        return result.response
+    return None
+
+
+# Public SPA routes, derived at startup from the dashboard files the server
+# actually ships. A hand-maintained list drifted from ``ui/app/`` and left real
+# pages (``/overview``, ``/inventory``, ``/reports``, …) 401-ing on a cold
+# deep-link while non-existent routes stayed allowlisted. Empty means no
+# dashboard is mounted, so there is no SPA route to make public.
+#
+# BEHAVIOUR CHANGE: on a REST-only deployment (``serve --no-ui`` /
+# ``AGENT_BOM_NO_UI``, or a wheel built without ``ui_dist``) SPA paths now
+# answer 401 rather than 404. Nothing is being withheld — there is no SPA to
+# serve in that mode — and the previous 404 came from the router only after
+# auth had already waved the path through. Deliberate: it keeps the allowlist
+# honest instead of re-introducing a hardcoded fallback that would drift again.
+_DASHBOARD_SPA_ROUTES: frozenset[str] = frozenset()
+
+
+def dashboard_spa_routes_from_files(relative_paths: Iterable[str]) -> frozenset[str]:
+    """Derive the public SPA first-segment allowlist from exported file paths.
+
+    ``relative_paths`` are the dashboard-relative keys the SPA catch-all
+    resolves against (``overview/index.html``, ``findings.html``, …).
+    """
+    routes: set[str] = set()
+    for relative in relative_paths:
+        normalized = relative.strip("/")
+        if not normalized or normalized.startswith("_next"):
+            continue
+        first_segment, separator, _ = normalized.partition("/")
+        if separator:
+            routes.add(first_segment)
+        elif first_segment.lower().endswith(".html"):
+            routes.add(first_segment.rsplit(".", 1)[0])
+    if "index" in routes:
+        # ``index.html`` is the SPA shell: it backs both ``/`` and every
+        # client-side route the export did not pre-render as its own file.
+        routes.add("")
+    return frozenset(routes)
+
+
+def register_dashboard_spa_routes(relative_paths: Iterable[str]) -> None:
+    """Publish the SPA route allowlist discovered while mounting the dashboard."""
+    global _DASHBOARD_SPA_ROUTES  # noqa: PLW0603 — process-wide startup registry
+    _DASHBOARD_SPA_ROUTES = dashboard_spa_routes_from_files(relative_paths)
+
+
+def dashboard_spa_routes() -> frozenset[str]:
+    """Return the currently registered public SPA first-segment allowlist."""
+    return _DASHBOARD_SPA_ROUTES
 
 
 class APIKeyMiddleware(BaseHTTPMiddleware):
@@ -46,76 +1081,587 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
     - RBAC mode: role-based access control via KeyStore with per-endpoint role checks
     """
 
-    _EXEMPT_PATHS = {"/", "/health", "/version", "/docs", "/redoc", "/openapi.json"}
+    # Set AGENT_BOM_DISABLE_DOCS=1 in production to block /docs and /redoc
+    _DOCS_DISABLED = os.environ.get("AGENT_BOM_DISABLE_DOCS", "").strip() in ("1", "true", "yes")
+    _EXEMPT_PATHS = (
+        {
+            "/",
+            "/health",
+            "/healthz",
+            "/livez",
+            "/ping",
+            "/readyz",
+            "/version",
+            "/brand/mark.svg",
+            "/docs",
+            "/redoc",
+            "/openapi.json",
+            "/v1/auth/session",
+            "/v1/auth/oidc/login",
+            "/v1/auth/oidc/callback",
+            "/v1/auth/trial/oidc/start",
+            "/v1/auth/trial/oidc/start-form",
+            "/v1/auth/snowflake/login",
+            "/v1/auth/snowflake/callback",
+            "/v1/auth/saml/metadata",
+            "/v1/auth/saml/relay-state",
+            "/v1/auth/saml/login",
+        }
+        if not _DOCS_DISABLED
+        else {
+            "/",
+            "/health",
+            "/healthz",
+            "/livez",
+            "/ping",
+            "/readyz",
+            "/version",
+            "/brand/mark.svg",
+            "/v1/auth/session",
+            "/v1/auth/oidc/login",
+            "/v1/auth/oidc/callback",
+            "/v1/auth/trial/oidc/start",
+            "/v1/auth/trial/oidc/start-form",
+            "/v1/auth/snowflake/login",
+            "/v1/auth/snowflake/callback",
+            "/v1/auth/saml/metadata",
+            "/v1/auth/saml/relay-state",
+            "/v1/auth/saml/login",
+        }
+    )
 
-    # Endpoints requiring ADMIN role (mutating / destructive operations)
-    _ADMIN_PATHS: set[tuple[str, str]] = {
-        ("DELETE", "/v1/scan/"),
-        ("POST", "/v1/gateway/policies"),
-        ("PUT", "/v1/gateway/policies/"),
-        ("DELETE", "/v1/gateway/policies/"),
-        ("POST", "/v1/fleet/sync"),
-        ("PUT", "/v1/fleet/"),
-        ("POST", "/v1/auth/keys"),
-        ("DELETE", "/v1/auth/keys/"),
-        ("POST", "/v1/exceptions"),
-        ("PUT", "/v1/exceptions/"),
-        ("DELETE", "/v1/exceptions/"),
-    }
+    @staticmethod
+    def _is_dashboard_public_request(path: str, method: str) -> bool:
+        if method not in {"GET", "HEAD"}:
+            return False
+        if path.startswith(("/v1/", "/metrics")):
+            return False
+        if path.startswith(("/scim/", "/docs", "/redoc", "/openapi.json")):
+            return False
+        if path.startswith("/_next/"):
+            return True
+        if path in {
+            "/favicon.ico",
+            "/robots.txt",
+            "/manifest.json",
+            "/apple-touch-icon.png",
+            "/brand/mark.svg",
+        }:
+            return True
+        if path.startswith("/brand/"):
+            return True
+        dashboard_routes = _DASHBOARD_SPA_ROUTES
+        normalized = path.strip("/")
+        first_segment = normalized.split("/", 1)[0] if normalized else ""
+        public_suffixes = (
+            ".html",
+            ".css",
+            ".js",
+            ".mjs",
+            ".map",
+            ".woff",
+            ".woff2",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp",
+            ".svg",
+            ".ico",
+            ".txt",
+        )
+        if path.lower().endswith(public_suffixes):
+            return first_segment in dashboard_routes or ("/" not in normalized and normalized.rsplit(".", 1)[0] in dashboard_routes)
+        # Client-side dashboard routes are served by the SPA fallback. The set
+        # is derived from the shipped dashboard files (see
+        # ``register_dashboard_spa_routes``) so it can neither drift from the
+        # real pages nor allowlist a route the SPA does not serve.
+        return first_segment in dashboard_routes
 
-    # Endpoints requiring ANALYST role (scan + write operations)
-    _ANALYST_PATHS: set[tuple[str, str]] = {
-        ("POST", "/v1/scan"),
-        ("POST", "/v1/gateway/evaluate"),
-        ("POST", "/v1/traces"),
-        ("POST", "/v1/results/push"),
-        ("POST", "/v1/schedules"),
-        ("DELETE", "/v1/schedules/"),
-        ("PUT", "/v1/schedules/"),
-    }
+    # Ordered route rules so narrower enterprise paths win over broad prefixes.
+    # Narrower posture sub-paths come before the `/v1/posture` viewer rule for
+    # readability — they would inherit `viewer` via the broad prefix anyway,
+    # but listing them explicitly makes the role intent of each subroute easy
+    # to grep and audit.
+    _ROLE_RULES: tuple[tuple[str, str, str], ...] = (
+        ("GET", "/v1/observability/adoption", "admin"),
+        ("POST", "/v1/observability/adoption/events", "analyst"),
+        ("GET", "/v1/compliance", "viewer"),
+        ("GET", "/v1/posture/backpressure", "viewer"),
+        ("GET", "/v1/posture/webhooks/", "analyst"),
+        ("GET", "/v1/posture", "viewer"),
+        ("GET", "/v1/auth/debug", "viewer"),
+        ("GET", "/v1/auth/me", "viewer"),
+        ("GET", "/v1/auth/policy", "admin"),
+        ("GET", "/v1/auth/scopes", "admin"),
+        ("GET", "/v1/auth/secrets/lifecycle", "admin"),
+        ("GET", "/v1/auth/secrets/rotation-plan", "admin"),
+        ("GET", "/v1/auth/secrets/credential-expiry", "admin"),
+        ("GET", "/v1/auth/scim/config", "admin"),
+        ("GET", "/v1/entitlements", "admin"),
+        ("GET", "/v1/credentials", "viewer"),
+        ("GET", "/v1/evaluations", "viewer"),
+        ("POST", "/v1/intel/match", "viewer"),
+        ("POST", "/v1/intel/daily-brief", "viewer"),
+        # Read-shaped POSTs (bounded query / decision / verify-only). These
+        # return no key material and were viewer-reachable before the mutating
+        # admin fallback below; keep them explicitly viewer so the fallback
+        # doesn't silently lock viewers/analysts out of read-only surfaces.
+        ("POST", "/v1/graph/query", "viewer"),
+        ("POST", "/v1/graph/should-i-deploy", "viewer"),
+        ("POST", "/v1/audit/export/verify", "viewer"),
+        # Per-span attack-path correlation is a read-only join over a submitted
+        # trace (returns no key material, stores nothing) — keep it viewer even
+        # though the /v1/traces ingest prefix below is analyst.
+        ("POST", "/v1/traces/attack-paths", "viewer"),
+        ("GET", "/v1/audit", "analyst"),
+        ("GET", "/v1/audit/", "analyst"),
+        ("GET", "/scim/v2", "admin"),
+        ("POST", "/scim/v2", "admin"),
+        ("PATCH", "/scim/v2", "admin"),
+        ("PUT", "/scim/v2", "admin"),
+        ("DELETE", "/scim/v2", "admin"),
+        ("GET", "/v1/auth/quota", "admin"),
+        ("GET", "/v1/auth/trial-tenants/", "admin"),
+        ("GET", "/v1/auth/keys", "admin"),
+        ("GET", "/v1/tenant/", "admin"),
+        ("PUT", "/v1/auth/quota", "admin"),
+        ("POST", "/v1/auth/invitations", "admin"),
+        ("POST", "/v1/auth/trial-invitations", "admin"),
+        ("POST", "/v1/auth/trial-tenants/", "admin"),
+        ("POST", "/v1/auth/keys", "admin"),
+        ("POST", "/v1/auth/keys/", "admin"),
+        ("DELETE", "/v1/auth/quota", "admin"),
+        ("DELETE", "/v1/auth/keys/", "admin"),
+        ("DELETE", "/v1/credentials/", "admin"),
+        ("DELETE", "/v1/tenant/", "admin"),
+        ("POST", "/v1/gateway/policies", "admin"),
+        ("POST", "/v1/posture/webhooks/", "admin"),
+        ("PUT", "/v1/gateway/policies/", "admin"),
+        ("DELETE", "/v1/gateway/policies/", "admin"),
+        ("POST", "/v1/fleet/sync", "admin"),
+        ("DELETE", "/v1/sources/", "admin"),
+        ("PUT", "/v1/fleet/", "admin"),
+        ("PUT", "/v1/exceptions/", "admin"),
+        ("DELETE", "/v1/exceptions/", "admin"),
+        ("POST", "/v1/siem/test", "admin"),
+        ("POST", "/v1/shield/start", "admin"),
+        ("POST", "/v1/shield/unblock", "admin"),
+        ("POST", "/v1/shield/break-glass", "admin"),
+        ("DELETE", "/v1/scan/", "admin"),
+        ("POST", "/v1/exceptions", "analyst"),
+        ("POST", "/v1/findings/bulk", "analyst"),
+        ("POST", "/v1/reports", "analyst"),
+        ("GET", "/v1/reports/", "analyst"),
+        ("POST", "/v1/findings/false-positive", "analyst"),
+        ("POST", "/v1/findings/feedback", "analyst"),
+        ("DELETE", "/v1/findings/false-positive/", "analyst"),
+        ("DELETE", "/v1/findings/feedback/", "analyst"),
+        ("POST", "/v1/scan", "analyst"),
+        ("POST", "/v1/credentials", "analyst"),
+        ("POST", "/v1/credentials/", "analyst"),
+        ("POST", "/v1/datasets/", "analyst"),
+        ("POST", "/v1/evaluations", "analyst"),
+        ("POST", "/v1/gateway/evaluate", "analyst"),
+        ("POST", "/v1/firewall/check", "analyst"),
+        ("POST", "/v1/proxy/audit", "analyst"),
+        ("POST", "/v1/traces", "analyst"),
+        ("POST", "/v1/ocsf/ingest", "analyst"),
+        ("POST", "/v1/results/push", "analyst"),
+        ("POST", "/v1/schedules", "analyst"),
+        ("POST", "/v1/sources", "analyst"),
+        ("POST", "/v1/sources/", "analyst"),
+        ("POST", "/v1/baseline/compare", "analyst"),
+        ("POST", "/v1/graph/presets", "analyst"),
+        # Model-key broker: registering / deleting a REAL provider credential is a
+        # root-credential write (admin, via the unmatched-mutating fallback below).
+        # Minting a scoped short-lived virtual key, authorizing it, and revoking it
+        # are operational and stay analyst — otherwise the admin fallback would
+        # silently over-gate the documented scan-tier surface. These prefixes match
+        # only the sub-paths (mint = providers/{id}/virtual-keys, revoke =
+        # virtual-keys/{id}/revoke); the exact register path /v1/model-keys/providers
+        # has no trailing slash and correctly falls through to the admin fallback.
+        ("POST", "/v1/model-keys/providers/", "analyst"),
+        ("POST", "/v1/model-keys/virtual-keys/", "analyst"),
+        ("POST", "/v1/model-keys/authorize", "analyst"),
+        ("DELETE", "/v1/schedules/", "analyst"),
+        ("DELETE", "/v1/graph/presets/", "analyst"),
+        ("PUT", "/v1/schedules/", "analyst"),
+        ("PUT", "/v1/credentials/", "analyst"),
+        ("PUT", "/v1/sources/", "analyst"),
+    )
 
-    def __init__(self, app: ASGIApp, api_key: str) -> None:
+    _SCOPE_RULES: tuple[tuple[str, str, str], ...] = (
+        ("GET", "/v1/observability/adoption", "audit:read"),
+        ("POST", "/v1/observability/adoption/events", "scan:write"),
+        ("GET", "/v1/cloud/connections", "cloud.connection:read"),
+        ("POST", "/v1/cloud/connections", "cloud.connection:write"),
+        ("PATCH", "/v1/cloud/connections/", "cloud.connection:write"),
+        ("DELETE", "/v1/cloud/connections/", "cloud.connection:write"),
+        ("GET", "/v1/findings", "finding:read"),
+        ("GET", "/v1/graph", "graph:read"),
+        ("POST", "/v1/graph/query", "graph:read"),
+        ("POST", "/v1/graph/should-i-deploy", "graph:read"),
+        ("GET", "/v1/auth/keys", "auth.keys:read"),
+        ("GET", "/v1/auth/secrets/lifecycle", "auth.secrets:read"),
+        ("GET", "/v1/auth/secrets/rotation-plan", "auth.secrets:read"),
+        ("GET", "/v1/auth/secrets/credential-expiry", "auth.secrets:read"),
+        ("GET", "/v1/auth/scim/config", "auth.scim:read"),
+        ("GET", "/v1/credentials", "source:read"),
+        ("GET", "/v1/evaluations", "eval:read"),
+        ("GET", "/v1/intel", "intel:read"),
+        ("POST", "/v1/intel/match", "intel:read"),
+        ("POST", "/v1/intel/daily-brief", "intel:read"),
+        ("GET", "/scim/v2", "auth.scim:read"),
+        ("POST", "/scim/v2", "auth.scim:write"),
+        ("PATCH", "/scim/v2", "auth.scim:write"),
+        ("PUT", "/scim/v2", "auth.scim:write"),
+        ("DELETE", "/scim/v2", "auth.scim:write"),
+        ("GET", "/v1/auth/quota", "auth.quota:read"),
+        ("GET", "/v1/auth/trial-tenants/", "auth.invitations:read"),
+        ("GET", "/v1/tenant/", "privacy.data:read"),
+        ("POST", "/v1/auth/invitations", "auth.keys:write"),
+        ("POST", "/v1/auth/trial-invitations", "auth.invitations:write"),
+        ("POST", "/v1/auth/trial-tenants/", "auth.invitations:write"),
+        ("POST", "/v1/auth/keys", "auth.keys:write"),
+        ("POST", "/v1/auth/keys/", "auth.keys:write"),
+        ("POST", "/v1/credentials", "source:write"),
+        ("POST", "/v1/credentials/", "source:write"),
+        ("POST", "/v1/evaluations", "eval:write"),
+        ("PUT", "/v1/auth/quota", "auth.quota:write"),
+        ("DELETE", "/v1/auth/quota", "auth.quota:write"),
+        ("DELETE", "/v1/auth/keys/", "auth.keys:write"),
+        ("DELETE", "/v1/credentials/", "source:write"),
+        ("DELETE", "/v1/tenant/", "privacy.data:delete"),
+        ("GET", "/v1/gateway/policies", "gateway.policy:read"),
+        ("POST", "/v1/gateway/policies", "gateway.policy:write"),
+        ("PUT", "/v1/gateway/policies/", "gateway.policy:write"),
+        ("DELETE", "/v1/gateway/policies/", "gateway.policy:write"),
+        ("POST", "/v1/firewall/check", "gateway.firewall:write"),
+        ("GET", "/v1/gateway/audit", "audit:read"),
+        ("POST", "/v1/fleet/sync", "fleet:write"),
+        ("POST", "/v1/shield/start", "shield:write"),
+        ("POST", "/v1/shield/unblock", "shield:write"),
+        ("POST", "/v1/shield/break-glass", "shield:write"),
+        ("POST", "/v1/scan", "scan:write"),
+        ("DELETE", "/v1/scan/", "scan:delete"),
+        ("POST", "/v1/schedules", "schedule:write"),
+        ("PUT", "/v1/credentials/", "source:write"),
+        ("DELETE", "/v1/schedules/", "schedule:write"),
+        ("PUT", "/v1/schedules/", "schedule:write"),
+        ("POST", "/v1/graph/presets", "graph.preset:write"),
+        ("DELETE", "/v1/graph/presets/", "graph.preset:write"),
+        ("POST", "/v1/exceptions", "exception:write"),
+        ("PUT", "/v1/exceptions/", "exception:write"),
+        ("DELETE", "/v1/exceptions/", "exception:write"),
+    )
+    _MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+    _PROTECTED_API_EXACT_PATHS = {"/v1", "/scim"}
+    _PROTECTED_API_PREFIXES = ("/v1/", "/scim/")
+
+    @classmethod
+    def scope_catalog(cls) -> list[dict[str, str]]:
+        """Return the enforced API scope catalog for operator discovery."""
+        catalog: list[dict[str, str]] = []
+        for method, path_prefix, scope in cls._SCOPE_RULES:
+            required_role = "viewer"
+            for role_method, role_path_prefix, role in cls._ROLE_RULES:
+                if method == role_method and path_prefix.startswith(role_path_prefix):
+                    required_role = role
+                    break
+            if ":" in scope:
+                family, action = scope.rsplit(":", 1)
+            else:
+                family, action = scope, "access"
+            catalog.append(
+                {
+                    "scope": scope,
+                    "family": family,
+                    "action": action,
+                    "method": method,
+                    "path_prefix": path_prefix,
+                    "required_role": required_role,
+                }
+            )
+        return sorted(catalog, key=lambda item: (item["scope"], item["method"], item["path_prefix"]))
+
+    def __init__(self, app: ASGIApp, api_key: str, allow_unauthenticated: bool = False) -> None:
         super().__init__(app)
+        if api_key and not static_api_key_allowed():
+            raise RuntimeError(static_api_key_rejection_message())
+        self._validate_exempt_paths_against_role_rules()
         self._api_key = api_key
+        # When the operator explicitly opts in, a request that presents NO
+        # credential at all is served as the configured NO_AUTH_ROLE (default
+        # viewer) instead of being rejected with 401; a present-but-invalid
+        # credential is still rejected. This is driven solely by the value
+        # ``configure_api`` resolves (explicit flag combined with
+        # AGENT_BOM_ALLOW_UNAUTHENTICATED_API) and passes in — the middleware
+        # deliberately does NOT re-read the env itself, so it fails closed
+        # unless an operator's configured posture explicitly enables it.
+        self._allow_unauthenticated = bool(allow_unauthenticated)
+        self._trusted_proxy_auth = _env_flag("AGENT_BOM_TRUST_PROXY_AUTH")
+        from agent_bom.api.secret_source import resolve_secret
+
+        self._trusted_proxy_secret = resolve_secret("AGENT_BOM_TRUST_PROXY_AUTH_SECRET")
+        self._trusted_proxy_issuer = os.environ.get("AGENT_BOM_TRUST_PROXY_AUTH_ISSUER", "").strip()
         # OIDC config loaded lazily from env on first request
         self._oidc_config: OIDCConfig | None = None
         self._oidc_checked = False
 
+    @classmethod
+    def _validate_exempt_paths_against_role_rules(cls) -> None:
+        # An exact-path entry in _EXEMPT_PATHS bypasses the entire dispatch chain.
+        # An exact-path entry in _ROLE_RULES (no trailing slash, no broader prefix)
+        # would silently grant unauthenticated access. Fail at startup if both lists
+        # ever name the same exact path.
+        role_paths = {path for _method, path, _role in cls._ROLE_RULES if not path.endswith("/")}
+        overlap = sorted(cls._EXEMPT_PATHS & role_paths)
+        if overlap:
+            raise RuntimeError("APIKeyMiddleware exempt-paths overlap with role-rule paths: " + ", ".join(overlap))
+
     def _required_role(self, method: str, path: str) -> str:
         """Determine the minimum role required for a request."""
-        for m, p in self._ADMIN_PATHS:
+        method = method.upper()
+        # A HEAD reaches the same handler as GET (it returns the GET headers with
+        # no body), so it must inherit the GET route's required role. Keying on
+        # the literal "HEAD" would miss every GET rule and silently fall through
+        # to the viewer default — letting an anonymous HEAD reach an admin GET
+        # handler when ALLOW_UNAUTHENTICATED_API is on.
+        if method == "HEAD":
+            method = "GET"
+        for m, p, role in self._ROLE_RULES:
             if method == m and path.startswith(p):
-                return "admin"
-        for m, p in self._ANALYST_PATHS:
-            if method == m and path.startswith(p):
-                return "analyst"
+                return role
+        if method in self._MUTATING_METHODS and (path in self._PROTECTED_API_EXACT_PATHS or path.startswith(self._PROTECTED_API_PREFIXES)):
+            return "admin"
         return "viewer"
 
-    async def dispatch(self, request: StarletteRequest, call_next):
+    def _required_scope(self, method: str, path: str) -> str | None:
+        """Determine the optional scope required for a request."""
+        if method.upper() == "HEAD":
+            method = "GET"
+        for m, p, scope in self._SCOPE_RULES:
+            if method == m and path.startswith(p):
+                return scope
+        return None
+
+    @staticmethod
+    def _role_allows(actual: Role, required: Role) -> bool:
+        from agent_bom.rbac import role_rank
+
+        return role_rank(actual) >= role_rank(required)
+
+    @staticmethod
+    def _record_scim_role_state(request: StarletteRequest, *, user_id: str | None, user_name: str | None) -> None:
+        request.state.auth_role_source = "scim"
+        request.state.scim_user_id = user_id
+        request.state.scim_user_name = user_name
+
+    def _resolve_runtime_role(
+        self,
+        request: StarletteRequest,
+        *,
+        tenant_id: str,
+        upstream_role: Role | None,
+        subjects: tuple[object, ...],
+    ) -> tuple[Role | None, JSONResponse | None]:
+        from agent_bom.api.auth import resolve_scim_user_role
+
+        resolution = resolve_scim_user_role(tenant_id, *subjects)
+        if not resolution.matched:
+            return upstream_role, None
+        if not resolution.active:
+            return None, JSONResponse(status_code=401, content={"detail": "Unauthorized — SCIM user is inactive"})
+        if resolution.role is None:
+            return None, JSONResponse(status_code=403, content={"detail": "Forbidden — SCIM user has no runtime role"})
+        self._record_scim_role_state(request, user_id=resolution.user_id, user_name=resolution.user_name)
+        if resolution.user_id:
+            request.state.scim_subject_id = resolution.user_id
+        return resolution.role, None
+
+    @staticmethod
+    def _credential_presented(request: StarletteRequest, auth_header: str) -> bool:
+        """Return true when the caller presented *any* credential material.
+
+        Distinguishes "no credential presented" (eligible for the anonymous
+        NO_AUTH_ROLE fallback when opted in) from "credential presented but
+        we could not turn it into a valid identity" (must be rejected, never
+        silently downgraded to anonymous). A non-empty Authorization header in
+        any scheme, or a non-empty X-API-Key header, counts as presented. The
+        session-cookie and trusted-proxy paths are handled by their own
+        branches before this is consulted.
+        """
+        if auth_header.strip():
+            return True
+        if request.headers.get("x-api-key", "").strip():
+            return True
+        # Proxy identity headers are credential material only when the trusted
+        # proxy resolver validates its shared attestation.  If that resolver is
+        # disabled or misconfigured, their presence must still be terminal:
+        # silently downgrading a spoofed/wrong-secret proxy identity to the
+        # anonymous NO_AUTH_ROLE would hide a broken auth boundary (and can
+        # unexpectedly elevate it on a local no-auth admin deployment).
+        if any(
+            request.headers.get(name, "").strip()
+            for name in (
+                "x-agent-bom-role",
+                "x-agent-bom-tenant-id",
+                "x-agent-bom-subject",
+                "x-agent-bom-proxy-secret",
+                "x-forwarded-email",
+                "x-auth-request-email",
+            )
+        ):
+            return True
+        return False
+
+    async def _serve_anonymous(self, request: StarletteRequest, call_next: RequestResponseEndpoint) -> Response:
+        """Serve a credential-less request as the configured NO_AUTH_ROLE.
+
+        The anonymous identity is subject to the exact same per-route role gate
+        as any other identity, so an anonymous viewer still gets 403 on
+        analyst/admin routes. DEMO_ESTATE clamps NO_AUTH_ROLE to viewer inside
+        ``_no_auth_role`` and remains authoritative here.
+        """
+        from agent_bom.api.auth import Role
+        from agent_bom.rbac import _no_auth_role
+
+        role = _no_auth_role()
+        # Combined mode: when credentials (a static API key or any stored keys)
+        # are also configured, the anonymous fallback is strictly read-only —
+        # otherwise NO_AUTH_ROLE=admin would hand an unauthenticated caller admin
+        # (they could mint admin keys). NO_AUTH_ROLE elevation only applies to a
+        # pure no-auth deployment with no credentials configured at all.
+        if role != Role.VIEWER and (self._api_key or get_key_store().has_keys()):
+            role = Role.VIEWER
+        required = Role(self._required_role(request.method, request.url.path))
+        if not self._role_allows(role, required):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": f"Forbidden — requires {required.value} role, anonymous access has {role.value}"},
+            )
+        request.state.api_key_name = "anonymous"
+        request.state.api_key_role = role.value
+        request.state.tenant_id = getattr(request.state, "tenant_id", None) or "default"
+        request.state.auth_method = "anonymous"
+        return await self._call_with_tenant_context(request, call_next)
+
+    async def dispatch(self, request: StarletteRequest, call_next: RequestResponseEndpoint) -> Response:
+        # CORS preflight (OPTIONS) MUST bypass auth: browsers do not attach
+        # Authorization headers to preflights (CORS spec / Fetch §3.2.2).
+        # Rejecting them with 401 before CORSMiddleware runs blocks every
+        # cross-origin dashboard / SaaS UI / SDK from talking to the API —
+        # the actual request never fires because the preflight failed.
+        # CORSMiddleware will reply with the right Access-Control-Allow-*
+        # headers for the configured origin set.
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        from agent_bom.api.managed_trial import managed_trial_enabled, managed_trial_route_allowed
+
+        if managed_trial_enabled() and not managed_trial_route_allowed(request.method, request.url.path):
+            return JSONResponse(status_code=403, content={"detail": "This API route is disabled in managed trial mode."})
         if request.url.path in self._EXEMPT_PATHS:
             return await call_next(request)
+        if self._is_dashboard_public_request(request.url.path, request.method):
+            return await call_next(request)
 
-        # Extract raw key from headers
-        raw_key = ""
+        if os.environ.get("AGENT_BOM_POSTGRES_URL"):
+            from agent_bom.api.postgres_store import is_tenant_rls_bypassed
+
+            if is_tenant_rls_bypassed():
+                _logger.critical("Rejecting request while Postgres tenant RLS bypass context is active")
+                return JSONResponse(status_code=500, content={"detail": "Tenant isolation guard is not clean"})
+
+        return await self.resolve_principal(request, call_next)
+
+    async def resolve_principal(self, request: StarletteRequest, call_next: RequestResponseEndpoint) -> Response:
+        """Decide authentication for a request through one ordered resolver chain.
+
+        This is the single authentication decision point. Each credential source
+        (SCIM bearer, browser session, trusted proxy, static key, OIDC bearer,
+        API key, anonymous fallback) is a resolver returning ``Resolved`` (a
+        principal was authenticated), ``Invalid`` (a credential was presented and
+        rejected — terminal, never falls through), or ``Absent`` (nothing to act
+        on — try the next resolver). The order and per-resolver semantics are
+        exactly those of the previous inline dispatch chain; see the individual
+        ``_resolve_*`` methods. The final resolver is always terminal.
+        """
+        session_token = request.cookies.get(SESSION_COOKIE_NAME, "")
+        # Extract raw key from headers for CLI and service clients.
         auth = request.headers.get("authorization", "")
-        if auth.startswith("Bearer "):
-            raw_key = auth[7:]
+        raw_key = auth[7:] if auth.startswith("Bearer ") else ""
         if not raw_key:
             raw_key = request.headers.get("x-api-key", "")
 
-        if not raw_key:
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Unauthorized — provide API key via Authorization: Bearer <key> or X-API-Key header"},
-            )
+        resolvers: tuple[Callable[[], Awaitable[Resolution]], ...] = (
+            lambda: self._resolve_scim_bearer(request, call_next),
+            lambda: self._resolve_browser_session(request, call_next, session_token),
+            lambda: self._resolve_trusted_proxy(request, call_next, raw_key),
+            lambda: self._resolve_static_key(request, call_next, raw_key),
+            lambda: self._resolve_oidc_bearer(request, call_next, raw_key, auth),
+            lambda: self._resolve_api_key(request, call_next, raw_key),
+            lambda: self._resolve_terminal(request, call_next, raw_key, auth),
+        )
+        response = await run_resolver_chain(resolvers)
+        if response is not None:
+            return response
+        # Unreachable: the terminal resolver never returns Absent. Fail closed.
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
+    @staticmethod
+    def _classify_terminal(request: StarletteRequest, response: Response) -> Resolution:
+        """Tag a terminal helper Response as Resolved or Invalid.
+
+        The SCIM / browser-session / trusted-proxy helpers set
+        ``request.state.auth_method`` only once a principal is established; an
+        auth rejection returns a JSONResponse without it. Both outcomes are
+        terminal, so the distinction is purely semantic (and sets up the
+        post-resolution policy point), never a control-flow change.
+        """
+        if getattr(request.state, "auth_method", None):
+            return Resolved(response)
+        return Invalid(response)
+
+    async def _resolve_scim_bearer(self, request: StarletteRequest, call_next: RequestResponseEndpoint) -> Resolution:
+        if not self._is_scim_path(request.url.path):
+            return Absent()
+        return self._classify_terminal(request, await self._try_scim_bearer_auth(request, call_next))
+
+    async def _resolve_browser_session(
+        self, request: StarletteRequest, call_next: RequestResponseEndpoint, session_token: str
+    ) -> Resolution:
+        if not session_token:
+            return Absent()
+        return self._classify_terminal(request, await self._try_browser_session_auth(request, call_next, session_token))
+
+    async def _resolve_trusted_proxy(self, request: StarletteRequest, call_next: RequestResponseEndpoint, raw_key: str) -> Resolution:
+        # Trusted-proxy headers are consulted only when no API key was presented,
+        # preserving the previous ``if not raw_key`` gate.
+        if raw_key:
+            return Absent()
+        proxy_response = await self._try_proxy_header_auth(request, call_next)
+        if proxy_response is None:
+            return Absent()
+        return self._classify_terminal(request, proxy_response)
+
+    async def _resolve_static_key(self, request: StarletteRequest, call_next: RequestResponseEndpoint, raw_key: str) -> Resolution:
         # Simple mode: single static key (backward compatible, all access)
-        if secrets.compare_digest(raw_key, self._api_key):
+        if not raw_key:
+            return Absent()
+        if self._api_key and secrets.compare_digest(raw_key, self._api_key):
             request.state.api_key_name = "static-key"
             request.state.api_key_role = "admin"
-            return await call_next(request)
+            request.state.tenant_id = "default"
+            request.state.auth_method = "static_api_key"
+            return Resolved(await self._call_with_tenant_context(request, call_next))
+        return Absent()
 
+    async def _resolve_oidc_bearer(
+        self, request: StarletteRequest, call_next: RequestResponseEndpoint, raw_key: str, auth: str
+    ) -> Resolution:
         # OIDC mode: try JWT verification when AGENT_BOM_OIDC_ISSUER is set
+        if not raw_key:
+            return Absent()
         if not self._oidc_checked:
             from agent_bom.api.oidc import OIDCConfig
 
@@ -123,116 +1669,848 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
             self._oidc_checked = True
 
         oidc_cfg = self._oidc_config
-        if oidc_cfg is not None and getattr(oidc_cfg, "enabled", False) and auth.startswith("Bearer "):
-            from agent_bom.api.oidc import OIDCError
+        if oidc_cfg is None or not getattr(oidc_cfg, "enabled", False) or not auth.startswith("Bearer "):
+            return Absent()
 
-            try:
-                _claims, oidc_role = oidc_cfg.verify(raw_key)
-                required = self._required_role(request.method, request.url.path)
-                from agent_bom.api.auth import _ROLE_HIERARCHY, Role
+        from agent_bom.api.oidc import OIDCError, record_oidc_decode_failure, token_is_jwt_shaped
 
-                if _ROLE_HIERARCHY.get(Role(oidc_role), 0) >= _ROLE_HIERARCHY.get(Role(required), 0):
-                    request.state.api_key_name = _claims.get("email") or _claims.get("sub", "oidc-user")
-                    request.state.api_key_role = oidc_role
-                    return await call_next(request)
-                return JSONResponse(
+        try:
+            # ``verify`` can fetch JWKS over the network (``urlopen`` in
+            # api/oidc.py) on a cache miss or key rotation, so it must not run
+            # on the event loop — this path is reached before authentication.
+            _claims, oidc_role = await anyio.to_thread.run_sync(oidc_cfg.verify, raw_key)
+            required = self._required_role(request.method, request.url.path)
+            from agent_bom.api.auth import Role
+
+            tenant_id = oidc_cfg.resolve_tenant(_claims)
+            subject = _claims.get("email") or _claims.get("preferred_username") or _claims.get("sub", "oidc-user")
+            upstream_role = Role(oidc_role)
+            effective_role, scim_error = self._resolve_runtime_role(
+                request,
+                tenant_id=tenant_id,
+                upstream_role=upstream_role,
+                subjects=(subject, _claims.get("email"), _claims.get("preferred_username"), _claims.get("upn"), _claims.get("sub")),
+            )
+            if scim_error is not None:
+                return Invalid(scim_error)
+            required_role = Role(required)
+            if effective_role is not None and self._role_allows(effective_role, required_role):
+                request.state.api_key_name = subject
+                request.state.api_key_role = effective_role.value
+                request.state.tenant_id = tenant_id
+                request.state.auth_method = "oidc"
+                # Short issuer suffix helps operators recognize which IdP
+                # resolved the token without leaking the full URL to all
+                # request-scoped log fields.
+                issuer = str(_claims.get("iss") or "")
+                request.state.auth_issuer = issuer.rsplit("/", 1)[-1][:64] if issuer else None
+                return Resolved(await self._call_with_tenant_context(request, call_next))
+            actual_role = effective_role.value if effective_role else oidc_role
+            return Invalid(
+                JSONResponse(
                     status_code=403,
-                    content={"detail": f"Forbidden — requires {required} role, OIDC token has {oidc_role}"},
+                    content={"detail": f"Forbidden — requires {required} role, OIDC session has {actual_role}"},
                 )
-            except OIDCError as exc:
-                _logger.debug("OIDC verification failed: %s", exc)
-                # Fall through to API key check — OIDC failure is non-fatal if keys also configured
+            )
+        except OIDCError as exc:
+            record_oidc_decode_failure()
+            _logger.debug("OIDC verification failed: %s", sanitize_text(exc))
+            # PR2 decision (#4274): distinguish a presented-but-invalid OIDC
+            # credential from a bearer that simply is not an OIDC token.
+            #
+            # A JWT-shaped bearer (header.payload.signature with an ``alg``
+            # header) that fails verification — bad signature, wrong issuer /
+            # audience, expired, unconfigured issuer, replay, malformed claims —
+            # WAS presented as an OIDC token. It is terminal ``Invalid`` (a hard
+            # 401) and must never be silently retried against the API-key store.
+            #
+            # A bearer that is not JWT-shaped is not an OIDC token at all (e.g. a
+            # raw opaque API key sent as ``Authorization: Bearer``). It stays
+            # ``Absent`` so the API-key resolver can still authenticate it,
+            # preserving the legitimate key-as-bearer path.
+            if token_is_jwt_shaped(raw_key):
+                return Invalid(
+                    JSONResponse(
+                        status_code=401,
+                        content={"detail": "Unauthorized — OIDC bearer token verification failed"},
+                    )
+                )
+            return Absent()
 
+    async def _resolve_api_key(self, request: StarletteRequest, call_next: RequestResponseEndpoint, raw_key: str) -> Resolution:
         # RBAC mode: check against KeyStore
+        if not raw_key:
+            return Absent()
         from agent_bom.api.auth import Role, get_key_store
 
         store = get_key_store()
-        if store.has_keys():
-            api_key = store.verify(raw_key)
-            if api_key:
-                required = self._required_role(request.method, request.url.path)
-                required_role = Role(required)
-                if not api_key.has_role(required_role):
-                    return JSONResponse(
-                        status_code=403,
-                        content={"detail": f"Forbidden — requires {required} role, you have {api_key.role.value}"},
-                    )
-                request.state.api_key_name = api_key.name
-                request.state.api_key_role = api_key.role.value
-                return await call_next(request)
+        if not store.has_keys():
+            return Absent()
+        # ``store.verify`` runs a ~21ms scrypt derivation (in-memory store) or
+        # a blocking DB read (Postgres store); offload it to a worker thread so
+        # it never stalls the async event loop while unrelated requests wait.
+        api_key = await anyio.to_thread.run_sync(store.verify, raw_key)
+        if not api_key:
+            return Absent()
+        required = self._required_role(request.method, request.url.path)
+        required_role = Role(required)
+        effective_role = api_key.role
+        if api_key.name.startswith("saml:") or api_key.scim_subject_id:
+            subjects = [api_key.name.removeprefix("saml:"), api_key.name]
+            if api_key.scim_subject_id:
+                subjects.append(api_key.scim_subject_id)
+            resolved_role, scim_error = self._resolve_runtime_role(
+                request,
+                tenant_id=api_key.tenant_id,
+                upstream_role=api_key.role,
+                subjects=tuple(subjects),
+            )
+            if scim_error is not None:
+                return Invalid(scim_error)
+            effective_role = resolved_role or api_key.role
+        if not self._role_allows(effective_role, required_role):
+            return Invalid(
+                JSONResponse(
+                    status_code=403,
+                    content={"detail": f"Forbidden — requires {required} role, you have {effective_role.value}"},
+                )
+            )
+        required_scope = self._required_scope(request.method, request.url.path)
+        if not api_key.has_scope(required_scope):
+            return Invalid(
+                JSONResponse(
+                    status_code=403,
+                    content={"detail": f"Forbidden — requires scope {required_scope}"},
+                )
+            )
+        request.state.api_key_name = api_key.name
+        request.state.api_key_role = effective_role.value
+        request.state.tenant_id = api_key.tenant_id
+        request.state.api_key_id = api_key.key_id
+        request.state.api_key_scopes = list(api_key.scopes)
+        if api_key.scim_subject_id:
+            request.state.scim_subject_id = api_key.scim_subject_id
+        # Carry the stable principal binding into the request so authz/tenant
+        # context is keyed to the subject's id, not its display name.
+        if api_key.principal_id:
+            request.state.principal_id = api_key.principal_id
+        # SAML-minted keys are named "saml:<subject>" — surface that
+        # as a distinct auth method so operators can trace who came
+        # in via which IdP path even after the key has been issued.
+        request.state.auth_method = "saml" if api_key.name.startswith("saml:") else "api_key"
+        return Resolved(await self._call_with_tenant_context(request, call_next))
 
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Unauthorized — invalid API key"},
+    async def _resolve_terminal(self, request: StarletteRequest, call_next: RequestResponseEndpoint, raw_key: str, auth: str) -> Resolution:
+        """Final resolver: anonymous fallback (opt-in) or a hard 401.
+
+        Reached only after every credential source returned Absent.
+        """
+        if not raw_key:
+            # No API key, no session cookie, no trusted-proxy attestation. If the
+            # operator opted into anonymous read-only access AND no credential
+            # was presented in any form, serve the request as NO_AUTH_ROLE
+            # instead of 401. A present-but-malformed credential (e.g. an
+            # unsupported Authorization scheme) must NOT silently downgrade to
+            # anonymous — it is treated as a presented credential and rejected.
+            if self._allow_unauthenticated and not self._credential_presented(request, auth):
+                return Resolved(await self._serve_anonymous(request, call_next))
+            return Invalid(
+                JSONResponse(
+                    status_code=401,
+                    content={"detail": "Unauthorized — provide API key via Authorization: Bearer <key> or X-API-Key header"},
+                )
+            )
+        return Invalid(
+            JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized — invalid API key"},
+            )
         )
+
+    def _is_scim_path(self, path: str) -> bool:
+        from agent_bom.api.scim import scim_base_path
+
+        base = scim_base_path()
+        return path == base or path.startswith(base + "/")
+
+    async def _try_scim_bearer_auth(self, request: StarletteRequest, call_next: RequestResponseEndpoint) -> Response:
+        """Authenticate dedicated SCIM provisioning traffic.
+
+        SCIM uses its own bearer token and tenant binding so IdP lifecycle
+        traffic cannot be hijacked through dashboard sessions or general API
+        keys, and tenant routing cannot be supplied by the inbound payload.
+        """
+        auth = request.headers.get("authorization", "")
+        raw_key = auth[7:] if auth.startswith("Bearer ") else ""
+
+        from agent_bom.api.scim import SCIMConfigurationError, resolve_scim_bearer_token
+
+        try:
+            binding = resolve_scim_bearer_token(raw_key)
+        except SCIMConfigurationError:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "SCIM bearer token configuration is invalid"},
+            )
+        if binding is None:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized — SCIM bearer token required"},
+            )
+
+        request.state.api_key_name = "scim-provisioner"
+        request.state.api_key_role = "admin"
+        request.state.tenant_id = binding.tenant_id
+        request.state.scim_token_source = binding.source
+        request.state.scim_token_id = binding.token_id
+        request.state.api_key_scopes = ["auth.scim:read", "auth.scim:write"]
+        request.state.auth_method = "scim_bearer"
+        return await self._call_with_tenant_context(request, call_next)
+
+    async def _try_browser_session_auth(self, request: StarletteRequest, call_next: RequestResponseEndpoint, token: str) -> Response:
+        from agent_bom.api.auth import Role, get_key_store
+
+        try:
+            payload = verify_browser_session_token(token)
+            session_role = Role(str(payload.get("role", "")).lower())
+        except (BrowserSessionError, ValueError):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized — invalid browser session"})
+
+        subject = str(payload.get("sub") or "browser-session")
+        tenant_id = str(payload.get("tenant_id") or "default")
+        auth_method = str(payload.get("auth_method") or "browser_session")
+        if auth_method == "managed_trial_oidc":
+            from agent_bom.api.tenant_lifecycle import tenant_access_active
+
+            if not await anyio.to_thread.run_sync(tenant_access_active, tenant_id):
+                return JSONResponse(status_code=401, content={"detail": "Unauthorized — managed trial is inactive"})
+        effective_role = session_role
+        if auth_method in {"oidc", "saml"} or subject.startswith("saml:"):
+            resolved_role, scim_error = self._resolve_runtime_role(
+                request,
+                tenant_id=tenant_id,
+                upstream_role=session_role,
+                subjects=(subject.removeprefix("saml:"), subject),
+            )
+            if scim_error is not None:
+                return scim_error
+            effective_role = resolved_role or session_role
+
+        required = Role(self._required_role(request.method, request.url.path))
+        if not self._role_allows(effective_role, required):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": f"Forbidden — requires {required.value} role, browser session has {effective_role.value}"},
+            )
+
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            csrf_cookie = request.cookies.get(CSRF_COOKIE_NAME, "")
+            csrf_header = request.headers.get(CSRF_HEADER_NAME, "")
+            if not verify_csrf(payload, csrf_cookie, csrf_header):
+                return JSONResponse(status_code=403, content={"detail": "Forbidden — missing or invalid CSRF token"})
+
+        store = get_key_store()
+        key_id = str(payload.get("key_id") or "")
+        if key_id:
+            stored = store.get(key_id)
+            if stored is None or stored.tenant_id != tenant_id or not stored.is_usable():
+                return JSONResponse(status_code=401, content={"detail": "Unauthorized — browser session key is no longer active"})
+            required_scope = self._required_scope(request.method, request.url.path)
+            if not stored.has_scope(required_scope):
+                return JSONResponse(status_code=403, content={"detail": f"Forbidden — requires scope {required_scope}"})
+        elif auth_method == "managed_trial_oidc":
+            required_scope = self._required_scope(request.method, request.url.path)
+            session_scopes = {str(scope) for scope in (payload.get("scopes") or [])}
+            if required_scope and required_scope not in session_scopes:
+                return JSONResponse(status_code=403, content={"detail": f"Forbidden — requires scope {required_scope}"})
+
+        request.state.api_key_name = subject
+        request.state.api_key_role = effective_role.value
+        request.state.tenant_id = tenant_id
+        request.state.api_key_id = key_id or None
+        request.state.api_key_scopes = list(payload.get("scopes") or [])
+        request.state.auth_method = auth_method
+        return await self._call_with_tenant_context(request, call_next)
+
+    async def _try_proxy_header_auth(self, request: StarletteRequest, call_next: RequestResponseEndpoint) -> Response | None:
+        if not self._trusted_proxy_auth:
+            return None
+
+        role_header = request.headers.get("x-agent-bom-role", "").strip().lower()
+        tenant_id = request.headers.get("x-agent-bom-tenant-id", "").strip()
+        subject = (
+            request.headers.get("x-agent-bom-subject")
+            or request.headers.get("x-forwarded-email")
+            or request.headers.get("x-auth-request-email")
+            or ""
+        )
+        if not role_header and not subject:
+            return None
+        if not self._trusted_proxy_secret:
+            _logger.error("AGENT_BOM_TRUST_PROXY_AUTH is enabled without AGENT_BOM_TRUST_PROXY_AUTH_SECRET")
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Trusted proxy authentication is not securely configured"},
+            )
+        if not _trusted_proxy_secret_is_strong(self._trusted_proxy_secret):
+            _logger.error("AGENT_BOM_TRUST_PROXY_AUTH_SECRET is too short for trusted proxy authentication")
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Trusted proxy authentication is not securely configured"},
+            )
+        presented_secret = request.headers.get("x-agent-bom-proxy-secret", "").strip()
+        if not hmac.compare_digest(presented_secret, self._trusted_proxy_secret):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized — invalid trusted proxy attestation"})
+        presented_issuer = request.headers.get("x-agent-bom-auth-issuer", "").strip()
+        if self._trusted_proxy_issuer and not hmac.compare_digest(presented_issuer, self._trusted_proxy_issuer):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized — invalid trusted proxy issuer"})
+        if not tenant_id:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Authentication required — trusted proxy requests must include X-Agent-Bom-Tenant-ID"},
+            )
+        # Customer-supplied identifiers must not collide with the agent-bom
+        # reserved tenant namespace (system fallbacks + role/permission
+        # vocabulary). See docs/IDENTITY_AND_NAMING_CONTRACT.md.
+        from agent_bom.platform_invariants import ReservedTenantIdError, validate_customer_tenant_id
+
+        try:
+            tenant_id = validate_customer_tenant_id(tenant_id)
+        except ReservedTenantIdError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+        from agent_bom.api.auth import Role
+
+        proxy_role: Role | None = None
+        if role_header:
+            try:
+                proxy_role = Role(role_header)
+            except ValueError:
+                return JSONResponse(status_code=403, content={"detail": f"Invalid proxy role '{role_header}'"})
+
+        effective_role, scim_error = self._resolve_runtime_role(
+            request,
+            tenant_id=tenant_id,
+            upstream_role=proxy_role,
+            subjects=(subject,),
+        )
+        if scim_error is not None:
+            return scim_error
+        if effective_role is None:
+            return JSONResponse(status_code=403, content={"detail": "Forbidden — trusted proxy role required"})
+
+        required = Role(self._required_role(request.method, request.url.path))
+        if not self._role_allows(effective_role, required):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": f"Forbidden — requires {required.value} role, proxy session has {effective_role.value}"},
+            )
+
+        request.state.api_key_name = subject or "proxy-header"
+        request.state.api_key_role = effective_role.value
+        request.state.tenant_id = tenant_id
+        request.state.auth_method = "proxy_header"
+        request.state.proxy_auth_attested = True
+        request.state.auth_issuer = presented_issuer or None
+        try:
+            from agent_bom.api.audit_log import log_action
+
+            log_action(
+                "auth.proxy_header_authenticated",
+                actor=str(request.state.api_key_name),
+                resource=str(request.url.path),
+                tenant_id=tenant_id,
+                role=effective_role.value,
+                issuer=presented_issuer or None,
+            )
+        except Exception:  # pragma: no cover - audit side effects must not block auth
+            _logger.exception("Failed to record trusted proxy authentication audit event")
+        return await self._call_with_tenant_context(request, call_next)
+
+    async def _call_with_tenant_context(self, request: StarletteRequest, call_next: RequestResponseEndpoint) -> Response:
+        tenant_token = None
+        try:
+            if os.environ.get("AGENT_BOM_POSTGRES_URL"):
+                from agent_bom.api.postgres_store import set_current_tenant
+
+                tenant_token = set_current_tenant(getattr(request.state, "tenant_id", "default"))
+            return await call_next(request)
+        finally:
+            if tenant_token is not None:
+                from agent_bom.api.postgres_store import reset_current_tenant
+
+                reset_current_tenant(tenant_token)
+
+
+DEFAULT_SCAN_RATE_LIMIT_RPM = 600
+# Anonymous / unidentified read budget. Kept where it was so raising the
+# authenticated budget below does not widen the pre-auth abuse surface.
+DEFAULT_READ_RATE_LIMIT_RPM = DEFAULT_SCAN_RATE_LIMIT_RPM * 5
+# Reads on a bucket we resolved to a tenant or API key. A cursor walk of a
+# large tenant is thousands of requests, so a connector or SIEM doing a full
+# sync through the public API was being 429'd partway through a legitimate
+# paginated read. Still bounded, and still under the coarse per-IP ceiling.
+DEFAULT_AUTHENTICATED_READ_RATE_LIMIT_RPM = DEFAULT_READ_RATE_LIMIT_RPM * 2
+MAX_RATE_LIMIT_RPM = 60_000
+# Coarse per-client-IP ceiling enforced OUTERMOST (before authentication) so an
+# unauthenticated flood is capped regardless of auth outcome. Deliberately much
+# higher than the per-tenant read budget so it never trips legitimate
+# single-tenant traffic; it exists to bound abuse from a single source address.
+DEFAULT_GLOBAL_IP_RATE_LIMIT_RPM = DEFAULT_READ_RATE_LIMIT_RPM * 4
+
+
+def _build_rate_limit_store(window_seconds: int) -> InMemoryRateLimitStore | PostgresRateLimitStore:
+    """Build the shared/in-memory limiter store with fail-closed semantics."""
+    if os.environ.get("AGENT_BOM_POSTGRES_URL"):
+        try:
+            return PostgresRateLimitStore(window_seconds=window_seconds)
+        except Exception as exc:
+            raise RuntimeError(
+                "Configured Postgres rate limiter could not initialize; refusing to fall back to process-local state"
+            ) from exc
+    if _shared_rate_limit_required():
+        raise RuntimeError(
+            "Shared rate limiting is required for multi-replica or fail-closed deployments. "
+            "Configure AGENT_BOM_POSTGRES_URL before starting the API."
+        )
+    return InMemoryRateLimitStore(window_seconds=window_seconds)
+
+
+def global_ip_rate_limit_rpm() -> int:
+    """Resolve the coarse per-IP ceiling, honoring an operator override."""
+    raw = (os.environ.get("AGENT_BOM_GLOBAL_IP_RATE_LIMIT_RPM") or "").strip()
+    if raw:
+        try:
+            return _validate_rate_limit("global_ip_rpm", int(raw), max_rpm=MAX_RATE_LIMIT_RPM * 5)
+        except ValueError:
+            _logger.warning("Invalid AGENT_BOM_GLOBAL_IP_RATE_LIMIT_RPM=%r; using default", raw)
+    return DEFAULT_GLOBAL_IP_RATE_LIMIT_RPM
+
+
+def _validate_rate_limit(name: str, value: int, *, max_rpm: int) -> int:
+    try:
+        rpm = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if rpm < 1:
+        raise ValueError(f"{name} must be at least 1")
+    if rpm > max_rpm:
+        raise ValueError(f"{name} must be <= {max_rpm}")
+    return rpm
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Per-IP sliding window rate limiter with bounded memory."""
+    """Tenant-aware sliding window rate limiter with bounded memory.
 
-    _MAX_ENTRIES = 10_000
+    Write / ingest POSTs (scan jobs and CWPP runtime-evidence ingest) share the
+    tighter ``scan_rpm`` bucket. Everything else uses ``read_rpm``.
+    """
 
-    def __init__(self, app: ASGIApp, scan_rpm: int = 60, read_rpm: int = 300):
+    # Health/readiness/liveness probes must never self-throttle: orchestrators
+    # (k8s, ELB, uptime monitors) hit these on short intervals and a probe storm
+    # would otherwise consume the per-tenant/IP read budget and 429 the probes.
+    # These stay behind the OUTERMOST GlobalRateLimitMiddleware flood cap, so an
+    # anonymous flood is still bounded pre-auth — this only removes the finer
+    # per-tenant/IP read limiter for liveness endpoints.
+    _HEALTH_EXEMPT_PATHS = frozenset(
+        {
+            "/health",
+            "/healthz",
+            "/livez",
+            "/readyz",
+            "/ping",
+        }
+    )
+    # Write/ingest doors that must not burn the generous read RPM budget.
+    _WRITE_RATE_LIMIT_PATHS = frozenset(
+        {
+            "/v1/cloud/runtime-evidence/ingest",
+            "/v1/cloud/connections/events/ingest",
+        }
+    )
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        scan_rpm: int = DEFAULT_SCAN_RATE_LIMIT_RPM,
+        read_rpm: int = DEFAULT_READ_RATE_LIMIT_RPM,
+        authenticated_read_rpm: int = DEFAULT_AUTHENTICATED_READ_RATE_LIMIT_RPM,
+    ):
         super().__init__(app)
-        self._scan_rpm = scan_rpm
-        self._read_rpm = read_rpm
+        self._scan_rpm = _validate_rate_limit("scan_rpm", scan_rpm, max_rpm=MAX_RATE_LIMIT_RPM)
+        self._read_rpm = _validate_rate_limit("read_rpm", read_rpm, max_rpm=MAX_RATE_LIMIT_RPM * 5)
+        self._authenticated_read_rpm = _validate_rate_limit(
+            "authenticated_read_rpm", authenticated_read_rpm, max_rpm=MAX_RATE_LIMIT_RPM * 10
+        )
         self._window = 60
-        self._hits: dict[str, list[float]] = defaultdict(list)
-        self._last_cleanup = time.time()
+        self._store = self._build_store()
 
-    def _cleanup(self, now: float) -> None:
-        """Prune stale entries to prevent unbounded memory growth."""
-        if now - self._last_cleanup < self._window:
-            return
-        self._last_cleanup = now
-        stale = [k for k, v in self._hits.items() if not v or v[-1] < now - self._window]
-        for k in stale:
-            del self._hits[k]
-        if len(self._hits) > self._MAX_ENTRIES:
-            self._hits.clear()
+    def _build_store(self) -> InMemoryRateLimitStore | PostgresRateLimitStore:
+        return _build_rate_limit_store(self._window)
 
-    async def dispatch(self, request: StarletteRequest, call_next):
-        client_ip = request.client.host if request.client else "unknown"
+    async def _resolve_tenant_scope(self, request: StarletteRequest, raw_key: str) -> str | None:
+        tenant_id = getattr(request.state, "tenant_id", "").strip() or None
+        auth_method = str(getattr(request.state, "auth_method", "") or "")
+        # APIKeyMiddleware sets ``tenant_id`` and ``auth_method`` together from
+        # the very ApiKey it just verified, so for these methods the state IS the
+        # answer and re-deriving it is pure waste — a second ~21.5ms scrypt on
+        # every authenticated request. The broader check below deliberately
+        # excludes "default", which is exactly the single-tenant and hosted-demo
+        # case, so without this clause the common path paid the cost every time.
+        if tenant_id and auth_method in _API_KEY_VERIFIED_AUTH_METHODS:
+            return tenant_id
+        if tenant_id and tenant_id != "default" and auth_method in _TENANT_SCOPED_AUTH_METHODS:
+            return tenant_id
+        if raw_key:
+            # ``verify`` runs the same ~21ms scrypt (or a blocking DB read) as the
+            # auth middleware. When APIKeyMiddleware has already authenticated the
+            # request the guard above short-circuits, but in the anonymous/demo
+            # deployment (APIKeyMiddleware removed) this is the only verify on the
+            # request path — offload it so rate-limit bucketing never stalls the
+            # event loop.
+            resolved = await anyio.to_thread.run_sync(get_key_store().verify, raw_key)
+            if resolved and resolved.tenant_id:
+                return resolved.tenant_id
+        return None
+
+    async def _bucket_key(self, request: StarletteRequest, is_scan: bool) -> str:
+        bucket_type = "scan" if is_scan else "read"
+        auth = request.headers.get("authorization", "")
+        raw_key = auth[7:] if auth.startswith("Bearer ") else request.headers.get("x-api-key", "")
+        tenant_scope = await self._resolve_tenant_scope(request, raw_key)
+        if tenant_scope:
+            scope = f"tenant:{tenant_scope}"
+        elif raw_key:
+            auth_hash = _rate_limit_fingerprint(raw_key)
+            scope = f"auth:{auth_hash}"
+        else:
+            client_ip = request.client.host if request.client else "unknown"
+            scope = f"ip:{client_ip}"
+        return f"{scope}:{bucket_type}"
+
+    @staticmethod
+    def _is_dashboard_static_asset(path: str, method: str) -> bool:
+        if method not in {"GET", "HEAD"}:
+            return False
+        if path.startswith("/_next/"):
+            return True
+        if path in {"/favicon.ico", "/robots.txt", "/manifest.json", "/apple-touch-icon.png"}:
+            return True
+        return False
+
+    @classmethod
+    def _is_write_rate_limited(cls, path: str, method: str) -> bool:
+        """True when the request should consume the tighter scan/write RPM bucket."""
+        if method != "POST":
+            return False
+        if path.startswith("/v1/scan"):
+            return True
+        if path.startswith("/v1/cloud/connections"):
+            return True
+        return path in cls._WRITE_RATE_LIMIT_PATHS
+
+    async def dispatch(self, request: StarletteRequest, call_next: RequestResponseEndpoint) -> Response:
+        if self._is_dashboard_static_asset(request.url.path, request.method):
+            return await call_next(request)
+
+        if request.url.path in self._HEALTH_EXEMPT_PATHS:
+            return await call_next(request)
+
         now = time.time()
 
-        self._cleanup(now)
+        is_scan = self._is_write_rate_limited(request.url.path, request.method)
+        key = await self._bucket_key(request, is_scan)
+        if is_scan:
+            limit = self._scan_rpm
+        elif key.startswith("ip:"):
+            # No tenant and no API key resolved — the anonymous budget, which
+            # is deliberately tighter than the authenticated one below.
+            limit = self._read_rpm
+        else:
+            limit = self._authenticated_read_rpm
 
-        is_scan = request.url.path.startswith("/v1/scan") and request.method == "POST"
-        limit = self._scan_rpm if is_scan else self._read_rpm
+        hit_count, reset_at = await asyncio.to_thread(self._store.hit, key, now)
+        remaining = max(0, limit - hit_count)
 
-        key = f"{client_ip}:{'scan' if is_scan else 'read'}"
-        self._hits[key] = [t for t in self._hits[key] if now - t < self._window]
-
-        if len(self._hits[key]) >= limit:
-            retry_after = max(int(self._window - (now - self._hits[key][0])), 1)
+        if hit_count > limit:
+            retry_after = max(int(reset_at - now), 1)
             return JSONResponse(
                 status_code=429,
                 content={"detail": "Rate limit exceeded"},
-                headers={"Retry-After": str(retry_after)},
+                headers={
+                    "Retry-After": str(retry_after),
+                    "X-RateLimit-Limit": str(limit),
+                    "X-RateLimit-Remaining": "0",
+                    "X-RateLimit-Reset": str(reset_at),
+                },
             )
 
-        self._hits[key].append(now)
+        response = await call_next(request)
+        response.headers["X-RateLimit-Limit"] = str(limit)
+        response.headers["X-RateLimit-Remaining"] = str(remaining)
+        response.headers["X-RateLimit-Reset"] = str(reset_at)
+        return response
+
+
+class GlobalRateLimitMiddleware(BaseHTTPMiddleware):
+    """Coarse per-client-IP request ceiling enforced OUTERMOST.
+
+    Mounted before :class:`APIKeyMiddleware` so an unauthenticated flood is
+    capped regardless of auth outcome — a rejected (401) request never reaches
+    the inner tenant/auth-scoped :class:`RateLimitMiddleware`, so without this
+    backstop an anonymous attacker could pound the auth layer without being
+    throttled. Keyed on the transport peer address; the inner limiter keeps
+    fine-grained per-tenant budgets.
+    """
+
+    def __init__(self, app: ASGIApp, rpm: int = DEFAULT_GLOBAL_IP_RATE_LIMIT_RPM):
+        super().__init__(app)
+        self._rpm = _validate_rate_limit("global_ip_rpm", rpm, max_rpm=MAX_RATE_LIMIT_RPM * 5)
+        self._window = 60
+        self._store = _build_rate_limit_store(self._window)
+
+    def _bucket_key(self, request: StarletteRequest) -> str:
+        client_ip = request.client.host if request.client else "unknown"
+        return f"global-ip:{client_ip}"
+
+    async def dispatch(self, request: StarletteRequest, call_next: RequestResponseEndpoint) -> Response:
+        if RateLimitMiddleware._is_dashboard_static_asset(request.url.path, request.method):
+            return await call_next(request)
+
+        now = time.time()
+        key = self._bucket_key(request)
+        hit_count, reset_at = await asyncio.to_thread(self._store.hit, key, now)
+        if hit_count > self._rpm:
+            retry_after = max(int(reset_at - now), 1)
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Global rate limit exceeded"},
+                headers={
+                    "Retry-After": str(retry_after),
+                    "X-RateLimit-Scope": "global-ip",
+                },
+            )
         return await call_next(request)
 
 
-class MaxBodySizeMiddleware(BaseHTTPMiddleware):
-    """Reject oversized bodies and enforce a per-request read timeout (slowloris mitigation).
+def _configured_api_replicas() -> int:
+    raw = os.environ.get("AGENT_BOM_CONTROL_PLANE_REPLICAS", "").strip()
+    if not raw:
+        return 1
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        _logger.warning("Invalid AGENT_BOM_CONTROL_PLANE_REPLICAS=%r; defaulting to 1", raw)
+        return 1
 
-    Two-layer protection:
+
+def _shared_rate_limit_required() -> bool:
+    return clustered_control_plane_required()
+
+
+def get_rate_limit_runtime_status() -> dict[str, object]:
+    """Report whether API rate limiting is shared across replicas."""
+    postgres_configured = bool(os.environ.get("AGENT_BOM_POSTGRES_URL", "").strip())
+    replicas = _configured_api_replicas()
+    shared_required = _shared_rate_limit_required()
+    backend = "postgres_shared" if postgres_configured else "inmemory_single_process"
+    return {
+        "backend": backend,
+        "postgres_configured": postgres_configured,
+        "configured_api_replicas": replicas,
+        "shared_required": shared_required,
+        "shared_across_replicas": postgres_configured,
+        "fail_closed": postgres_configured or shared_required,
+        "message": (
+            "Rate limiting uses Postgres-backed shared state across replicas."
+            if postgres_configured
+            else (
+                "Rate limiting is process-local only because the API is configured for a single replica. "
+                "Multi-replica deployments must configure AGENT_BOM_POSTGRES_URL."
+            )
+        ),
+    }
+
+
+def _rate_limit_fingerprint_key() -> bytes:
+    from agent_bom.api.secret_source import resolve_secret
+
+    key = resolve_secret("AGENT_BOM_RATE_LIMIT_KEY")
+    return key.encode() if key else _RATE_LIMIT_FINGERPRINT_FALLBACK
+
+
+@lru_cache(maxsize=4096)
+def _rate_limit_fingerprint(raw_key: str) -> str:
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        raw_key.encode(),
+        _rate_limit_fingerprint_key(),
+        200_000,
+        dklen=8,
+    ).hex()
+
+
+def get_rate_limit_key_status(now: "datetime | None" = None) -> dict:
+    """Report rate-limit fingerprint key configuration and rotation status.
+
+    Returns a structured dict suitable for surfacing in /v1/auth/policy and
+    operator dashboards. Status values:
+
+    - "ephemeral":         no key configured; using process-local random key
+    - "ok":                key configured and within rotation interval
+    - "rotation_due":      key age past AGENT_BOM_RATE_LIMIT_KEY_ROTATION_DAYS
+    - "max_age_exceeded":  key age past AGENT_BOM_RATE_LIMIT_KEY_MAX_AGE_DAYS
+    - "unknown_age":       key configured but no last-rotated timestamp set
+    """
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    from agent_bom.api.secret_source import resolve_secret
+    from agent_bom.config import (
+        RATE_LIMIT_KEY_LAST_ROTATED,
+        RATE_LIMIT_KEY_MAX_AGE_DAYS,
+        RATE_LIMIT_KEY_ROTATION_DAYS,
+    )
+
+    raw_key = resolve_secret("AGENT_BOM_RATE_LIMIT_KEY")
+    fallback_source = None
+
+    if not raw_key:
+        production_or_clustered = _production_or_clustered_control_plane()
+        return {
+            "status": "ephemeral",
+            "severity": "warning" if production_or_clustered else "info",
+            "production_or_clustered": production_or_clustered,
+            "rotation_days": RATE_LIMIT_KEY_ROTATION_DAYS,
+            "max_age_days": RATE_LIMIT_KEY_MAX_AGE_DAYS,
+            "fallback_source": None,
+            "last_rotated": None,
+            "age_days": None,
+            "message": (
+                (
+                    "No AGENT_BOM_RATE_LIMIT_KEY configured. Rate-limit fingerprints use a "
+                    "process-local random key that resets on restart and breaks shared bucket "
+                    "scoping across replicas. Set AGENT_BOM_RATE_LIMIT_KEY for production."
+                )
+                if production_or_clustered
+                else (
+                    "No AGENT_BOM_RATE_LIMIT_KEY configured. Rate-limit fingerprints use a "
+                    "process-local random key that resets on restart; this is acceptable for "
+                    "single-process local development."
+                )
+            ),
+        }
+
+    if not RATE_LIMIT_KEY_LAST_ROTATED:
+        return {
+            "status": "unknown_age",
+            "rotation_days": RATE_LIMIT_KEY_ROTATION_DAYS,
+            "max_age_days": RATE_LIMIT_KEY_MAX_AGE_DAYS,
+            "fallback_source": fallback_source,
+            "last_rotated": None,
+            "age_days": None,
+            "message": (
+                "Rate-limit key is configured but AGENT_BOM_RATE_LIMIT_KEY_LAST_ROTATED is "
+                "unset. Set it to an ISO-8601 timestamp when the key was last rotated to "
+                "enable rotation tracking."
+            ),
+        }
+
+    try:
+        rotated = _dt.fromisoformat(RATE_LIMIT_KEY_LAST_ROTATED)
+    except ValueError:
+        return {
+            "status": "unknown_age",
+            "rotation_days": RATE_LIMIT_KEY_ROTATION_DAYS,
+            "max_age_days": RATE_LIMIT_KEY_MAX_AGE_DAYS,
+            "fallback_source": fallback_source,
+            "last_rotated": RATE_LIMIT_KEY_LAST_ROTATED,
+            "age_days": None,
+            "message": (
+                "AGENT_BOM_RATE_LIMIT_KEY_LAST_ROTATED is set but is not a valid ISO-8601 "
+                "timestamp. Use a value like '2026-04-17T00:00:00+00:00'."
+            ),
+        }
+
+    if rotated.tzinfo is None:
+        rotated = rotated.replace(tzinfo=_tz.utc)
+    current = now or _dt.now(_tz.utc)
+    age_days = max(0, int((current - rotated).total_seconds() // 86400))
+
+    if age_days >= RATE_LIMIT_KEY_MAX_AGE_DAYS:
+        status = "max_age_exceeded"
+        message = (
+            f"Rate-limit key is {age_days} days old, exceeding the configured maximum "
+            f"({RATE_LIMIT_KEY_MAX_AGE_DAYS} days). Rotate AGENT_BOM_RATE_LIMIT_KEY now and "
+            "update AGENT_BOM_RATE_LIMIT_KEY_LAST_ROTATED."
+        )
+    elif age_days >= RATE_LIMIT_KEY_ROTATION_DAYS:
+        status = "rotation_due"
+        message = (
+            f"Rate-limit key is {age_days} days old, past the rotation interval ({RATE_LIMIT_KEY_ROTATION_DAYS} days). Schedule a rotation."
+        )
+    else:
+        status = "ok"
+        message = f"Rate-limit key is {age_days} days old; rotation interval is {RATE_LIMIT_KEY_ROTATION_DAYS} days."
+
+    return {
+        "status": status,
+        "rotation_days": RATE_LIMIT_KEY_ROTATION_DAYS,
+        "max_age_days": RATE_LIMIT_KEY_MAX_AGE_DAYS,
+        "fallback_source": fallback_source,
+        "last_rotated": rotated.isoformat(),
+        "age_days": age_days,
+        "message": message,
+    }
+
+
+class MaxBodySizeMiddleware(BaseHTTPMiddleware):
+    """Reject oversized bodies and enforce read deadline + throughput floor (slowloris mitigation).
+
+    Three-layer protection:
     1. Content-Length fast-path: reject before reading if header exceeds limit.
     2. Streaming body drain with asyncio timeout: covers chunked/streaming uploads
        that omit Content-Length — a common slowloris vector.
+    3. Throughput floor (audit-5 PR-C): even within the 30s deadline an attacker
+       can keep a connection alive indefinitely by trickling just enough bytes
+       per second to avoid the timeout. Once the body reaches a small warmup
+       threshold, the middleware tracks bytes/second over a rolling window and
+       aborts the request when sustained throughput drops below the floor.
+       Tunable via env so legitimate slow clients in restricted environments
+       can keep working.
     """
 
-    # 30s to fully receive a request body; covers slow legitimate clients
-    # while cutting off slowloris attacks that trickle bytes indefinitely.
     _BODY_TIMEOUT_SECONDS = 30
+    """Hard read deadline; covers slow legitimate clients but bounds slowloris attacks."""
+
+    _THROUGHPUT_WINDOW_SECONDS = 5.0
+    """Rolling window for the throughput floor."""
+
+    _THROUGHPUT_WARMUP_BYTES = 4096
+    """Don't enforce the floor until the body crosses this many bytes —
+    protects tiny POSTs from being penalised by the connect/TLS handshake delay."""
+
+    _DEFAULT_THROUGHPUT_FLOOR_BPS = 256
+    """Bytes/second floor over the rolling window once warmup is past."""
 
     def __init__(self, app: ASGIApp, max_bytes: int = 10 * 1024 * 1024):
         super().__init__(app)
         self._max_bytes = max_bytes
 
-    async def dispatch(self, request: StarletteRequest, call_next):
+    @classmethod
+    def _throughput_floor_bps(cls) -> int:
+        """Read the throughput floor from env so operators can tune it."""
+        raw = (os.environ.get("AGENT_BOM_BODY_MIN_BPS") or "").strip()
+        if not raw:
+            return cls._DEFAULT_THROUGHPUT_FLOOR_BPS
+        try:
+            value = int(raw)
+        except ValueError:
+            return cls._DEFAULT_THROUGHPUT_FLOOR_BPS
+        # 0 disables the floor entirely (debug/load-test escape hatch).
+        return max(0, value)
+
+    async def dispatch(self, request: StarletteRequest, call_next: RequestResponseEndpoint) -> Response:
         content_length = request.headers.get("content-length")
         if content_length:
             try:
@@ -246,9 +2524,14 @@ class MaxBodySizeMiddleware(BaseHTTPMiddleware):
                 )
         elif request.method in ("POST", "PUT", "PATCH"):
             # No Content-Length — drain and check streaming body under timeout
+            min_bps = self._throughput_floor_bps()
+            window = self._THROUGHPUT_WINDOW_SECONDS
+            warmup = self._THROUGHPUT_WARMUP_BYTES
+            chunk_history: list[tuple[float, int]] = []
             try:
                 chunks: list[bytes] = []
                 total = 0
+                start_monotonic = time.monotonic()
                 async with asyncio.timeout(self._BODY_TIMEOUT_SECONDS):
                     async for chunk in request.stream():
                         total += len(chunk)
@@ -258,15 +2541,230 @@ class MaxBodySizeMiddleware(BaseHTTPMiddleware):
                                 content={"detail": f"Request body too large (max {self._max_bytes // (1024 * 1024)}MB)"},
                             )
                         chunks.append(chunk)
+                        # Throughput floor check — only meaningful past warmup
+                        # AND after the window has elapsed, otherwise a
+                        # legitimate slow-start request looks like a slowloris.
+                        now_monotonic = time.monotonic()
+                        chunk_history.append((now_monotonic, len(chunk)))
+                        if min_bps > 0 and total >= warmup and (now_monotonic - start_monotonic) >= window:
+                            cutoff = now_monotonic - window
+                            while chunk_history and chunk_history[0][0] < cutoff:
+                                chunk_history.pop(0)
+                            window_bytes = sum(size for _ts, size in chunk_history)
+                            elapsed = now_monotonic - chunk_history[0][0] if chunk_history else 0.0
+                            if elapsed > 0:
+                                bps = window_bytes / elapsed
+                                if bps < min_bps:
+                                    return JSONResponse(
+                                        status_code=408,
+                                        content={
+                                            "detail": (
+                                                "Request body throughput below "
+                                                f"floor ({int(bps)} B/s < {min_bps} B/s) — "
+                                                "set AGENT_BOM_BODY_MIN_BPS to tune for legitimate slow clients."
+                                            )
+                                        },
+                                    )
             except TimeoutError:
                 return JSONResponse(status_code=408, content={"detail": "Request body read timed out"})
 
             # Re-inject the drained body so downstream handlers can read it
             body = b"".join(chunks)
 
-            async def _receive():
+            async def _receive() -> Message:
                 return {"type": "http.request", "body": body, "more_body": False}
 
-            request._receive = _receive  # type: ignore[attr-defined]
+            request._receive = _receive
 
         return await call_next(request)
+
+
+# ─── structured error envelope ───────────────────────────
+
+# Map HTTP status codes to stable string codes that downstream consumers can
+# pin on without parsing free-form messages. The mapping is intentionally
+# narrow — every API error funnels through one of these buckets, with anything
+# else falling back to ``INTERNAL_ERROR``.
+_ERROR_CODE_BY_STATUS = {
+    400: "BAD_REQUEST",
+    401: "AUTH_FAILED",
+    403: "FORBIDDEN",
+    404: "NOT_FOUND",
+    405: "METHOD_NOT_ALLOWED",
+    409: "CONFLICT",
+    413: "PAYLOAD_TOO_LARGE",
+    415: "UNSUPPORTED_MEDIA_TYPE",
+    422: "VALIDATION_ERROR",
+    429: "RATE_LIMITED",
+    500: "INTERNAL_ERROR",
+    503: "SERVICE_UNAVAILABLE",
+}
+
+
+def _error_code_for_status(status_code: int) -> str:
+    return _ERROR_CODE_BY_STATUS.get(status_code, "INTERNAL_ERROR")
+
+
+def _error_message_for(status_code: int, detail: object) -> str:
+    """Best-effort short human message derived from the FastAPI detail."""
+    if isinstance(detail, str) and detail.strip():
+        return detail
+    if isinstance(detail, list) and detail:
+        # RequestValidationError serializes to a list of field-level errors;
+        # collapse the first message so the envelope still has a human field.
+        first = detail[0]
+        if isinstance(first, dict):
+            msg = first.get("msg")
+            if isinstance(msg, str) and msg.strip():
+                return msg
+    if isinstance(detail, dict):
+        msg = detail.get("message") or detail.get("msg")
+        if isinstance(msg, str) and msg.strip():
+            return msg
+    return {
+        400: "Bad request",
+        401: "Authentication required",
+        403: "Forbidden",
+        404: "Not found",
+        409: "Conflict",
+        413: "Payload too large",
+        422: "Validation error",
+        429: "Rate limited",
+        500: "Internal error",
+        503: "Service unavailable",
+    }.get(status_code, "Request failed")
+
+
+def _json_safe_validation_errors(errors: Sequence[object]) -> list[dict[str, object]]:
+    """Make Pydantic validation errors JSON-serializable and value-free.
+
+    Two failure modes are handled here:
+
+    * ``model_validator`` failures embed a live ``ValueError`` in
+      ``ctx['error']``, and a non-JSON request body (``text/plain``, form
+      encoding, or no ``Content-Type`` at all) makes Pydantic report the raw
+      ``bytes`` in ``input``. Serializing either verbatim raises *inside* the
+      validation handler, so the caller got a bare 500 with no ``error.code``
+      and no ``correlation_id`` — on every POST/PUT/PATCH.
+    * ``input`` reflected the submitted value back verbatim, so a
+      credential-shaped field ended up in CI logs, proxies, and error trackers.
+
+    Dropping ``input`` fixes both; ``jsonable_encoder`` is the backstop for any
+    remaining non-JSON value elsewhere in the error record.
+    """
+    from fastapi.encoders import jsonable_encoder
+
+    safe: list[dict[str, object]] = []
+    for err in errors:
+        if not isinstance(err, dict):
+            safe.append({"error": str(err)})
+            continue
+        item = {key: value for key, value in err.items() if key != "input"}
+        ctx = item.get("ctx")
+        if isinstance(ctx, dict):
+            item["ctx"] = {key: str(value) if isinstance(value, BaseException) else value for key, value in ctx.items()}
+        try:
+            safe.append(cast(dict[str, object], jsonable_encoder(item)))
+        except Exception:  # noqa: BLE001 — the error envelope must never fail to serialize
+            safe.append(
+                {
+                    "type": str(item.get("type", "value_error")),
+                    "loc": [str(part) for part in cast(Sequence[object], item.get("loc") or ())],
+                    "msg": str(item.get("msg", "Validation error")),
+                }
+            )
+    return safe
+
+
+def _build_error_envelope(
+    *,
+    status_code: int,
+    detail: object,
+    correlation_id: str,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    payload = {
+        "error": {
+            "code": _error_code_for_status(status_code),
+            "message": _error_message_for(status_code, detail),
+            "correlation_id": correlation_id,
+            # Preserve the original FastAPI detail payload for backward
+            # compatibility — existing UIs that displayed `detail` still work
+            # while new clients can read `error.code` / `error.message`.
+            "details": detail,
+        },
+        # Top-level alias kept so callers that grew up on
+        # ``{"detail": "..."}`` still parse. New code should read ``error``.
+        "detail": detail,
+    }
+    response_headers = dict(headers or {})
+    response_headers.setdefault("X-Request-ID", correlation_id)
+    return JSONResponse(status_code=status_code, content=payload, headers=response_headers)
+
+
+def install_error_envelope(application: object) -> None:
+    """Register FastAPI exception handlers that emit the v1 error envelope.
+
+    The envelope is ``{error: {code, message, correlation_id, details}}`` and
+    is also surfaced as a top-level ``detail`` field for backward compatibility
+    with the historical FastAPI shape.
+    """
+    from fastapi import HTTPException
+    from fastapi.exceptions import RequestValidationError
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+
+    from agent_bom.api.idempotency_store import IdempotencyPayloadError
+
+    def _correlation_id(request: StarletteRequest) -> str:
+        return getattr(request.state, "request_id", "") or request.headers.get("x-request-id") or str(uuid.uuid4())
+
+    async def http_exception_handler(request: StarletteRequest, exc: HTTPException) -> JSONResponse:
+        if request.url.path.startswith("/scim/"):
+            from agent_bom.api.scim import scim_error_body
+
+            correlation_id = _correlation_id(request)
+            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            payload = scim_error_body(status_code=exc.status_code, detail=detail)
+            response_headers = dict(getattr(exc, "headers", None) or {})
+            response_headers.setdefault("X-Request-ID", correlation_id)
+            return JSONResponse(
+                status_code=exc.status_code,
+                content=payload,
+                media_type="application/scim+json",
+                headers=response_headers,
+            )
+        return _build_error_envelope(
+            status_code=exc.status_code,
+            detail=exc.detail,
+            correlation_id=_correlation_id(request),
+            headers=getattr(exc, "headers", None),
+        )
+
+    async def starlette_http_exception_handler(request: StarletteRequest, exc: StarletteHTTPException) -> JSONResponse:
+        return _build_error_envelope(
+            status_code=exc.status_code,
+            detail=exc.detail,
+            correlation_id=_correlation_id(request),
+            headers=getattr(exc, "headers", None),
+        )
+
+    async def validation_exception_handler(request: StarletteRequest, exc: RequestValidationError) -> JSONResponse:
+        return _build_error_envelope(
+            status_code=422,
+            detail=_json_safe_validation_errors(exc.errors()),
+            correlation_id=_correlation_id(request),
+        )
+
+    async def idempotency_payload_exception_handler(request: StarletteRequest, exc: Exception) -> JSONResponse:
+        # The payload that could not be fingerprinted is caller-controlled, so
+        # this is a client error — not an unhandled 500 that poisons 5xx alerting.
+        return _build_error_envelope(
+            status_code=422,
+            detail=sanitize_error(exc) or "Request payload could not be processed",
+            correlation_id=_correlation_id(request),
+        )
+
+    application.add_exception_handler(HTTPException, http_exception_handler)  # type: ignore[attr-defined]
+    application.add_exception_handler(StarletteHTTPException, starlette_http_exception_handler)  # type: ignore[attr-defined]
+    application.add_exception_handler(RequestValidationError, validation_exception_handler)  # type: ignore[attr-defined]
+    application.add_exception_handler(IdempotencyPayloadError, idempotency_payload_exception_handler)  # type: ignore[attr-defined]

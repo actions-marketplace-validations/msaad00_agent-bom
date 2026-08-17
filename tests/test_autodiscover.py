@@ -1,6 +1,10 @@
 """Tests for the auto-discovery module — risk inference, justification, and enrichment filtering."""
 
+import asyncio
+import time
+
 from agent_bom.autodiscover import (
+    enrich_unknown_packages,
     generate_risk_justification,
     infer_risk_level,
 )
@@ -86,6 +90,34 @@ def test_infer_risk_no_repo():
     assert risk_order[no_level] > risk_order[with_level]
 
 
+def test_nullable_registry_text_fields_do_not_abort_risk_inference():
+    metadata = {
+        "description": None,
+        "keywords": None,
+        "maintainers": 3,
+        "repository": "https://github.com/example/lib",
+        "dependencies_count": 0,
+    }
+    assert infer_risk_level(metadata) == "low"
+    assert generate_risk_justification(metadata, "low")
+
+
+def test_more_than_fifty_dependencies_receive_the_larger_risk_weight():
+    base = {
+        "description": "a simple utility library",
+        "keywords": [],
+        "maintainers": 5,
+        "repository": "https://github.com/example/lib",
+    }
+    assert infer_risk_level({**base, "dependencies_count": 21}) == "low"
+    assert infer_risk_level({**base, "dependencies_count": 51}) == "low"
+
+    # The score difference becomes visible at the medium threshold when paired
+    # with a single-maintainer trust signal.
+    assert infer_risk_level({**base, "maintainers": 1, "dependencies_count": 21}) == "low"
+    assert infer_risk_level({**base, "maintainers": 1, "dependencies_count": 51}) == "medium"
+
+
 # ── generate_risk_justification tests ─────────────────────────────────────
 
 
@@ -147,3 +179,34 @@ def test_enrich_skips_registry_packages():
 
     assert registry_pkg not in to_enrich
     assert unknown_pkg in to_enrich
+
+
+def test_enrich_unknown_packages_global_timeout(monkeypatch):
+    """Metadata enrichment should return promptly when the whole batch times out."""
+
+    async def _slow_autodiscover(*_args, **_kwargs):
+        await asyncio.sleep(0.1)
+        return {"auto_risk_level": "low", "auto_risk_justification": "slow"}
+
+    monkeypatch.setattr("agent_bom.autodiscover.autodiscover_package", _slow_autodiscover)
+    packages = [
+        Package(
+            name=f"slow-package-{idx}",
+            version="1.0.0",
+            ecosystem="npm",
+            resolved_from_registry=False,
+        )
+        for idx in range(3)
+    ]
+
+    started = time.monotonic()
+    enriched = asyncio.run(enrich_unknown_packages(packages, global_timeout=0.01))
+    elapsed = time.monotonic() - started
+
+    # Timeout correctness is proven by the behavioral asserts: if the 10ms
+    # global_timeout had NOT fired, the 0.1s autodiscover would have completed and
+    # enriched all 3 packages. The wall-clock check is only a generous hang-guard
+    # (not a latency SLA) so it can't flake under asyncio-cleanup load on slow CI.
+    assert enriched == 0
+    assert elapsed < 2.0
+    assert all(pkg.auto_risk_level is None for pkg in packages)

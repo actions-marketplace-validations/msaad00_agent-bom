@@ -1,42 +1,189 @@
-"""Posture scorecard engine — computes a letter grade + compliance % for an AI-BOM report.
+"""Posture scorecard engine — letter grade + score from a scan report snapshot.
 
-The scorecard aggregates multiple security dimensions into a single
-enterprise-friendly posture view:
+Default logic is informed by findings, enrichment, credentials, KEV/EPSS,
+framework coverage, and config quality on **that report** (latest completed
+scan, or the scan the operator is viewing). Metrics are not a static demo
+grade — they move with scan evidence.
 
-- Vulnerability severity distribution
-- Credential exposure footprint
-- Supply-chain quality (OpenSSF Scorecard)
-- Framework compliance coverage
-- Fleet trust score average
-- KEV / active exploitation presence
+Adopters are not forced onto the defaults. Override dimension weights and/or
+grade thresholds via ``AGENT_BOM_POSTURE_POLICY`` (inline JSON) or
+``AGENT_BOM_POSTURE_POLICY_FILE`` (path to JSON). Example::
 
-Output: letter grade (A–F), numeric score (0–100), and per-dimension breakdown.
+    {
+      "weights": {
+        "vulnerability_posture": 0.40,
+        "credential_hygiene": 0.25,
+        "supply_chain_quality": 0.10,
+        "compliance_coverage": 0.10,
+        "active_exploitation": 0.10,
+        "configuration_quality": 0.05
+      },
+      "grade_thresholds": {"A": 92, "B": 82, "C": 72, "D": 60}
+    }
+
+Missing keys keep the built-in defaults. Weights are renormalized to sum to 1.
 """
 
 from __future__ import annotations
 
+import json
+import os
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Mapping
+
+from agent_bom.compliance_utils import effective_blast_radius_tags
+from agent_bom.evidence.scan_run import vulnerability_coverage_incomplete
+from agent_bom.graph.severity import severity_policy_rank
+from agent_bom.scorecard import summarize_scorecard_coverage
+from agent_bom.vex import active_blast_radii
 
 if TYPE_CHECKING:
     from agent_bom.models import AIBOMReport
+
+# Default dimension weights — informed defaults, not a locked customer policy.
+DEFAULT_DIMENSION_WEIGHTS: dict[str, float] = {
+    "vulnerability_posture": 0.30,
+    "credential_hygiene": 0.20,
+    "supply_chain_quality": 0.15,
+    "compliance_coverage": 0.15,
+    "active_exploitation": 0.10,
+    "configuration_quality": 0.10,
+}
+
+# Minimum score (inclusive) for each letter grade.
+DEFAULT_GRADE_THRESHOLDS: dict[str, float] = {
+    "A": 90.0,
+    "B": 80.0,
+    "C": 70.0,
+    "D": 60.0,
+}
+
+
+@dataclass(frozen=True)
+class PosturePolicy:
+    """Resolved posture scoring policy (defaults + optional adopter overrides)."""
+
+    weights: Mapping[str, float]
+    grade_thresholds: Mapping[str, float]
+    source: str = "default"
+
+
+def _normalize_weights(weights: Mapping[str, float]) -> dict[str, float]:
+    merged = {key: float(DEFAULT_DIMENSION_WEIGHTS[key]) for key in DEFAULT_DIMENSION_WEIGHTS}
+    for key, value in weights.items():
+        if key in merged:
+            try:
+                merged[key] = max(0.0, float(value))
+            except (TypeError, ValueError):
+                continue
+    total = sum(merged.values())
+    if total <= 0:
+        return dict(DEFAULT_DIMENSION_WEIGHTS)
+    return {key: round(value / total, 6) for key, value in merged.items()}
+
+
+def _normalize_thresholds(thresholds: Mapping[str, float]) -> dict[str, float]:
+    merged = {key: float(DEFAULT_GRADE_THRESHOLDS[key]) for key in DEFAULT_GRADE_THRESHOLDS}
+    for key, value in thresholds.items():
+        letter = str(key).upper()
+        if letter in merged:
+            try:
+                merged[letter] = float(value)
+            except (TypeError, ValueError):
+                continue
+    # Keep A >= B >= C >= D so grade bands stay ordered.
+    ordered = sorted(
+        (("A", merged["A"]), ("B", merged["B"]), ("C", merged["C"]), ("D", merged["D"])),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    return {letter: score for letter, score in ordered}
+
+
+def load_posture_policy(
+    *,
+    weights: Mapping[str, float] | None = None,
+    grade_thresholds: Mapping[str, float] | None = None,
+) -> PosturePolicy:
+    """Resolve posture policy from explicit args, then env, then defaults."""
+
+    source = "default"
+    env_weights: dict[str, float] = {}
+    env_thresholds: dict[str, float] = {}
+
+    raw = os.environ.get("AGENT_BOM_POSTURE_POLICY", "").strip()
+    file_path = os.environ.get("AGENT_BOM_POSTURE_POLICY_FILE", "").strip()
+    payload: dict | None = None
+    if raw:
+        try:
+            loaded = json.loads(raw)
+            if isinstance(loaded, dict):
+                payload = loaded
+                source = "env:AGENT_BOM_POSTURE_POLICY"
+        except json.JSONDecodeError:
+            payload = None
+    elif file_path:
+        try:
+            loaded = json.loads(Path(file_path).read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                payload = loaded
+                source = f"file:{file_path}"
+        except (OSError, json.JSONDecodeError):
+            payload = None
+
+    if payload:
+        maybe_weights = payload.get("weights")
+        if isinstance(maybe_weights, dict):
+            env_weights = {str(k): float(v) for k, v in maybe_weights.items() if _is_number(v)}
+        maybe_thresholds = payload.get("grade_thresholds") or payload.get("thresholds")
+        if isinstance(maybe_thresholds, dict):
+            env_thresholds = {str(k).upper(): float(v) for k, v in maybe_thresholds.items() if _is_number(v)}
+
+    if weights is not None:
+        env_weights = {**env_weights, **{str(k): float(v) for k, v in weights.items()}}
+        source = "explicit" if source == "default" else f"{source}+explicit"
+    if grade_thresholds is not None:
+        env_thresholds = {
+            **env_thresholds,
+            **{str(k).upper(): float(v) for k, v in grade_thresholds.items()},
+        }
+        source = "explicit" if source == "default" else f"{source}+explicit"
+
+    return PosturePolicy(
+        weights=_normalize_weights(env_weights),
+        grade_thresholds=_normalize_thresholds(env_thresholds),
+        source=source,
+    )
+
+
+def _is_number(value: object) -> bool:
+    try:
+        float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 @dataclass
 class PostureScorecard:
     """Enterprise posture scorecard result."""
 
-    grade: str  # A, B, C, D, F
+    grade: str  # A, B, C, D, F, or N/A
     score: float  # 0-100
     dimensions: dict[str, DimensionScore] = field(default_factory=dict)
     summary: str = ""
+    policy_source: str = "default"
+    no_data: bool = False  # True when the scan examined no gradable artifacts
 
     def to_dict(self) -> dict:
         return {
             "grade": self.grade,
             "score": self.score,
             "summary": self.summary,
+            "policy_source": self.policy_source,
+            "no_data": self.no_data,
             "dimensions": {k: v.to_dict() for k, v in self.dimensions.items()},
         }
 
@@ -60,23 +207,33 @@ class DimensionScore:
         }
 
 
-def _score_to_grade(score: float) -> str:
-    """Convert numeric score to letter grade."""
-    if score >= 90:
+def _score_to_grade(
+    score: float,
+    thresholds: Mapping[str, float] | None = None,
+) -> str:
+    """Convert numeric score to letter grade (adopter thresholds optional)."""
+    bands = thresholds or DEFAULT_GRADE_THRESHOLDS
+    if score >= float(bands.get("A", 90)):
         return "A"
-    if score >= 80:
+    if score >= float(bands.get("B", 80)):
         return "B"
-    if score >= 70:
+    if score >= float(bands.get("C", 70)):
         return "C"
-    if score >= 60:
+    if score >= float(bands.get("D", 60)):
         return "D"
     return "F"
 
 
-def compute_posture_scorecard(report: "AIBOMReport") -> PostureScorecard:
-    """Compute posture scorecard from an AI-BOM report.
+def compute_posture_scorecard(
+    report: "AIBOMReport",
+    *,
+    policy: PosturePolicy | None = None,
+    weights: Mapping[str, float] | None = None,
+    grade_thresholds: Mapping[str, float] | None = None,
+) -> PostureScorecard:
+    """Compute posture scorecard from a scan report snapshot.
 
-    Dimensions and weights:
+    Dimensions (default weights — override via ``policy`` / env):
         vulnerability_posture  30%  — severity distribution + fix availability
         credential_hygiene     20%  — credential exposure footprint
         supply_chain_quality   15%  — OpenSSF Scorecard coverage
@@ -85,15 +242,20 @@ def compute_posture_scorecard(report: "AIBOMReport") -> PostureScorecard:
         configuration_quality  10%  — registry verification + tool declaration
 
     Returns:
-        PostureScorecard with grade, score, and per-dimension breakdown.
+        PostureScorecard with grade, score, and per-dimension breakdown for
+        **this report** (current scan / selected snapshot), not a frozen demo.
     """
+    resolved = policy or load_posture_policy(weights=weights, grade_thresholds=grade_thresholds)
+    w = resolved.weights
     dimensions: dict[str, DimensionScore] = {}
 
-    # ── 1. Vulnerability Posture (30%) ──
+    # ── 1. Vulnerability Posture ──
     sev_counts: Counter[str] = Counter()
     fixable = 0
     total_vulns = 0
-    for br in report.blast_radii:
+    active_findings = active_blast_radii(report.blast_radii)
+
+    for br in active_findings:
         sev = br.vulnerability.severity.value.upper()
         sev_counts[sev] += 1
         total_vulns += 1
@@ -121,11 +283,11 @@ def compute_posture_scorecard(report: "AIBOMReport") -> PostureScorecard:
     dimensions["vulnerability_posture"] = DimensionScore(
         name="Vulnerability Posture",
         score=round(vuln_score, 1),
-        weight=0.30,
+        weight=float(w["vulnerability_posture"]),
         details=vuln_detail,
     )
 
-    # ── 2. Credential Hygiene (20%) ──
+    # ── 2. Credential Hygiene ──
     total_cred_servers = 0
     unique_creds: set[str] = set()
     for agent in report.agents:
@@ -147,49 +309,82 @@ def compute_posture_scorecard(report: "AIBOMReport") -> PostureScorecard:
     dimensions["credential_hygiene"] = DimensionScore(
         name="Credential Hygiene",
         score=round(cred_score, 1),
-        weight=0.20,
+        weight=float(w["credential_hygiene"]),
         details=cred_detail,
     )
 
-    # ── 3. Supply Chain Quality (15%) ──
+    # ── 3. Supply Chain Quality ──
     scorecard_scores: list[float] = []
+    all_packages = []
     for agent in report.agents:
         for server in agent.mcp_servers:
             for pkg in server.packages:
+                all_packages.append(pkg)
                 if pkg.scorecard_score is not None:
                     scorecard_scores.append(pkg.scorecard_score)
 
+    scorecard_stats = summarize_scorecard_coverage(all_packages)
+    transient_scorecard_failures = {
+        pkg.scorecard_lookup_reason
+        for pkg in all_packages
+        if pkg.scorecard_lookup_state == "failed"
+        and pkg.scorecard_lookup_reason in {"scorecard_rate_limited", "scorecard_service_unavailable"}
+    }
     if scorecard_scores:
         avg_scorecard = sum(scorecard_scores) / len(scorecard_scores)
         sc_score = min(100.0, avg_scorecard * 10)  # 0-10 → 0-100
-        sc_detail = f"Avg OpenSSF Scorecard: {avg_scorecard:.1f}/10 ({len(scorecard_scores)} packages)"
+        sc_detail = (
+            f"Avg OpenSSF Scorecard: {avg_scorecard:.1f}/10 "
+            f"({scorecard_stats.enriched_packages}/{scorecard_stats.eligible_packages} eligible packages enriched)"
+        )
+    elif scorecard_stats.eligible_packages == 0:
+        sc_score = 50.0
+        sc_detail = "No GitHub-backed packages eligible for OpenSSF Scorecard"
+    elif scorecard_stats.failed_packages > 0 and transient_scorecard_failures:
+        sc_score = 100.0
+        sc_detail = (
+            "OpenSSF Scorecard temporarily unavailable upstream; "
+            f"not penalizing posture ({scorecard_stats.enriched_packages}/{scorecard_stats.eligible_packages} eligible packages enriched, "
+            f"{scorecard_stats.failed_packages} transient lookup failures)"
+        )
+    elif scorecard_stats.failed_packages > 0:
+        sc_score = 50.0
+        sc_detail = (
+            "OpenSSF Scorecard coverage pending: "
+            f"{scorecard_stats.enriched_packages}/{scorecard_stats.eligible_packages} eligible packages enriched, "
+            f"{scorecard_stats.failed_packages} lookup failures"
+        )
     else:
-        sc_score = 50.0  # Neutral when no scorecard data
-        sc_detail = "No OpenSSF Scorecard data available"
+        sc_score = 50.0
+        sc_detail = (
+            "OpenSSF Scorecard coverage unresolved: "
+            f"{scorecard_stats.unresolved_packages} package(s) lacked resolvable GitHub source metadata"
+        )
 
     dimensions["supply_chain_quality"] = DimensionScore(
         name="Supply Chain Quality",
         score=round(sc_score, 1),
-        weight=0.15,
+        weight=float(w["supply_chain_quality"]),
         details=sc_detail,
     )
 
     # ── 4. Compliance Coverage (15%) ──
     total_tags = 0
     tagged_findings = 0
-    for br in report.blast_radii:
+    for br in active_findings:
+        tags = effective_blast_radius_tags(br)
         total_tags += 1
         has_tag = bool(
-            br.owasp_tags
-            or br.atlas_tags
-            or br.nist_ai_rmf_tags
-            or br.owasp_mcp_tags
-            or br.owasp_agentic_tags
-            or br.eu_ai_act_tags
-            or br.nist_csf_tags
-            or br.iso_27001_tags
-            or br.soc2_tags
-            or br.cis_tags
+            tags["owasp_tags"]
+            or tags["atlas_tags"]
+            or tags["nist_ai_rmf_tags"]
+            or tags["owasp_mcp_tags"]
+            or tags["owasp_agentic_tags"]
+            or tags["eu_ai_act_tags"]
+            or tags["nist_csf_tags"]
+            or tags["iso_27001_tags"]
+            or tags["soc2_tags"]
+            or tags["cis_tags"]
         )
         if has_tag:
             tagged_findings += 1
@@ -205,7 +400,7 @@ def compute_posture_scorecard(report: "AIBOMReport") -> PostureScorecard:
     dimensions["compliance_coverage"] = DimensionScore(
         name="Compliance Coverage",
         score=round(comp_score, 1),
-        weight=0.15,
+        weight=float(w["compliance_coverage"]),
         details=comp_detail,
     )
 
@@ -214,7 +409,7 @@ def compute_posture_scorecard(report: "AIBOMReport") -> PostureScorecard:
 
     kev_ids: set[str] = set()
     high_epss_ids: set[str] = set()
-    for br in report.blast_radii:
+    for br in active_findings:
         vid = br.vulnerability.id
         if br.vulnerability.is_kev:
             kev_ids.add(vid)
@@ -243,7 +438,7 @@ def compute_posture_scorecard(report: "AIBOMReport") -> PostureScorecard:
     dimensions["active_exploitation"] = DimensionScore(
         name="Active Exploitation",
         score=round(exploit_score, 1),
-        weight=0.10,
+        weight=float(w["active_exploitation"]),
         details=exploit_detail,
     )
 
@@ -255,6 +450,9 @@ def compute_posture_scorecard(report: "AIBOMReport") -> PostureScorecard:
     if total_servers == 0:
         config_score = 50.0
         config_detail = "No servers to evaluate"
+    elif not report.has_mcp_context:
+        config_score = 100.0
+        config_detail = "N/A for scans without MCP server configuration context"
     else:
         verified_pct = verified_servers / total_servers
         tools_pct = servers_with_tools / total_servers
@@ -264,28 +462,86 @@ def compute_posture_scorecard(report: "AIBOMReport") -> PostureScorecard:
     dimensions["configuration_quality"] = DimensionScore(
         name="Configuration Quality",
         score=round(config_score, 1),
-        weight=0.10,
+        weight=float(w["configuration_quality"]),
         details=config_detail,
     )
+
+    # ── Did-we-scan guard ──
+    # A grade requires real evaluated inputs. When a scan examined ZERO gradable
+    # artifacts (no packages, no MCP servers, no active findings), every
+    # dimension above falls back to its empty default (100/50) and would produce
+    # a passing "B" — an honest-looking pass for a scan that evaluated nothing.
+    # Return an explicit no-data / N/A posture instead, mirroring the honest N/A
+    # treatment used elsewhere (overview tile, exec score). Dimensions and policy
+    # source are preserved for downstream plumbing; only the headline is honest.
+    examined_artifacts = total_vulns + total_servers + len(all_packages)
+    if examined_artifacts == 0:
+        return PostureScorecard(
+            grade="N/A",
+            score=0.0,
+            dimensions=dimensions,
+            summary="No artifacts scanned — posture grade unavailable. Connect a surface or run a scan to grade posture.",
+            policy_source=resolved.source,
+            no_data=True,
+        )
+
+    # ── Could-we-evaluate guard ──
+    # The guard above measures DISCOVERY. A scan can discover packages and still
+    # have had no vulnerability data to grade them against — the vuln DB was
+    # unavailable, a required scanner failed. Every dimension then falls back to
+    # its empty default and the headline reads "No vulnerabilities found …(A)",
+    # which is a false all-clear, not a missing one. Grade only what we could
+    # actually evaluate.
+    if vulnerability_coverage_incomplete(report):
+        return PostureScorecard(
+            grade="N/A",
+            score=0.0,
+            dimensions=dimensions,
+            summary="Vulnerability coverage incomplete — posture grade unavailable. Re-run once vulnerability data is available.",
+            policy_source=resolved.source,
+            no_data=True,
+        )
 
     # ── Final score ──
     total_score = sum(d.score * d.weight for d in dimensions.values())
     total_score = round(min(100.0, max(0.0, total_score)), 1)
-    grade = _score_to_grade(total_score)
+    grade = _score_to_grade(total_score, resolved.grade_thresholds)
 
-    # Build summary
-    if grade in ("A", "B"):
-        summary = f"Strong security posture ({grade}, {total_score}%)"
+    # Build summary. Keep vulnerability cleanliness separate from
+    # best-practice/configuration quality so clean scans do not read as
+    # contradictory when optional metadata is incomplete.
+    if total_vulns == 0:
+        if grade in ("A", "B"):
+            summary = f"No vulnerabilities found; strong best-practice/config posture ({grade}, {total_score}%)"
+        elif grade == "C":
+            summary = f"No vulnerabilities found; config/best-practice improvements recommended ({grade}, {total_score}%)"
+        else:
+            summary = f"No vulnerabilities found; config/best-practice gaps need attention ({grade}, {total_score}%)"
+    elif grade in ("A", "B"):
+        summary = f"Strong best-practice/config posture ({grade}, {total_score}%)"
     elif grade == "C":
-        summary = f"Moderate security posture ({grade}, {total_score}%) — improvements recommended"
+        summary = f"Moderate best-practice/config posture ({grade}, {total_score}%) — improvements recommended"
     else:
-        summary = f"Weak security posture ({grade}, {total_score}%) — immediate attention required"
+        drivers: list[str] = []
+        if total_cred_servers > 0:
+            drivers.append(f"real credential exposure across {total_cred_servers} server{'s' if total_cred_servers != 1 else ''}")
+        if report.has_mcp_context and total_servers > 0 and verified_servers < total_servers:
+            drivers.append(
+                "unverified or underspecified MCP configuration on "
+                f"{total_servers - verified_servers}/{total_servers} "
+                f"server{'s' if total_servers != 1 else ''}"
+            )
+        if drivers:
+            summary = f"Weak best-practice/config posture ({grade}, {total_score}%) — this grade is driven by " + " and ".join(drivers)
+        else:
+            summary = f"Weak best-practice/config posture ({grade}, {total_score}%) — immediate attention required"
 
     return PostureScorecard(
         grade=grade,
         score=total_score,
         dimensions=dimensions,
         summary=summary,
+        policy_source=resolved.source,
     )
 
 
@@ -301,24 +557,31 @@ def compute_credential_risk_ranking(report: "AIBOMReport") -> list[dict]:
     """
     cred_data: dict[str, dict] = {}
 
-    for br in report.blast_radii:
+    def _entry(cred: str) -> dict:
+        if cred not in cred_data:
+            cred_data[cred] = {
+                "credential": cred,
+                "server_count": 0,
+                "agents": set(),
+                "servers": set(),
+                "reachable_tools": set(),
+                "vuln_critical": 0,
+                "vuln_high": 0,
+                "vuln_total": 0,
+                "max_risk_score": 0.0,
+            }
+        return cred_data[cred]
+
+    # ── Phase 1: CVE-backed exposure ──
+    # Credentials reachable from an active (non-VEX-suppressed) blast radius.
+    for br in active_blast_radii(report.blast_radii):
         for cred in br.exposed_credentials:
-            if cred not in cred_data:
-                cred_data[cred] = {
-                    "credential": cred,
-                    "server_count": 0,
-                    "agents": set(),
-                    "vuln_critical": 0,
-                    "vuln_high": 0,
-                    "vuln_total": 0,
-                    "max_risk_score": 0.0,
-                    "servers": set(),
-                }
-            entry = cred_data[cred]
+            entry = _entry(cred)
             for a in br.affected_agents:
                 entry["agents"].add(a.name)
             for s in br.affected_servers:
                 entry["servers"].add(s.name)
+                entry["reachable_tools"].update(t.name for t in s.tools)
             sev = br.vulnerability.severity.value.upper()
             if sev == "CRITICAL":
                 entry["vuln_critical"] += 1
@@ -327,27 +590,52 @@ def compute_credential_risk_ranking(report: "AIBOMReport") -> list[dict]:
             entry["vuln_total"] += 1
             entry["max_risk_score"] = max(entry["max_risk_score"], br.risk_score)
 
+    # ── Phase 2: discovery-only exposure ──
+    # A credential on an MCP server with no CVE-backed blast radius is still a
+    # standing exposure — a long-lived secret reachable by the agent's tools.
+    # Rank it by breadth instead of dropping it from the report (previously it
+    # was invisible whenever no vulnerability matched). Credentials already
+    # ranked in Phase 1 are enriched in place (servers/agents/tools merge via
+    # sets); their CVE-derived tier is preserved.
+    for agent in report.agents:
+        for server in agent.mcp_servers:
+            for cred in server.credential_names:
+                entry = _entry(cred)
+                entry["agents"].add(agent.name)
+                entry["servers"].add(server.name)
+                entry["reachable_tools"].update(t.name for t in server.tools)
+
     results = []
     for cred, data in cred_data.items():
         server_count = len(data["servers"])
-        agents = sorted(data["agents"])
+        reachable_tools = sorted(data["reachable_tools"])
         risk_score = data["max_risk_score"]
 
-        if data["vuln_critical"] > 0 or risk_score >= 8.0:
-            risk_tier = "critical"
-        elif data["vuln_high"] > 0 or risk_score >= 6.0:
-            risk_tier = "high"
-        elif data["vuln_total"] > 3:
-            risk_tier = "medium"
+        if data["vuln_total"] > 0:
+            basis = "vulnerability"
+            if data["vuln_critical"] > 0 or risk_score >= 8.0:
+                risk_tier = "critical"
+            elif data["vuln_high"] > 0 or risk_score >= 6.0:
+                risk_tier = "high"
+            elif data["vuln_total"] > 3:
+                risk_tier = "medium"
+            else:
+                risk_tier = "low"
         else:
-            risk_tier = "low"
+            # Discovery-only: no proven exploit path, so cap at medium. A secret
+            # reachable by tools or shared across servers has a broader standing
+            # blast radius than one isolated to a single tool-less server.
+            basis = "discovery"
+            risk_tier = "medium" if (server_count > 1 or reachable_tools) else "low"
 
         results.append(
             {
                 "credential": cred,
                 "risk_tier": risk_tier,
+                "basis": basis,
                 "server_count": server_count,
-                "agents": agents,
+                "agents": sorted(data["agents"]),
+                "reachable_tools": reachable_tools,
                 "vuln_critical": data["vuln_critical"],
                 "vuln_high": data["vuln_high"],
                 "vuln_total": data["vuln_total"],
@@ -355,9 +643,16 @@ def compute_credential_risk_ranking(report: "AIBOMReport") -> list[dict]:
             }
         )
 
-    # Sort by risk: critical first, then by max_risk_score descending
-    tier_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-    results.sort(key=lambda x: (tier_order.get(x["risk_tier"], 4), -x["max_risk_score"]))
+    # Sort: tier first, then proven (vulnerability) before discovery at the same
+    # tier, then by max_risk_score descending.
+    basis_order = {"vulnerability": 0, "discovery": 1}
+    results.sort(
+        key=lambda x: (
+            -severity_policy_rank(str(x["risk_tier"])),
+            basis_order.get(x["basis"], 9),
+            -x["max_risk_score"],
+        )
+    )
     return results
 
 
@@ -373,8 +668,9 @@ def compute_incident_correlation(report: "AIBOMReport") -> list[dict]:
     - recommended actions
     """
     agent_incidents: dict[str, dict] = {}
+    active_findings = active_blast_radii(report.blast_radii)
 
-    for br in report.blast_radii:
+    for br in active_findings:
         for agent in br.affected_agents:
             if agent.name not in agent_incidents:
                 agent_incidents[agent.name] = {

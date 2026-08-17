@@ -7,6 +7,8 @@ drift between duplicated definitions.
 
 from __future__ import annotations
 
+import re
+
 # ── AI/ML Framework Packages ────────────────────────────────────────────────
 # Used by compliance taggers (owasp, atlas, nist_ai_rmf, eu_ai_act,
 # owasp_agentic) to determine if a vulnerability affects an AI/ML component.
@@ -111,6 +113,11 @@ AI_PACKAGES: frozenset[str] = frozenset(
         "vllm",
         "text-generation-inference",
         "ctransformers",
+        "gpt4all",
+        "ollama",
+        # Emerging agent frameworks
+        "smolagents",
+        "qwen-agent",
         # MLOps / experiment tracking
         "mlflow",
         "wandb",
@@ -172,8 +179,9 @@ def critical_severities() -> frozenset:
 
 
 # ── Credential Detection Patterns ───────────────────────────────────────────
-# Used by models.MCPServer.has_credentials / credential_names and
-# context_graph._is_credential_key.
+# Compatibility vocabulary for callers that display the broad families.  The
+# product judgement itself lives in ``is_credential_key`` below; consumers
+# must call it instead of repeating substring matching.
 
 SENSITIVE_PATTERNS: list[str] = [
     "key",
@@ -212,10 +220,168 @@ SENSITIVE_PATTERNS: list[str] = [
 ]
 
 
+# These words make the variable a policy/lifecycle setting about a credential,
+# not the credential (or a reference to it).  Examples from agent-bom's own
+# supported configuration include ``API_KEY_DEFAULT_TTL_SECONDS`` and
+# ``TOKEN_ROTATION_DAYS``.
+_CONFIGURATION_WORDS = frozenset(
+    {
+        "age",
+        "configured",
+        "days",
+        "disable",
+        "disabled",
+        "enable",
+        "enabled",
+        "expires",
+        "expiry",
+        "max",
+        "method",
+        "min",
+        "mode",
+        "policy",
+        "records",
+        "require",
+        "required",
+        "rotated",
+        "rotation",
+        "seconds",
+        "status",
+        "ttl",
+        "type",
+    }
+)
+
+# A name carrying one of these is authentication material, or a reference to
+# some, wherever the word appears.  ``SNOWFLAKE_PRIVATE_KEY_PATH`` names the
+# file holding a private key and is as much credential evidence as the key.
+_CREDENTIAL_WORDS = frozenset(
+    {
+        "apikey",
+        "authorization",
+        "bearer",
+        "credential",
+        "key",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+    }
+)
+
+# Weaker evidence: on its own the word names credential material, but qualified
+# by a locator it names a *file or endpoint* that is not itself secret.
+# ``CERTIFICATE`` holds a PEM blob; ``CERTIFICATE_PATH`` holds ``/etc/ssl/…``
+# and ``OAUTH_CLIENT_ID`` holds a public identifier.  Widening these two words
+# without the locator guard is what previously turned ``CERTIFICATE_PATH`` into
+# a credential node.
+_CREDENTIAL_MATERIAL_WORDS = frozenset({"cert", "certificate", "oauth"})
+
+_LOCATOR_WORDS = frozenset(
+    {
+        "arn",
+        "dir",
+        "directories",
+        "directory",
+        "endpoint",
+        "file",
+        "filename",
+        "host",
+        "hostname",
+        "id",
+        "location",
+        "name",
+        "path",
+        "port",
+        "ref",
+        "url",
+    }
+)
+
+# Only words this module already knows are folded to their singular, so an
+# unrelated plural is left alone — ``DAYS`` must keep matching the
+# configuration word ``days`` rather than becoming an unknown ``day``.
+_SINGULARIZABLE_WORDS = _CREDENTIAL_WORDS | _CREDENTIAL_MATERIAL_WORDS | _LOCATOR_WORDS
+
+
+def _singularize(token: str) -> str:
+    if token.endswith("s") and token[:-1] in _SINGULARIZABLE_WORDS:
+        return token[:-1]
+    return token
+
+
+_CREDENTIAL_WORD_PAIRS = frozenset(
+    {
+        ("ca", "cert"),
+        ("client", "cert"),
+        ("client", "certificate"),
+        ("conn", "str"),
+        ("connection", "string"),
+        ("connection", "uri"),
+        ("connection", "url"),
+        ("database", "url"),
+        ("db", "url"),
+    }
+)
+
+# Established names for real credentials that contain no credential word at all,
+# so no amount of vocabulary matching reaches them.  ``PGPASSWORD`` is libpq's;
+# the ``ID_*`` family is what ``ssh-keygen`` writes.  Matched on the whole name
+# so a qualified variant (``ID_RSA_PATH``) still goes through the normal rules.
+_CREDENTIAL_COMPOUND_NAMES = frozenset(
+    {
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        "id_rsa",
+        "mysql_pwd",
+        "pgpassword",
+    }
+)
+
+
 def is_credential_key(name: str) -> bool:
-    """Check if an environment variable name matches credential patterns."""
-    low = name.lower()
-    return any(pat in low for pat in SENSITIVE_PATTERNS)
+    """Return whether an environment-variable name denotes a credential.
+
+    Credential inventory feeds graph, posture, and blast-radius evidence, so
+    substring matching is too imprecise: ``AUTH_MODE``, ``KEYBOARD_LAYOUT``,
+    and ``DB_CONNECTION_POOL_SIZE`` are configuration rather than credentials.
+    Split on identifier boundaries and match credential words or the few
+    credential-shaped compound names that do not contain one.
+
+    Plural forms count: a name is no less a credential for holding more than
+    one, and ``API_KEYS``/``CREDENTIALS`` are common.
+
+    This predicate intentionally answers a narrower question than payload
+    sanitization.  Redaction may conservatively hide additional values; those
+    values must not become credential nodes merely because their names contain
+    an adjacent substring.
+    """
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+    tokens = tuple(_singularize(token) for token in re.findall(r"[a-z0-9]+", separated.casefold()))
+    if not tokens:
+        return False
+
+    if any(token in _CONFIGURATION_WORDS for token in tokens):
+        return False
+    if "no" in tokens:
+        return False
+
+    if "_".join(tokens) in _CREDENTIAL_COMPOUND_NAMES:
+        return True
+
+    if any(token in _CREDENTIAL_WORDS for token in tokens):
+        return True
+
+    if set(zip(tokens, tokens[1:])) & _CREDENTIAL_WORD_PAIRS:
+        return True
+
+    if any(token in _CREDENTIAL_MATERIAL_WORDS for token in tokens) and not any(token in _LOCATOR_WORDS for token in tokens):
+        return True
+
+    # A terminal AUTH commonly holds an auth header/blob.  AUTH_MODE and
+    # NO_AUTH are posture settings and must not become credential evidence.
+    return tokens[-1] == "auth" and (len(tokens) == 1 or tokens[-2] != "no")
 
 
 # ── CWE-to-Compliance Mapping ────────────────────────────────────────────────
@@ -572,3 +738,31 @@ CWE_COMPLIANCE_MAP: dict[str, dict[str, list[str]]] = {
         "nist_800_53": ["AC-3", "SC-8"],
     },
 }
+
+
+# ── Compliance Framework Registry ──────────────────────────────────────────
+#
+# Single source of truth for framework count.  Every tagger called in
+# scanners/__init__.py must have an entry here.  Code that displays
+# "N frameworks" should reference COMPLIANCE_FRAMEWORK_COUNT instead of
+# hardcoding a number.
+
+COMPLIANCE_FRAMEWORKS: tuple[tuple[str, str], ...] = (
+    ("owasp_llm", "OWASP LLM Top 10"),
+    ("atlas", "MITRE ATLAS"),
+    ("attack", "MITRE ATT&CK Enterprise"),
+    ("nist_ai_rmf", "NIST AI RMF 1.0"),
+    ("owasp_mcp", "OWASP MCP Top 10"),
+    ("owasp_agentic", "OWASP Agentic Top 10"),
+    ("eu_ai_act", "EU AI Act"),
+    ("nist_csf", "NIST CSF 2.0"),
+    ("iso_27001", "ISO 27001:2022"),
+    ("soc2", "SOC 2 TSC"),
+    ("cis", "CIS Controls v8"),
+    ("cmmc", "CMMC 2.0"),
+    ("nist_800_53", "NIST 800-53 Rev 5"),
+    ("fedramp", "FedRAMP Moderate"),
+    ("pci_dss", "PCI DSS"),
+)
+
+COMPLIANCE_FRAMEWORK_COUNT: int = len(COMPLIANCE_FRAMEWORKS)

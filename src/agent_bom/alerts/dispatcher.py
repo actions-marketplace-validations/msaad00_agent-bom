@@ -9,12 +9,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+from agent_bom.event_normalization import build_runtime_alert_relationships
 
 logger = logging.getLogger(__name__)
+
+
+def _escape_slack_text(value: object) -> str:
+    text = str(value).replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    text = re.sub(r"[*~`]", "", text)
+    text = re.sub(r"_{2,}", "", text)
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")[:3000]
+
+
+if TYPE_CHECKING:
+    from agent_bom.api.clickhouse_store import ClickHouseAnalyticsStore
 
 
 # ─── Channel Protocol ────────────────────────────────────────────────────────
@@ -109,9 +123,9 @@ def _build_slack_payload(alert: dict) -> dict:
     credentials, risk score) when available in the alert's ``details`` dict.
     """
     severity = alert.get("severity", "info").upper()
-    message = alert.get("message", "")
-    detector = alert.get("detector", "")
-    ts = alert.get("ts", "")
+    message = _escape_slack_text(alert.get("message", ""))
+    detector = _escape_slack_text(alert.get("detector", ""))
+    ts = _escape_slack_text(alert.get("ts", ""))
     emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵"}.get(severity, "ℹ️")
 
     blocks: list[dict] = [
@@ -133,13 +147,13 @@ def _build_slack_payload(alert: dict) -> dict:
             enrichment_parts.append(f"Risk Score: *{risk_score:.1f}/10*")
         agents = details.get("affected_agents", [])
         if agents:
-            enrichment_parts.append(f"Agents: {', '.join(agents[:5])}")
+            enrichment_parts.append(f"Agents: {', '.join(_escape_slack_text(agent) for agent in agents[:5])}")
         creds = details.get("credentials_exposed", [])
         if creds:
-            enrichment_parts.append(f"Credentials: `{'`, `'.join(creds[:3])}`")
+            enrichment_parts.append(f"Credentials: {', '.join(_escape_slack_text(cred) for cred in creds[:3])}")
         fixed = details.get("fixed_version")
         if fixed:
-            enrichment_parts.append(f"Fix: upgrade to `{fixed}`")
+            enrichment_parts.append(f"Fix: upgrade to {_escape_slack_text(fixed)}")
         if enrichment_parts:
             blocks.append(
                 {
@@ -163,6 +177,28 @@ def _build_slack_payload(alert: dict) -> dict:
     return {"blocks": blocks}
 
 
+def _normalize_alert_event(alert: dict) -> dict:
+    """Attach canonical relationship metadata to runtime alerts when possible."""
+    if alert.get("type") != "runtime_alert" or "event_relationships" in alert:
+        return alert
+
+    detector = str(alert.get("detector", "unknown"))
+    details = alert.get("details")
+    if not isinstance(details, dict):
+        return alert
+
+    event_relationships = build_runtime_alert_relationships(
+        detector=detector,
+        details=details,
+    )
+    if event_relationships is None:
+        return alert
+    return {
+        **alert,
+        "event_relationships": event_relationships,
+    }
+
+
 # ─── Generic Webhook Channel ─────────────────────────────────────────────────
 
 
@@ -170,22 +206,34 @@ class WebhookChannel:
     """Generic HTTP POST webhook for PagerDuty, Teams, custom endpoints."""
 
     def __init__(self, url: str, headers: dict[str, str] | None = None) -> None:
+        from agent_bom.security import validate_url
+
+        validate_url(url)
         self.url = url
         self.headers = headers or {}
 
     async def send(self, alert: dict) -> bool:
         try:
-            import httpx
+            from agent_bom.http_client import create_client, request_with_retry
+            from agent_bom.security import validate_url
 
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(
+            validate_url(self.url)
+            async with create_client(timeout=10.0) as client:
+                resp = await request_with_retry(
+                    client,
+                    "POST",
                     self.url,
                     json=alert,
                     headers={"Content-Type": "application/json", **self.headers},
+                    max_retries=0,
                 )
-                return resp.status_code < 400
+                return bool(resp and resp.status_code < 400)
         except Exception:
-            logger.exception("Webhook channel delivery failed for %s", self.url)
+            from agent_bom.security import redact_secret_url
+
+            # The webhook URL can itself be the secret (Slack-style incoming
+            # webhooks embed the token in the path), so never log it verbatim.
+            logger.exception("Webhook channel delivery failed for %s", redact_secret_url(self.url))
             return False
 
 
@@ -202,9 +250,9 @@ class ClickHouseChannel:
     def __init__(self, url: str, **kwargs) -> None:
         self._url = url
         self._kwargs = kwargs
-        self._store = None  # lazy init
+        self._store: ClickHouseAnalyticsStore | None = None  # lazy init
 
-    def _get_store(self):
+    def _get_store(self) -> "ClickHouseAnalyticsStore":
         if self._store is None:
             from agent_bom.api.clickhouse_store import ClickHouseAnalyticsStore
 
@@ -281,6 +329,7 @@ class AlertDispatcher:
         # Ensure timestamp
         if "ts" not in alert_dict:
             alert_dict["ts"] = datetime.now(timezone.utc).isoformat()
+        alert_dict = _normalize_alert_event(alert_dict)
 
         successes = 0
         for ch in self._channels:

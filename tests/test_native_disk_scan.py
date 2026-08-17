@@ -26,6 +26,7 @@ Package: libssl3
 Status: install ok installed
 Architecture: amd64
 Version: 3.0.11-1~deb12u2
+Source: openssl
 Description: Secure Sockets Layer toolkit - shared libraries
 
 Package: python3-requests
@@ -83,6 +84,13 @@ class TestParseDpkgStatus:
         pkgs = parse_dpkg_status(f)
         by_name = {p.name: p for p in pkgs}
         assert by_name["libssl3"].purl == "pkg:deb/debian/libssl3@3.0.11-1~deb12u2"
+
+    def test_extracts_debian_source_package(self, tmp_path):
+        f = tmp_path / "status"
+        f.write_text(DPKG_STATUS)
+        pkgs = parse_dpkg_status(f)
+        by_name = {p.name: p for p in pkgs}
+        assert by_name["libssl3"].source_package == "openssl"
 
     def test_missing_file_returns_empty(self, tmp_path):
         assert parse_dpkg_status(tmp_path / "nonexistent") == []
@@ -201,6 +209,17 @@ class TestScanDiskPathNative:
         pkgs = scan_disk_path_native(tmp_path)
         assert pkgs == []
 
+    def test_applies_os_release_metadata_to_os_packages(self, tmp_path):
+        (tmp_path / "etc").mkdir(parents=True)
+        (tmp_path / "etc" / "os-release").write_text('ID=debian\nVERSION_ID="13"\n')
+        status_dir = tmp_path / "var" / "lib" / "dpkg"
+        status_dir.mkdir(parents=True)
+        (status_dir / "status").write_text("Package: openssl\nStatus: install ok installed\nVersion: 3.1.0\n\n")
+        pkgs = scan_disk_path_native(tmp_path)
+        openssl = next(p for p in pkgs if p.name == "openssl")
+        assert openssl.distro_name == "debian"
+        assert openssl.distro_version == "13"
+
 
 # ── parse_pip_environment ─────────────────────────────────────────────────────
 
@@ -252,6 +271,22 @@ class TestParsePipEnvironment:
             mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
             pkgs = parse_pip_environment()
         assert pkgs == []
+
+    def test_pip_unavailable_uses_metadata_fallback(self):
+        fallback_output = json.dumps(
+            [
+                {"name": "pytest", "version": "9.0.3"},
+                {"name": "agent-bom", "version": "0.81.3"},
+            ]
+        )
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=1, stdout="", stderr="No module named pip"),
+                MagicMock(returncode=0, stdout=fallback_output, stderr=""),
+            ]
+            pkgs = parse_pip_environment()
+        names = {p.name for p in pkgs}
+        assert names == {"pytest", "agent-bom"}
 
     def test_pip_timeout_returns_empty(self):
         with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=[], timeout=30)):
@@ -305,11 +340,13 @@ APK_INSTALLED = """\
 P:busybox
 V:1.36.1-r6
 A:x86_64
+o:busybox
 T:Size optimized toolbox of many common UNIX utilities
 
-P:musl
+P:musl-utils
 V:1.2.4_git20230717-r4
 A:x86_64
+o:musl
 T:the musl c library (libc) implementation
 
 P:zlib
@@ -326,7 +363,7 @@ class TestParseApkInstalled:
         pkgs = parse_apk_installed(f)
         assert len(pkgs) == 3
         names = {p.name for p in pkgs}
-        assert names == {"busybox", "musl", "zlib"}
+        assert names == {"busybox", "musl-utils", "zlib"}
 
     def test_ecosystem_is_apk(self, tmp_path):
         f = tmp_path / "installed"
@@ -340,6 +377,8 @@ class TestParseApkInstalled:
         pkgs = parse_apk_installed(f)
         bb = next(p for p in pkgs if p.name == "busybox")
         assert bb.purl == "pkg:apk/alpine/busybox@1.36.1-r6"
+        musl_utils = next(p for p in pkgs if p.name == "musl-utils")
+        assert musl_utils.source_package == "musl"
 
     def test_missing_file_returns_empty(self, tmp_path):
         assert parse_apk_installed(tmp_path / "nonexistent") == []

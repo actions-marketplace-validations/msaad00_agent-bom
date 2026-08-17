@@ -1,9 +1,31 @@
 """Tests for deployment configs and MCP server metadata."""
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_dependency_light_deployment_helpers_do_not_import_pydantic():
+    """Helm and release helpers run before project dependencies are installed."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            ("import sys; sys.path.insert(0, 'src'); import agent_bom.deploy_profiles; import agent_bom.mcp_registry_text"),
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -16,10 +38,42 @@ def test_dockerfile_sse_exists():
     f = ROOT / "deploy" / "docker" / "Dockerfile.sse"
     assert f.exists(), "deploy/docker/Dockerfile.sse is missing"
     content = f.read_text()
-    assert "mcp-server" in content
+    assert "mcp" in content and "server" in content
     assert "--transport" in content
     assert "sse" in content
     assert "EXPOSE" in content
+
+
+def test_deployment_metadata_uses_canonical_mcp_server_command():
+    """Glama, mcporter, and stdio Docker metadata should not drift to the hidden alias."""
+    glama = json.loads((ROOT / "integrations" / "glama" / "server.json").read_text())
+    mcporter = json.loads((ROOT / "config" / "mcporter.json").read_text())
+    dockerfile_mcp = (ROOT / "deploy" / "docker" / "Dockerfile.mcp").read_text()
+    glama_dockerfile = (ROOT / "integrations" / "glama" / "Dockerfile").read_text()
+
+    assert glama["command"] == "agent-bom"
+    assert glama["args"] == ["mcp", "server"]
+    assert mcporter["mcpServers"]["agent-bom"] == {
+        "command": "agent-bom",
+        "args": ["mcp", "server"],
+    }
+    assert 'ENTRYPOINT ["agent-bom", "mcp", "server"]' in dockerfile_mcp
+    assert 'ENTRYPOINT ["agent-bom", "mcp", "server"]' in glama_dockerfile
+    assert '"mcp-server"' not in glama_dockerfile
+    assert '"mcp-server"' not in dockerfile_mcp
+
+
+def test_remote_mcp_deployment_uses_canonical_streamable_http_command():
+    """Remote deployment files should invoke the canonical grouped command."""
+    remote_files = [
+        ROOT / "deploy" / "docker" / "Dockerfile.sse",
+        ROOT / "deploy" / "Procfile",
+    ]
+
+    for path in remote_files:
+        content = path.read_text()
+        assert "agent-bom mcp server --transport streamable-http" in content
+        assert "agent-bom mcp-server" not in content
 
 
 def test_railway_json_valid():
@@ -66,8 +120,81 @@ def test_procfile_exists():
     assert f.exists(), "deploy/Procfile is missing"
     content = f.read_text().strip()
     assert content.startswith("web:")
-    assert "mcp-server" in content
+    assert "mcp" in content and "server" in content
     assert "streamable-http" in content
+    assert "AGENT_BOM_MCP_BEARER_TOKEN" in content
+
+
+def test_dockerfile_sse_does_not_opt_into_insecure_public_mode():
+    """The maintained SSE/HTTP image should not disable remote auth by default."""
+    content = (ROOT / "deploy" / "docker" / "Dockerfile.sse").read_text()
+    assert "--allow-insecure-no-auth" not in content
+    assert "AGENT_BOM_MCP_BEARER_TOKEN" in content
+
+
+def test_clickhouse_grafana_compose_reads_admin_password_from_secret_file():
+    """Analytics compose must use a mounted password file and local ports."""
+    import yaml
+
+    path = ROOT / "deploy" / "supabase" / "clickhouse" / "docker-compose.yml"
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    grafana = data["services"]["grafana"]
+    clickhouse = data["services"]["clickhouse"]
+
+    assert grafana["environment"]["GF_SECURITY_ADMIN_USER"] != "admin"
+    assert "GRAFANA_ADMIN_USER:?" in grafana["environment"]["GF_SECURITY_ADMIN_USER"]
+    assert "GF_SECURITY_ADMIN_PASSWORD" not in grafana["environment"]
+    assert grafana["environment"]["GF_SECURITY_ADMIN_PASSWORD__FILE"] == "/run/secrets/grafana_admin_password"
+    assert "grafana_admin_password" in grafana["secrets"]
+    assert "GRAFANA_ADMIN_PASSWORD_FILE" in data["secrets"]["grafana_admin_password"]["file"]
+    assert grafana["ports"] == ["127.0.0.1:3001:3000"]
+    assert clickhouse["ports"] == ["127.0.0.1:8123:8123", "127.0.0.1:9000:9000"]
+
+
+def test_monitoring_example_has_no_default_admin_password_or_public_ports():
+    """Example monitoring stack must stay local-only and require a real Grafana password."""
+    import yaml
+
+    path = ROOT / "examples" / "docker-compose-monitoring.yml"
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    services = data["services"]
+    grafana = services["grafana"]
+
+    assert "admin / admin" not in path.read_text(encoding="utf-8")
+    assert "GRAFANA_ADMIN_PASSWORD:?" in grafana["environment"][0]
+    assert grafana["ports"] == ["127.0.0.1:3000:3000"]
+    assert services["prometheus"]["ports"] == ["127.0.0.1:9090:9090"]
+    assert services["pushgateway"]["ports"] == ["127.0.0.1:9091:9091"]
+    assert services["otel-collector"]["ports"] == ["127.0.0.1:4317:4317", "127.0.0.1:4318:4318"]
+
+
+def test_pilot_insecure_mode_is_loopback_scoped():
+    """Pilot no-auth mode is acceptable only with loopback ports and local CORS."""
+    import yaml
+
+    path = ROOT / "deploy" / "docker-compose.pilot.yml"
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    api = data["services"]["api"]
+    ui = data["services"]["ui"]
+
+    assert "--allow-insecure-no-auth" in api["command"]
+    assert "--cors-allow-all" not in api["command"]
+    assert "--cors-origins http://localhost:3000,http://127.0.0.1:3000" in api["command"]
+    assert api["ports"] == ["127.0.0.1:8422:8422"]
+    assert ui["ports"] == ["127.0.0.1:3000:3000"]
+
+
+def test_dev_compose_mounts_agent_bom_home_for_abom_user():
+    """Dev compose profiles persist ~/.agent-bom into the abom user home."""
+    import yaml
+
+    for relative in ("deploy/docker-compose.yml", "deploy/docker-compose.fullstack.yml"):
+        data = yaml.safe_load((ROOT / relative).read_text(encoding="utf-8"))
+        services = data["services"]
+        service = services.get("agent-bom") or services.get("api")
+        assert service is not None, relative
+        volumes = service.get("volumes") or []
+        assert "~/.agent-bom:/home/abom/.agent-bom" in volumes, relative
 
 
 # ---------------------------------------------------------------------------
@@ -87,17 +214,6 @@ def test_mcp_registry_entry_valid():
     pkg = data["packages"][0]
     assert pkg["registryType"] == "pypi"
     assert pkg["transport"]["type"] == "stdio"
-
-
-def test_toolhive_entry_valid():
-    """ToolHive entry should be valid JSON with OCI transport."""
-    f = ROOT / "integrations" / "toolhive" / "server.json"
-    assert f.exists()
-    data = json.loads(f.read_text())
-    assert data["name"] == "io.github.msaad00/agent-bom"
-    pkg = data["packages"][0]
-    assert pkg["registryType"] == "oci"
-    assert pkg["identifier"].startswith("ghcr.io/msaad00/agent-bom:")
 
 
 def test_smithery_yaml_exists():
@@ -128,6 +244,8 @@ def test_server_card_has_all_tools():
     assert "scan" in tool_names
     assert "check" in tool_names
     assert "blast_radius" in tool_names
+    assert "exposure_paths" in tool_names
+    assert "should_i_deploy" in tool_names
     assert "policy_check" in tool_names
     assert "registry_lookup" in tool_names
     assert "generate_sbom" in tool_names
@@ -151,18 +269,164 @@ def test_server_card_has_all_tools():
     assert "model_file_scan" in tool_names
 
 
+def test_server_card_tools_expose_capability_classes():
+    """Server card should classify tool capabilities for agents and marketplaces."""
+    from agent_bom.mcp_server import build_server_card
+
+    write_tools = {
+        "shield_start",
+        "shield_unblock",
+        "shield_break_glass",
+        "identity_issue",
+        "identity_rotate",
+        "identity_revoke",
+        "identity_grant_jit",
+        "identity_revoke_jit",
+        "ingest_external_scan",
+        "runtime_evidence_ingest",
+        # Triggers an agentless Azure/GCP disk side-scan: creates then tears down a
+        # temporary snapshot/scan-disk (destructive cloud write, read-only intent).
+        "cloud_side_scan",
+        # access_review recomputes+persists campaign status on read; diff persists
+        # the fresh scan to history and prunes old reports.
+        "access_review",
+        "diff",
+        # Connect-once ITSM ticketing writes: file a ticket / refresh its status
+        # through a stored connection (no per-action credential).
+        "create_ticket",
+        "sync_ticket_status",
+        # Records a triage decision to the exception store (can suppress a
+        # finding); admin-gated findings:write.
+        "findings_triage",
+        # Assigns, tickets, and verifies persisted remediation campaigns.
+        "risk_campaign_workflow",
+    }
+    # Writes that tear down or invalidate state advertise destructiveHint; issuing
+    # an identity or granting access creates state and is non-destructive.
+    # ingest_external_scan mutates the control plane (bulk-ingest + reconcile
+    # resolves absent findings), so it is a destructive write. diff prunes old
+    # saved reports, so it is destructive; access_review's upsert is idempotent.
+    destructive_writes = {
+        "shield_start",
+        "shield_unblock",
+        "shield_break_glass",
+        "identity_revoke",
+        "identity_revoke_jit",
+        "ingest_external_scan",
+        "diff",
+        "create_ticket",
+        "sync_ticket_status",
+        "findings_triage",
+        "risk_campaign_workflow",
+        "cloud_side_scan",
+    }
+    card = build_server_card()
+    for tool in card["tools"]:
+        classes = tool.get("capability_classes")
+        assert isinstance(classes, list), tool["name"]
+        assert classes, tool["name"]
+        if tool["name"] in write_tools:
+            assert "WRITE" in classes, tool["name"]
+            assert tool["annotations"]["readOnlyHint"] is False
+            assert tool["annotations"]["destructiveHint"] is (tool["name"] in destructive_writes), tool["name"]
+        else:
+            assert "READ" in classes, tool["name"]
+            assert tool["annotations"]["readOnlyHint"] is True
+
+
+def test_server_card_exposes_resources_and_workflow_prompts():
+    """Server card should advertise the live resource and prompt catalog."""
+    from agent_bom.mcp_server import build_server_card
+
+    card = build_server_card()
+    resource_uris = {resource["uri"] for resource in card["resources"]}
+    assert "registry://servers" in resource_uris
+    assert "policy://template" in resource_uris
+    assert "metrics://tools" in resource_uris
+    assert "schema://inventory-v1" in resource_uris
+    assert "bestpractices://mcp-hardening" in resource_uris
+    assert "compliance://framework-controls" in resource_uris
+
+    prompt_names = {prompt["name"] for prompt in card["prompts"]}
+    assert "quick-audit" in prompt_names
+    assert "pre-install-check" in prompt_names
+    assert "compliance-report" in prompt_names
+    assert "fleet-audit" in prompt_names
+    assert "incident-triage" in prompt_names
+    assert "remediation-plan" in prompt_names
+    assert "cloud-connection-review" in prompt_names
+    assert "gateway-fleet-live-demo" in prompt_names
+
+
+def test_mcp_docs_match_resource_and_prompt_catalog():
+    """Human MCP docs should stay aligned with the server-card catalog."""
+    from agent_bom.mcp_server import build_server_card
+
+    docs = "\n".join(
+        [
+            (ROOT / "docs" / "MCP_SERVER.md").read_text(),
+            (ROOT / "site-docs" / "getting-started" / "mcp-server.md").read_text(),
+            (ROOT / "site-docs" / "reference" / "mcp-tools.md").read_text(),
+        ]
+    )
+    card = build_server_card()
+    assert "35 security tools" not in docs
+    assert f"{len(card['tools'])} MCP tools" in docs
+    assert "Most tools are read-only" in docs
+    assert "AGENT_BOM_MCP_OPERATOR_TOKEN" in docs
+    write_tools = [tool["name"] for tool in card["tools"] if tool.get("annotations", {}).get("readOnlyHint") is False]
+    assert sorted(write_tools) == [
+        "access_review",
+        "cloud_side_scan",
+        "create_ticket",
+        "diff",
+        "findings_triage",
+        "identity_grant_jit",
+        "identity_issue",
+        "identity_revoke",
+        "identity_revoke_jit",
+        "identity_rotate",
+        "ingest_external_scan",
+        "risk_campaign_workflow",
+        "runtime_evidence_ingest",
+        "shield_break_glass",
+        "shield_start",
+        "shield_unblock",
+        "sync_ticket_status",
+    ]
+    assert f"{len(write_tools)} write-annotated tools" in docs
+    for required_scope in ("cloud:write", "findings:write", "identity:write", "shield:write", "ticketing:write"):
+        assert required_scope in docs
+    for resource in card["resources"]:
+        assert resource["uri"] in docs
+    for prompt in card["prompts"]:
+        assert prompt["name"] in docs
+
+
 def test_server_card_tool_count_matches_decorators():
-    """_SERVER_CARD_TOOLS must list every @mcp.tool in create_mcp_server."""
+    """_SERVER_CARD_TOOLS must list every @mcp.tool across MCP tool surfaces."""
     import inspect
     import re
 
+    from agent_bom import (
+        mcp_server_operator_tools,
+        mcp_server_runtime_catalog,
+        mcp_server_specialized,
+        mcp_server_ticketing_tools,
+    )
     from agent_bom.mcp_server import _SERVER_CARD_TOOLS, create_mcp_server
 
-    source = inspect.getsource(create_mcp_server)
+    source = (
+        inspect.getsource(create_mcp_server)
+        + inspect.getsource(mcp_server_operator_tools)
+        + inspect.getsource(mcp_server_runtime_catalog)
+        + inspect.getsource(mcp_server_specialized)
+        + inspect.getsource(mcp_server_ticketing_tools)
+    )
     decorator_count = len(re.findall(r"@mcp\.tool", source))
     card_count = len(_SERVER_CARD_TOOLS)
     assert card_count == decorator_count, (
-        f"_SERVER_CARD_TOOLS has {card_count} entries but create_mcp_server has {decorator_count} @mcp.tool decorators"
+        f"_SERVER_CARD_TOOLS has {card_count} entries but MCP server surfaces define {decorator_count} @mcp.tool decorators"
     )
 
 
@@ -175,8 +439,11 @@ def test_server_card_capabilities():
     assert "OWASP LLM Top 10" in caps["frameworks"]
     assert "MITRE ATLAS" in caps["frameworks"]
     assert "NIST AI RMF" in caps["frameworks"]
-    assert caps["read_only"] is True
+    assert caps["read_only"] is False
     assert "OSV.dev" in caps["data_sources"]
+    from agent_bom.mcp_server_helpers import get_registry_data
+
+    assert caps["registry_servers"] == int(get_registry_data().get("_total_servers") or 0)
 
 
 def test_server_card_metadata():
@@ -189,6 +456,25 @@ def test_server_card_metadata():
     assert "stdio" in card["transport"]
     assert "sse" in card["transport"]
     assert "github.com/msaad00/agent-bom" in card["repository"]
+    assert card["serverInfo"] == {"name": "agent-bom", "version": card["version"]}
+    assert card["authentication"] == {"required": False, "schemes": []}
+
+
+def test_live_server_card_exposes_exact_mcp_tool_schemas():
+    """Marketplace metadata must use FastMCP's live schemas, not hand-written copies."""
+    from starlette.testclient import TestClient
+
+    from agent_bom.mcp_server import _SERVER_CARD_TOOLS, create_mcp_server
+
+    server = create_mcp_server(bearer_token="test-token")
+    response = TestClient(server.streamable_http_app()).get("/.well-known/mcp/server-card.json")
+
+    assert response.status_code == 200
+    card = response.json()
+    assert card["authentication"] == {"required": True, "schemes": ["bearer"]}
+    assert len(card["tools"]) == len(_SERVER_CARD_TOOLS)
+    assert all(isinstance(tool.get("inputSchema"), dict) for tool in card["tools"])
+    assert all(tool["inputSchema"].get("additionalProperties") is False for tool in card["tools"])
 
 
 def test_root_metadata_fields():
@@ -203,10 +489,10 @@ def test_root_metadata_fields():
 
 
 def test_health_endpoint_fields():
-    """Health check should return name, version, and healthy status."""
+    """Health check contract should expose version and tool-count metadata."""
 
     from agent_bom import __version__
-    from agent_bom.mcp_server import create_mcp_server
+    from agent_bom.mcp_server import _tool_metrics_snapshot, create_mcp_server
 
     create_mcp_server()
     # The routes are registered; verify the build_server_card still works
@@ -215,6 +501,444 @@ def test_health_endpoint_fields():
     card = build_server_card()
     assert card["version"] == __version__
     assert card["name"] == "agent-bom"
+    summary = _tool_metrics_snapshot()["summary"]
+    assert "tool_count" in summary
+
+
+def test_deployment_freshness_workflow_uses_bearer_token_and_parses_tool_count():
+    """Deployment freshness should probe authenticated MCP health endpoints safely."""
+    workflow = (ROOT / ".github" / "workflows" / "deployment-freshness.yml").read_text()
+    assert "RAILWAY_MCP_BEARER_TOKEN" in workflow
+    assert "SMITHERY_SERVER_QUALIFIED_NAME" in workflow
+    assert "api.smithery.ai/servers" in workflow
+    assert "python3 -m agent_bom.deployment_probe" in workflow
+    assert "tool_count" in workflow
+    assert "smithery-oauth" in workflow
+    assert "probe_failed=true" in workflow
+    assert "steps.railway.outputs.probe_failed != 'true'" in workflow
+    assert "--server-card" in workflow
+
+
+def test_deployment_freshness_targets_exact_published_server_card_contract():
+    """Unreleased main and same-version tool drift must not blur deployment truth."""
+    workflow = (ROOT / ".github" / "workflows" / "deployment-freshness.yml").read_text()
+
+    assert "Get expected contract from latest published release" in workflow
+    assert "repos/$GITHUB_REPOSITORY/releases/latest" in workflow
+    assert 'git show "${RELEASE_SHA}:docs/PRODUCT_METRICS.json"' in workflow
+    assert 'select(.name == "MCP tools")' in workflow
+    assert "--server-card" in workflow
+    assert '--expected-version "${{ steps.expected.outputs.version }}"' in workflow
+    assert '--expected-tool-count "${{ steps.expected.outputs.tool_count }}"' in workflow
+    assert "steps.railway.outputs.probe_failed == 'true'" in workflow
+
+
+def test_deployment_freshness_uses_a_version_stable_issue_identity():
+    """A clean release must close deployment alerts opened by an older version."""
+    workflow = (ROOT / ".github" / "workflows" / "deployment-freshness.yml").read_text()
+
+    assert 'TITLE="supply-chain-drift: deployment surfaces out of sync"' in workflow
+    assert 'LEGACY_TITLE_PREFIX="${TITLE} with "' in workflow
+    assert workflow.count("startswith($legacy)") == 2
+    assert 'TITLE="supply-chain-drift: deployment surfaces out of sync with $EXPECTED"' not in workflow
+
+
+def test_surface_freshness_targets_the_latest_published_release():
+    """Unreleased source versions must not create distribution drift alerts."""
+    workflow = (ROOT / ".github" / "workflows" / "surface-freshness.yml").read_text()
+
+    assert "Get expected version from latest published release" in workflow
+    assert "repos/$GITHUB_REPOSITORY/releases/latest" in workflow
+    assert "EXPECTED_VERSION: ${{ steps.expected.outputs.version }}" in workflow
+    assert '--expected "$EXPECTED_VERSION"' in workflow
+    # One shipped tool inventory, so one expectation, fed to every surface that
+    # advertises a tool list. The Glama-specific spelling this used to pin is
+    # still accepted by the script as an alias.
+    assert '--expected-tool-count "${{ steps.expected.outputs.tool_count }}"' in workflow
+    assert 'git show "${RELEASE_SHA}:docs/PRODUCT_METRICS.json"' in workflow
+    assert 'select(.name == "MCP tools")' in workflow
+    assert 'METRICS_VERSION" != "$VERSION"' in workflow
+    assert "persist-credentials: false" in workflow
+    assert "Expected version from published release" in workflow
+
+
+def test_docs_workflow_never_deploys_pages_from_release_tags():
+    """Release tags may build docs, but Pages deploy is protected to main only."""
+    workflow = (ROOT / ".github" / "workflows" / "docs.yml").read_text()
+    assert "github.ref == 'refs/heads/main'" in workflow
+    assert "inputs.deploy == true" in workflow
+    assert "actions/deploy-pages" in workflow
+
+
+def test_release_registry_gate_is_deterministic_without_live_sync():
+    """Tag releases should not mutate the bundled registry from live catalogs."""
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+    release_check = (ROOT / "scripts" / "check_release_consistency.py").read_text()
+    assert "agent-bom registry status --stale-after-days 14 --fail-on-stale" in workflow
+    assert "dumps_registry_json" in workflow
+    assert "dumps_registry_json" in release_check
+    assert "canonical registry " in release_check
+    assert "serialization. Run the registry formatter before tagging." in release_check
+    assert "agent-bom registry sync-all" not in workflow
+
+
+def test_mcp_registry_sync_canonicalizes_generated_json():
+    """Scheduled registry updates must satisfy the release serialization gate."""
+    workflow = (ROOT / ".github" / "workflows" / "mcp-registry-sync.yml").read_text()
+    assert "Canonicalize registry serialization" in workflow
+    assert "from agent_bom.mcp_registry_text import dumps_registry_json" in workflow
+    assert "registry_path.write_text(dumps_registry_json(registry)" in workflow
+
+
+def test_release_consistency_checks_generated_data_model_atlas():
+    """The fast release gate should catch stale DATA_MODEL atlas counts before matrix tests."""
+    release_check = (ROOT / "scripts" / "check_release_consistency.py").read_text()
+    assert "_assert_data_model_atlas_current" in release_check
+    assert "scripts/regenerate_data_model_atlas.py" in release_check
+    assert "--check" in release_check
+
+
+def test_release_verifies_pypi_provenance_for_each_published_file():
+    """The release workflow should fail if any uploaded PyPI file lacks provenance."""
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+    assert "Verify PyPI provenance attestations" in workflow
+    assert "https://pypi.org/integrity/{project}/{version}/{encoded_filename}/provenance" in workflow
+    assert 'headers = {"Accept": "application/vnd.pypi.integrity.v1+json"}' in workflow
+    assert 'Path("dist").iterdir()' in workflow
+    assert 'path.suffix in {".whl", ".gz"}' in workflow
+    assert "attestation_bundles" in workflow
+    assert "Missing PyPI provenance attestations" in workflow
+
+
+def test_release_package_verifies_dashboard_csp_hash_manifest():
+    """Release wheels should not ship packaged dashboard fallback CSP accidentally."""
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+    assert "agent_bom/ui_dist/csp-hashes.json" in workflow
+    assert 'csp_manifest.get("script_hashes")' in workflow
+    assert "packaged UI would fall back to unsafe-inline" in workflow
+
+
+def test_security_scan_npm_installs_use_network_retries():
+    """Each audited npm install tolerates resets; the JS guard reuses SDK deps."""
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    install_count = workflow.count("npm ci --ignore-scripts")
+    assert install_count == 2  # UI + SDK audits; the supply-chain guard reuses SDK's tree.
+    assert workflow.count("npm config set fetch-retries 5") == install_count
+    assert workflow.count("npm config set fetch-retry-mintimeout 20000") == install_count
+    assert workflow.count("npm config set fetch-retry-maxtimeout 120000") == install_count
+    assert "preceding SDK audit step installed this exact lockfile" in workflow
+
+
+def test_postgres_ci_upgrade_checks_preserved_queue_through_scoped_maintenance_role():
+    """FORCE RLS must not make the migration-preservation assertion self-contradictory."""
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    assert ("export AGENT_BOM_POSTGRES_MAINTENANCE_URL='postgresql://agent_bom_maintenance@127.0.0.1:5432/agentbom_migration'") in workflow
+    assert (
+        "PGPASSWORD=maintenancepass PGOPTIONS='-c app.bypass_rls=1' psql -h 127.0.0.1 -U agent_bom_maintenance -d agentbom_migration"
+    ) in workflow
+    assert (
+        "PGPASSWORD=migrationpass psql -h 127.0.0.1 "
+        "-U agentbom_migration_owner -d agentbom_migration -Atc "
+        '"SELECT count(*) FROM scan_dispatch_queue'
+    ) not in workflow
+
+
+def test_publish_registries_workflow_validates_smithery_best_effort_and_curated_clawhub_set():
+    """Smithery publishing must never use Smithery's proxy as its upstream."""
+    workflow = (ROOT / ".github" / "workflows" / "publish-registries.yml").read_text()
+    assert "SMITHERY_MCP_URL" in workflow
+    assert "server.smithery.ai" in workflow
+    assert "avoid publishing the proxy back to itself" in workflow
+    # The Smithery probe no longer hard-fails the publish on async rebuild lag.
+    assert "--forbid-auth-required" not in workflow
+    assert "continue-on-error: true" in workflow
+    assert "integrations/openclaw/scan" in workflow
+    assert "integrations/openclaw/compliance" in workflow
+    assert "integrations/openclaw/registry" in workflow
+    assert "integrations/openclaw/runtime" in workflow
+    assert "integrations/openclaw/discover-aws" in workflow
+    assert "integrations/openclaw/discover-azure" in workflow
+    assert "integrations/openclaw/discover-gcp" in workflow
+    assert "integrations/openclaw/discover-snowflake" in workflow
+    assert "integrations/openclaw/ingest" in workflow
+    assert "integrations/openclaw/vulnerability-intel" in workflow
+    assert '_publish_skill "integrations/openclaw" "agent-bom"' not in workflow
+    assert 'git fetch --no-tags --depth=1 origin "$RELEASE_SHA"' in workflow
+    assert 'check_glama_listing.py --verify-manifest --git-ref "${{ needs.release.outputs.release_sha }}"' in workflow
+    # Privileged workflow_run jobs may never check out a data-derived ref. The
+    # ClawHub job stages regular-file assets from the verified release object
+    # without executing or checking out that tree.
+    assert "ref: ${{ needs.release.outputs.release_sha }}" not in workflow
+    assert workflow.count("ref: ${{ github.event.repository.default_branch }}") == 4
+    assert workflow.count("persist-credentials: false") == 4
+    assert "Stage exact release ClawHub assets" in workflow
+    assert 'git ls-tree -r "$RELEASE_SHA" -- integrations/openclaw' in workflow
+    assert 'git archive --format=tar "$RELEASE_SHA" -- integrations/openclaw' in workflow
+    assert "Only regular, non-executable release assets may be published to ClawHub" in workflow
+    assert "${CLAWHUB_RELEASE_ROOT}/integrations/openclaw/scan" in workflow
+    assert "RUN_EVENT: ${{ github.event.workflow_run.event }}" in workflow
+    assert "RUN_REPOSITORY: ${{ github.event.workflow_run.repository.full_name }}" in workflow
+    assert 'git merge-base --is-ancestor "$RELEASE_SHA" "origin/$DEFAULT_BRANCH"' in workflow
+    assert "Release workflow must be a same-repository tag push" in workflow
+    assert "workflow_run.head_sha || github.ref" not in workflow
+    assert "actions: read" in workflow
+    assert "jq -n" in workflow
+    assert "dockerfile: $dockerfile" in workflow
+
+
+def test_publish_registries_manual_repair_resolves_latest_release_only():
+    """Manual repair cannot fan out an older release to other registries."""
+    workflow = (ROOT / ".github" / "workflows" / "publish-registries.yml").read_text()
+
+    assert "Resolve published release" in workflow
+    assert "repos/${GITHUB_REPOSITORY}/releases/latest" in workflow
+    assert "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" in workflow
+    assert workflow.count("needs: release") == 3
+    assert "release_tag:" not in workflow
+    assert "REQUESTED_TAG" not in workflow
+    assert "releases/tags/${REQUESTED_TAG}" not in workflow
+    assert "GITHUB_REF_NAME" not in workflow
+    assert "VERSION=$(grep '^version' pyproject.toml" not in workflow
+
+
+def test_publish_registries_uses_release_metrics_for_glama_and_clawhub_assets():
+    """Current checker code must evaluate exact release evidence and assets."""
+    workflow = (ROOT / ".github" / "workflows" / "publish-registries.yml").read_text()
+
+    assert "tool_count: ${{ steps.release.outputs.tool_count }}" in workflow
+    assert 'git show "${RELEASE_SHA}:docs/PRODUCT_METRICS.json"' in workflow
+    assert 'METRICS_VERSION" != "$VERSION"' in workflow
+    assert 'select(.name == "MCP tools")' in workflow
+    assert "EXPECTED_TOOL_COUNT: ${{ needs.release.outputs.tool_count }}" in workflow
+    assert '--expected-tool-count "$EXPECTED_TOOL_COUNT"' in workflow
+    assert "ref: ${{ needs.release.outputs.release_sha }}" not in workflow
+    assert 'git archive --format=tar "$RELEASE_SHA" -- integrations/openclaw' in workflow
+
+
+def test_glama_rebuild_webhook_is_secret_and_missing_secret_is_honest():
+    """A missing webhook must not leak a URL or claim a rebuild happened."""
+    workflow = (ROOT / ".github" / "workflows" / "publish-registries.yml").read_text()
+
+    assert "GLAMA_WEBHOOK_URL: ${{ secrets.GLAMA_WEBHOOK_URL }}" in workflow
+    assert "GLAMA_WEBHOOK_URL: ${{ vars.GLAMA_WEBHOOK_URL }}" not in workflow
+    assert "id: glama_trigger" in workflow
+    assert 'echo "rebuild_triggered=false" >> "$GITHUB_OUTPUT"' in workflow
+    assert "No Glama rebuild was triggered" in workflow
+    assert "set GLAMA_WEBHOOK_URL as a repository Actions secret" in workflow
+    assert "REBUILD_TRIGGERED: ${{ steps.glama_trigger.outputs.rebuild_triggered }}" in workflow
+    assert 'if [ "$REBUILD_TRIGGERED" = "true" ]; then' in workflow
+    assert 'HTTP_STATUS" -lt 300' in workflow
+    assert 'HTTP_STATUS" -lt 400' not in workflow
+    # The gate reads the operator's stated intent, not merely that the run was
+    # dispatched. Gating on event_name made every manual re-publish a "repair",
+    # so an unconfigured optional webhook failed the whole multi-registry run
+    # and blocked releases (#4651). Repair is now opt-in.
+    assert "GLAMA_REPAIR: ${{ inputs.glama_repair }}" in workflow
+    assert 'if [ "$GLAMA_REPAIR" = "true" ]; then' in workflow
+    assert "::error::Requested Glama repair" in workflow
+    assert "exit 1" in workflow
+
+
+def test_smithery_publish_is_gated_on_server_card_and_catalog_parity():
+    """A 202 response alone must not be reported as a fresh marketplace listing."""
+    workflow = (ROOT / ".github" / "workflows" / "publish-registries.yml").read_text()
+
+    assert "Validate Smithery public server card" in workflow
+    assert "(.tools | length) == $tool_count" in workflow
+    assert '(.inputSchema | type == "object")' in workflow
+    assert "Wait for Smithery release" in workflow
+    # The terminal statuses are split deliberately (#4687). Our MCP endpoint
+    # authenticates every request by design and the published configSchema marks
+    # `bearerToken` required, so Smithery's scanner CANNOT enumerate our tools
+    # and settles the release as AUTH_REQUIRED. The release itself succeeded;
+    # only the optional post-publish scan did not. Treating that as fatal failed
+    # every release and auto-opened a release-blocker for a server that had in
+    # fact published.
+    assert "AUTH_REQUIRED|AUTH_TIMEOUT" in workflow, "auth statuses must be handled as their own non-fatal case"
+    assert "FAILURE|FAILURE_SCAN|CANCELLED|INTERNAL_ERROR" in workflow, "real failures must still fail the job"
+    # Guard the split itself: if AUTH_REQUIRED is ever folded back in with the
+    # fatal statuses, releases start failing again for a publish that worked.
+    assert "FAILURE_SCAN|AUTH_REQUIRED" not in workflow, "AUTH_REQUIRED must not be grouped with the fatal statuses"
+    assert "Verify Smithery catalog inventory" in workflow
+    assert 'if [ "$ACTUAL" = "$EXPECTED_TOOL_COUNT" ]; then' in workflow
+
+
+def test_refresh_latest_container_keeps_release_code_but_applies_runtime_security_overlay():
+    """Daily latest refresh can patch runtime CVEs without changing app code."""
+    workflow = (ROOT / ".github" / "workflows" / "refresh-latest-container.yml").read_text()
+
+    assert "main_sha=$MAIN_SHA" in workflow
+    assert 'git checkout "$TAG"' in workflow
+    assert "Apply current runtime security overlay" in workflow
+    assert 'git checkout "${{ steps.release.outputs.main_sha }}" -- \\' in workflow
+    assert "Dockerfile \\" in workflow
+    assert "deploy/docker/pip-requirements.txt \\" in workflow
+    assert "deploy/docker/runtime-security-requirements.txt \\" in workflow
+    assert ".image-scan-ignore \\" in workflow
+    assert "security/image-exceptions.yaml" in workflow
+    assert "The application code and version stay pinned to the latest release tag" in workflow
+
+
+def test_refresh_latest_container_has_publish_budget_and_buildkit_cache():
+    """Daily latest refresh should not rebuild multi-arch images from cold every run."""
+    workflow = (ROOT / ".github" / "workflows" / "refresh-latest-container.yml").read_text()
+
+    assert workflow.count("timeout-minutes: 30") >= 2
+    assert "cache-from: type=gha,scope=refresh-api-latest" in workflow
+    assert "cache-to: type=gha,mode=max,scope=refresh-api-latest" in workflow
+    assert "cache-from: type=gha,scope=refresh-ui-latest" in workflow
+    assert "cache-to: type=gha,mode=max,scope=refresh-ui-latest" in workflow
+
+
+def test_deploy_mcp_sse_workflow_uses_bearer_token_for_health_check():
+    """Post-deploy health verification should use the same auth contract as Railway."""
+    workflow = (ROOT / ".github" / "workflows" / "deploy-mcp-sse.yml").read_text()
+    assert "RAILWAY_MCP_BEARER_TOKEN" in workflow
+    assert "python3 -m agent_bom.deployment_probe" in workflow
+    assert "--attempts 5" in workflow
+
+
+def test_deploy_mcp_sse_fails_closed_on_exact_release_server_card_drift():
+    """A release deploy is green only when version, tool count, and schemas match."""
+    workflow = (ROOT / ".github" / "workflows" / "deploy-mcp-sse.yml").read_text()
+
+    assert 'METRICS_JSON=$(git show "HEAD:docs/PRODUCT_METRICS.json")' in workflow
+    assert 'select(.name == "MCP tools")' in workflow
+    assert "repo_tool_count=$TOOL_COUNT" in workflow
+    assert "--server-card" in workflow
+    assert '--expected-version "$repo_version"' in workflow
+    assert '--expected-tool-count "$repo_tool_count"' in workflow
+    assert "Could not verify deployed version" not in workflow
+
+
+def test_dockerfiles_support_proxy_and_ca_contract():
+    """Maintained Docker images should support standard proxy and CA env vars."""
+    dockerfiles = [
+        ROOT / "Dockerfile",
+        ROOT / "deploy" / "docker" / "Dockerfile.mcp",
+        ROOT / "deploy" / "docker" / "Dockerfile.sse",
+        ROOT / "deploy" / "docker" / "Dockerfile.runtime",
+        ROOT / "deploy" / "docker" / "Dockerfile.snowpark",
+    ]
+    required_tokens = [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "PIP_CERT",
+        "ca-certificates",
+    ]
+    for dockerfile in dockerfiles:
+        content = dockerfile.read_text()
+        for token in required_tokens:
+            assert token in content, f"{dockerfile.name} missing {token}"
+
+
+def test_primary_api_image_includes_snowflake_extra_for_snowflake_backend():
+    """The default API image must bake in Snowflake, Postgres, and cloud BYOC extras.
+
+    The extras are driven by the ``AGENT_BOM_EXTRAS`` build-arg whose default must
+    include the cloud SDKs so self-hosted AWS/Azure/GCP BYOC works out of the box
+    (#3832); the install line must consume that arg.
+    """
+    content = (ROOT / "Dockerfile").read_text()
+    assert "ARG AGENT_BOM_EXTRAS=api,snowflake,postgres,aws,azure,gcp" in content
+    assert "COPY --from=ghcr.io/astral-sh/uv:0.10.9@sha256:" in content
+    assert "COPY pyproject.toml uv.lock README.md PYPI_README.md LICENSE ./" in content
+    assert "uv sync --locked --no-dev --no-editable" in content
+    assert "COPY --from=builder /app/.venv /app/.venv" in content
+    assert 'pip install --no-cache-dir --prefix=/install ".[${AGENT_BOM_EXTRAS}]"' not in content
+
+
+def test_runtime_dockerfile_builds_from_repo_source():
+    """Runtime image should install agent-bom from the checked-out source tree, not PyPI."""
+    content = (ROOT / "deploy" / "docker" / "Dockerfile.runtime").read_text()
+    assert "COPY pyproject.toml uv.lock README.md PYPI_README.md LICENSE ./" in content
+    assert "COPY src/ ./src/" in content
+    assert "uv sync --locked --no-dev --no-editable --extra runtime" in content
+    assert "COPY --from=builder /app/.venv /app/.venv" in content
+    assert "agent-bom==${VERSION}" not in content
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        ROOT / "deploy" / "docker" / "Dockerfile.mcp",
+        ROOT / "deploy" / "docker" / "Dockerfile.runtime",
+        ROOT / "deploy" / "docker" / "Dockerfile.snowpark",
+        ROOT / "deploy" / "docker" / "Dockerfile.sse",
+        ROOT / "integrations" / "glama" / "Dockerfile",
+    ],
+)
+def test_maintained_python_images_install_project_from_reviewed_lock(dockerfile):
+    """Every maintained project image must reproduce the reviewed Python graph."""
+    content = dockerfile.read_text()
+    assert "COPY --from=ghcr.io/astral-sh/uv:0.10.9@sha256:" in content
+    assert "uv.lock" in content
+    assert "uv sync --locked --no-dev --no-editable" in content
+    assert "COPY --from=builder /app/.venv /app/.venv" in content
+    assert "pip install --no-cache-dir --prefix=/install" not in content
+
+
+def test_compose_examples_pass_through_proxy_and_ca_env():
+    """Compose examples should expose the same enterprise network env contract."""
+    compose_files = [
+        ROOT / "deploy" / "docker-compose.yml",
+        ROOT / "deploy" / "docker-compose.runtime-example.yml",
+    ]
+    required_tokens = [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "PIP_CERT",
+    ]
+    for compose_file in compose_files:
+        content = compose_file.read_text()
+        for token in required_tokens:
+            assert token in content, f"{compose_file.name} missing {token}"
+
+
+def test_eks_snowflake_values_use_supported_chart_keys():
+    """Snowflake EKS profile should render with keys the Helm chart actually consumes."""
+    import yaml
+
+    values = yaml.safe_load((ROOT / "deploy" / "helm" / "agent-bom" / "examples" / "eks-snowflake-values.yaml").read_text())
+    api = values["controlPlane"]["api"]
+    assert "extraVolumeMounts" in api
+    assert "extraVolumes" in api
+    assert "volumeMounts" not in api
+    assert "volumes" not in api
+    assert api["extraVolumeMounts"][0]["mountPath"] == "/var/snowflake"
+    assert api["extraVolumes"][0]["secret"]["secretName"] == "agent-bom-snowflake"
+
+    assert "scanCronJob" not in values["controlPlane"]
+    assert values["scanner"]["enabled"] is True
+    assert "--push-url" in values["scanner"]["extraArgs"]
+    assert "http://agent-bom-api.agent-bom.svc.cluster.local:8422/v1/fleet/sync" in values["scanner"]["extraArgs"]
+
+    assert "networkPolicy" not in values["controlPlane"]
+    assert values["networkPolicy"]["enabled"] is True
+    assert values["networkPolicy"]["restrictIngress"] is True
+    assert values["networkPolicy"]["additionalEgress"][0]["ports"][0]["port"] == 443
+
+
+def test_eks_pilot_doc_matches_chart_secret_and_service_port():
+    """The pilot runbook should match the values file and the actual API service port."""
+    doc = (ROOT / "site-docs" / "deployment" / "eks-mcp-pilot.md").read_text()
+    assert "kubectl -n agent-bom create secret generic agent-bom-control-plane" in doc
+    assert "controlPlane.externalSecrets" in doc
+    assert '--from-literal=AGENT_BOM_API_KEYS="${API_KEY}:admin"' in doc
+    assert "--from-literal=AGENT_BOM_API_KEY=" not in doc
+    assert "AGENT_BOM_BROWSER_SESSION_SIGNING_KEY" in doc
+    assert "AGENT_BOM_CONNECTIONS_KEY" in doc
+    assert "8080:8422" in doc
+    assert "/v1/compliance/owasp-llm/report" in doc
+    assert "/v1/compliance/soc2/report" not in doc
 
 
 # ---------------------------------------------------------------------------
@@ -222,15 +946,18 @@ def test_health_endpoint_fields():
 # ---------------------------------------------------------------------------
 
 
-def test_mcp_server_help_shows_14_tools():
-    """MCP server help should mention 14 tools."""
+def test_mcp_server_help_shows_skill_tools():
+    """MCP server help should mention the expanded skill tool surface."""
     from click.testing import CliRunner
 
     from agent_bom.cli import main
+    from agent_bom.mcp_server import _SERVER_CARD_TOOLS
 
     runner = CliRunner()
-    result = runner.invoke(main, ["mcp-server", "--help"])
-    assert "32 security tools" in result.output
+    result = runner.invoke(main, ["mcp", "server", "--help"])
+    assert f"{len(_SERVER_CARD_TOOLS)} security tools" in result.output
+    assert "skill_scan" in result.output
+    assert "skill_verify" in result.output
     assert "compliance" in result.output
     assert "remediate" in result.output
 
@@ -256,3 +983,49 @@ def test_deploy_sse_workflow_exists():
     """deploy-mcp-sse.yml should exist."""
     f = ROOT / ".github" / "workflows" / "deploy-mcp-sse.yml"
     assert f.exists()
+
+
+def test_mcp_registry_has_source_metadata():
+    """mcp_registry.json must declare its feed sources."""
+    f = ROOT / "src" / "agent_bom" / "mcp_registry.json"
+    assert f.exists(), "mcp_registry.json is missing"
+    data = json.loads(f.read_text())
+    assert "_sources" in data, "mcp_registry.json is missing '_sources' key"
+    assert "mcp-official" in data["_sources"], f"'mcp-official' not in _sources: {data['_sources']}"
+
+
+def test_mcp_registry_descriptions_are_bounded():
+    """Bundled registry descriptions stay safe for catalog/UI consumers."""
+    from agent_bom.mcp_registry_text import MCP_REGISTRY_DESCRIPTION_MAX_CHARS
+
+    f = ROOT / "src" / "agent_bom" / "mcp_registry.json"
+    data = json.loads(f.read_text())
+    too_long = [
+        (name, len(str(entry.get("description", ""))))
+        for name, entry in data.get("servers", {}).items()
+        if len(str(entry.get("description", ""))) > MCP_REGISTRY_DESCRIPTION_MAX_CHARS
+    ]
+    assert not too_long, f"registry descriptions exceed {MCP_REGISTRY_DESCRIPTION_MAX_CHARS} chars: {too_long[:5]}"
+
+
+def test_smithery_release_declares_the_upstream_credential():
+    """Smithery cannot enumerate an endpoint it has no credential for.
+
+    The agent-bom MCP endpoint authenticates every request. Smithery reads the
+    public server card (which advertises all 77 tools) but its live connection
+    401s, so the release settles as ``AUTH_REQUIRED`` and the public catalog
+    listed 36 of 77 — the tools it could reach without one.
+
+    Publishing the credential requirement in ``configSchema`` is what lets a
+    connection be established with a scoped, revocable token instead of opening
+    the endpoint anonymously.
+    """
+    workflow = (ROOT / ".github" / "workflows" / "publish-registries.yml").read_text()
+
+    assert "bearerToken" in workflow, "the release must declare the upstream credential"
+    assert '\\"required\\": [\\"bearerToken\\"]' in workflow, (
+        "the token must be required — an optional credential leaves the catalog "
+        "enumerating anonymously, which is the state that produced 36 of 77 tools"
+    )
+    # The endpoint must never be published as open in place of supplying a token.
+    assert "--allow-insecure-no-auth" not in workflow

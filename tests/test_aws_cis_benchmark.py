@@ -235,26 +235,42 @@ class TestCheck110:
 
 class TestCheck112:
     def test_pass_no_stale(self):
+        recent_use = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         client = _iam_client()
         client.generate_credential_report.return_value = {"State": "COMPLETE"}
         client.get_credential_report.return_value = {
             "Content": (
                 "user,password_last_used,access_key_1_last_used_date,access_key_2_last_used_date\n"
                 "<root_account>,N/A,N/A,N/A\n"
-                "alice,2026-03-01T00:00:00+00:00,N/A,N/A\n"
+                f"alice,{recent_use},N/A,N/A\n"
+            ).encode()
+        }
+        result = _check_1_12(client)
+        assert result.status == CheckStatus.PASS
+
+    def test_pass_on_45_day_boundary(self):
+        boundary_use = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+        client = _iam_client()
+        client.generate_credential_report.return_value = {"State": "COMPLETE"}
+        client.get_credential_report.return_value = {
+            "Content": (
+                "user,password_last_used,access_key_1_last_used_date,access_key_2_last_used_date\n"
+                "<root_account>,N/A,N/A,N/A\n"
+                f"alice,{boundary_use},N/A,N/A\n"
             ).encode()
         }
         result = _check_1_12(client)
         assert result.status == CheckStatus.PASS
 
     def test_fail_stale_user(self):
+        stale_use = (datetime.now(timezone.utc) - timedelta(days=46)).isoformat()
         client = _iam_client()
         client.generate_credential_report.return_value = {"State": "COMPLETE"}
         client.get_credential_report.return_value = {
             "Content": (
                 "user,password_last_used,access_key_1_last_used_date,access_key_2_last_used_date\n"
                 "<root_account>,N/A,N/A,N/A\n"
-                "stale-bob,2020-01-01T00:00:00+00:00,N/A,N/A\n"
+                f"stale-bob,{stale_use},N/A,N/A\n"
             ).encode()
         }
         result = _check_1_12(client)
@@ -543,6 +559,8 @@ class TestCheck52:
         result = _check_5_2(client)
         assert result.status == CheckStatus.FAIL
         assert "sg-bad" in result.evidence
+        # Structured network exposure (open port/CIDR) for the graph, not just text.
+        assert result.network_exposure == [{"resource": "sg-bad", "from_port": 22, "to_port": 22, "protocol": "tcp", "scope": "internet"}]
 
     def test_fail_rdp_ipv6_open(self):
         client = MagicMock()
@@ -2275,6 +2293,17 @@ class TestCheck416:
         result = _check_4_16(client)
         assert result.status == CheckStatus.ERROR
 
+    def test_subscription_required_is_actionable_fail(self):
+        # SubscriptionRequiredException means Security Hub is simply not enabled —
+        # render an actionable FAIL, not an opaque ERR.
+        client = MagicMock()
+        exc = Exception("SubscriptionRequiredException")
+        exc.response = {"Error": {"Code": "SubscriptionRequiredException"}}
+        client.describe_hub.side_effect = exc
+        result = _check_4_16(client)
+        assert result.status == CheckStatus.FAIL
+        assert "enable it to evaluate this control" in result.evidence
+
 
 # ---------------------------------------------------------------------------
 # 5.5 — No security groups allow unrestricted ingress to all ports
@@ -2536,3 +2565,52 @@ class TestRunBenchmark:
             report = run_benchmark(checks=["1.4", "1.5"])
             assert report.total == 2
             assert {c.check_id for c in report.checks} == {"1.4", "1.5"}
+
+    def test_error_path_titles_are_own_descriptors_not_verbatim_cis(self):
+        """Copyright guard for the AWS error path.
+
+        On a boto3 failure ``_run_check`` derives the check title from the
+        function docstring via ``_extract_title``. That title is emitted as
+        ``CISCheckResult.title``, so the docstring must carry agent-bom's own
+        descriptor keyed to the CIS check id — never the verbatim (copyrighted)
+        official CIS Foundations Benchmark title. This drives every check onto
+        the error path and asserts no emitted title reproduces the CIS
+        "Ensure ..." house style or a known verbatim title.
+        """
+
+        class _RaisingClient:
+            def __getattr__(self, _name):
+                def _raise(*_a, **_k):
+                    raise RuntimeError("forced failure")
+
+                return _raise
+
+        modules_patch, mock_boto3 = _mock_boto3_modules()
+        with modules_patch:
+            mock_session = MagicMock()
+            mock_boto3.Session.return_value = mock_session
+            mock_session.region_name = "us-east-1"
+
+            mock_sts = MagicMock()
+            mock_sts.get_caller_identity.return_value = {"Account": "123"}
+
+            def client_factory(service, **_kwargs):
+                if service == "sts":
+                    return mock_sts
+                return _RaisingClient()
+
+            mock_session.client.side_effect = client_factory
+
+            report = run_benchmark()
+
+        assert report.total == 60
+        # The forced failures must actually exercise the error path.
+        assert sum(1 for c in report.checks if c.status == CheckStatus.ERROR) >= 50
+        offenders = [c.title for c in report.checks if c.title.lower().startswith("ensure ")]
+        assert not offenders, f"AWS error-path titles leak verbatim CIS text: {offenders}"
+        forbidden = {
+            "Ensure MFA is enabled for the root user account",
+            "Ensure no root user account access key exists",
+            "Maintain current contact details",
+        }
+        assert not (forbidden & {c.title for c in report.checks})

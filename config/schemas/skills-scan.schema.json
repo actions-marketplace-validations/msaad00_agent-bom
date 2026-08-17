@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-bom.github.io/schemas/skills-scan/v1",
+  "title": "agent-bom Skills Scan Schema v1",
+  "description": "Structured output format for `agent-bom skills scan`.",
+  "type": "object",
+  "required": [
+    "$schema",
+    "schema_version",
+    "report_type",
+    "generated_at",
+    "summary",
+    "files"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "const": "https://agent-bom.github.io/schemas/skills-scan/v1"
+    },
+    "schema_version": {
+      "type": "string",
+      "const": "1"
+    },
+    "report_type": {
+      "type": "string",
+      "const": "skills_scan"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "catalog_path": {
+      "type": "string"
+    },
+    "policy": {
+      "type": "object",
+      "description": "Present when CI gating (--ci / --fail-on-verdict / --warn-on-verdict / --policy) is active.",
+      "required": ["status", "warnings", "violations", "suppressions_applied"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["pass", "warn", "fail"]
+        },
+        "policy_path": { "type": "string" },
+        "warnings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/policyDecision" }
+        },
+        "violations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/policyDecision" }
+        },
+        "suppressions_applied": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "files_scanned",
+        "bundles",
+        "bundled_files",
+        "packages_found",
+        "servers_found",
+        "credential_env_vars",
+        "findings",
+        "verified_files",
+        "suspicious_files",
+        "malicious_files",
+        "blocked_files",
+        "high_risk_files",
+        "clean_files",
+        "suspicious_status_files",
+        "malicious_status_files",
+        "pending_status_files",
+        "unavailable_status_files"
+      ],
+      "properties": {
+        "files_scanned": { "type": "integer", "minimum": 0 },
+        "bundles": { "type": "integer", "minimum": 0 },
+        "bundled_files": { "type": "integer", "minimum": 0 },
+        "packages_found": { "type": "integer", "minimum": 0 },
+        "servers_found": { "type": "integer", "minimum": 0 },
+        "credential_env_vars": { "type": "integer", "minimum": 0 },
+        "findings": { "type": "integer", "minimum": 0 },
+        "verified_files": { "type": "integer", "minimum": 0 },
+        "suspicious_files": { "type": "integer", "minimum": 0 },
+        "malicious_files": { "type": "integer", "minimum": 0 },
+        "blocked_files": { "type": "integer", "minimum": 0 },
+        "high_risk_files": { "type": "integer", "minimum": 0 },
+        "clean_files": { "type": "integer", "minimum": 0 },
+        "suspicious_status_files": { "type": "integer", "minimum": 0 },
+        "malicious_status_files": { "type": "integer", "minimum": 0 },
+        "pending_status_files": { "type": "integer", "minimum": 0 },
+        "unavailable_status_files": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "path",
+          "status",
+          "bundle",
+          "packages",
+          "servers",
+          "credential_env_vars",
+          "audit",
+          "trust",
+          "provenance",
+          "threat_intel"
+        ],
+        "properties": {
+          "path": { "type": "string" },
+          "status": { "type": "string" },
+          "bundle": { "type": "object" },
+          "packages": { "type": "array" },
+          "servers": { "type": "array" },
+          "credential_env_vars": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "audit": { "type": "object" },
+          "trust": {
+            "type": "object",
+            "properties": {
+              "skill_name": { "type": "string" },
+              "source_file": { "type": "string" },
+              "verdict": {
+                "type": "string",
+                "enum": ["benign", "suspicious", "malicious"]
+              },
+              "content_verdict": {
+                "type": "string",
+                "enum": ["benign", "suspicious", "malicious"]
+              },
+              "provenance_verdict": {
+                "type": "string",
+                "enum": ["verified", "unverified"]
+              },
+              "review_verdict": {
+                "type": "string",
+                "enum": ["trusted", "review", "high_risk", "blocked"]
+              },
+              "overall_recommendation": {
+                "type": "string",
+                "enum": ["trusted", "review", "high_risk", "blocked"]
+              },
+              "confidence": {
+                "type": "string",
+                "enum": ["high", "medium", "low"]
+              },
+              "categories": { "type": "array" },
+              "recommendations": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "review_reasons": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "reviewer_guidance": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "publisher_guidance": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            },
+            "additionalProperties": true
+          },
+          "provenance": { "type": "object" },
+          "threat_intel": {
+            "oneOf": [
+              { "type": "object" },
+              { "type": "null" }
+            ]
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "policyDecision": {
+      "type": "object",
+      "required": ["action", "reason", "path"],
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["warn", "fail"]
+        },
+        "reason": { "type": "string" },
+        "path": { "type": "string" },
+        "rule_id": { "type": "string" },
+        "category": { "type": "string" },
+        "severity": { "type": "string" },
+        "fingerprint": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

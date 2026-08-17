@@ -10,6 +10,8 @@ import base64
 import hashlib
 import json as _json
 import logging
+import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
@@ -24,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 # npm registry provides shasum (SHA-1) and integrity (SHA-512 SRI) in dist metadata
 # PyPI provides sha256 digests in the JSON API
+_DEFAULT_COSIGN_CERTIFICATE_IDENTITY_REGEXP = r"https://github\.com/msaad00/agent-bom/\.github/workflows/release\.yml@.*"
+_DEFAULT_COSIGN_CERTIFICATE_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
+_COSIGN_CERTIFICATE_IDENTITY_REGEXP_ENV = "AGENT_BOM_COSIGN_CERTIFICATE_IDENTITY_REGEXP"
+_COSIGN_CERTIFICATE_OIDC_ISSUER_ENV = "AGENT_BOM_COSIGN_CERTIFICATE_OIDC_ISSUER"
 
 
 async def verify_npm_integrity(
@@ -149,7 +155,13 @@ async def check_npm_provenance(
         f"https://registry.npmjs.org/-/npm/v1/attestations/{encoded_name}@{version}",
     )
 
-    if response and response.status_code == 200:
+    if response is None:
+        return {"has_provenance": False, "status": "unavailable"}
+
+    if response.status_code == 404:
+        return {"has_provenance": False, "status": "not_published", "attestation_count": 0}
+
+    if response.status_code == 200:
         try:
             data = response.json()
             attestations = data.get("attestations", [])
@@ -158,6 +170,7 @@ async def check_npm_provenance(
                 if "slsa" in predicate_type.lower() or "provenance" in predicate_type.lower():
                     return {
                         "has_provenance": True,
+                        "status": "verified",
                         "predicate_type": predicate_type,
                         "attestation_count": len(attestations),
                     }
@@ -165,13 +178,20 @@ async def check_npm_provenance(
             if attestations:
                 return {
                     "has_provenance": False,
+                    "status": "not_provenance",
                     "attestation_count": len(attestations),
                     "predicate_types": [a.get("predicateType", "") for a in attestations],
                 }
+            return {
+                "has_provenance": False,
+                "status": "not_published",
+                "attestation_count": 0,
+            }
         except (ValueError, KeyError):
-            pass
+            logger.warning("npm provenance parse failed for %s@%s", package_name, version)
+            return {"has_provenance": False, "status": "unavailable"}
 
-    return None
+    return {"has_provenance": False, "status": "unavailable", "http_status": response.status_code}
 
 
 async def check_pypi_provenance(
@@ -186,25 +206,82 @@ async def check_pypi_provenance(
     Returns:
         Dict with provenance info or None if not available
     """
-    # PyPI attestation endpoint (PEP 740)
-    response = await request_with_retry(
+    metadata_response = await request_with_retry(
         client,
         "GET",
-        f"https://pypi.org/integrity/{package_name}/{version}/",
+        f"https://pypi.org/pypi/{package_name}/{version}/json",
     )
 
-    if response and response.status_code == 200:
+    if metadata_response is None:
+        return {"has_provenance": False, "status": "unavailable"}
+
+    if metadata_response.status_code == 404:
+        return {"has_provenance": False, "status": "not_published", "attestation_count": 0}
+
+    if metadata_response.status_code != 200:
+        return {"has_provenance": False, "status": "unavailable", "http_status": metadata_response.status_code}
+
+    try:
+        release_data = metadata_response.json()
+        filenames = [str(item.get("filename", "")).strip() for item in release_data.get("urls", [])]
+        filenames = [name for name in filenames if name]
+    except (ValueError, TypeError):
+        logger.warning("PyPI provenance metadata parse failed for %s@%s", package_name, version)
+        return {"has_provenance": False, "status": "unavailable"}
+
+    if not filenames:
+        return {"has_provenance": False, "status": "not_published", "attestation_count": 0}
+
+    attestations_by_file: dict[str, int] = {}
+    missing_files: list[str] = []
+    unavailable_status: int | None = None
+    for filename in filenames:
+        response = await request_with_retry(
+            client,
+            "GET",
+            f"https://pypi.org/integrity/{package_name}/{version}/{filename}/provenance",
+            headers={"Accept": "application/vnd.pypi.integrity.v1+json"},
+        )
+        if response is None:
+            return {"has_provenance": False, "status": "unavailable"}
+        if response.status_code == 404:
+            missing_files.append(filename)
+            continue
+        if response.status_code != 200:
+            unavailable_status = response.status_code
+            missing_files.append(filename)
+            continue
         try:
             data = response.json()
-            if data.get("attestations"):
-                return {
-                    "has_provenance": True,
-                    "attestation_count": len(data["attestations"]),
-                }
-        except (ValueError, KeyError):
-            pass
+            bundles = data.get("attestation_bundles", [])
+            attestation_count = sum(len(bundle.get("attestations", [])) for bundle in bundles if isinstance(bundle, dict))
+            if attestation_count:
+                attestations_by_file[filename] = attestation_count
+            else:
+                missing_files.append(filename)
+        except (ValueError, TypeError):
+            logger.warning("PyPI provenance parse failed for %s@%s", package_name, version)
+            return {"has_provenance": False, "status": "unavailable"}
 
-    return None
+    if attestations_by_file and not missing_files and len(attestations_by_file) == len(filenames):
+        return {
+            "has_provenance": True,
+            "status": "verified",
+            "attestation_count": sum(attestations_by_file.values()),
+            "files": sorted(attestations_by_file),
+            "attestations_by_file": attestations_by_file,
+        }
+
+    result = {"has_provenance": False, "status": "not_published", "attestation_count": 0}
+    if attestations_by_file:
+        result["status"] = "partial"
+        result["attestation_count"] = sum(attestations_by_file.values())
+        result["files"] = sorted(attestations_by_file)
+    if missing_files:
+        result["missing_files"] = missing_files
+    if unavailable_status is not None:
+        result["http_status"] = unavailable_status
+    return result
 
 
 async def check_package_provenance(
@@ -227,8 +304,121 @@ async def check_package_provenance(
         return await check_npm_provenance(package.name, package.version, client)
     elif package.ecosystem == "pypi":
         return await check_pypi_provenance(package.name, package.version, client)
+    elif package.ecosystem == "go":
+        return await check_go_provenance(package.name, package.version, client)
 
     return None
+
+
+async def check_go_provenance(
+    module_path: str,
+    version: str,
+    client: httpx.AsyncClient,
+) -> Optional[dict]:
+    """Check Go module integrity via the Go checksum database (sum.golang.org).
+
+    The Go checksum database provides a tamper-proof log of module hashes.
+    If a module+version is present, it means the Go team has recorded its
+    hash — providing a form of supply chain attestation.
+
+    Returns:
+        Dict with provenance info or None if not available
+    """
+    # Go checksum DB lookup: /lookup/<module>@<version>
+    response = await request_with_retry(
+        client,
+        "GET",
+        f"https://sum.golang.org/lookup/{module_path}@{version}",
+    )
+
+    if response is None:
+        return {"has_provenance": False, "status": "unavailable"}
+
+    if response.status_code == 404:
+        return {"has_provenance": False, "status": "not_published"}
+
+    if response.status_code == 200:
+        body = response.text.strip()
+        # Response format: line 1 = id, line 2 = module@version hash, line 3 = go.sum hash
+        lines = body.split("\n")
+        if len(lines) >= 2:
+            return {
+                "has_provenance": True,
+                "status": "verified",
+                "source": "sum.golang.org",
+                "checksum_db_entry": lines[0].strip() if lines else "",
+            }
+
+    return {"has_provenance": False, "status": "unavailable", "http_status": response.status_code}
+
+
+#: Provenance statuses that mean the registry never gave us an answer: the
+#: request timed out, returned 5xx, or came back unparseable. Coercing any of
+#: them to ``False`` publishes "we asked and the attestation is missing" — the
+#: verdict a release gate blocks on — out of an outage. They leave
+#: ``provenance_attested`` at ``None`` and record the reason in
+#: ``provenance_status`` instead, so a consumer can tell the two apart.
+PROVENANCE_UNKNOWN_STATUSES = frozenset({"unavailable"})
+
+
+@dataclass
+class PackageVerification:
+    """One package's verification outcome, plus the raw registry responses.
+
+    ``package`` already carries the applied verdict (``integrity_verified`` /
+    ``provenance_attested`` / ``provenance_source``); the raw dicts are kept so a
+    renderer can explain *why* (``status: unavailable`` vs ``not_provenance``)
+    without re-deriving it.
+    """
+
+    package: Package
+    integrity: Optional[dict] = None
+    provenance: Optional[dict] = None
+
+
+async def verify_packages(
+    packages: Iterable[Package],
+    client: httpx.AsyncClient,
+) -> list[PackageVerification]:
+    """Verify integrity + provenance and write the verdict onto every package.
+
+    The single entry point behind ``--verify-integrity`` on every surface (CLI,
+    MCP, API). Each distinct ecosystem/name/version is fetched once and the
+    verdict is applied to every ``Package`` instance sharing that identity, so
+    two surfaces can never report a different answer for the same package.
+
+    Packages whose version is unresolved are skipped: they leave the verdict
+    ``None`` ("never checked") rather than recording a failure the registry was
+    never asked about. A registry that was asked but did not answer
+    (``PROVENANCE_UNKNOWN_STATUSES``) is treated the same way, with the reason
+    kept on ``provenance_status`` so the two are still distinguishable.
+    """
+    by_key: dict[str, list[Package]] = {}
+    for package in packages:
+        if package.version in ("latest", "unknown", "", None):
+            continue
+        by_key.setdefault(f"{package.ecosystem}:{package.name}@{package.version}", []).append(package)
+
+    results: list[PackageVerification] = []
+    for instances in by_key.values():
+        primary = instances[0]
+        integrity = await verify_package_integrity(primary, client)
+        provenance = await check_package_provenance(primary, client)
+        for package in instances:
+            if integrity is not None:
+                package.integrity_verified = bool(integrity.get("verified"))
+            if provenance is not None:
+                status = str(provenance.get("status") or "").strip() or None
+                package.provenance_status = status
+                if status in PROVENANCE_UNKNOWN_STATUSES:
+                    # The registry did not answer. Leave the verdict unknown.
+                    package.provenance_attested = None
+                else:
+                    package.provenance_attested = bool(provenance.get("has_provenance"))
+                    if package.provenance_attested:
+                        package.provenance_source = str(provenance.get("source") or f"{package.ecosystem}_attestation")
+        results.append(PackageVerification(package=primary, integrity=integrity, provenance=provenance))
+    return results
 
 
 def verify_installed_record(package_name: str) -> dict:
@@ -517,16 +707,16 @@ def verify_instruction_file(file_path: str | Path) -> InstructionFileVerificatio
     else:
         result.reason = "no_subject_digest_in_bundle"
 
-    # Try cosign for full cryptographic verification
+    # Try cosign for full cryptographic verification. A matching digest proves
+    # the bundle describes this file, but it does not prove who signed it.
     if result.bundle_valid:
         cosign_ok = _try_cosign_verify(path, bundle_path)
         if cosign_ok:
             result.verified = True
             result.reason = "cosign_verified"
         else:
-            # cosign not available but digest matches — partial verification
-            result.verified = True
-            result.reason = "digest_verified"
+            result.verified = False
+            result.reason = "cosign_verification_failed"
 
     return result
 
@@ -539,6 +729,10 @@ def _try_cosign_verify(file_path: Path, bundle_path: Path) -> bool:
     cosign = shutil.which("cosign")
     if cosign is None:
         return False
+    certificate_identity = (
+        os.environ.get(_COSIGN_CERTIFICATE_IDENTITY_REGEXP_ENV, "").strip() or _DEFAULT_COSIGN_CERTIFICATE_IDENTITY_REGEXP
+    )
+    certificate_issuer = os.environ.get(_COSIGN_CERTIFICATE_OIDC_ISSUER_ENV, "").strip() or _DEFAULT_COSIGN_CERTIFICATE_OIDC_ISSUER
 
     try:
         proc = subprocess.run(
@@ -548,9 +742,9 @@ def _try_cosign_verify(file_path: Path, bundle_path: Path) -> bool:
                 "--bundle",
                 str(bundle_path),
                 "--certificate-identity-regexp",
-                ".*",
-                "--certificate-oidc-issuer-regexp",
-                ".*",
+                certificate_identity,
+                "--certificate-oidc-issuer",
+                certificate_issuer,
                 str(file_path),
             ],
             capture_output=True,

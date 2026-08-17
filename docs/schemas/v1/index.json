@@ -1,0 +1,312 @@
+{
+  "generator": "scripts/generate_v1_schemas.py",
+  "models": [
+    {
+      "doc": "Public schema contract for one advisory AI assessment.",
+      "name": "AIFindingAssessment",
+      "schema": "AIFindingAssessment.json"
+    },
+    {
+      "doc": "Public schema contract for model-derived scan evidence.",
+      "name": "AIProvenance",
+      "schema": "AIProvenance.json"
+    },
+    {
+      "doc": "",
+      "name": "AnalyticsHealth",
+      "schema": "AnalyticsHealth.json"
+    },
+    {
+      "doc": "Request body for POST /v1/scan/browser-extensions.",
+      "name": "BrowserExtensionsRequest",
+      "schema": "BrowserExtensionsRequest.json"
+    },
+    {
+      "doc": "",
+      "name": "ComplianceAuditIntegrity",
+      "schema": "ComplianceAuditIntegrity.json"
+    },
+    {
+      "doc": "",
+      "name": "ComplianceEvidenceItem",
+      "schema": "ComplianceEvidenceItem.json"
+    },
+    {
+      "doc": "",
+      "name": "ComplianceReportBundle",
+      "schema": "ComplianceReportBundle.json"
+    },
+    {
+      "doc": "",
+      "name": "ComplianceReportControl",
+      "schema": "ComplianceReportControl.json"
+    },
+    {
+      "doc": "",
+      "name": "ComplianceReportScope",
+      "schema": "ComplianceReportScope.json"
+    },
+    {
+      "doc": "",
+      "name": "ComplianceReportSummary",
+      "schema": "ComplianceReportSummary.json"
+    },
+    {
+      "doc": "Whether the bundle's own signature can be verified, and by whom.",
+      "name": "ComplianceSignatureDisclosure",
+      "schema": "ComplianceSignatureDisclosure.json"
+    },
+    {
+      "doc": "",
+      "name": "ComplianceThreatModel",
+      "schema": "ComplianceThreatModel.json"
+    },
+    {
+      "doc": "",
+      "name": "CreateKeyRequest",
+      "schema": "CreateKeyRequest.json"
+    },
+    {
+      "doc": "",
+      "name": "CredentialRefCreate",
+      "schema": "CredentialRefCreate.json"
+    },
+    {
+      "doc": "",
+      "name": "CredentialRefRecord",
+      "schema": "CredentialRefRecord.json"
+    },
+    {
+      "doc": "",
+      "name": "CredentialRefUpdate",
+      "schema": "CredentialRefUpdate.json"
+    },
+    {
+      "doc": "Request body for POST /v1/scan/dataset-cards.",
+      "name": "DatasetCardsRequest",
+      "schema": "DatasetCardsRequest.json"
+    },
+    {
+      "doc": "",
+      "name": "EntitlementHealth",
+      "schema": "EntitlementHealth.json"
+    },
+    {
+      "doc": "",
+      "name": "EvaluateRequest",
+      "schema": "EvaluateRequest.json"
+    },
+    {
+      "doc": "",
+      "name": "ExceptionRequest",
+      "schema": "ExceptionRequest.json"
+    },
+    {
+      "doc": "Body for PUT /v1/overview/score-config (issue #3940).",
+      "name": "ExecScoreConfigUpdateRequest",
+      "schema": "ExecScoreConfigUpdateRequest.json"
+    },
+    {
+      "doc": "Request body for POST /v1/findings/false-positive.",
+      "name": "FalsePositiveRequest",
+      "schema": "FalsePositiveRequest.json"
+    },
+    {
+      "doc": "Request body for POST /v1/findings/feedback.",
+      "name": "FindingFeedbackRequest",
+      "schema": "FindingFeedbackRequest.json"
+    },
+    {
+      "doc": "Request body for PUT /v1/findings/triage/{triage_id}/decision.",
+      "name": "FindingTriageDecisionRequest",
+      "schema": "FindingTriageDecisionRequest.json"
+    },
+    {
+      "doc": "Request body for POST /v1/findings/triage.",
+      "name": "FindingTriageRequest",
+      "schema": "FindingTriageRequest.json"
+    },
+    {
+      "doc": "Request body for POST /v1/findings/triage/vex/ingest.",
+      "name": "FindingTriageVexIngestRequest",
+      "schema": "FindingTriageVexIngestRequest.json"
+    },
+    {
+      "doc": "",
+      "name": "FleetAgentUpdate",
+      "schema": "FleetAgentUpdate.json"
+    },
+    {
+      "doc": "",
+      "name": "HealthResponse",
+      "schema": "HealthResponse.json"
+    },
+    {
+      "doc": "Body for POST /v1/auth/invitations \u2014 admin provisions a NEW tenant.",
+      "name": "InvitationRequest",
+      "schema": "InvitationRequest.json"
+    },
+    {
+      "doc": "",
+      "name": "IssueStatusUpdateRequest",
+      "schema": "IssueStatusUpdateRequest.json"
+    },
+    {
+      "doc": "Request body for POST /v1/scan/model-files.",
+      "name": "ModelFilesRequest",
+      "schema": "ModelFilesRequest.json"
+    },
+    {
+      "doc": "Request body for POST /v1/scan/model-provenance.",
+      "name": "ModelProvenanceRequest",
+      "schema": "ModelProvenanceRequest.json"
+    },
+    {
+      "doc": "",
+      "name": "PolicyCreate",
+      "schema": "PolicyCreate.json"
+    },
+    {
+      "doc": "",
+      "name": "PolicyUpdate",
+      "schema": "PolicyUpdate.json"
+    },
+    {
+      "doc": "Non-secret, operator-declared PostgreSQL compatibility posture.",
+      "name": "PostgresPortabilityHealth",
+      "schema": "PostgresPortabilityHealth.json"
+    },
+    {
+      "doc": "Request body for POST /v1/scan/prompt-scan.",
+      "name": "PromptScanRequest",
+      "schema": "PromptScanRequest.json"
+    },
+    {
+      "doc": "",
+      "name": "ProxyAuditIngestRequest",
+      "schema": "ProxyAuditIngestRequest.json"
+    },
+    {
+      "doc": "Non-sensitive liveness and UI bootstrap posture.",
+      "name": "PublicHealthResponse",
+      "schema": "PublicHealthResponse.json"
+    },
+    {
+      "doc": "",
+      "name": "PushPayload",
+      "schema": "PushPayload.json"
+    },
+    {
+      "doc": "Async findings export job backed by streamed hub reads.",
+      "name": "ReportJob",
+      "schema": "ReportJob.json"
+    },
+    {
+      "doc": "Request body for ``POST /v1/reports``.",
+      "name": "ReportJobRequest",
+      "schema": "ReportJobRequest.json"
+    },
+    {
+      "doc": "",
+      "name": "RotateKeyRequest",
+      "schema": "RotateKeyRequest.json"
+    },
+    {
+      "doc": "Authenticated, tenant-scoped CWPP runtime workload-evidence ingest batch.",
+      "name": "RuntimeEvidenceIngestRequest",
+      "schema": "RuntimeEvidenceIngestRequest.json"
+    },
+    {
+      "doc": "One raw CWPP runtime/EDR signal in an ingest batch.",
+      "name": "RuntimeEvidenceSignalIn",
+      "schema": "RuntimeEvidenceSignalIn.json"
+    },
+    {
+      "doc": "",
+      "name": "SAMLLoginRequest",
+      "schema": "SAMLLoginRequest.json"
+    },
+    {
+      "doc": "Bounded execution issue accepted from a trusted scan producer.",
+      "name": "ScanIssuePayload",
+      "schema": "ScanIssuePayload.json"
+    },
+    {
+      "doc": "Represents a running or completed scan job.",
+      "name": "ScanJob",
+      "schema": "ScanJob.json"
+    },
+    {
+      "doc": "Options accepted by POST /v1/scan \u2014 mirrors agent-bom scan CLI flags.",
+      "name": "ScanRequest",
+      "schema": "ScanRequest.json"
+    },
+    {
+      "doc": "Canonical evidence-quality contract, separate from job lifecycle.",
+      "name": "ScanRunPayload",
+      "schema": "ScanRunPayload.json"
+    },
+    {
+      "doc": "Bounded completeness metadata for one requested collection scope.",
+      "name": "ScanScopePayload",
+      "schema": "ScanScopePayload.json"
+    },
+    {
+      "doc": "",
+      "name": "ScheduleCreate",
+      "schema": "ScheduleCreate.json"
+    },
+    {
+      "doc": "Trigger one cross-cloud (Azure/GCP) agentless disk side-scan (#4158 Wave 2).",
+      "name": "SideScanTriggerRequest",
+      "schema": "SideScanTriggerRequest.json"
+    },
+    {
+      "doc": "",
+      "name": "SourceCreate",
+      "schema": "SourceCreate.json"
+    },
+    {
+      "doc": "",
+      "name": "SourceRecord",
+      "schema": "SourceRecord.json"
+    },
+    {
+      "doc": "",
+      "name": "SourceUpdate",
+      "schema": "SourceUpdate.json"
+    },
+    {
+      "doc": "",
+      "name": "StateUpdate",
+      "schema": "StateUpdate.json"
+    },
+    {
+      "doc": "",
+      "name": "StorageHealth",
+      "schema": "StorageHealth.json"
+    },
+    {
+      "doc": "",
+      "name": "TenantQuotaUpdateRequest",
+      "schema": "TenantQuotaUpdateRequest.json"
+    },
+    {
+      "doc": "",
+      "name": "TracingHealth",
+      "schema": "TracingHealth.json"
+    },
+    {
+      "doc": "Request body for POST /v1/scan/training-pipelines.",
+      "name": "TrainingPipelinesRequest",
+      "schema": "TrainingPipelinesRequest.json"
+    },
+    {
+      "doc": "",
+      "name": "VersionInfo",
+      "schema": "VersionInfo.json"
+    }
+  ],
+  "source_module": "agent_bom.api.models",
+  "version": "v1"
+}

@@ -167,8 +167,11 @@ def test_resolve_agent_id_jwks_blocks_on_invalid_signature():
     import httpx
 
     token = _make_jwt({"sub": "agent-bad"})
+    # expected_audience is required for a direct jwks_uri; set it so this test
+    # exercises the signature-verification path (not the audience-pin gate).
+    policy = {"jwks_uri": "https://idp.example.com/jwks", "expected_audience": "svc"}
     with patch("httpx.get", side_effect=httpx.ConnectError("unreachable")):
-        agent_id, err = resolve_agent_id(token, {"jwks_uri": "https://idp.example.com/jwks"})
+        agent_id, err = resolve_agent_id(token, policy)
     assert agent_id == ANONYMOUS
     assert err is not None
     assert "signature" in err.lower() or "unreachable" in err.lower()
@@ -202,8 +205,8 @@ def test_check_identity_jwks_required_blocks_on_no_jwks_key():
     assert block is not None
 
 
-def test_check_identity_no_jwks_configured_passes_as_before():
-    """Without jwks_uri, identity check passes for well-formed JWT — no regression."""
+def test_check_identity_no_jwks_configured_audit_mode_passes_as_before():
+    """Without jwks_uri, non-enforcing audit mode still resolves a well-formed JWT."""
 
     def _msg(token):
         return {
@@ -215,3 +218,101 @@ def test_check_identity_no_jwks_configured_passes_as_before():
     agent_id, block = check_identity(_msg(token), {})
     assert agent_id == "agent-ok"
     assert block is None
+
+
+def test_check_identity_required_jwt_without_verification_policy_blocks():
+    """Enforced identity mode must not trust an unsigned JWT identity claim."""
+
+    def _msg(token):
+        return {
+            "method": "tools/call",
+            "params": {"name": "x", "arguments": {}, "_meta": {"agent_identity": token}},
+        }
+
+    token = _make_jwt({"sub": "agent-claimed"})
+    agent_id, block = check_identity(_msg(token), {"require_agent_identity": True})
+    assert agent_id == ANONYMOUS
+    assert block is not None
+    assert "signature verification required" in block
+
+
+# ─── F2: aud/iss binding in JWT verification ──────────────────────────────────
+
+
+def _signing_key():
+    from agent_bom.api.oauth_as import OAuthSigningKey
+
+    return OAuthSigningKey()
+
+
+def _signed_identity_jwt(key, *, sub="agent-x", aud="service-b", iss="https://issuer-b"):
+    now = int(time.time())
+    return key.sign({"sub": sub, "aud": aud, "iss": iss, "iat": now, "exp": now + 3600})
+
+
+def test_verify_jwt_wrong_audience_rejected_when_pinned():
+    key = _signing_key()
+    token = _signed_identity_jwt(key, aud="service-b")
+    with patch("agent_bom.agent_identity._fetch_jwks", return_value=key.jwks()):
+        verified, err = _verify_jwt_signature(token, "https://idp/jwks", expected_audience="service-a", expected_issuer="https://issuer-b")
+    assert not verified
+    assert err and "claim mismatch" in err
+
+
+def test_verify_jwt_wrong_issuer_rejected_when_pinned():
+    key = _signing_key()
+    token = _signed_identity_jwt(key, iss="https://issuer-b")
+    with patch("agent_bom.agent_identity._fetch_jwks", return_value=key.jwks()):
+        verified, err = _verify_jwt_signature(token, "https://idp/jwks", expected_audience="service-b", expected_issuer="https://issuer-a")
+    assert not verified
+    assert err and "claim mismatch" in err
+
+
+def test_verify_jwt_matching_aud_iss_accepted():
+    key = _signing_key()
+    token = _signed_identity_jwt(key)
+    with patch("agent_bom.agent_identity._fetch_jwks", return_value=key.jwks()):
+        verified, err = _verify_jwt_signature(token, "https://idp/jwks", expected_audience="service-b", expected_issuer="https://issuer-b")
+    assert verified
+    assert err is None
+
+
+def test_resolve_agent_id_rejects_audience_confusion():
+    key = _signing_key()
+    token = _signed_identity_jwt(key, sub="agent-x", aud="service-b", iss="https://issuer-b")
+    policy = {
+        "jwks_uri": "https://idp/jwks",
+        "expected_audience": "service-a",
+        "expected_issuer": "https://issuer-b",
+    }
+    with patch("agent_bom.agent_identity._fetch_jwks", return_value=key.jwks()):
+        agent_id, err = resolve_agent_id(token, policy)
+    assert agent_id == ANONYMOUS
+    assert err and "signature invalid" in err
+
+
+def test_resolve_agent_id_accepts_matching_aud_iss():
+    key = _signing_key()
+    token = _signed_identity_jwt(key, sub="agent-x", aud="service-b", iss="https://issuer-b")
+    policy = {
+        "jwks_uri": "https://idp/jwks",
+        "expected_audience": "service-b",
+        "expected_issuer": "https://issuer-b",
+    }
+    with patch("agent_bom.agent_identity._fetch_jwks", return_value=key.jwks()):
+        agent_id, err = resolve_agent_id(token, policy)
+    assert err is None
+    assert agent_id == "agent-x"
+
+
+def test_resolve_agent_id_direct_jwks_without_audience_is_rejected():
+    # A direct jwks_uri with NO expected_audience must fail closed: a validly-signed
+    # token minted by the same IdP keys for a DIFFERENT relying party would otherwise
+    # be accepted (audience confusion). The operator must pin expected_audience.
+    key = _signing_key()
+    token = _signed_identity_jwt(key, sub="agent-x", aud="some-other-service", iss="https://whatever")
+    policy = {"jwks_uri": "https://idp/jwks"}
+    with patch("agent_bom.agent_identity._fetch_jwks", return_value=key.jwks()):
+        agent_id, err = resolve_agent_id(token, policy)
+    assert agent_id == ANONYMOUS
+    assert err and "audience" in err.lower() and "expected_audience" in err

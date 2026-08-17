@@ -17,10 +17,11 @@ spec:
         app.kubernetes.io/name: agent-bom
         app.kubernetes.io/component: monitor
     spec:
+      automountServiceAccountToken: false
       serviceAccountName: agent-bom
       containers:
         - name: monitor
-          image: msaad02/agent-bom-runtime:latest
+          image: agentbom/agent-bom:0.101.0
           command: ["agent-bom"]
           args:
             - "protect"
@@ -41,9 +42,22 @@ spec:
             limits:
               memory: "128Mi"
               cpu: "200m"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
           livenessProbe:
             httpGet:
               path: /status
               port: protect
             initialDelaySeconds: 5
             periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /status
+              port: protect
+            initialDelaySeconds: 2
+            periodSeconds: 10

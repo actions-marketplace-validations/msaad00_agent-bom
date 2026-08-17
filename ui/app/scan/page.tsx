@@ -21,14 +21,19 @@ function ScanRouter() {
   if (id && view === "attack-flow") return <AttackFlowView id={id} />;
   if (id && view === "mesh") return <ScanMeshView id={id} />;
   if (id) return <ScanResultView id={id} />;
-  return <ScanForm />;
+  return (
+    <ScanForm
+      initialConnectionId={searchParams.get("connection") || undefined}
+      initialPreset={searchParams.get("preset") || undefined}
+    />
+  );
 }
 
 export default function ScanPage() {
   return (
     <Suspense
       fallback={
-        <div className="flex items-center justify-center h-[50vh] text-zinc-400">
+        <div className="flex items-center justify-center h-[50vh] text-[var(--text-secondary)]">
           <Loader2 className="w-5 h-5 animate-spin mr-2" />Loading...
         </div>
       }

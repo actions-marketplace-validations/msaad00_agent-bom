@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from agent_bom.audit_integrity import verify_audit_jsonl_chain
+
 # ─── Entry dataclasses ────────────────────────────────────────────────────────
 
 
@@ -65,6 +67,7 @@ class ResponseHMACEntry:
     ts: str
     message_id: object
     hmac_sha256: str
+    response_sha256: str = ""
 
 
 @dataclass
@@ -79,6 +82,10 @@ class SummaryEntry:
     replay_rejections: int
     relay_errors: int
     runtime_alerts: int
+    runtime_alerts_by_severity: dict = field(default_factory=dict)
+    runtime_alerts_by_detector: dict = field(default_factory=dict)
+    blocked_runtime_alerts: int = 0
+    latest_runtime_alert_at: str = ""
 
 
 @dataclass
@@ -89,6 +96,7 @@ class AuditLog:
     hmac_entries: list[ResponseHMACEntry] = field(default_factory=list)
     summary: Optional[SummaryEntry] = None
     unknown: list[dict] = field(default_factory=list)
+    malformed_lines: int = 0
 
 
 # ─── Parser ───────────────────────────────────────────────────────────────────
@@ -104,6 +112,10 @@ def parse_audit_log(path: Path) -> AuditLog:
         try:
             entry = json.loads(raw_line)
         except json.JSONDecodeError:
+            log.malformed_lines += 1
+            continue
+        if not isinstance(entry, dict):
+            log.malformed_lines += 1
             continue
 
         entry_type = entry.get("type", "")
@@ -137,6 +149,7 @@ def parse_audit_log(path: Path) -> AuditLog:
                     ts=entry.get("ts", ""),
                     message_id=entry.get("id"),
                     hmac_sha256=entry.get("hmac_sha256", ""),
+                    response_sha256=str(entry.get("response_sha256", "")),
                 )
             )
 
@@ -152,6 +165,10 @@ def parse_audit_log(path: Path) -> AuditLog:
                 replay_rejections=entry.get("replay_rejections", 0),
                 relay_errors=entry.get("relay_errors", 0),
                 runtime_alerts=entry.get("runtime_alerts", 0),
+                runtime_alerts_by_severity=entry.get("runtime_alerts_by_severity", {}),
+                runtime_alerts_by_detector=entry.get("runtime_alerts_by_detector", {}),
+                blocked_runtime_alerts=entry.get("blocked_runtime_alerts", 0),
+                latest_runtime_alert_at=entry.get("latest_runtime_alert_at", ""),
             )
 
         elif "severity" in entry and "detector" in entry:
@@ -159,11 +176,34 @@ def parse_audit_log(path: Path) -> AuditLog:
             log.alerts.append(
                 AlertEntry(
                     ts=entry.get("ts", ""),
-                    detector=entry.get("detector", entry.get("type", "unknown")),
-                    severity=entry.get("severity", "medium"),
-                    message=entry.get("message", entry.get("detail", "")),
+                    detector=str(entry.get("detector") or entry.get("type") or "unknown"),
+                    severity=str(entry.get("severity") or "medium"),
+                    message=str(entry.get("message") or entry.get("detail") or ""),
                     tool=entry.get("tool", ""),
                     raw=entry,
+                )
+            )
+
+        elif "tool" in entry and ("outcome" in entry or "policy" in entry):
+            # Generic MCP audit JSONL adapter. This keeps replay useful for
+            # simple third-party logs while preserving the richer proxy schema
+            # for native agent-bom records.
+            outcome = str(entry.get("policy") or entry.get("outcome") or "allowed").lower()
+            policy = "blocked" if outcome in {"blocked", "denied", "deny", "rejected", "failed"} else "allowed"
+            raw_args = entry.get("args")
+            args: dict = dict(raw_args) if isinstance(raw_args, dict) else {}
+            if entry.get("server") and "server" not in args:
+                args = {**args, "server": entry.get("server")}
+            log.tool_calls.append(
+                ToolCallEntry(
+                    ts=str(entry.get("ts") or entry.get("timestamp") or ""),
+                    tool=str(entry.get("tool") or "unknown"),
+                    policy=policy,
+                    reason=str(entry.get("reason") or entry.get("outcome") or ""),
+                    agent_id=str(entry.get("agent_id") or entry.get("agent") or ""),
+                    args=args,
+                    payload_sha256=str(entry.get("payload_sha256") or ""),
+                    message_id=entry.get("message_id") or entry.get("id"),
                 )
             )
 
@@ -177,34 +217,55 @@ def parse_audit_log(path: Path) -> AuditLog:
 
 
 def verify_hmac_entries(log: AuditLog, sign_key: str) -> tuple[int, int]:
-    """Verify HMAC entries against corresponding tool call payloads.
+    """Verify HMAC entries written by the proxy ``--response-sign-key``.
 
-    Returns (verified_count, failed_count).
+    Returns ``(verified_count, failed_count)``.
+
+    The proxy stores the canonical sha256 of the live response as
+    ``response_sha256`` and the HMAC of that hash as ``hmac_sha256``. The
+    verifier recomputes ``HMAC-SHA256(sign_key, response_sha256_hex)`` and
+    compares it to the stored value in constant time. Legacy records that
+    pre-date the ``response_sha256`` field are skipped (counted as neither
+    verified nor failed) because the original wire response is not
+    available for re-derivation.
     """
-    # Build a map of message_id → ToolCallEntry for correlation
-    call_map: dict[object, ToolCallEntry] = {tc.message_id: tc for tc in log.tool_calls if tc.message_id is not None}
-
     verified = 0
     failed = 0
+    key_bytes = sign_key.encode("utf-8")
     for hmac_entry in log.hmac_entries:
-        tc = call_map.get(hmac_entry.message_id)
-        if tc is None:
-            continue  # response for a non-tool-call message (tools/list etc.)
-        # Recompute expected HMAC from the stored payload hash — we can only
-        # verify the audit record itself here since we don't have the raw
-        # wire payload. This confirms the log wasn't tampered with.
-        raw_hash = tc.payload_sha256
-        expected = hmac.new(
-            sign_key.encode("utf-8"),
-            raw_hash.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        # Compare constant-time
-        if hmac.compare_digest(expected, hmac_entry.hmac_sha256[:64]):
+        stored_hmac = hmac_entry.hmac_sha256
+        if len(stored_hmac) != 64:
+            failed += 1
+            continue
+        response_hash = hmac_entry.response_sha256
+        if not response_hash:
+            # Legacy entry without response_sha256: cannot recompute the HMAC
+            # without the original response body. Treat as unverifiable rather
+            # than counting it as a failure, which would tank otherwise-clean
+            # logs produced before this field shipped.
+            continue
+        expected = hmac.new(key_bytes, response_hash.encode("utf-8"), hashlib.sha256).hexdigest()
+        if hmac.compare_digest(expected, stored_hmac):
             verified += 1
         else:
             failed += 1
     return verified, failed
+
+
+def verify_hash_chain(path: Path) -> tuple[int, int]:
+    """Verify prev-hash chaining across JSONL audit records.
+
+    Returns ``(verified_count, tampered_count)``.
+
+    The chain MAC algorithm is read from each record's
+    ``record_hash_algorithm`` field; ``aes-cmac-128`` records are validated
+    against the operator-configured ``AGENT_BOM_AUDIT_HMAC_KEY`` (or the
+    sidecar key persisted next to the log by the proxy when no operator key
+    is set). Records emitted without ``record_hash_algorithm`` are treated
+    as legacy and validated against the process-global chain key.
+    """
+    result = verify_audit_jsonl_chain(path)
+    return int(result["verified"]), int(result["tampered"])
 
 
 # ─── Rich display ─────────────────────────────────────────────────────────────
@@ -231,6 +292,7 @@ def display_rich(
     blocked_only: bool = False,
     alerts_only: bool = False,
     verify_hmac_key: Optional[str] = None,
+    verify_chain_result: tuple[int, int] | None = None,
 ) -> int:
     """Render audit log to terminal using Rich. Returns exit code (1 if issues found)."""
     from rich import box
@@ -240,6 +302,7 @@ def display_rich(
 
     console = Console()
     exit_code = 0
+    type_filter_normalized = entry_type_alias(type_filter) if type_filter else None
 
     # ── Summary panel ──────────────────────────────────────────────────────
     s = log.summary
@@ -268,6 +331,13 @@ def display_rich(
             summary_lines.append("[bold]Top tools:[/bold] " + "  ".join(f"{t}×{c}" for t, c in top))
         if s.blocked_by_reason:
             summary_lines.append("[bold red]Blocked by:[/bold red] " + "  ".join(f"{r}×{c}" for r, c in s.blocked_by_reason.items()))
+        if s.runtime_alerts_by_severity:
+            summary_lines.append(
+                "[bold yellow]Alert severities:[/bold yellow] "
+                + "  ".join(f"{severity}×{count}" for severity, count in s.runtime_alerts_by_severity.items())
+            )
+        if s.latest_runtime_alert_at:
+            summary_lines.append(f"[bold]Latest alert:[/bold] {s.latest_runtime_alert_at[:19].replace('T', ' ')}")
 
         console.print(
             Panel(
@@ -280,9 +350,23 @@ def display_rich(
     if s and (s.total_blocked > 0 or s.relay_errors > 0):
         exit_code = 1
 
+    # Summary-less logs previously ignored blocked tool_calls for exit (only
+    # summary.total_blocked counted). Align with display_json / module docs when
+    # tool calls are in the active display scope. Relay errors stay filter-aware
+    # via the table block below — do not fail closed on out-of-scope relays.
+    tools_in_scope = not alerts_only and (type_filter_normalized is None or type_filter_normalized == "tools/call")
+    if exit_code == 0 and not s and tools_in_scope:
+        scoped_calls = log.tool_calls
+        if tool_filter:
+            scoped_calls = [c for c in scoped_calls if tool_filter.lower() in c.tool.lower()]
+        if any(c.policy == "blocked" for c in scoped_calls):
+            exit_code = 1
+
     # ── Tool call table ─────────────────────────────────────────────────────
     if not alerts_only:
         calls = log.tool_calls
+        if type_filter_normalized and type_filter_normalized != "tools/call":
+            calls = []
         if tool_filter:
             calls = [c for c in calls if tool_filter.lower() in c.tool.lower()]
         if blocked_only:
@@ -315,6 +399,8 @@ def display_rich(
 
     # ── Alerts table ───────────────────────────────────────────────────────
     alerts = log.alerts
+    if type_filter_normalized and type_filter_normalized not in {"runtime_alert", "alert"}:
+        alerts = []
     if tool_filter:
         alerts = [a for a in alerts if tool_filter.lower() in a.tool.lower()]
 
@@ -338,27 +424,47 @@ def display_rich(
         console.print(atbl)
 
     # ── Relay errors ───────────────────────────────────────────────────────
-    if log.relay_errors:
+    relay_errors = log.relay_errors
+    if type_filter_normalized and type_filter_normalized != "relay_error":
+        relay_errors = []
+    if relay_errors:
         etbl = Table(title="[bold red]Relay Errors[/bold red]", box=box.SIMPLE_HEAVY)
         etbl.add_column("Time", style="dim")
         etbl.add_column("Error Type")
         etbl.add_column("Error")
-        for e in log.relay_errors:
+        for e in relay_errors:
             etbl.add_row(e.ts[:19].replace("T", " "), e.error_type, e.error[:120])
         console.print(etbl)
         exit_code = 1
 
     # ── HMAC entries ───────────────────────────────────────────────────────
-    if log.hmac_entries and not alerts_only:
+    hmac_entries = log.hmac_entries
+    if type_filter_normalized and type_filter_normalized != "response_hmac":
+        hmac_entries = []
+    if hmac_entries and not alerts_only:
         console.print(f"[dim]Response HMACs recorded: {len(log.hmac_entries)} (use --verify-hmac with --sign-key to verify)[/dim]")
 
     if verify_hmac_key:
         verified, failed = verify_hmac_entries(log, verify_hmac_key)
         if failed:
             console.print(f"[bold red]HMAC verification FAILED for {failed} entries![/bold red]")
-            exit_code = 1
+            # Cryptographic verification failure outranks blocked/relay (exit 1)
+            exit_code = 2
         elif verified:
             console.print(f"[green]HMAC verification passed for {verified} entries[/green]")
+
+    if verify_chain_result is not None:
+        verified_chain, tampered_chain = verify_chain_result
+        if tampered_chain:
+            console.print(f"[bold red]Audit chain verification FAILED for {tampered_chain} entries![/bold red]")
+            exit_code = 2
+        elif verified_chain:
+            console.print(f"[green]Audit chain verification passed for {verified_chain} entries[/green]")
+
+    if log.malformed_lines or log.unknown:
+        console.print(
+            f"[yellow]Audit parser skipped {log.malformed_lines} malformed line(s) and {len(log.unknown)} unsupported record(s).[/yellow]"
+        )
 
     # ── Nothing to show ────────────────────────────────────────────────────
     total_entries = len(log.tool_calls) + len(log.alerts) + len(log.relay_errors) + len(log.hmac_entries)
@@ -368,15 +474,41 @@ def display_rich(
     return exit_code
 
 
-def display_json(log: AuditLog) -> int:
+def entry_type_alias(entry_type: str) -> str:
+    """Normalize audit replay type filters to the accepted JSONL record names."""
+    normalized = entry_type.strip().lower().replace("-", "_")
+    aliases = {
+        "tool_call": "tools/call",
+        "tools_call": "tools/call",
+        "tools/call": "tools/call",
+        "relay_error": "relay_error",
+        "response_hmac": "response_hmac",
+        "proxy_summary": "proxy_summary",
+        "alert": "runtime_alert",
+        "runtime_alert": "runtime_alert",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def display_json(
+    log: AuditLog,
+    *,
+    chain_verification: tuple[int, int] | None = None,
+    hmac_verification: tuple[int, int] | None = None,
+    blocked_only: bool = False,
+) -> int:
     """Output structured JSON summary (for CI/scripting)."""
     s = log.summary
     out = {
+        "schema": "agent-bom proxy audit JSONL",
+        "accepted_types": ["tools/call", "relay_error", "response_hmac", "proxy_summary", "runtime_alert"],
         "tool_calls": len(log.tool_calls),
         "blocked": sum(1 for c in log.tool_calls if c.policy == "blocked"),
         "alerts": len(log.alerts),
         "relay_errors": len(log.relay_errors),
         "hmac_entries": len(log.hmac_entries),
+        "unknown_records": len(log.unknown),
+        "malformed_lines": log.malformed_lines,
         "summary": {
             "uptime_seconds": s.uptime_seconds,
             "total_tool_calls": s.total_tool_calls,
@@ -387,15 +519,41 @@ def display_json(log: AuditLog) -> int:
             "latency": s.latency,
             "calls_by_tool": s.calls_by_tool,
             "blocked_by_reason": s.blocked_by_reason,
+            "runtime_alerts_by_severity": s.runtime_alerts_by_severity,
+            "runtime_alerts_by_detector": s.runtime_alerts_by_detector,
+            "blocked_runtime_alerts": s.blocked_runtime_alerts,
+            "latest_runtime_alert_at": s.latest_runtime_alert_at,
         }
         if s
         else None,
         "alert_details": [{"severity": a.severity, "detector": a.detector, "tool": a.tool, "message": a.message} for a in log.alerts],
     }
-    print(json.dumps(out, indent=2))
+    if chain_verification is not None:
+        out["chain_verification"] = {
+            "verified": chain_verification[0],
+            "tampered": chain_verification[1],
+        }
+    if hmac_verification is not None:
+        out["hmac_verification"] = {
+            "verified": hmac_verification[0],
+            "failed": hmac_verification[1],
+        }
+    sys.stdout.write(json.dumps(out, indent=2))
+    sys.stdout.write("\n")
     blocked = out["blocked"]
     errors = out["relay_errors"]
-    return 1 if (blocked or errors) else 0
+    tampered = chain_verification[1] if chain_verification is not None else 0
+    hmac_failed = hmac_verification[1] if hmac_verification is not None else 0
+    # Exit-code contract: cryptographic failure (chain tamper / HMAC mismatch)
+    # → exit 2, content failure (blocked calls / relay errors / blocked-only
+    # match) → exit 1, clean → exit 0. Cryptographic failure outranks content.
+    if tampered or hmac_failed:
+        return 2
+    if blocked_only:
+        return 1 if blocked else 0
+    if blocked or errors:
+        return 1
+    return 0
 
 
 # ─── Public entry point ───────────────────────────────────────────────────────
@@ -410,24 +568,51 @@ def replay(
     alerts_only: bool = False,
     sign_key: Optional[str] = None,
     verify_hmac: bool = False,
+    verify_chain: bool = False,
     as_json: bool = False,
 ) -> int:
-    """Parse and display an audit log. Returns exit code (0 = clean, 1 = issues)."""
+    """Parse and display an audit log.
+
+    Exit-code contract:
+
+    * ``0`` — log is clean (no blocked calls, no relay errors, no integrity
+      failures)
+    * ``1`` — ``--blocked-only`` matched at least one blocked entry, or the
+      log contains blocked calls / relay errors
+    * ``2`` — ``--verify-chain`` detected tamper, ``--verify-hmac`` detected
+      a signature mismatch, or the log file is missing
+    """
     path = Path(log_path)
     if not path.exists():
-        print(f"Error: audit log not found: {log_path}", file=sys.stderr)
+        sys.stderr.write(f"Error: audit log not found: {log_path}\n")
         return 2
 
     log = parse_audit_log(path)
+    chain_result = verify_hash_chain(path) if verify_chain else None
+    hmac_result = verify_hmac_entries(log, sign_key) if (verify_hmac and sign_key) else None
 
     if as_json:
-        return display_json(log)
+        return display_json(
+            log,
+            chain_verification=chain_result,
+            hmac_verification=hmac_result,
+            blocked_only=blocked_only,
+        )
 
-    return display_rich(
+    display_exit = display_rich(
         log,
         tool_filter=tool,
         type_filter=entry_type,
         blocked_only=blocked_only,
         alerts_only=alerts_only,
         verify_hmac_key=sign_key if verify_hmac else None,
+        verify_chain_result=chain_result,
     )
+
+    # Apply the documented exit-code contract on top of display output. The
+    # display function tracks blocked/relay (exit 1) and crypto failures
+    # (exit 2). The --blocked-only case also raises to 1 if it matched any
+    # blocked entries even when there are no relay errors.
+    if display_exit == 0 and blocked_only and any(c.policy == "blocked" for c in log.tool_calls):
+        return 1
+    return display_exit

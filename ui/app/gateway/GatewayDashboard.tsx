@@ -1,0 +1,751 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import {
+  api,
+  type FirewallRuntimeStats,
+  type GatewayPolicy,
+  type GatewayPolicyRuntimeSummary,
+  type GatewayStatsResponse,
+  type PolicyAuditEntry,
+  type PolicyMode,
+  formatDate,
+} from "@/lib/api";
+import {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
+} from "recharts";
+import {
+  Lock,
+  RefreshCw,
+  Loader2,
+  ShieldCheck,
+  ShieldAlert,
+  ChevronDown,
+  ChevronRight,
+  Plus,
+  Trash2,
+  Play,
+  FileText,
+  AlertTriangle,
+  Activity,
+} from "lucide-react";
+import { GatewayFeedPanel } from "./GatewayFeedPanel";
+import { GatewayFeedKpiBar } from "@/components/gateway-feed-kpi-bar";
+import { useDeploymentContext } from "@/hooks/use-deployment-context";
+import { useRuntimeEmbedded } from "@/components/runtime-embed-context";
+import { useChartTheme } from "@/lib/theme-colors";
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+const MODE_COLORS: Record<PolicyMode, string> = {
+  audit: "bg-blue-950 text-blue-300 border-blue-800",
+  enforce: "bg-red-950 text-red-300 border-red-800",
+};
+
+const RUNTIME_COLORS: Record<GatewayPolicyRuntimeSummary["rollout_mode"], string> = {
+  disabled: "bg-[var(--surface)] text-[var(--text-secondary)] border-[var(--border-subtle)]",
+  advisory_only: "bg-blue-950 text-blue-300 border-blue-800",
+  mixed: "bg-amber-950 text-amber-300 border-amber-800",
+  default_deny: "bg-red-950 text-red-300 border-red-800",
+  blocking: "bg-emerald-950 text-emerald-300 border-emerald-800",
+};
+
+// ─── Page ───────────────────────────────────────────────────────────────────
+
+export default function GatewayPage() {
+  const chart = useChartTheme();
+  const embedded = useRuntimeEmbedded();
+  const { counts } = useDeploymentContext();
+  const [kpiRefreshKey, setKpiRefreshKey] = useState(0);
+  const [policies, setPolicies] = useState<GatewayPolicy[]>([]);
+  const [stats, setStats] = useState<GatewayStatsResponse | null>(null);
+  const [audit, setAudit] = useState<PolicyAuditEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [tab, setTab] = useState<"feed" | "policies" | "audit" | "evaluate">("feed");
+
+  // Evaluate form state
+  const [evalTool, setEvalTool] = useState("");
+  const [evalArgs, setEvalArgs] = useState("{}");
+  const [evalResult, setEvalResult] = useState<{ allowed: boolean; reason: string } | null>(null);
+
+  // Create form state
+  const [showCreate, setShowCreate] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newMode, setNewMode] = useState<PolicyMode>("audit");
+  const [newBlockTools, setNewBlockTools] = useState("");
+  const [newDescription, setNewDescription] = useState("");
+  const gatewayUnavailable = counts ? !counts.has_gateway : false;
+
+  const load = () => {
+    setLoading(true);
+    setError(null);
+    Promise.all([
+      api.listGatewayPolicies(),
+      api.getGatewayStats(),
+      api.listGatewayAudit(),
+    ])
+      .then(([p, s, a]) => {
+        setPolicies(p.policies);
+        setStats(s);
+        setAudit(a.entries);
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void load();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  const toggleExpand = (id: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const handleCreate = async () => {
+    const tools = newBlockTools.split(",").map((t) => t.trim()).filter(Boolean);
+    const rules = tools.length > 0
+      ? [{ id: "r1", action: "block", block_tools: tools, description: "Block listed tools" }]
+      : [];
+    await api.createGatewayPolicy({
+      name: newName,
+      description: newDescription,
+      mode: newMode,
+      rules,
+      enabled: true,
+    } as Partial<GatewayPolicy>);
+    setShowCreate(false);
+    setNewName("");
+    setNewMode("audit");
+    setNewBlockTools("");
+    setNewDescription("");
+    void load();
+  };
+
+  const handleDelete = async (id: string) => {
+    if (!confirm('Delete this policy? This cannot be undone.')) return;
+    await api.deleteGatewayPolicy(id);
+    void load();
+  };
+
+  const handleToggleEnabled = async (policy: GatewayPolicy) => {
+    await api.updateGatewayPolicy(policy.policy_id, { enabled: !policy.enabled } as Partial<GatewayPolicy>);
+    void load();
+  };
+
+  const handleEvaluate = async () => {
+    try {
+      const args = JSON.parse(evalArgs);
+      const result = await api.evaluateGateway({ tool_name: evalTool, arguments: args });
+      setEvalResult(result);
+    } catch {
+      setEvalResult({ allowed: false, reason: "Invalid JSON arguments" });
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      {!embedded ? (
+      <div className="flex items-start justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight flex items-center gap-2">
+            <Lock className="w-6 h-6 text-blue-400" />
+            Gateway Policies
+          </h1>
+          <p className="text-[var(--text-secondary)] text-sm mt-1">
+            Runtime MCP gateway rules with policy-as-code enforcement
+          </p>
+        </div>
+        <button
+          onClick={() => setShowCreate(true)}
+          className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-medium transition-colors"
+        >
+          <Plus className="w-4 h-4" />
+          Create Policy
+        </button>
+      </div>
+      ) : null}
+
+      <GatewayFeedKpiBar refreshKey={kpiRefreshKey} />
+
+      {/* Stats */}
+      {stats && (
+        <>
+          <RuntimePostureCard runtime={stats.policy_runtime} />
+          {stats.firewall_runtime && stats.firewall_runtime.total_decisions > 0 && (
+            <FirewallRuntimeCard runtime={stats.firewall_runtime} />
+          )}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <StatCard label="Total Policies" value={stats.total_policies} icon={Lock} color="text-[var(--text-secondary)]" />
+            <StatCard label="Enforce Mode" value={stats.enforce_count} icon={ShieldAlert} color="text-red-400" />
+            <StatCard label="Audit Mode" value={stats.audit_count} icon={ShieldCheck} color="text-blue-400" />
+            <StatCard label="Blocked" value={stats.blocked_count} icon={ShieldAlert} color="text-orange-400" />
+          </div>
+        </>
+      )}
+
+      {/* Tabs */}
+      <div className="flex gap-1.5">
+        {(["feed", "policies", "audit", "evaluate"] as const).map((t) => (
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors inline-flex items-center gap-1.5 ${
+              tab === t
+                ? "bg-[var(--surface-elevated)] text-[var(--foreground)]"
+                : "text-[var(--text-tertiary)] hover:text-[var(--text-secondary)] hover:bg-[var(--surface)]"
+            }`}
+          >
+            {t === "feed" && <Activity className="w-3.5 h-3.5" />}
+            {t === "feed"
+              ? "Live Feed"
+              : t === "policies"
+                ? "Policies"
+                : t === "audit"
+                  ? "Audit Log"
+                  : "Evaluate"}
+          </button>
+        ))}
+      </div>
+
+      {/* Live Feed tab — self-contained, has its own data + WebSocket lifecycle */}
+      {tab === "feed" && (
+        <GatewayFeedPanel onActivity={() => setKpiRefreshKey((current) => current + 1)} />
+      )}
+
+      {/* Loading */}
+      {loading && tab !== "feed" && (
+        <div className="flex items-center justify-center py-12">
+          <Loader2 className="w-6 h-6 animate-spin text-[var(--text-tertiary)]" />
+        </div>
+      )}
+
+      {/* Error state */}
+      {error && !loading && tab !== "feed" && (
+        <div className="text-center py-10 border border-dashed border-red-900/50 rounded-xl space-y-3">
+          <AlertTriangle className="w-8 h-8 text-red-500 mx-auto" />
+          <p className="text-red-400 text-sm">Failed to load gateway data</p>
+          <p className="text-[var(--text-tertiary)] text-xs">{error}</p>
+          <button onClick={load} className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[var(--surface-elevated)] hover:bg-[var(--surface-muted)] border border-[var(--border-subtle)] rounded-lg text-xs text-[var(--text-secondary)] transition-colors">
+            <RefreshCw className="w-3.5 h-3.5" /> Retry
+          </button>
+        </div>
+      )}
+
+      {/* Create modal */}
+      {showCreate && (
+        <div className="bg-[var(--surface)] border border-[var(--border-subtle)] rounded-xl p-5 space-y-4">
+          <h3 className="text-sm font-semibold text-[var(--foreground)]">New Gateway Policy</h3>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs text-[var(--text-tertiary)] block mb-1">Name</label>
+              <input
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                className="w-full bg-[var(--surface-elevated)] border border-[var(--border-subtle)] rounded px-3 py-1.5 text-sm text-[var(--foreground)] focus:outline-none focus:border-blue-600"
+                placeholder="block-exec-tools"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-[var(--text-tertiary)] block mb-1">Mode</label>
+              <select
+                value={newMode}
+                onChange={(e) => setNewMode(e.target.value as PolicyMode)}
+                className="w-full bg-[var(--surface-elevated)] border border-[var(--border-subtle)] rounded px-3 py-1.5 text-sm text-[var(--foreground)] focus:outline-none focus:border-blue-600"
+              >
+                <option value="audit">Audit (log only)</option>
+                <option value="enforce">Enforce (block)</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label className="text-xs text-[var(--text-tertiary)] block mb-1">Block Tools (comma-separated)</label>
+            <input
+              value={newBlockTools}
+              onChange={(e) => setNewBlockTools(e.target.value)}
+              className="w-full bg-[var(--surface-elevated)] border border-[var(--border-subtle)] rounded px-3 py-1.5 text-sm text-[var(--foreground)] focus:outline-none focus:border-blue-600"
+              placeholder="execute_command, write_file, http_request"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-[var(--text-tertiary)] block mb-1">Description</label>
+            <input
+              value={newDescription}
+              onChange={(e) => setNewDescription(e.target.value)}
+              className="w-full bg-[var(--surface-elevated)] border border-[var(--border-subtle)] rounded px-3 py-1.5 text-sm text-[var(--foreground)] focus:outline-none focus:border-blue-600"
+              placeholder="Block dangerous command execution tools"
+            />
+          </div>
+          <div className="flex gap-2 justify-end">
+            <button
+              onClick={() => setShowCreate(false)}
+              className="px-3 py-1.5 text-sm text-[var(--text-secondary)] hover:text-[var(--foreground)] transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleCreate}
+              disabled={!newName}
+              className="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded text-sm font-medium transition-colors"
+            >
+              Create
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Policies tab */}
+      {!loading && tab === "policies" && (
+        <>
+          {policies.length === 0 && (
+            <div className="text-center py-16 border border-dashed border-[var(--border-subtle)] rounded-xl">
+              <Lock className="w-8 h-8 text-[var(--text-tertiary)] mx-auto mb-3" />
+              <p className="text-[var(--text-tertiary)] text-sm">
+                {gatewayUnavailable ? "Gateway not enabled for this estate." : "No gateway policies yet."}
+              </p>
+              <p className="text-[var(--text-tertiary)] text-xs mt-1">
+                {gatewayUnavailable
+                  ? "Enable the runtime gateway to manage shared MCP policy enforcement."
+                  : "Create a policy to define runtime MCP tool enforcement rules."}
+              </p>
+            </div>
+          )}
+          <div className="space-y-2">
+            {policies?.map((policy) => {
+              const isExpanded = expanded.has(policy.policy_id);
+              return (
+                <div key={policy.policy_id} className="bg-[var(--surface)] border border-[var(--border-subtle)] rounded-xl overflow-hidden">
+                  <button
+                    onClick={() => toggleExpand(policy.policy_id)}
+                    className="w-full px-4 py-3 flex items-center justify-between hover:bg-[var(--surface-elevated)]/50 transition-colors"
+                  >
+                    <div className="flex items-center gap-3">
+                      {isExpanded ? <ChevronDown className="w-4 h-4 text-[var(--text-tertiary)]" /> : <ChevronRight className="w-4 h-4 text-[var(--text-tertiary)]" />}
+                      <span className="font-medium text-[var(--foreground)]">{policy.name}</span>
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded border ${MODE_COLORS[policy.mode]}`}>
+                        {policy.mode}
+                      </span>
+                      {!policy.enabled && (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded border bg-[var(--surface)] text-[var(--text-tertiary)] border-[var(--border-subtle)]">
+                          disabled
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-3 text-xs text-[var(--text-tertiary)]">
+                      <span>{policy.rules.length} rule{policy.rules.length !== 1 ? "s" : ""}</span>
+                      {policy.bound_agents.length > 0 && (
+                        <span>{policy.bound_agents.length} bound</span>
+                      )}
+                    </div>
+                  </button>
+                  {isExpanded && (
+                    <div className="border-t border-[var(--border-subtle)] px-4 py-3 space-y-3">
+                      {policy.description && (
+                        <p className="text-xs text-[var(--text-secondary)]">{policy.description}</p>
+                      )}
+                      {/* Rules */}
+                      {policy.rules.length > 0 && (
+                        <div>
+                          <span className="text-xs text-[var(--text-tertiary)] block mb-1">Rules</span>
+                          <div className="space-y-1">
+                            {policy.rules?.map((rule) => (
+                              <div key={rule.id} className="text-xs bg-[var(--surface-elevated)] border border-[var(--border-subtle)] rounded px-2 py-1.5 text-[var(--text-secondary)]">
+                                <span className="text-[var(--foreground)] font-mono">{rule.id}</span>
+                                {rule.description && <span className="ml-2">{rule.description}</span>}
+                                {rule.block_tools.length > 0 && (
+                                  <span className="ml-2 text-red-400">
+                                    blocks: {rule.block_tools.join(", ")}
+                                  </span>
+                                )}
+                                {rule.tool_name_pattern && (
+                                  <span className="ml-2 text-yellow-400">
+                                    pattern: {rule.tool_name_pattern}
+                                  </span>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {/* Detail grid */}
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                        <div>
+                          <span className="text-[var(--text-tertiary)]">Created</span>
+                          <div className="text-[var(--text-secondary)] mt-0.5">{policy.created_at ? formatDate(policy.created_at) : "—"}</div>
+                        </div>
+                        <div>
+                          <span className="text-[var(--text-tertiary)]">Updated</span>
+                          <div className="text-[var(--text-secondary)] mt-0.5">{policy.updated_at ? formatDate(policy.updated_at) : "—"}</div>
+                        </div>
+                        <div>
+                          <span className="text-[var(--text-tertiary)]">Bound Agents</span>
+                          <div className="text-[var(--text-secondary)] mt-0.5">{policy.bound_agents.length > 0 ? policy.bound_agents.join(", ") : "All"}</div>
+                        </div>
+                        <div>
+                          <span className="text-[var(--text-tertiary)]">Environments</span>
+                          <div className="text-[var(--text-secondary)] mt-0.5">{policy.bound_environments.length > 0 ? policy.bound_environments.join(", ") : "All"}</div>
+                        </div>
+                      </div>
+                      {/* Actions */}
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={(e) => { e.stopPropagation(); void handleToggleEnabled(policy); }}
+                          className="text-[10px] px-2 py-0.5 rounded border transition-colors hover:opacity-80 bg-[var(--surface-elevated)] text-[var(--text-secondary)] border-[var(--border-subtle)]"
+                        >
+                          {policy.enabled ? "Disable" : "Enable"}
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); void handleDelete(policy.policy_id); }}
+                          className="text-[10px] px-2 py-0.5 rounded border transition-colors hover:opacity-80 bg-red-950 text-red-300 border-red-800 flex items-center gap-1"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {/* Audit tab */}
+      {!loading && tab === "audit" && (
+        <>
+          {audit.length === 0 ? (
+            <div className="text-center py-16 border border-dashed border-[var(--border-subtle)] rounded-xl">
+              <FileText className="w-8 h-8 text-[var(--text-tertiary)] mx-auto mb-3" />
+              <p className="text-[var(--text-tertiary)] text-sm">No audit entries yet.</p>
+            </div>
+          ) : (
+            <>
+              {/* Audit chart: action breakdown by top tools */}
+              {(() => {
+                const toolCounts: Record<string, { blocked: number; alerted: number; allowed: number }> = {};
+                for (const e of audit) {
+                  let bucket = toolCounts[e.tool_name];
+                  if (!bucket) {
+                    bucket = { blocked: 0, alerted: 0, allowed: 0 };
+                    toolCounts[e.tool_name] = bucket;
+                  }
+                  const key = e.action_taken as "blocked" | "alerted" | "allowed";
+                  if (key in bucket) bucket[key]++;
+                }
+                const chartData = Object.entries(toolCounts)
+                  .sort(([, a], [, b]) => (b.blocked + b.alerted) - (a.blocked + a.alerted))
+                  .slice(0, 10)
+                  .map(([tool, counts]) => ({ tool: tool.length > 16 ? tool.slice(0, 14) + "…" : tool, ...counts }));
+                return (
+                  <div className="bg-[var(--surface)] border border-[var(--border-subtle)] rounded-xl p-5">
+                    <h3 className="text-sm font-semibold text-[var(--text-secondary)] mb-1">Enforcement Actions by Tool</h3>
+                    <p className="text-[10px] text-[var(--text-tertiary)] mb-4">Top tools by blocked + alerted count</p>
+                    <div className="h-44">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={chartData} margin={{ top: 4, right: 8, bottom: 4, left: 0 }}>
+                          <CartesianGrid strokeDasharray="3 3" stroke={chart.grid} vertical={false} />
+                          <XAxis dataKey="tool" tick={{ fontSize: 9, fill: chart.text }} tickLine={false} axisLine={{ stroke: chart.border }} />
+                          <YAxis tick={{ fontSize: 10, fill: chart.text }} tickLine={false} axisLine={false} allowDecimals={false} width={28} />
+                          <Tooltip contentStyle={{ background: chart.tooltip.bg, border: `1px solid ${chart.tooltip.border}`, borderRadius: 8, fontSize: 12 }} itemStyle={{ color: chart.tooltip.text }} labelStyle={{ color: chart.text, marginBottom: 4 }} />
+                          <Bar dataKey="blocked" name="blocked" stackId="a" fill={chart.severity.critical} fillOpacity={0.8} />
+                          <Bar dataKey="alerted" name="alerted" stackId="a" fill={chart.severity.high} fillOpacity={0.8} />
+                          <Bar dataKey="allowed" name="allowed" stackId="a" fill={chart.status.success} fillOpacity={0.5} radius={[4, 4, 0, 0]} />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+                );
+              })()}
+            <div className="space-y-1">
+              {audit?.map((entry) => (
+                <div key={entry.entry_id} className="bg-[var(--surface)] border border-[var(--border-subtle)] rounded-lg px-4 py-2 flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                      entry.action_taken === "blocked"
+                        ? "bg-red-950 text-red-300 border-red-800"
+                        : entry.action_taken === "alerted"
+                        ? "bg-yellow-950 text-yellow-300 border-yellow-800"
+                        : "bg-emerald-950 text-emerald-300 border-emerald-800"
+                    }`}>
+                      {entry.action_taken}
+                    </span>
+                    <span className="text-xs text-[var(--text-secondary)] font-mono">{entry.tool_name}</span>
+                    <span className="text-xs text-[var(--text-tertiary)]">{entry.agent_name || "—"}</span>
+                    <span className="text-xs text-[var(--text-tertiary)] truncate max-w-xs">{entry.reason}</span>
+                  </div>
+                  <span className="text-xs text-[var(--text-tertiary)]">{entry.timestamp ? formatDate(entry.timestamp) : ""}</span>
+                </div>
+              ))}
+            </div>
+            </>
+          )}
+        </>
+      )}
+
+      {/* Evaluate tab */}
+      {!loading && tab === "evaluate" && (
+        <div className="bg-[var(--surface)] border border-[var(--border-subtle)] rounded-xl p-5 space-y-4">
+          <h3 className="text-sm font-semibold text-[var(--foreground)] flex items-center gap-2">
+            <Play className="w-4 h-4 text-blue-400" />
+            Dry-Run Evaluation
+          </h3>
+          <p className="text-xs text-[var(--text-tertiary)]">
+            Test how gateway policies would evaluate a tool call without actually making one.
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs text-[var(--text-tertiary)] block mb-1">Tool Name</label>
+              <input
+                value={evalTool}
+                onChange={(e) => setEvalTool(e.target.value)}
+                className="w-full bg-[var(--surface-elevated)] border border-[var(--border-subtle)] rounded px-3 py-1.5 text-sm text-[var(--foreground)] font-mono focus:outline-none focus:border-blue-600"
+                placeholder="execute_command"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-[var(--text-tertiary)] block mb-1">Arguments (JSON)</label>
+              <input
+                value={evalArgs}
+                onChange={(e) => setEvalArgs(e.target.value)}
+                className="w-full bg-[var(--surface-elevated)] border border-[var(--border-subtle)] rounded px-3 py-1.5 text-sm text-[var(--foreground)] font-mono focus:outline-none focus:border-blue-600"
+                placeholder='{"command": "rm -rf /"}'
+              />
+            </div>
+          </div>
+          <button
+            onClick={handleEvaluate}
+            disabled={!evalTool}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
+          >
+            <Play className="w-4 h-4" />
+            Evaluate
+          </button>
+          {evalResult && (
+            <div className={`rounded-lg border p-4 ${
+              evalResult.allowed
+                ? "border-emerald-800 bg-emerald-950/50"
+                : "border-red-800 bg-red-950/50"
+            }`}>
+              <div className="flex items-center gap-2">
+                {evalResult.allowed ? (
+                  <ShieldCheck className="w-5 h-5 text-emerald-400" />
+                ) : (
+                  <ShieldAlert className="w-5 h-5 text-red-400" />
+                )}
+                <span className={`text-sm font-semibold ${evalResult.allowed ? "text-emerald-300" : "text-red-300"}`}>
+                  {evalResult.allowed ? "Allowed" : "Blocked"}
+                </span>
+              </div>
+              {evalResult.reason && (
+                <p className="text-xs text-[var(--text-secondary)] mt-1">{evalResult.reason}</p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Components ──────────────────────────────────────────────────────────────
+
+function StatCard({
+  label,
+  value,
+  icon: Icon,
+  color,
+}: {
+  label: string;
+  value: number;
+  icon: React.ElementType;
+  color: string;
+}) {
+  return (
+    <div className="bg-[var(--surface)] border border-[var(--border-subtle)] rounded-xl p-4">
+      <Icon className={`w-4 h-4 mb-2 ${color}`} />
+      <div className="text-2xl font-bold font-mono">{value}</div>
+      <div className="text-xs text-[var(--text-tertiary)] mt-0.5">{label}</div>
+    </div>
+  );
+}
+
+function RuntimePostureCard({ runtime }: { runtime: GatewayPolicyRuntimeSummary }) {
+  const highlights = [
+    { label: "Enabled policies", value: String(runtime.enabled_policies) },
+    { label: "Blocking rules", value: String(runtime.blocking_rules) },
+    { label: "Advisory rules", value: String(runtime.advisory_rules) },
+    { label: "Allowlist rules", value: String(runtime.allowlist_rules) },
+  ];
+
+  if (runtime.protects_secret_paths) {
+    highlights.push({ label: "Secret path guard", value: "On" });
+  }
+  if (runtime.restricts_unknown_egress) {
+    highlights.push({ label: "Unknown egress guard", value: "On" });
+  }
+
+  return (
+    <div className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--surface)] p-5">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-[11px] font-medium uppercase tracking-[0.18em] text-[var(--text-tertiary)]">
+              Runtime posture
+            </span>
+            <span className={`rounded-full border px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.14em] ${RUNTIME_COLORS[runtime.rollout_mode]}`}>
+              {runtime.rollout_mode.replaceAll("_", " ")}
+            </span>
+          </div>
+          <p className="max-w-2xl text-sm text-[var(--text-secondary)]">{runtime.summary}</p>
+          {runtime.denied_tool_classes.length > 0 && (
+            <p className="text-xs text-[var(--text-tertiary)]">
+              Denied tool classes: {runtime.denied_tool_classes.join(", ")}
+            </p>
+          )}
+        </div>
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+          {highlights.map((item) => (
+            <div key={item.label} className="rounded-xl border border-[var(--border-subtle)] bg-[var(--background)]/80 px-3 py-2">
+              <div className="text-[10px] uppercase tracking-[0.16em] text-[var(--text-tertiary)]">{item.label}</div>
+              <div className="mt-1 text-sm font-semibold text-[var(--foreground)]">{item.value}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Inter-agent firewall runtime card (#982 PR 4) ─────────────────────────
+
+const FIREWALL_DECISION_COLORS: Record<"allow" | "warn" | "deny", string> = {
+  allow: "text-emerald-400",
+  warn: "text-amber-400",
+  deny: "text-rose-400",
+};
+
+function FirewallRuntimeCard({ runtime }: { runtime: FirewallRuntimeStats }) {
+  const lastSeen = runtime.last_seen_ts
+    ? new Date(runtime.last_seen_ts * 1000).toLocaleString()
+    : "—";
+  const enforcementMode = runtime.recent[0]?.enforcement_mode ?? null;
+
+  return (
+    <div className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--surface)] p-5 space-y-4">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-[11px] font-medium uppercase tracking-[0.18em] text-[var(--text-tertiary)]">
+              Inter-agent firewall
+            </span>
+            {enforcementMode && (
+              <span className="rounded-full border border-[var(--border-subtle)] bg-[var(--surface)] px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--text-secondary)]">
+                {enforcementMode === "dry_run" ? "dry run" : enforcementMode}
+              </span>
+            )}
+          </div>
+          <p className="max-w-2xl text-sm text-[var(--text-secondary)]">
+            {runtime.total_decisions} agent → agent decision(s) seen across the runtime plane. Last seen {lastSeen}.
+          </p>
+        </div>
+        <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+          <FirewallStat label="Total" value={runtime.total_decisions} tone="text-[var(--foreground)]" />
+          <FirewallStat label="Allow" value={runtime.allow} tone="text-emerald-400" />
+          <FirewallStat label="Warn" value={runtime.warn} tone="text-amber-400" />
+          <FirewallStat label="Deny" value={runtime.deny} tone="text-rose-400" />
+        </div>
+      </div>
+      {runtime.top_pairs.length > 0 && (
+        <div>
+          <div className="text-[10px] uppercase tracking-[0.18em] text-[var(--text-tertiary)] mb-2">Top pairs</div>
+          <div className="flex flex-wrap gap-2">
+            {runtime.top_pairs.map((p) => (
+              <div
+                key={`${p.source_agent}->${p.target_agent}`}
+                className="flex items-center gap-2 rounded-lg border border-[var(--border-subtle)] bg-[var(--background)]/80 px-3 py-1.5 text-xs"
+              >
+                <span className="font-medium text-[var(--foreground)]">{p.source_agent}</span>
+                <span className="text-[var(--text-tertiary)]">→</span>
+                <span className="font-medium text-[var(--foreground)]">{p.target_agent}</span>
+                {p.deny > 0 && <span className="text-rose-400">{p.deny}d</span>}
+                {p.warn > 0 && <span className="text-amber-400">{p.warn}w</span>}
+                {p.allow > 0 && <span className="text-emerald-400">{p.allow}a</span>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {runtime.recent.length > 0 && (
+        <div>
+          <div className="text-[10px] uppercase tracking-[0.18em] text-[var(--text-tertiary)] mb-2">
+            Recent decisions
+          </div>
+          <div className="overflow-hidden rounded-lg border border-[var(--border-subtle)]">
+            <table className="w-full text-xs">
+              <thead className="bg-[var(--surface)]/60 text-[var(--text-tertiary)] uppercase tracking-[0.14em] text-[10px]">
+                <tr>
+                  <th className="text-left px-3 py-2 font-medium">When</th>
+                  <th className="text-left px-3 py-2 font-medium">Source → Target</th>
+                  <th className="text-left px-3 py-2 font-medium">Decision</th>
+                  <th className="text-left px-3 py-2 font-medium">Rule</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[var(--border-subtle)]">
+                {runtime.recent.slice(0, 10).map((r, idx) => (
+                  <tr key={`${r.timestamp}-${idx}`} className="bg-[var(--background)]/40">
+                    <td className="px-3 py-2 text-[var(--text-secondary)]">
+                      {r.timestamp ? new Date(r.timestamp * 1000).toLocaleTimeString() : "—"}
+                    </td>
+                    <td className="px-3 py-2 text-[var(--foreground)]">
+                      <span>{r.source_agent}</span>
+                      <span className="text-[var(--text-tertiary)] mx-1">→</span>
+                      <span>{r.target_agent}</span>
+                    </td>
+                    <td className={`px-3 py-2 font-semibold ${FIREWALL_DECISION_COLORS[r.effective_decision]}`}>
+                      {r.effective_decision.toUpperCase()}
+                      {r.decision !== r.effective_decision && (
+                        <span className="text-[var(--text-tertiary)] ml-1">
+                          (was {r.decision})
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 text-[var(--text-secondary)]">
+                      {r.matched_rule
+                        ? r.matched_rule.description || `${r.matched_rule.source} → ${r.matched_rule.target}`
+                        : "default"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FirewallStat({ label, value, tone }: { label: string; value: number; tone: string }) {
+  return (
+    <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--background)]/80 px-3 py-2">
+      <div className="text-[10px] uppercase tracking-[0.16em] text-[var(--text-tertiary)]">{label}</div>
+      <div className={`mt-1 text-sm font-semibold ${tone}`}>{value}</div>
+    </div>
+  );
+}

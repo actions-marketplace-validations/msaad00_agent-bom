@@ -1,0 +1,177 @@
+import Graph from "graphology";
+import type { Edge, Node } from "@xyflow/react";
+
+import type {
+  LineageNodeData,
+  LineageNodeType,
+} from "@/components/lineage-nodes";
+import type { UnifiedGraphData } from "@/lib/graph-schema";
+import {
+  buildLargeGraphOverviewModel,
+  summarizeLargeGraphOverview,
+  type LargeGraphOverviewModel,
+  type LargeGraphOverviewSummary,
+} from "@/lib/large-graph-overview";
+import {
+  buildUnifiedFlowGraph,
+  type UnifiedGraphFlowFilters,
+} from "@/lib/unified-graph-flow";
+
+export type SigmaNodeAttributes = {
+  label: string;
+  x: number;
+  y: number;
+  size: number;
+  color: string;
+  nodeType: LineageNodeType;
+  severity?: string | undefined;
+  hidden: boolean;
+  highlighted: boolean;
+  forceLabel: boolean;
+  dimmed: boolean;
+  zIndex: number;
+} & Record<string, unknown>;
+
+export type SigmaEdgeAttributes = {
+  label: string;
+  relationship: string;
+  color: string;
+  size: number;
+  hidden: boolean;
+  highlighted: boolean;
+  zIndex: number;
+} & Record<string, unknown>;
+
+export interface SigmaGraphOverviewModel {
+  graph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes>;
+  overview: LargeGraphOverviewModel;
+  summary: LargeGraphOverviewSummary;
+}
+
+const SIGMA_DEFAULT_LAYERS: Record<LineageNodeType, boolean> = {
+  provider: true,
+  agent: true,
+  org: true,
+  account: true,
+  user: true,
+  group: true,
+  role: true,
+  policy: true,
+  serviceAccount: true,
+  servicePrincipal: true,
+  federatedIdentity: true,
+  environment: true,
+  fleet: true,
+  cluster: true,
+  server: true,
+  sharedServer: true,
+  package: true,
+  vulnerability: true,
+  credential: true,
+  tool: true,
+  model: true,
+  framework: true,
+  dataset: true,
+  container: true,
+  cloudResource: true,
+  misconfiguration: true,
+  managedIdentity: true,
+  accessGrant: true,
+  accessPolicy: true,
+  driftIncident: true,
+  dataStore: true,
+  directory: true,
+  sourceFile: true,
+  configFile: true,
+  codeModule: true,
+  ciJob: true,
+  apiGateway: true,
+  toolCall: true,
+  blueprint: true,
+};
+
+const SIGMA_DEFAULT_FILTERS: UnifiedGraphFlowFilters = {
+  layers: SIGMA_DEFAULT_LAYERS,
+  severity: null,
+  agentName: null,
+  vulnOnly: false,
+  maxDepth: 8,
+};
+
+function edgeIsHighlighted(
+  source: { highlighted: boolean; forceLabel: boolean } | undefined,
+  target: { highlighted: boolean; forceLabel: boolean } | undefined,
+): boolean {
+  return Boolean(
+    source?.highlighted ||
+    target?.highlighted ||
+    source?.forceLabel ||
+    target?.forceLabel,
+  );
+}
+
+export function buildSigmaGraphOverviewModel(
+  nodes: Node<LineageNodeData>[],
+  edges: Edge[],
+): SigmaGraphOverviewModel {
+  const overview = buildLargeGraphOverviewModel(nodes, edges);
+  const graph = new Graph<SigmaNodeAttributes, SigmaEdgeAttributes>({
+    allowSelfLoops: true,
+    multi: true,
+    type: "directed",
+  });
+
+  for (const node of overview.nodes) {
+    graph.addNode(node.id, {
+      label: node.label,
+      x: node.x,
+      y: node.y,
+      size: node.size,
+      color: node.color,
+      nodeType: node.nodeType,
+      severity: node.severity,
+      hidden: node.hidden,
+      highlighted: node.highlighted,
+      // Sigma always draws a `forceLabel` node's label, bypassing both the
+      // rendered-size threshold and the label-grid declutter. The overview
+      // model force-labels every agent/server/credential/tool, which on a
+      // broad estate is hundreds of nodes and paints an unreadable smear. Only
+      // force the label for genuinely highlighted nodes here; every other label
+      // is governed by the size threshold + grid declutter and appears on zoom
+      // or hover. The model's `forceLabel` still drives z-ordering below so
+      // high-signal nodes keep drawing on top.
+      forceLabel: node.highlighted,
+      dimmed: node.hidden,
+      zIndex: node.highlighted || node.forceLabel ? 2 : 1,
+    });
+  }
+
+  overview.edges.forEach((edge, index) => {
+    const source = overview.nodeById.get(edge.source);
+    const target = overview.nodeById.get(edge.target);
+    const highlighted = edgeIsHighlighted(source, target);
+    graph.addDirectedEdgeWithKey(edge.id, edge.source, edge.target, {
+      label: edge.relationship.replace(/_/g, " "),
+      relationship: edge.relationship,
+      color: edge.color,
+      size: edge.size,
+      hidden: edge.hidden || source?.hidden === true || target?.hidden === true,
+      highlighted,
+      zIndex: highlighted ? 2 : 1 - index / 100_000,
+    });
+  });
+
+  return {
+    graph,
+    overview,
+    summary: summarizeLargeGraphOverview(nodes, edges),
+  };
+}
+
+export function buildSigmaGraphOverviewModelFromUnifiedGraph(
+  graph: UnifiedGraphData,
+  filters: UnifiedGraphFlowFilters = SIGMA_DEFAULT_FILTERS,
+): SigmaGraphOverviewModel {
+  const flow = buildUnifiedFlowGraph(graph, filters);
+  return buildSigmaGraphOverviewModel(flow.nodes, flow.edges);
+}

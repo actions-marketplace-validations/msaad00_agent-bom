@@ -1,24 +1,120 @@
-"""Analysis commands — analytics, graph, dashboard, introspect."""
+"""Analysis commands — analytics, graph, dashboard, introspect, mesh."""
 
 from __future__ import annotations
 
 import json
 import sys
+from collections import Counter
+from io import StringIO
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import click
 from rich.console import Console
 
+from agent_bom.cli._common import PORT_RANGE, read_json_file_for_cli
+from agent_bom.constants import is_credential_key
+
+if TYPE_CHECKING:
+    from agent_bom.mcp_introspect import IntrospectionReport, ServerIntrospection
+
+
+def _load_mesh_source(scan_file: Optional[str], project_dir: Optional[str]) -> tuple[list[dict], list[dict] | None, str]:
+    """Load agent topology from either a saved report or live discovery."""
+    if scan_file:
+        data = read_json_file_for_cli(scan_file, label="scan file")
+        agents_data = data.get("agents", [])
+        blast_radius = data.get("blast_radius")
+        if not isinstance(agents_data, list):
+            raise ValueError("scan file did not contain a valid 'agents' list")
+        if blast_radius is not None and not isinstance(blast_radius, list):
+            blast_radius = None
+        return agents_data, blast_radius, "saved scan"
+
+    from dataclasses import asdict
+
+    from agent_bom.discovery import discover_all
+    from agent_bom.parsers import extract_packages
+
+    agents = discover_all(project_dir=project_dir)
+    for agent in agents:
+        for server in agent.mcp_servers:
+            if not server.packages:
+                server.packages = extract_packages(server)
+
+    scope_label = f"project-scoped ({project_dir})" if project_dir else "machine-wide"
+    return [asdict(agent) for agent in agents], None, scope_label
+
+
+def _coerce_introspection_results(
+    report_or_results: "IntrospectionReport | list[ServerIntrospection]",
+) -> list["ServerIntrospection"]:
+    """Support both IntrospectionReport and the older list-returning test doubles."""
+    results = getattr(report_or_results, "results", report_or_results)
+    if not isinstance(results, list):
+        raise TypeError("introspection results must be a list")
+    return results
+
+
+def _render_mesh_summary(con: Console, agents_data: list[dict], mesh: dict, *, scope_label: str, quiet: bool = False) -> None:
+    """Print a compact human-readable topology summary."""
+    stats = mesh.get("stats", {})
+    shared_counts: Counter[str] = Counter()
+    for agent in agents_data:
+        for server in agent.get("mcp_servers", []):
+            shared_counts[server.get("name", "unknown")] += 1
+
+    if not quiet:
+        con.print()
+        con.print(
+            f"[bold]Mesh[/bold]  "
+            f"[dim]{scope_label} · {stats.get('total_agents', 0)} agents · {stats.get('total_servers', 0)} servers · "
+            f"{stats.get('total_tools', 0)} tools · {stats.get('total_vulnerabilities', 0)} vulns[/dim]"
+        )
+
+    for agent in agents_data:
+        servers = agent.get("mcp_servers", [])
+        con.print(f"  [bold]{agent.get('name', 'unknown')}[/bold] [dim]({len(servers)} server(s))[/dim]")
+        for server in servers:
+            packages = server.get("packages", [])
+            tools = server.get("tools", [])
+            env = server.get("env", {}) or {}
+            creds = [k for k in env if is_credential_key(k)]
+            vuln_count = sum(len(pkg.get("vulnerabilities", [])) for pkg in packages)
+            shared = " [dim](shared)[/dim]" if shared_counts[server.get("name", "unknown")] > 1 else ""
+            con.print(
+                "    "
+                f"• [cyan]{server.get('name', 'unknown')}[/cyan]{shared} "
+                f"[dim]{len(packages)} pkg · {len(tools)} tool · {len(creds)} cred · {vuln_count} vuln[/dim]"
+            )
+    if not quiet:
+        con.print()
+
+
+def _mesh_summary_text(agents_data: list[dict], mesh: dict, *, scope_label: str, quiet: bool = False) -> str:
+    """Render the human mesh summary to plain text for file output."""
+    buffer = StringIO()
+    con = Console(file=buffer, force_terminal=False, color_system=None, width=120)
+    _render_mesh_summary(con, agents_data, mesh, scope_label=scope_label, quiet=quiet)
+    return buffer.getvalue()
+
 
 @click.command("analytics")
-@click.argument("query_type", type=click.Choice(["trends", "posture", "events", "top-cves"]))
+@click.argument("query_type", type=click.Choice(["trends", "posture", "events", "top-cves", "fleet", "compliance"]))
 @click.option("--days", default=30, type=int, help="Lookback window in days (default: 30)")
 @click.option("--hours", default=24, type=int, help="Lookback window in hours for events (default: 24)")
 @click.option("--agent", default=None, help="Filter by agent name")
 @click.option("--limit", "top_limit", default=20, type=int, help="Limit for top-cves (default: 20)")
 @click.option("--clickhouse-url", default=None, envvar="AGENT_BOM_CLICKHOUSE_URL", metavar="URL", help="ClickHouse HTTP URL")
-def analytics_cmd(query_type, days, hours, agent, top_limit, clickhouse_url):
+@click.option(
+    "--tenant",
+    "tenant_id",
+    default=None,
+    envvar="AGENT_BOM_TENANT_ID",
+    metavar="TENANT",
+    help="Scope results to a single tenant. Omit to read across tenants (admin scope).",
+)
+def analytics_cmd(query_type, days, hours, agent, top_limit, clickhouse_url, tenant_id):
     """Query vulnerability trends, posture history, and runtime events from ClickHouse.
 
     \b
@@ -27,6 +123,8 @@ def analytics_cmd(query_type, days, hours, agent, top_limit, clickhouse_url):
       agent-bom analytics posture [--days 90] [--agent NAME]
       agent-bom analytics events [--hours 24]
       agent-bom analytics top-cves [--limit 20]
+      agent-bom analytics fleet [--limit 20]
+      agent-bom analytics compliance [--days 30]
     """
     from rich.table import Table
 
@@ -45,7 +143,7 @@ def analytics_cmd(query_type, days, hours, agent, top_limit, clickhouse_url):
         sys.exit(1)
 
     if query_type == "trends":
-        rows = store.query_vuln_trends(days=days, agent=agent)
+        rows = store.query_vuln_trends(days=days, agent=agent, tenant_id=tenant_id)
         table = Table(title=f"Vulnerability Trends (last {days} days)")
         table.add_column("Day", style="cyan")
         table.add_column("Severity", style="yellow")
@@ -55,7 +153,7 @@ def analytics_cmd(query_type, days, hours, agent, top_limit, clickhouse_url):
         console.print(table)
 
     elif query_type == "posture":
-        rows = store.query_posture_history(agent=agent, days=days)
+        rows = store.query_posture_history(agent=agent, days=days, tenant_id=tenant_id)
         table = Table(title=f"Posture History (last {days} days)")
         table.add_column("Day", style="cyan")
         table.add_column("Agent", style="blue")
@@ -73,7 +171,7 @@ def analytics_cmd(query_type, days, hours, agent, top_limit, clickhouse_url):
         console.print(table)
 
     elif query_type == "events":
-        rows = store.query_event_summary(hours=hours)
+        rows = store.query_event_summary(hours=hours, tenant_id=tenant_id)
         table = Table(title=f"Runtime Events (last {hours} hours)")
         table.add_column("Event Type", style="cyan")
         table.add_column("Severity", style="yellow")
@@ -83,13 +181,49 @@ def analytics_cmd(query_type, days, hours, agent, top_limit, clickhouse_url):
         console.print(table)
 
     elif query_type == "top-cves":
-        rows = store.query_top_cves(limit=top_limit)
+        rows = store.query_top_cves(limit=top_limit, tenant_id=tenant_id)
         table = Table(title=f"Top {top_limit} CVEs")
         table.add_column("CVE ID", style="cyan")
         table.add_column("Count", style="bold")
         table.add_column("Max CVSS", style="red")
         for r in rows:
             table.add_row(r.get("cve_id", ""), str(r.get("cnt", 0)), str(r.get("max_cvss", "")))
+        console.print(table)
+
+    elif query_type == "fleet":
+        rows = store.query_top_riskiest_agents(limit=top_limit, tenant_id=tenant_id)
+        table = Table(title=f"Top {top_limit} Riskiest Fleet Agents")
+        table.add_column("Agent", style="cyan")
+        table.add_column("State", style="yellow")
+        table.add_column("Trust", style="bold")
+        table.add_column("Vulns", style="red")
+        table.add_column("Creds", style="magenta")
+        table.add_column("Tenant", style="green")
+        for r in rows:
+            table.add_row(
+                r.get("agent_name", ""),
+                r.get("lifecycle_state", ""),
+                str(r.get("trust_score", "")),
+                str(r.get("vuln_count", "")),
+                str(r.get("credential_count", "")),
+                r.get("tenant_id", ""),
+            )
+        console.print(table)
+
+    elif query_type == "compliance":
+        rows = store.query_compliance_heatmap(days=days, tenant_id=tenant_id)
+        table = Table(title=f"Compliance Heatmap (last {days} days)")
+        table.add_column("Framework", style="cyan")
+        table.add_column("Status", style="yellow")
+        table.add_column("Count", style="bold")
+        table.add_column("Avg Score", style="green")
+        for r in rows:
+            table.add_row(
+                r.get("framework", ""),
+                r.get("status", ""),
+                str(r.get("cnt", "")),
+                str(r.get("avg_score", "")),
+            )
         console.print(table)
 
     if not rows:
@@ -99,10 +233,52 @@ def analytics_cmd(query_type, days, hours, agent, top_limit, clickhouse_url):
 @click.command("graph")
 @click.argument("scan_file", type=click.Path(exists=True))
 @click.option(
-    "--format", "-f", "fmt", type=click.Choice(["json", "dot", "mermaid"]), default="json", show_default=True, help="Output format."
+    "--format",
+    "-f",
+    "fmt",
+    type=click.Choice(["json", "dot", "mermaid", "graphml", "cypher"]),
+    default="json",
+    show_default=True,
+    help="Output format.",
 )
 @click.option("--output", "-o", "output_path", default=None, help="Write to file instead of stdout.")
-def graph_cmd(scan_file: str, fmt: str, output_path: Optional[str]) -> None:
+@click.option("--quiet", "-q", is_flag=True, help="Suppress success messages when writing files.")
+@click.option(
+    "--expected",
+    "expected_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Evaluate the graph against an expected graph fixture JSON.",
+)
+@click.option(
+    "--eval-output",
+    "eval_output_path",
+    default=None,
+    help="Write graph evaluation JSON to this path when --expected is set.",
+)
+@click.option(
+    "--fail-under",
+    type=click.FloatRange(min=0.0, max=1.0),
+    default=None,
+    help="Exit non-zero when the graph evaluation score is below this threshold.",
+)
+@click.option(
+    "--mermaid-limit",
+    type=click.IntRange(min=0),
+    default=80,
+    show_default=True,
+    help="Maximum nodes rendered for Mermaid output; 0 renders the full graph.",
+)
+def graph_cmd(
+    scan_file: str,
+    fmt: str,
+    output_path: Optional[str],
+    quiet: bool,
+    expected_path: Optional[str],
+    eval_output_path: Optional[str],
+    fail_under: Optional[float],
+    mermaid_limit: int,
+) -> None:
     """Export the transitive dependency graph from a saved JSON scan report.
 
     \b
@@ -115,14 +291,15 @@ def graph_cmd(scan_file: str, fmt: str, output_path: Optional[str]) -> None:
         dot -Tsvg deps.dot -o deps.svg
 
         agent-bom graph report.json --format mermaid
-
-    Closes #292.
+        agent-bom graph report.json --expected expected-graph.json --eval-output graph-eval.json --fail-under 0.9
     """
     from rich.console import Console as _Console
 
-    from agent_bom.output.graph_export import load_graph_from_scan, to_dot, to_json, to_mermaid
+    from agent_bom.graph.evaluation import evaluate_graph, load_expected_graph_spec
+    from agent_bom.output.graph_export import load_graph_from_scan, to_cypher, to_dot, to_graphml, to_json, to_mermaid
 
     _con = _Console()
+    _err_con = _Console(stderr=True)
 
     try:
         graph = load_graph_from_scan(scan_file)
@@ -133,22 +310,214 @@ def graph_cmd(scan_file: str, fmt: str, output_path: Optional[str]) -> None:
     if fmt == "dot":
         output = to_dot(graph)
     elif fmt == "mermaid":
-        output = to_mermaid(graph)
+        if mermaid_limit == 0:
+            output = to_mermaid(graph, max_nodes=None, max_edges=None)
+        else:
+            output = to_mermaid(graph, max_nodes=mermaid_limit)
+    elif fmt == "graphml":
+        output = to_graphml(graph)
+    elif fmt == "cypher":
+        output = to_cypher(graph)
     else:
         output = json.dumps(to_json(graph), indent=2)
 
     if output_path:
         Path(output_path).write_text(output)
-        _con.print(f"[green]Graph exported[/green] ({graph.node_count()} nodes, {graph.edge_count()} edges) → {output_path}")
+        if not quiet:
+            _con.print(f"[green]Graph exported[/green] ({graph.node_count()} nodes, {graph.edge_count()} edges) → {output_path}")
+    else:
+        click.echo(output)
+
+    if expected_path:
+        try:
+            evaluation = evaluate_graph(to_json(graph), load_expected_graph_spec(expected_path))
+        except ValueError as exc:
+            _err_con.print(f"[red]Error evaluating graph:[/red] {exc}")
+            raise SystemExit(1) from exc
+
+        evaluation_json = json.dumps(evaluation.to_dict(), indent=2, sort_keys=True)
+        if eval_output_path:
+            Path(eval_output_path).write_text(evaluation_json)
+            if not quiet:
+                _err_con.print(
+                    "[green]Graph evaluated[/green] "
+                    f"({evaluation.overall_score:.2%}, {evaluation.to_dict()['grade']}) -> {eval_output_path}",
+                )
+        elif not quiet:
+            _err_con.print(
+                "[bold]Graph evaluation[/bold] "
+                f"{evaluation.overall_score:.2%} ({evaluation.to_dict()['grade']}) "
+                f"nodes {evaluation.nodes.matched}/{evaluation.nodes.expected}, "
+                f"edges {evaluation.edges.matched}/{evaluation.edges.expected}, "
+                f"paths {evaluation.paths.matched}/{evaluation.paths.expected}",
+            )
+
+        if fail_under is not None and evaluation.overall_score < fail_under:
+            _err_con.print(
+                f"[red]Graph evaluation failed:[/red] score {evaluation.overall_score:.4f} is below {fail_under:.4f}",
+            )
+            raise SystemExit(1)
+
+
+@click.command("graph-evidence")
+@click.option(
+    "--mode",
+    type=click.Choice(["history", "manifest"]),
+    default="manifest",
+    show_default=True,
+    help="Evidence view to export.",
+)
+@click.option("--graph-db", type=click.Path(dir_okay=False), default=None, help="SQLite graph DB path. Defaults to active graph config.")
+@click.option("--tenant", "tenant_id", default="default", show_default=True, help="Tenant to scope graph evidence to.")
+@click.option("--scan-id", default="", help="Snapshot ID for manifest mode. Defaults to latest.")
+@click.option("--baseline-scan-id", default="", help="Optional diff baseline snapshot for manifest mode.")
+@click.option("--limit", type=click.IntRange(min=1, max=500), default=50, show_default=True, help="Snapshot history limit.")
+@click.option("--output", "-o", "output_path", default=None, help="Write JSON to file instead of stdout.")
+def graph_evidence_cmd(
+    mode: str,
+    graph_db: Optional[str],
+    tenant_id: str,
+    scan_id: str,
+    baseline_scan_id: str,
+    limit: int,
+    output_path: Optional[str],
+) -> None:
+    """Export retained graph history or a redaction-aware evidence manifest.
+
+    \b
+    Examples:
+      agent-bom graph-evidence --mode history
+      agent-bom graph-evidence --mode manifest --scan-id scan-2026-06-22 -o manifest.json
+    """
+    from agent_bom.db.graph_store import default_graph_db_path, graph_evidence_manifest, graph_history, open_graph_db
+
+    db_path = Path(graph_db).expanduser() if graph_db else default_graph_db_path()
+    with open_graph_db(db_path) as conn:
+        if mode == "history":
+            payload = graph_history(conn, tenant_id=tenant_id, limit=limit)
+        else:
+            payload = graph_evidence_manifest(
+                conn,
+                tenant_id=tenant_id,
+                scan_id=scan_id,
+                baseline_scan_id=baseline_scan_id,
+            )
+            if not payload.get("scan_id"):
+                raise click.ClickException("Graph snapshot not found for tenant.")
+
+    output = json.dumps(payload, indent=2, sort_keys=True)
+    if output_path:
+        Path(output_path).write_text(output + "\n", encoding="utf-8")
     else:
         click.echo(output)
 
 
+@click.command("mesh")
+@click.argument("scan_file", required=False, type=click.Path(exists=True))
+@click.option(
+    "--project",
+    "project_dir",
+    type=click.Path(exists=True, file_okay=False),
+    default=None,
+    help="Restrict discovery to a project directory (replaces machine-wide discovery).",
+)
+@click.option(
+    "--format",
+    "-f",
+    "fmt",
+    type=click.Choice(["summary", "json"]),
+    default="summary",
+    show_default=True,
+    help="Output format.",
+)
+@click.option("--output", "-o", "output_path", default=None, help="Write to file instead of stdout.")
+@click.option("--quiet", "-q", is_flag=True, help="Suppress summary headers and export notices.")
+def mesh_cmd(scan_file: Optional[str], project_dir: Optional[str], fmt: str, output_path: Optional[str], quiet: bool) -> None:
+    """Show lightweight agent/MCP topology without the dashboard.
+
+    \b
+    Examples:
+      agent-bom mesh
+      agent-bom mesh --project .   # project-local discovery only
+      agent-bom mesh report.json --format json --output mesh.json
+    """
+    from agent_bom.cli._agent_mode import agent_mode_requested, emit_command_envelope
+    from agent_bom.output.agent_mesh import build_agent_mesh
+
+    con = Console()
+    agent_mode = agent_mode_requested()
+
+    try:
+        if agent_mode:
+            # Keep stdout carrying ONLY the JSON envelope — silence the live
+            # discovery progress banner that discover_all prints through the
+            # discovery module's console.
+            import io as _io
+
+            from agent_bom import discovery as _discovery
+
+            _prev_console = _discovery.console
+            _discovery.console = Console(file=_io.StringIO(), quiet=True)
+            try:
+                agents_data, blast_radius, scope_label = _load_mesh_source(scan_file, project_dir)
+            finally:
+                _discovery.console = _prev_console
+        else:
+            agents_data, blast_radius, scope_label = _load_mesh_source(scan_file, project_dir)
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        if agent_mode:
+            emit_command_envelope(
+                command="mesh",
+                data={"error": str(exc)},
+                exit_code=1,
+                error_type="mesh_source_error",
+            )
+            raise SystemExit(1) from exc
+        con.print(f"[red]Error loading mesh source:[/red] {exc}")
+        raise SystemExit(1) from exc
+
+    if not agents_data:
+        if agent_mode:
+            emit_command_envelope(command="mesh", data=build_agent_mesh([], blast_radius))
+            return
+        if project_dir:
+            con.print("[yellow]No project-local agents discovered.[/yellow] Try [bold]agent-bom mesh[/bold] for machine-wide discovery.")
+        else:
+            con.print("[yellow]No agents discovered.[/yellow]")
+        return
+
+    mesh = build_agent_mesh(agents_data, blast_radius)
+
+    if agent_mode:
+        emit_command_envelope(command="mesh", data=mesh)
+        return
+
+    if fmt == "json":
+        output = json.dumps(mesh, indent=2)
+        if output_path:
+            Path(output_path).write_text(output)
+            if not quiet:
+                con.print(f"[green]Mesh exported[/green] → {output_path}")
+        else:
+            click.echo(output)
+        return
+
+    if output_path:
+        Path(output_path).write_text(_mesh_summary_text(agents_data, mesh, scope_label=scope_label, quiet=quiet))
+        if not quiet:
+            con.print(f"[green]Mesh summary exported[/green] → {output_path}")
+        return
+
+    _render_mesh_summary(con, agents_data, mesh, scope_label=scope_label, quiet=quiet)
+
+
 @click.command("dashboard")
 @click.option("--report", type=click.Path(exists=True), default=None, help="Path to agent-bom JSON report file.")
-@click.option("--port", default=8501, show_default=True, help="Streamlit server port.")
+@click.option("--port", default=8501, show_default=True, type=PORT_RANGE, help="Legacy Streamlit server port.")
 def dashboard_cmd(report: Optional[str], port: int):
-    """Launch the interactive Streamlit dashboard.
+    """Launch the legacy Streamlit compatibility dashboard.
+
+    The bundled Next.js dashboard is served by `agent-bom serve`.
 
     \b
     Requires:  pip install 'agent-bom[dashboard]'
@@ -183,7 +552,8 @@ def dashboard_cmd(report: Optional[str], port: int):
         cmd += ["--", "--report", report]
 
     try:
-        subprocess.run(cmd, check=True)
+        # Foreground server command: intentionally runs until the operator stops it.
+        subprocess.run(cmd, check=True, timeout=None)
     except KeyboardInterrupt:
         pass
     except subprocess.CalledProcessError as exc:
@@ -214,11 +584,11 @@ def introspect_cmd(server_command, server_url, timeout, introspect_all, baseline
 
     \b
     Usage:
-      agent-bom introspect --command "npx @mcp/server-filesystem /"
-      agent-bom introspect --url http://localhost:8080/sse
-      agent-bom introspect --all                           # all discovered servers
-      agent-bom introspect --all --baseline baseline.json  # drift report
-      agent-bom introspect --all --format json             # machine-readable
+      agent-bom mcp introspect --command "npx @mcp/server-filesystem /"
+      agent-bom mcp introspect --url http://localhost:8080/sse
+      agent-bom mcp introspect --all                           # all discovered servers
+      agent-bom mcp introspect --all --baseline baseline.json  # drift report
+      agent-bom mcp introspect --all --format json             # machine-readable
 
     \b
     Requires: pip install 'agent-bom[mcp-server]'  (for MCP SDK)
@@ -268,13 +638,14 @@ def introspect_cmd(server_command, server_url, timeout, introspect_all, baseline
     baseline: dict[str, list[str]] = {}
     if baseline_path:
         try:
-            baseline = _json.loads(Path(baseline_path).read_text())
-        except Exception as e:  # noqa: BLE001
+            baseline = read_json_file_for_cli(baseline_path, label="baseline file")
+        except click.ClickException as e:
             con.print(f"[yellow]Warning: could not load baseline: {e}[/yellow]")
 
     # Introspect
     try:
-        results = introspect_servers_sync(servers, timeout=timeout)
+        report = introspect_servers_sync(servers, timeout=timeout)
+        results = _coerce_introspection_results(report)
     except ImportError:
         con.print("[red]MCP SDK not installed.[/red] Run: pip install 'agent-bom[mcp-server]'")
         sys.exit(1)
@@ -282,13 +653,50 @@ def introspect_cmd(server_command, server_url, timeout, introspect_all, baseline
     if output_format == "json":
         output = []
         for r in results:
-            entry = {
-                "server": r.server_name,
-                "success": r.success,
-                "tools": [t.name for t in r.runtime_tools],
-                "resources": [res.name for res in r.runtime_resources],
-                "error": r.error,
-            }
+            if hasattr(r, "to_dict") and type(r).__name__ != "MagicMock":
+                entry = r.to_dict(include_runtime_objects=True)
+                entry["server"] = entry.pop("server_name")
+                entry["tools"] = [t["name"] for t in entry.get("runtime_tools", [])]
+                entry["resources"] = [res["name"] for res in entry.get("runtime_resources", [])]
+                entry["prompts"] = [prompt["name"] for prompt in entry.get("runtime_prompts", [])]
+            else:
+                risk_level = getattr(r, "capability_risk_level", "low")
+                if not isinstance(risk_level, str):
+                    risk_level = "low"
+                risk_score = getattr(r, "capability_risk_score", 0.0)
+                try:
+                    risk_score = float(risk_score)
+                except (TypeError, ValueError):
+                    risk_score = 0.0
+                runtime_tools = getattr(r, "runtime_tools", [])
+                runtime_resources = getattr(r, "runtime_resources", [])
+                runtime_prompts = getattr(r, "runtime_prompts", [])
+                server_name = getattr(r, "server_name", "server")
+                if not isinstance(server_name, str):
+                    server_name = "server"
+                protocol_version = getattr(r, "protocol_version", None)
+                if protocol_version is not None and not isinstance(protocol_version, str):
+                    protocol_version = None
+                error = getattr(r, "error", None)
+                if error is not None and not isinstance(error, str):
+                    error = None
+
+                entry = {
+                    "server": server_name,
+                    "success": bool(getattr(r, "success", False)),
+                    "protocol_version": protocol_version,
+                    "error": error,
+                    "capability_risk_score": risk_score,
+                    "capability_risk_level": risk_level,
+                    "tool_risk_profiles": [],
+                    "dangerous_combinations": [],
+                    "runtime_tools": [],
+                    "runtime_resources": [],
+                    "runtime_prompts": [],
+                    "tools": [getattr(t, "name", str(t)) for t in runtime_tools],
+                    "resources": [getattr(res, "name", str(res)) for res in runtime_resources],
+                    "prompts": [getattr(prompt, "name", str(prompt)) for prompt in runtime_prompts],
+                }
             if baseline:
                 expected = baseline.get(r.server_name, [])
                 entry["drift_added"] = [t for t in entry["tools"] if t not in expected]
@@ -309,10 +717,30 @@ def introspect_cmd(server_command, server_url, timeout, introspect_all, baseline
         if r.protocol_version:
             con.print(f"  Protocol: {r.protocol_version}")
 
+        risk_level = getattr(r, "capability_risk_level", "low")
+        if not isinstance(risk_level, str):
+            risk_level = "low"
+        risk_score = getattr(r, "capability_risk_score", 0.0)
+        try:
+            risk_score = float(risk_score)
+        except (TypeError, ValueError):
+            risk_score = 0.0
+        dangerous_combinations = getattr(r, "dangerous_combinations", [])
+        if not isinstance(dangerous_combinations, list):
+            dangerous_combinations = []
+
+        con.print(f"  Capability Risk: [bold]{risk_level.upper()}[/bold] ({risk_score:.1f}/10)")
+        if dangerous_combinations:
+            con.print(f"  Dangerous combos: {', '.join(dangerous_combinations[:2])}")
+
         if r.runtime_tools:
             tbl = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
             tbl.add_column("Tool")
+            tbl.add_column("Risk")
+            tbl.add_column("Capabilities")
             tbl.add_column("Description")
+            raw_profiles = getattr(r, "tool_risk_profiles", [])
+            profile_map = {item["tool_name"]: item for item in raw_profiles if isinstance(item, dict) and "tool_name" in item}
             for t in r.runtime_tools:
                 desc = (t.description or "")[:80]
                 expected_tools = baseline.get(r.server_name, [])
@@ -320,13 +748,20 @@ def introspect_cmd(server_command, server_url, timeout, introspect_all, baseline
                 if expected_tools and t.name not in expected_tools:
                     marker = " [yellow](NEW)[/yellow]"
                     any_drift = True
-                tbl.add_row(f"  {t.name}{marker}", desc)
+                tool_profile = profile_map.get(t.name, {})
+                caps = ", ".join(tool_profile.get("capabilities", [])) or "—"
+                risk = tool_profile.get("risk_level", "low").upper()
+                tbl.add_row(f"  {t.name}{marker}", risk, caps, desc)
             con.print(tbl)
         else:
             con.print("  [dim]No tools[/dim]")
 
         if r.runtime_resources:
             con.print(f"  Resources: {', '.join(res.name for res in r.runtime_resources)}")
+
+        runtime_prompts = getattr(r, "runtime_prompts", [])
+        if runtime_prompts:
+            con.print(f"  Prompts: {', '.join(prompt.name for prompt in runtime_prompts)}")
 
         if baseline:
             expected_tools = baseline.get(r.server_name, [])

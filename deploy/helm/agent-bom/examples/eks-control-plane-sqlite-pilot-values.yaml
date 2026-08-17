@@ -1,0 +1,60 @@
+controlPlane:
+  enabled: true
+  migrations:
+    postgres:
+      enabled: false
+  api:
+    replicas: 1
+    envFrom:
+      - secretRef:
+          name: agent-bom-control-plane
+    env:
+      - name: AGENT_BOM_DB
+        value: /var/lib/agent-bom/control-plane.sqlite
+      # DEMO ONLY — opens the dashboard anonymously at the viewer role so a fresh
+      # `helm install` has a working first-run without an auth backend. Never use
+      # this posture in production; drop it and seed AGENT_BOM_API_KEYS (see
+      # control-plane-auth-secret.example.yaml) or OIDC for a real login.
+      - name: AGENT_BOM_ALLOW_UNAUTHENTICATED_API
+        value: "1"
+    extraVolumes:
+      - name: sqlite-data
+        persistentVolumeClaim:
+          claimName: agent-bom-sqlite-pilot
+    extraVolumeMounts:
+      - name: sqlite-data
+        mountPath: /var/lib/agent-bom
+  ui:
+    replicas: 1
+    env:
+      - name: NEXT_PUBLIC_API_URL
+        value: ""
+  ingress:
+    enabled: true
+    className: nginx
+    hosts:
+      - host: agent-bom.internal.example.com
+        apiPaths:
+          - path: /v1
+            pathType: Prefix
+          - path: /scim
+            pathType: Prefix
+          - path: /health
+            pathType: Prefix
+          - path: /docs
+            pathType: Prefix
+          - path: /redoc
+            pathType: Prefix
+          - path: /openapi.json
+            pathType: Prefix
+          - path: /ws
+            pathType: Prefix
+        uiPaths:
+          - path: /
+            pathType: Prefix
+
+scanner:
+  enabled: false
+
+pdb:
+  enabled: false

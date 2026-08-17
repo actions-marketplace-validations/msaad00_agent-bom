@@ -1,0 +1,30 @@
+name: Dependency Submission
+
+# Keep dependency submission off pull_request runs.
+# Dependency Review already handles statically-declared ecosystems on PRs,
+# and submitting head snapshots in parallel introduces a GitHub-side race
+# where review sees head/base snapshot mismatches (base=0, head=1).
+# We only submit authoritative snapshots on main and on manual runs.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  dependency-submission:
+    name: Submit dependency snapshots
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Submit dependency graph snapshot
+        uses: advanced-security/component-detection-dependency-submission-action@31f25a8de68ae5ce2ca274bc28546a78683c15ce # v0.1.4
+        with:
+          detectorArgs: UvLock=EnableIfDefaultOff,NpmLockfile3=EnableIfDefaultOff,Pip=EnableIfDefaultOff,SimplePip=EnableIfDefaultOff,Dockerfile=EnableIfDefaultOff,Spdx22=EnableIfDefaultOff

@@ -13,7 +13,7 @@ Options considered:
    requires API key for reasonable throughput, CPE matching is complex
 2. **OSV.dev** — open, no API key required, ecosystem-native identifiers (GHSA, PYSEC),
    supports batch queries, maintained by Google
-3. **Snyk** — commercial API, requires token, good data quality but vendor lock-in
+3. **Commercial vulnerability APIs** — good data quality but introduce vendor lock-in and require tokens for reasonable throughput
 4. **GitHub Advisory Database (GHSA)** — good for npm/PyPI but limited ecosystem coverage
 
 ## Decision
@@ -25,7 +25,7 @@ supplemental enrichment sources.
 - NVD enriches with CVSS scores, CWE IDs, and reference links (90-day cache)
 - EPSS enriches with exploit probability scores (30-day cache)
 - CISA KEV flags known-exploited vulnerabilities (24-hour cache)
-- Snyk is available as an optional source via `--snyk-token`
+- Optional commercial vulnerability APIs can be wired via configuration when a token is available
 
 ## Consequences
 
@@ -40,4 +40,4 @@ supplemental enrichment sources.
 
 - OSV coverage for some ecosystems (C/C++, system packages) is thinner than NVD
 - NVD enrichment adds latency (mitigated by 90-day disk cache)
-- No single source has complete coverage — users may see different results vs Grype/Snyk
+- No single source has complete coverage — users may see different results from other vulnerability scanners

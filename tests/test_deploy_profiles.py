@@ -1,0 +1,380 @@
+"""Tests for canonical Helm deployment validation profiles."""
+
+from __future__ import annotations
+
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+import yaml
+
+from agent_bom.deploy_profiles import (
+    build_helm_profile_command,
+    helm_chart_dir,
+    helm_validation_profiles,
+    ingress_hosts_missing_paths,
+)
+
+
+def test_helm_validation_profiles_reference_existing_chart_assets():
+    repo_root = Path(__file__).resolve().parent.parent
+    chart_dir = helm_chart_dir(repo_root)
+    assert chart_dir.exists()
+    profiles = helm_validation_profiles(repo_root)
+    assert [profile.name for profile in profiles] == [
+        "scanner-only",
+        "sqlite-pilot",
+        "synthetic-enterprise-story",
+        "focused-pilot",
+        "enterprise-demo",
+        "focused-pilot-byo-postgres",
+        "production-secret-sync",
+        "production",
+        "keda-autoscaling",
+        "eks-vanilla",
+        "mesh-hardening",
+        "snowflake-backend",
+        "gateway-runtime",
+        "airgap-vuln-db",
+    ]
+    for profile in profiles:
+        for values_file in profile.values_files:
+            assert values_file.exists(), f"{profile.name} missing values file {values_file}"
+        for _key, file_path in profile.set_file_arguments:
+            assert file_path.exists(), f"{profile.name} missing set-file input {file_path}"
+
+
+def test_production_secret_sync_profile_layers_the_bootstrap_overlay() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    examples = repo_root / "deploy" / "helm" / "agent-bom" / "examples"
+    profiles = {profile.name: profile for profile in helm_validation_profiles(repo_root)}
+
+    assert profiles["production-secret-sync"].values_files == (
+        examples / "eks-production-values.yaml",
+        examples / "eks-production-secret-sync-values.yaml",
+    )
+
+
+def test_synthetic_enterprise_story_profile_is_explicit_and_demo_only() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    examples = repo_root / "deploy" / "helm" / "agent-bom" / "examples"
+    profiles = {profile.name: profile for profile in helm_validation_profiles(repo_root)}
+    profile = profiles["synthetic-enterprise-story"]
+
+    assert profile.values_files == (examples / "synthetic-enterprise-story-values.yaml",)
+    values = yaml.safe_load(profile.values_files[0].read_text())
+    env = {row["name"]: row["value"] for row in values["controlPlane"]["api"]["env"]}
+    assert env["AGENT_BOM_DEMO_ESTATE"] == "1"
+    assert env["AGENT_BOM_ALLOW_UNAUTHENTICATED_API"] == "1"
+    assert env["AGENT_BOM_NO_AUTH_ROLE"] == "viewer"
+    assert values["scanner"]["enabled"] is False
+
+
+def test_production_secret_sync_uses_a_separate_release_by_default() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+
+    sync = build_helm_profile_command(repo_root, "production-secret-sync")
+    workload = build_helm_profile_command(repo_root, "production")
+
+    assert sync[3] == "agent-bom-secrets"
+    assert workload[3] == "agent-bom"
+    assert sync[3] != workload[3]
+
+
+def test_gateway_runtime_profile_uses_shipped_upstreams_example():
+    repo_root = Path(__file__).resolve().parent.parent
+    profiles = {profile.name: profile for profile in helm_validation_profiles(repo_root)}
+    gateway = profiles["gateway-runtime"]
+    assert gateway.set_arguments == ("gateway.enabled=true",)
+    assert gateway.set_file_arguments == (
+        ("gateway.upstreamsYaml", repo_root / "deploy" / "helm" / "agent-bom" / "examples" / "gateway-upstreams.example.yaml"),
+    )
+
+
+def test_keda_profile_layers_production_and_keda_overlay():
+    repo_root = Path(__file__).resolve().parent.parent
+    profiles = {profile.name: profile for profile in helm_validation_profiles(repo_root)}
+    keda = profiles["keda-autoscaling"]
+    example_dir = repo_root / "deploy" / "helm" / "agent-bom" / "examples"
+
+    assert keda.values_files == (
+        example_dir / "eks-production-values.yaml",
+        example_dir / "eks-keda-values.yaml",
+    )
+    assert keda.set_arguments == ("gateway.enabled=true",)
+    assert keda.set_file_arguments == (("gateway.upstreamsYaml", example_dir / "gateway-upstreams.example.yaml"),)
+
+
+def test_postgres_secret_example_documents_byo_postgres_contract():
+    repo_root = Path(__file__).resolve().parent.parent
+    chart = repo_root / "deploy" / "helm" / "agent-bom" / "Chart.yaml"
+    postgres_secret = repo_root / "deploy" / "helm" / "agent-bom" / "examples" / "postgres-secret.example.yaml"
+    docs = repo_root / "site-docs" / "deployment" / "postgres-provisioning.md"
+
+    assert "dependencies:" not in chart.read_text()
+    assert "AGENT_BOM_POSTGRES_URL" in postgres_secret.read_text()
+    byo_values = repo_root / "deploy" / "helm" / "agent-bom" / "examples" / "byo-postgres-values.yaml"
+    byo_body = byo_values.read_text()
+    assert "AGENT_BOM_POSTGRES_URL" in byo_body
+    assert "Snowflake Postgres" in byo_body
+    assert "smoke-test required" in byo_body
+    docs_body = docs.read_text()
+    assert "no Postgres subchart dependency" in docs_body
+    assert "provision Postgres/RDS with your platform tooling" in docs_body
+
+
+def test_build_helm_profile_command_uses_shipped_profile_stack():
+    repo_root = Path(__file__).resolve().parent.parent
+    cmd = build_helm_profile_command(repo_root, "focused-pilot")
+    assert cmd[:6] == [
+        "helm",
+        "upgrade",
+        "--install",
+        "agent-bom",
+        str(repo_root / "deploy" / "helm" / "agent-bom"),
+        "--namespace",
+    ]
+    assert "agent-bom" in cmd
+    assert "--create-namespace" in cmd
+    assert str(repo_root / "deploy" / "helm" / "agent-bom" / "examples" / "eks-mcp-pilot-values.yaml") in cmd
+
+
+def test_byo_postgres_profile_layers_focused_pilot_with_database_overlay():
+    repo_root = Path(__file__).resolve().parent.parent
+    cmd = build_helm_profile_command(repo_root, "focused-pilot-byo-postgres")
+    assert str(repo_root / "deploy" / "helm" / "agent-bom" / "examples" / "eks-mcp-pilot-values.yaml") in cmd
+    assert str(repo_root / "deploy" / "helm" / "agent-bom" / "examples" / "byo-postgres-values.yaml") in cmd
+
+
+def test_enterprise_demo_profile_layers_pilot_with_aws_inventory_overlay():
+    repo_root = Path(__file__).resolve().parent.parent
+    profiles = {profile.name: profile for profile in helm_validation_profiles(repo_root)}
+    demo = profiles["enterprise-demo"]
+    example_dir = repo_root / "deploy" / "helm" / "agent-bom" / "examples"
+    assert demo.values_files == (
+        example_dir / "eks-mcp-pilot-values.yaml",
+        example_dir / "eks-enterprise-demo-overlay.yaml",
+    )
+    overlay = yaml.safe_load((example_dir / "eks-enterprise-demo-overlay.yaml").read_text())
+    assert overlay["scanner"]["cloud"]["enabled"] is True
+    assert overlay["scanner"]["cloud"]["aws"]["inventory"] is True
+
+
+def test_ingress_hosts_missing_paths_flags_empty_rule():
+    rendered = (
+        "apiVersion: networking.k8s.io/v1\n"
+        "kind: Ingress\n"
+        "spec:\n"
+        "  rules:\n"
+        "    -\n"
+        '      host: "agent-bom.internal.example.com"\n'
+        "      http:\n"
+        "        paths:\n"
+        "  tls:\n"
+        "    - hosts:\n"
+        "      - agent-bom.internal.example.com\n"
+    )
+    assert ingress_hosts_missing_paths(rendered) == ["agent-bom.internal.example.com"]
+
+
+def test_ingress_hosts_missing_paths_accepts_populated_rule():
+    rendered = (
+        "apiVersion: networking.k8s.io/v1\n"
+        "kind: Ingress\n"
+        "spec:\n"
+        "  rules:\n"
+        "    -\n"
+        '      host: "agent-bom.internal.example.com"\n'
+        "      http:\n"
+        "        paths:\n"
+        '          - path: "/v1"\n'
+        "            pathType: Prefix\n"
+        '          - path: "/"\n'
+        "            pathType: Prefix\n"
+    )
+    assert ingress_hosts_missing_paths(rendered) == []
+
+
+def test_ingress_hosts_missing_paths_ignores_non_ingress_docs():
+    rendered = "kind: Service\nspec:\n  ports:\n    - port: 80\n"
+    assert ingress_hosts_missing_paths(rendered) == []
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not available")
+def test_production_profile_renders_ingress_with_real_paths():
+    repo_root = Path(__file__).resolve().parent.parent
+    chart_dir = helm_chart_dir(repo_root)
+    values = repo_root / "deploy" / "helm" / "agent-bom" / "examples" / "eks-production-values.yaml"
+    result = subprocess.run(
+        ["helm", "template", "agent-bom-production", str(chart_dir), "-f", str(values)],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert ingress_hosts_missing_paths(result.stdout) == []
+    ingress = [doc for doc in yaml.safe_load_all(result.stdout) if isinstance(doc, dict) and doc.get("kind") == "Ingress"]
+    assert ingress, "production profile should render a control-plane Ingress"
+    for manifest in ingress:
+        for rule in manifest["spec"]["rules"]:
+            assert rule["http"]["paths"], f"host {rule.get('host')} has no ingress paths"
+
+
+def test_airgap_profile_uses_the_shipped_standalone_example():
+    repo_root = Path(__file__).resolve().parent.parent
+    profiles = {profile.name: profile for profile in helm_validation_profiles(repo_root)}
+    airgap = profiles["airgap-vuln-db"]
+    example_dir = repo_root / "deploy" / "helm" / "agent-bom" / "examples"
+    assert airgap.values_files == (example_dir / "airgap-vuln-db-values.yaml",)
+    assert airgap.set_arguments == ()
+
+
+def test_airgap_example_disables_egress_dependent_startup_work():
+    """The one profile whose premise is no egress must not call out to PyPI."""
+    repo_root = Path(__file__).resolve().parent.parent
+    example = repo_root / "deploy" / "helm" / "agent-bom" / "examples" / "airgap-vuln-db-values.yaml"
+    values = yaml.safe_load(example.read_text())
+
+    for name, env in (
+        ("controlPlane.api", values["controlPlane"]["api"]["env"]),
+        ("scanner", values["scanner"]["env"]),
+    ):
+        by_name = {entry["name"]: entry["value"] for entry in env}
+        for required in ("AGENT_BOM_VULN_DB_OFFLINE", "AGENT_BOM_OFFLINE", "AGENT_BOM_SKIP_UPDATE_CHECK"):
+            assert by_name.get(required) == "1", f"{name} is missing {required}=1"
+
+    # The chart defaults the Postgres migration hook on; a standalone air-gap
+    # render carries no Postgres URL, so the example must opt out explicitly.
+    assert values["controlPlane"]["migrations"]["postgres"]["enabled"] is False
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not available")
+def test_airgap_example_renders_standalone_as_documented():
+    """The example's own step 4 documents a single ``-f`` invocation."""
+    repo_root = Path(__file__).resolve().parent.parent
+    chart_dir = helm_chart_dir(repo_root)
+    values = repo_root / "deploy" / "helm" / "agent-bom" / "examples" / "airgap-vuln-db-values.yaml"
+    result = subprocess.run(
+        ["helm", "template", "agent-bom-airgap", str(chart_dir), "-f", str(values)],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+    manifests = [doc for doc in yaml.safe_load_all(result.stdout) if isinstance(doc, dict)]
+    assert not [doc for doc in manifests if doc.get("kind") == "Job" and "postgres-migrate" in doc["metadata"]["name"]], (
+        "the air-gap render must not schedule a Postgres migration hook it has no database for"
+    )
+    assert ingress_hosts_missing_paths(result.stdout) == []
+
+    api = [
+        doc
+        for doc in manifests
+        if doc.get("kind") == "Deployment" and doc["metadata"]["labels"].get("app.kubernetes.io/component") == "api"
+    ]
+    assert api, "air-gap profile should render a control-plane API Deployment"
+    env = {entry["name"]: entry.get("value") for entry in api[0]["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env.get("AGENT_BOM_SKIP_UPDATE_CHECK") == "1"
+    assert env.get("AGENT_BOM_OFFLINE") == "1"
+
+
+def test_install_helm_profile_script_prints_packaged_command():
+    repo_root = Path(__file__).resolve().parent.parent
+    result = subprocess.run(
+        [
+            "python3",
+            "scripts/install_helm_profile.py",
+            "focused-pilot",
+            "--print-command",
+        ],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    stdout = result.stdout.strip()
+    assert stdout.startswith("helm upgrade --install agent-bom ")
+    assert "deploy/helm/agent-bom/examples/eks-mcp-pilot-values.yaml" in stdout
+
+
+def test_install_helm_profile_script_prints_separate_secret_sync_release():
+    repo_root = Path(__file__).resolve().parent.parent
+    result = subprocess.run(
+        [
+            "python3",
+            "scripts/install_helm_profile.py",
+            "production-secret-sync",
+            "--print-command",
+        ],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip().startswith("helm upgrade --install agent-bom-secrets ")
+
+
+def test_baseline_helm_hint_never_references_an_unpopulated_secret():
+    """Every secret the baseline hint references must be one somebody actually fills.
+
+    The baseline used to create ``aws_secretsmanager_secret.db_url`` and point the
+    emitted ExternalSecret at it, but no resource ever wrote a version. A Secrets
+    Manager secret with no version stores nothing, so ``AGENT_BOM_POSTGRES_URL``
+    never resolved and a baseline-only install started the control plane with no
+    database URL — silently, because the manifest itself looked correct.
+
+    The hint is now workload-only: External Secrets is off and it references
+    Kubernetes Secrets the operator pre-creates, which its own description tells
+    them to do. This guards the contract in both directions — the dangling
+    Secrets Manager reference must not come back, and the count of referenced
+    Secrets must keep matching the count the description promises.
+    """
+
+    repo_root = Path(__file__).resolve().parent.parent
+    outputs = (repo_root / "deploy" / "terraform" / "aws" / "baseline" / "outputs.tf").read_text()
+
+    block = outputs.split('output "helm_values_hint"', 1)[1]
+    description = block.split("value", 1)[0]
+    hint = block.split("EOT", 2)[1]
+
+    assert "REPLACE_ME_DB_URL_SECRET_NAME" not in hint, "the baseline hint points at a db_url secret that no resource populates"
+    assert "aws_secretsmanager_secret.db_url" not in hint, (
+        "the baseline hint reintroduced the never-populated db_url Secrets Manager secret"
+    )
+
+    # Workload-only: the hint hands off to pre-created Kubernetes Secrets rather
+    # than reconciling them itself.
+    assert "externalSecrets:\n    enabled: false" in hint
+
+    referenced = re.findall(r"(?:secretRef|SecretRef):\s*\n\s*name:", hint)
+    assert len(referenced) == 4, f"expected the four documented Secret references, found {len(referenced)}"
+    assert "four referenced Kubernetes Secrets" in description, (
+        "the output description no longer matches the number of Secrets the hint references"
+    )
+
+
+def test_eks_postgres_url_percent_encodes_the_rds_password():
+    """RDS-generated passwords may contain reserved characters that corrupt a URI.
+
+    ``platform-eks`` composes AGENT_BOM_POSTGRES_URL from the RDS master secret
+    via an ExternalSecrets template. Interpolating the raw password breaks the
+    connection string whenever the generated password contains a reserved
+    character, so the password must be percent-encoded in the template.
+    """
+
+    repo_root = Path(__file__).resolve().parent.parent
+    main_tf = (repo_root / "deploy" / "terraform" / "platform-eks" / "main.tf").read_text()
+
+    url_lines = [line for line in main_tf.splitlines() if "AGENT_BOM_POSTGRES_URL" in line and "postgresql://" in line]
+    assert url_lines, "platform-eks no longer composes AGENT_BOM_POSTGRES_URL"
+    for line in url_lines:
+        assert "{{ .password }}" not in line, (
+            "platform-eks interpolates the RDS password unencoded into a URI; "
+            "percent-encode it so reserved characters cannot corrupt the connection string"
+        )
+        assert "urlquery" in line

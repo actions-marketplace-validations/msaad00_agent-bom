@@ -1,0 +1,244 @@
+"""Adaptive process-local backpressure controls for expensive runtime paths."""
+
+from __future__ import annotations
+
+import math
+import os
+import random
+import time
+from collections import deque
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from threading import Lock
+from typing import Any, AsyncIterator
+
+
+class BackpressureRejectedError(RuntimeError):
+    """Raised when a runtime path is shedding work under pressure."""
+
+    def __init__(self, path: str, reason: str, retry_after_seconds: int) -> None:
+        super().__init__(f"{path} backpressure active: {reason}")
+        self.path = path
+        self.reason = reason
+        self.retry_after_seconds = retry_after_seconds
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "message": "Backpressure active for runtime path",
+            "path": self.path,
+            "reason": self.reason,
+            "retry_after_seconds": self.retry_after_seconds,
+        }
+
+
+@dataclass
+class BackpressureController:
+    """Small adaptive controller with concurrency and p99-triggered cooldown."""
+
+    path: str
+    max_concurrency: int
+    p99_threshold_ms: float
+    cooldown_seconds: int
+    min_samples: int
+    window_size: int = 128
+    active: int = 0
+    rejected: int = 0
+    completed: int = 0
+    open_until_monotonic: float = 0.0
+    last_trigger_reason: str = ""
+    _latencies_ms: deque[float] = field(default_factory=deque)
+    _lock: Lock = field(default_factory=Lock)
+
+    def try_enter(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if now < self.open_until_monotonic:
+                self.rejected += 1
+                raise BackpressureRejectedError(self.path, self.last_trigger_reason or "latency_degraded", self.retry_after_seconds(now))
+            if self.open_until_monotonic:
+                self.open_until_monotonic = 0.0
+                self.last_trigger_reason = ""
+                self._latencies_ms.clear()
+            if self.active >= self.max_concurrency:
+                self.rejected += 1
+                raise BackpressureRejectedError(self.path, "concurrency_limit", 1)
+            self.active += 1
+
+    def exit(self, latency_ms: float) -> None:
+        with self._lock:
+            self.active = max(self.active - 1, 0)
+            self.completed += 1
+            self._latencies_ms.append(latency_ms)
+            while len(self._latencies_ms) > self.window_size:
+                self._latencies_ms.popleft()
+            if len(self._latencies_ms) >= self.min_samples and self.p99_ms > self.p99_threshold_ms:
+                self.open_until_monotonic = time.monotonic() + self.cooldown_seconds
+                self.last_trigger_reason = "p99_latency_threshold"
+
+    def retry_after_seconds(self, now: float | None = None) -> int:
+        # Multiplicative jitter in [-15%, +35%]. The previous additive form
+        # `int(base + uniform(0, base*0.3) + 0.999)` collapsed to a single
+        # value (typically 2) when base ≈ 1s — which is the most common
+        # path because base is clamped to max(1.0, ...) — re-creating the
+        # thundering-herd this jitter exists to prevent. Using a
+        # multiplicative range that straddles the base makes math.ceil
+        # return at least two distinct values for any base ≥ 1, while
+        # still rounding up so retry-after never tells a client "0".
+        now = time.monotonic() if now is None else now
+        base = max(1.0, self.open_until_monotonic - now)
+        jitter_factor = random.uniform(0.85, 1.35)
+        return max(1, math.ceil(base * jitter_factor))
+
+    @property
+    def p95_ms(self) -> float:
+        return _percentile(list(self._latencies_ms), 0.95)
+
+    @property
+    def p99_ms(self) -> float:
+        return _percentile(list(self._latencies_ms), 0.99)
+
+    def describe(self) -> dict[str, Any]:
+        now = time.monotonic()
+        open_state = now < self.open_until_monotonic
+        return {
+            "path": self.path,
+            "state": "open" if open_state else "closed",
+            "reason": self.last_trigger_reason if open_state else "",
+            "active": self.active,
+            "max_concurrency": self.max_concurrency,
+            "completed": self.completed,
+            "rejected": self.rejected,
+            "latency_samples": len(self._latencies_ms),
+            "p95_ms": round(self.p95_ms, 2),
+            "p99_ms": round(self.p99_ms, 2),
+            "p99_threshold_ms": self.p99_threshold_ms,
+            "retry_after_seconds": self.retry_after_seconds(now) if open_state else 0,
+        }
+
+
+_CONTROLLERS: dict[str, BackpressureController] = {}
+_CONTROLLERS_LOCK = Lock()
+
+# Default p99 cooldown threshold per path. A path's own honest latency must sit
+# *below* its threshold or a normal single request counts as overload and trips
+# the shared cooldown, 429-storming every route on that controller. The graph
+# path builds a full unified graph on a cold snapshot (~2.6s) and a single GET
+# fans out into several store+compute samples, so the generic 2500ms budget
+# false-trips on cold traffic. Give ``graph`` explicit headroom above its honest
+# build latency; genuinely degraded builds (well past this ceiling) and the
+# concurrency limit still shed real overload.
+#
+# ``findings`` gets the same treatment. The in-memory default hub copies and
+# re-sorts the entire current-state table in Python per request, so an honest
+# deep ``?sort=cvss`` read at millions of rows can legitimately take several
+# seconds. Below the generic 2500ms budget a single well-behaved deep read
+# would trip the shared cooldown and 429-storm every reader — shedding under
+# normal single-user load, not overload. Give it headroom above its honest
+# latency; the concurrency limit still sheds a genuine pile-up of concurrent
+# deep reads (the event-loop-starvation case this guard exists to prevent).
+_DEFAULT_P99_THRESHOLD_MS: dict[str, int] = {"graph": 12_000, "findings": 12_000}
+_GENERIC_P99_THRESHOLD_MS = 2500
+
+
+def _default_concurrency() -> int:
+    """Default concurrency ceiling: the process's worker-thread capacity.
+
+    Read handlers offload their synchronous store work to the AnyIO worker
+    pool, so that pool — not a magic number — is what the process can actually
+    serve in parallel. A hardcoded 8 shed 92% of reads at 50 concurrent clients
+    (4 successful reads/sec) while 20 worker threads sat idle: backpressure was
+    firing at single-analyst load rather than at overload. Deriving it from
+    ``WORKER_THREAD_LIMIT`` keeps the two from drifting; the per-path
+    ``AGENT_BOM_BACKPRESSURE_<PATH>_CONCURRENCY`` override still wins, and the
+    shedding behaviour past the ceiling is unchanged.
+    """
+    from agent_bom.config import WORKER_THREAD_LIMIT
+
+    return max(1, int(WORKER_THREAD_LIMIT))
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * percentile))))
+    return ordered[index]
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return min(max(value, minimum), maximum)
+
+
+def _path_env_key(path: str, suffix: str) -> str:
+    normalized = "".join(ch if ch.isalnum() else "_" for ch in path.upper()).strip("_")
+    return f"AGENT_BOM_BACKPRESSURE_{normalized}_{suffix}"
+
+
+def _controller_for(path: str) -> BackpressureController:
+    with _CONTROLLERS_LOCK:
+        controller = _CONTROLLERS.get(path)
+        if controller is not None:
+            return controller
+        controller = BackpressureController(
+            path=path,
+            max_concurrency=_env_int(_path_env_key(path, "CONCURRENCY"), _default_concurrency(), minimum=1, maximum=1024),
+            p99_threshold_ms=float(
+                _env_int(
+                    _path_env_key(path, "P99_MS"),
+                    _DEFAULT_P99_THRESHOLD_MS.get(path, _GENERIC_P99_THRESHOLD_MS),
+                    minimum=1,
+                    maximum=120_000,
+                )
+            ),
+            cooldown_seconds=_env_int(_path_env_key(path, "COOLDOWN_SECONDS"), 10, minimum=1, maximum=3600),
+            min_samples=_env_int(_path_env_key(path, "MIN_SAMPLES"), 20, minimum=1, maximum=10_000),
+        )
+        _CONTROLLERS[path] = controller
+        return controller
+
+
+@asynccontextmanager
+async def adaptive_backpressure(path: str) -> AsyncIterator[None]:
+    """Apply adaptive backpressure around a runtime operation."""
+    if not _env_bool("AGENT_BOM_BACKPRESSURE_ENABLED", True):
+        yield
+        return
+    controller = _controller_for(path)
+    controller.try_enter()
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        controller.exit((time.perf_counter() - started) * 1000)
+
+
+def describe_backpressure_posture() -> dict[str, Any]:
+    """Return non-secret operator posture for adaptive backpressure."""
+    enabled = _env_bool("AGENT_BOM_BACKPRESSURE_ENABLED", True)
+    with _CONTROLLERS_LOCK:
+        paths = [controller.describe() for controller in sorted(_CONTROLLERS.values(), key=lambda c: c.path)]
+    return {
+        "enabled": enabled,
+        "status": "active" if any(path["state"] == "open" for path in paths) else "ready",
+        "paths": paths,
+        "notes": "Process-local adaptive backpressure. Static budgets and source circuit breakers still apply.",
+    }
+
+
+def reset_backpressure_for_tests() -> None:
+    with _CONTROLLERS_LOCK:
+        _CONTROLLERS.clear()

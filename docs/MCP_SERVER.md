@@ -1,0 +1,282 @@
+# MCP Server — Connect agent-bom to AI Assistants
+
+agent-bom exposes 81 MCP tools as an MCP server. Any MCP-compatible client can
+connect and get vulnerability scanning, blast radius analysis, compliance
+checks, runtime posture, and supply-chain verification through natural
+conversation.
+
+See also:
+
+- [MCP client guides](MCP_CLIENT_GUIDES.md)
+- [Claude Desktop / Claude Code guide](CLAUDE_INTEGRATION.md)
+- [Cortex CoCo / Cortex Code guide](CORTEX_CODE.md)
+- [Codex CLI guide](CODEX_CLI.md)
+- [Runtime Monitoring](RUNTIME_MONITORING.md)
+
+## Quick Start
+
+### Claude Desktop
+
+Add to your `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`):
+
+```json
+{
+  "mcpServers": {
+    "agent-bom": {
+      "command": "agent-bom",
+      "args": ["mcp", "server"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop. You can now ask: *"Scan my AI agents for vulnerabilities"*
+
+### Claude Code
+
+If you already use the Claude CLI, add agent-bom directly:
+
+```bash
+claude mcp add agent-bom -- uvx agent-bom mcp server
+```
+
+Claude Code project-level MCP servers are also discovered from `~/.claude.json`.
+
+### Cortex CoCo
+
+Add to `~/.snowflake/cortex/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "agent-bom": {
+      "command": "uvx",
+      "args": ["agent-bom", "mcp", "server"]
+    }
+  }
+}
+```
+
+CoCo can then call the same 54 `agent-bom` tools over MCP.
+
+agent-bom also discovers Cortex auxiliary security files alongside `mcp.json`:
+
+- `settings.json`
+- `permissions.json`
+- `hooks.json`
+
+### Cursor / Windsurf / VS Code
+
+Add to your MCP settings (`.cursor/mcp.json` or equivalent):
+
+```json
+{
+  "mcpServers": {
+    "agent-bom": {
+      "command": "agent-bom",
+      "args": ["mcp", "server"]
+    }
+  }
+}
+```
+
+agent-bom discovers these MCP client config paths directly:
+
+- Cursor: `~/Library/Application Support/Cursor/User/globalStorage/cursor.mcp/mcp.json`, `~/.cursor/mcp.json`
+- Windsurf: `~/.windsurf/mcp.json`, `~/Library/Application Support/Windsurf/User/globalStorage/windsurf.mcp/mcp.json`
+- VS Code: `~/Library/Application Support/Code/User/mcp.json`, plus workspace `.vscode/mcp.json`
+
+### Codex CLI
+
+Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.agent-bom]
+command = "uvx"
+args = ["agent-bom", "mcp", "server"]
+```
+
+Codex uses TOML, so manual proxy wrapping is the right path when you want runtime inspection around a third-party server.
+
+### SSE Transport (Remote / Multi-Client)
+
+```bash
+agent-bom mcp server --transport sse --host 0.0.0.0 --port 8000 --bearer-token "$AGENT_BOM_MCP_BEARER_TOKEN"
+```
+
+Connect any SSE-capable MCP client to `https://your-server/sse`.
+For non-loopback SSE or Streamable HTTP binds, `agent-bom` now fails closed unless you set
+`--bearer-token` / `AGENT_BOM_MCP_BEARER_TOKEN` or explicitly pass
+`--allow-insecure-no-auth`. Keep TLS at your proxy or ingress for remote deployments.
+The regular bearer token is read-only. To enable audited Shield or identity
+write tools, configure a separate `AGENT_BOM_MCP_OPERATOR_TOKEN`; write calls
+still need `operator_role=admin`, the matching `operator_scopes` value, and an
+audit reason, but those arguments no longer authorize the write by themselves.
+For hosted or shared deployments, set ISO-8601 expiries for both tokens with
+`AGENT_BOM_MCP_BEARER_TOKEN_EXPIRES_AT` and
+`AGENT_BOM_MCP_OPERATOR_TOKEN_EXPIRES_AT`; expired tokens are rejected before
+any read or write scope is returned.
+
+### Enterprise Control-Plane Contract
+
+Local MCP server mode stays intentionally low-friction for workstation scans.
+Enterprise MCP Gateway deployments should consume the same control-plane
+contract as the API and UI: tenant identity, policy, audit, secret-manager
+posture, and lifecycle state come from the control plane. Gateway credentials
+belong in Helm/Kubernetes secrets or the operator secret manager, not in client
+configs, and gateway audit events should flow back through the tenant-scoped
+control-plane audit path.
+
+### Docker
+
+```bash
+docker run -it --rm \
+  -v ~/.config:/home/abom/.config:ro \
+  -v ~/.agent-bom:/home/abom/.agent-bom \
+  agentbom/agent-bom:latest mcp server
+```
+
+## Runtime proxy
+
+Use the proxy when you want to inspect or enforce on MCP traffic between a client and a third-party server:
+
+```bash
+agent-bom proxy "npx @modelcontextprotocol/server-filesystem /workspace"
+```
+
+This keeps the real server behind `agent-bom` and enables runtime detectors for tool drift, credential leakage, injection patterns, sequence risk, and related policy decisions.
+
+For JSON-configured clients like Claude Desktop or Cortex CoCo, use:
+
+```bash
+agent-bom proxy-configure --log-dir ~/.agent-bom/logs --detect-credentials
+```
+
+Add `--apply` to write the wrapped config back to compatible JSON MCP config files.
+
+For IT-owned rollout across managed laptops, use:
+
+```bash
+agent-bom proxy-bootstrap \
+  --bundle-dir ./endpoint-bundle \
+  --control-plane-url https://agent-bom.example.com \
+  --push-url https://agent-bom.example.com/v1/fleet/sync
+```
+
+`proxy-configure` is best for JSON MCP clients such as Claude Desktop, Cursor, Windsurf, and Cortex CoCo. TOML-based clients like Codex CLI need manual proxy wrapping.
+
+## Tool Categories (81 tools)
+
+| Category | Tools | What They Do |
+|----------|-------|-------------|
+| **Scan** | `scan`, `code_scan`, `vector_db_scan`, `gpu_infra_scan`, `ai_inventory_scan` | Discover agents; execute Semgrep SAST with typed findings/clean/skipped/failed status; scan packages, vector stores, GPU infra, and AI usage |
+| **Check** | `check`, `verify`, `marketplace_check`, `license_compliance_scan` | Pre-install CVE gate, integrity verification, marketplace trust, and license policy |
+| **Blast Radius** | `blast_radius`, `exposure_paths`, `should_i_deploy` | Map package → vulnerability finding → MCP server (tools + credential env names) → connected agents; return ranked ExposurePath JSON and allow/warn/block deploy guidance for headless agents |
+| **Registry** | `registry_lookup`, `inventory`, `where`, `fleet_scan` | Query the MCP registry, inspect discovery paths, and summarize fleet inventories |
+| **Compliance** | `compliance`, `cis_benchmark`, `aisvs_benchmark` | Run OWASP, NIST, MITRE ATLAS, CIS, and AISVS-aligned posture checks |
+| **Policy** | `policy_check`, `remediate` | Evaluate policies and generate guided remediation plans |
+| **Inventory** | `inventory` | List agents/servers without CVE scanning |
+| **Trust** | `marketplace_check`, `runtime_correlate`, `tool_risk_assessment` | Score package trust, correlate runtime usage, and assess live tool capability risk |
+| **Skills** | `skill_scan`, `skill_verify`, `skill_trust` | Instruction-file trust, provenance, and tool-poisoning detection |
+| **Graph / Runtime** | `exposure_paths`, `should_i_deploy`, `context_graph`, `graph_export`, `runtime_correlate`, `runtime_production_index`, `runtime_blueprints`, `runtime_blueprint_drift`, `proxy_status`, `proxy_alerts`, `gateway_status`, `shield_status`, `shield_start`, `shield_unblock`, `shield_break_glass`, `firewall_check`, `audit_query`, `audit_integrity`, `tool_risk_assessment` | Return ranked investigation paths, deploy decisions, graph exports, runtime posture, blueprints, drift checks, proxy alerts, audit-chain evidence, read-only firewall decisions, and audited Shield actions |
+| **AI supply chain** | `dataset_card_scan`, `training_pipeline_scan`, `browser_extension_scan`, `model_provenance_scan`, `prompt_scan`, `model_file_scan`, `ingest_external_scan`, `runtime_evidence_ingest` | Scan AI artifacts, prompts, model files, and browser extensions; import tool-agnostic SARIF/SBOM/scanner evidence without executing its producer; merge CWPP runtime signals |
+
+<details>
+<summary>Complete current catalog (81 tools)</summary>
+
+`scan`, `check`, `intel_lookup`, `intel_match`, `intel_sources`,
+`intel_daily_brief`, `youcom_search`, `blast_radius`, `exposure_paths`, `should_i_deploy`,
+`policy_check`, `registry_lookup`, `generate_sbom`, `compliance`, `remediate`,
+`skill_scan`, `skill_verify`, `skill_trust`, `verify`, `inventory_summary`,
+`inventory_list`, `inventory_asset`, `where`, `tool_risk_assessment`,
+`inventory`, `diff`, `marketplace_check`, `code_scan`, `context_graph`,
+`graph_export`, `analytics_query`, `cis_benchmark`, `kspm_cluster_posture`,
+`fleet_scan`, `runtime_correlate`, `runtime_production_index`,
+`runtime_blueprints`, `runtime_blueprint_drift`, `cost_report`, `anomaly_scan`,
+`drift_incidents`, `proxy_status`, `proxy_alerts`, `gateway_status`,
+`shield_status`, `shield_start`, `shield_unblock`, `shield_break_glass`,
+`identity_issue`, `identity_rotate`, `identity_revoke`, `identity_grant_jit`,
+`identity_revoke_jit`, `firewall_check`, `audit_query`, `audit_integrity`,
+`vector_db_scan`, `aisvs_benchmark`, `gpu_infra_scan`, `registry_sweep_scan`,
+`dataset_card_scan`, `training_pipeline_scan`, `browser_extension_scan`,
+`model_provenance_scan`, `prompt_scan`, `model_file_scan`, `ai_inventory_scan`,
+`license_compliance_scan`, `ingest_external_scan`, `runtime_evidence_ingest`,
+`cost_forecast`, `cost_allocation`, `credential_expiry`, `nhi_discover`,
+`cloud_inventory`, `access_review`, `create_ticket`, `sync_ticket_status`,
+`findings_triage`, `risk_campaign_workflow`, `cloud_side_scan`.
+
+</details>
+
+## Agent-facing decision tools
+
+Two graph-native tools are the primary MCP entry points for headless security
+agents:
+
+- `exposure_paths` returns ranked `ExposurePath` JSON from the graph store so
+  an agent can explain what is exposed, why it matters, which entities prove
+  it, and what fix path is recommended.
+- `should_i_deploy` returns allow/warn/block deploy guidance based on matched
+  `ExposurePath` risk and caller-supplied thresholds.
+
+Both tools are read-only decision aids. They do not modify repositories,
+create tickets, deploy workloads, or mutate cloud resources. Use proxy,
+gateway, Shield, or API audit evidence when a decision depends on selected
+live runtime traffic rather than static reachability.
+
+## Example Conversations
+
+**"Are my AI agents vulnerable?"**
+> Agent-bom discovers your Claude Desktop, Cursor, and VS Code MCP configs,
+> extracts all server packages, queries OSV/NVD for CVEs, and shows the
+> blast radius chain.
+
+**"Is it safe to install mcp-server-sqlite?"**
+> Runs pre-install check: CVE scan, typosquat detection, OpenSSF Scorecard,
+> license analysis, and supply chain provenance verification.
+
+**"Show me my compliance posture"**
+> Runs OWASP LLM Top 10, MITRE ATLAS, NIST AI RMF, and CIS benchmarks
+> against your infrastructure. Returns per-framework pass/fail/warn.
+
+## Security Model
+
+- **Read-mostly**: scanner, graph, audit, and posture tools are read-only.
+  The 17 write-annotated tools cover scan-history diff, Shield, identity,
+  external ingest, CWPP runtime-evidence ingest, access review, finding
+  triage, remediation campaigns, and ticket workflows. They require an
+  authenticated MCP operator token plus admin role, their specific write
+  scope (`cloud:write`, `findings:write`, `identity:write`, `shield:write`,
+  or `ticketing:write`), and an audit reason; stdio cannot invoke them.
+- **No credential storage**: Never stores, logs, or transmits your credentials.
+- **No network exfiltration**: Scans local configs, queries public CVE databases.
+- **Agentless**: No agents installed on targets.
+
+## Resources
+
+The server exposes six MCP resources:
+
+- `registry://servers` — Browse the full 1081-entry server security metadata registry
+- `policy://template` — Default security policy template
+- `metrics://tools` — Bounded MCP tool execution metrics
+- `schema://inventory-v1` — Canonical pushed-inventory schema contract
+- `bestpractices://mcp-hardening` — NSA-informed MCP hardening control mapping
+- `compliance://framework-controls` — Framework coverage and evidence mapping
+
+## Prompts
+
+Built-in prompts for common workflows:
+
+- `quick-audit` — Full agent + MCP server vulnerability scan
+- `pre-install-check` — Check a package before installing
+- `compliance-report` — Multi-framework compliance assessment
+- `fleet-audit` — Endpoint or cloud inventory audit with graph-ready findings
+- `incident-triage` — CVE or suspicious MCP finding triage using blast radius and runtime evidence
+- `remediation-plan` — Human-reviewed remediation plan without modifying files
+- `cloud-connection-review` — Read-only cloud or Snowflake connection review before first scan
+- `gateway-fleet-live-demo` — Gateway and fleet enforcement walkthrough for a live demo
+
+See [MCP workflow bundles](MCP_WORKFLOWS.md) for the tool order, evidence
+outputs, and demo script behind each workflow.
+- `fleet-audit` — Inventory and fleet scan playbook
+- `incident-triage` — Finding triage with blast radius and runtime context
+- `remediation-plan` — Human-reviewed remediation plan without file writes

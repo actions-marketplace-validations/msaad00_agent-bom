@@ -1,0 +1,16 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "status": {
+      "maxLength": 64,
+      "minLength": 1,
+      "title": "Status",
+      "type": "string"
+    }
+  },
+  "required": [
+    "status"
+  ],
+  "title": "IssueStatusUpdateRequest",
+  "type": "object"
+}

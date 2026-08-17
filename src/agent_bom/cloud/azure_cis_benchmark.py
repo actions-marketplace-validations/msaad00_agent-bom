@@ -50,7 +50,20 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from .aws_cis_benchmark import CheckStatus, CISCheckResult
+from agent_bom.security import sanitize_error
+
+from .aws_cis_benchmark import CheckStatus, CISCheckResult, finalize_read_coverage
+from .aws_inventory import is_access_denied_error
+from .azure_graph import (
+    ACCESS_REVIEW_DEFINITIONS_PATH,
+    AUTHORIZATION_POLICY_PATH,
+    AZURE_MANAGEMENT_APP_ID,
+    CONDITIONAL_ACCESS_POLICIES_PATH,
+    RESTRICTED_GUEST_ROLE_TEMPLATE_ID,
+    SECURITY_DEFAULTS_PATH,
+    GraphError,
+    GraphPermissionDeniedError,
+)
 from .base import CloudDiscoveryError
 
 logger = logging.getLogger(__name__)
@@ -68,6 +81,11 @@ class AzureCISReport:
     benchmark_version: str = "3.0"
     checks: list[CISCheckResult] = field(default_factory=list)
     subscription_id: str = ""
+    # Populated only by the multi-subscription fan-out: the subscriptions actually
+    # evaluated and any per-subscription warnings (e.g. a subscription skipped
+    # because the credential could not read it). Empty for a single-sub run.
+    subscriptions_scanned: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def passed(self) -> int:
@@ -78,24 +96,42 @@ class AzureCISReport:
         return sum(1 for c in self.checks if c.status == CheckStatus.FAIL)
 
     @property
+    def errored(self) -> int:
+        return sum(1 for c in self.checks if c.status == CheckStatus.ERROR)
+
+    @property
+    def not_applicable(self) -> int:
+        return sum(1 for c in self.checks if c.status == CheckStatus.NOT_APPLICABLE)
+
+    @property
+    def evaluated(self) -> int:
+        return self.passed + self.failed
+
+    @property
     def total(self) -> int:
         return len(self.checks)
 
     @property
     def pass_rate(self) -> float:
-        evaluated = sum(1 for c in self.checks if c.status in (CheckStatus.PASS, CheckStatus.FAIL))
-        return (self.passed / evaluated * 100) if evaluated else 0.0
+        return (self.passed / self.evaluated * 100) if self.evaluated else 0.0
 
     def to_dict(self) -> dict:
+        from agent_bom.cloud.benchmark_manifests import benchmark_manifest
         from agent_bom.mitre_attack import tag_cis_check
 
         return {
             "benchmark": "CIS Microsoft Azure Foundations",
             "benchmark_version": self.benchmark_version,
+            "benchmark_manifest": benchmark_manifest("azure"),
             "subscription_id": self.subscription_id,
+            "subscriptions_scanned": self.subscriptions_scanned,
+            "warnings": self.warnings,
             "pass_rate": round(self.pass_rate, 1),
             "passed": self.passed,
             "failed": self.failed,
+            "errored": self.errored,
+            "not_applicable": self.not_applicable,
+            "evaluated": self.evaluated,
             "total": self.total,
             "checks": [
                 {
@@ -106,7 +142,11 @@ class AzureCISReport:
                     "evidence": c.evidence,
                     "resource_ids": c.resource_ids,
                     "recommendation": c.recommendation,
+                    "remediation": c.remediation,
                     "cis_section": c.cis_section,
+                    # Per-check subscription attribution for the multi-subscription
+                    # fan-out; empty string on a single-subscription run.
+                    "subscription_id": c.account_id,
                     "attack_techniques": tag_cis_check(c),
                 }
                 for c in self.checks
@@ -130,15 +170,87 @@ _APPSERVICE_SECTION = "9 - App Service"
 
 
 # ---------------------------------------------------------------------------
-# Individual checks — CIS 1.x (Identity and Access Management)
+# Microsoft Graph identity evidence helpers (CIS 1.x)
+#
+# The 1.x identity controls that depend on Microsoft Entra directory state — the
+# authorization policy, security defaults, Conditional Access, and access
+# reviews — are evaluated from read-only Microsoft Graph v1.0 reads rather than
+# left as manual verification. Fail-closed contract: any denied, missing, or
+# unreadable Graph evidence yields ``unevaluable`` (ERROR), never an assumed PASS.
 # ---------------------------------------------------------------------------
+
+
+def _mark_unevaluable(result: CISCheckResult, exc: Exception) -> CISCheckResult:
+    """Fail closed: record why the Graph evidence could not be trusted."""
+    if isinstance(exc, GraphPermissionDeniedError):
+        detail = "the credential lacks the read-only Microsoft Graph permission (Policy.Read.All / AccessReview.Read.All)"
+    else:
+        detail = "Microsoft Graph directory evidence could not be read"
+    result.status = CheckStatus.ERROR
+    result.evidence = (
+        f"Unevaluable — {detail}; this control was not assessed and is NOT treated as passed. "
+        f"Grant read-only Graph access or verify in the Microsoft Entra admin center. ({sanitize_error(exc, generic=True)})"
+    )
+    return result
+
+
+def _ca_state(policy: dict[str, Any]) -> str:
+    return str(policy.get("state") or "").strip().lower()
+
+
+def _ca_enabled(policy: dict[str, Any]) -> bool:
+    """A Conditional Access policy is enforced only in the ``enabled`` state.
+
+    ``enabledForReportingButNotEnforced`` (report-only) and ``disabled`` do not
+    enforce the control, so they never satisfy a benchmark requirement.
+    """
+    return _ca_state(policy) == "enabled"
+
+
+def _ca_grant_controls(policy: dict[str, Any]) -> list[str]:
+    grant = policy.get("grantControls") or {}
+    controls = grant.get("builtInControls") if isinstance(grant, dict) else None
+    return [str(c).strip().lower() for c in controls] if isinstance(controls, list) else []
+
+
+def _ca_conditions(policy: dict[str, Any]) -> dict[str, Any]:
+    conditions = policy.get("conditions")
+    return conditions if isinstance(conditions, dict) else {}
+
+
+def _ca_included_users(policy: dict[str, Any]) -> list[str]:
+    users = _ca_conditions(policy).get("users") or {}
+    inc = users.get("includeUsers") if isinstance(users, dict) else None
+    return [str(u).strip().lower() for u in inc] if isinstance(inc, list) else []
+
+
+def _ca_included_roles(policy: dict[str, Any]) -> list[str]:
+    users = _ca_conditions(policy).get("users") or {}
+    inc = users.get("includeRoles") if isinstance(users, dict) else None
+    return [str(r) for r in inc] if isinstance(inc, list) else []
+
+
+def _ca_included_apps(policy: dict[str, Any]) -> list[str]:
+    apps = _ca_conditions(policy).get("applications") or {}
+    inc = apps.get("includeApplications") if isinstance(apps, dict) else None
+    return [str(a).strip().lower() for a in inc] if isinstance(inc, list) else []
+
+
+def _ca_client_app_types(policy: dict[str, Any]) -> list[str]:
+    types = _ca_conditions(policy).get("clientAppTypes")
+    return [str(t).strip().lower() for t in types] if isinstance(types, list) else []
+
+
+def _ca_sign_in_risk_levels(policy: dict[str, Any]) -> list[str]:
+    levels = _ca_conditions(policy).get("signInRiskLevels")
+    return [str(level).strip().lower() for level in levels] if isinstance(levels, list) else []
 
 
 def _check_1_1(auth_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 1.1 — Ensure no subscription Owner assignments to guest/external users."""
     result = CISCheckResult(
         check_id="1.1",
-        title="Ensure no subscription Owner role assigned to guest or external users",
+        title="No subscription Owner role for guest/external users",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation=(
@@ -153,30 +265,30 @@ def _check_1_1(auth_client: Any, subscription_id: str) -> CISCheckResult:
         # Owner role definition ID is fixed across all Azure tenants
         owner_role = "8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
 
-        guest_owners = []
+        owner_assignments = []
         for ra in assignments:
             role_def_id = (getattr(ra, "role_definition_id", "") or "").split("/")[-1]
             if role_def_id == owner_role:
                 principal_id = getattr(ra, "principal_id", "") or ""
                 # We can't easily get UPN without Graph API, so flag principals
                 # and let the evidence guide investigation
-                guest_owners.append(principal_id)
+                owner_assignments.append(principal_id)
 
-        # Heuristic: if we found any Owner assignments, flag for review
-        # A more precise check requires MS Graph for UPN inspection
-        if guest_owners:
-            result.status = CheckStatus.PASS  # Can't confirm guest without Graph
+        if owner_assignments:
+            result.status = CheckStatus.ERROR
             result.evidence = (
-                f"Found {len(guest_owners)} Owner assignment(s)."
-                " Verify none are guest (#EXT#) accounts via Azure Portal > Subscriptions > Access control."
+                f"Cannot evaluate guest/external identity for {len(owner_assignments)} Owner assignment(s): "
+                "Microsoft Graph identity evidence is unavailable. Verify the principals in Azure Portal "
+                "before treating this control as passed."
             )
+            result.resource_ids = [principal_id for principal_id in owner_assignments if principal_id]
         else:
             result.status = CheckStatus.PASS
             result.evidence = "No Owner role assignments found on subscription."
 
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not read role assignments: {exc}"
+        result.evidence = f"Could not read Owner role assignments: {sanitize_error(exc, generic=True)}"
     return result
 
 
@@ -184,7 +296,7 @@ def _check_1_2(auth_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 1.2 — Ensure no subscription-level Contributor assignments to guest users."""
     result = CISCheckResult(
         check_id="1.2",
-        title="Ensure no subscription-level Contributor role assigned to guest users",
+        title="No subscription Contributor role for guest users",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Review all Contributor role assignments and remove guest/external users. Use resource group scope instead.",
@@ -196,44 +308,101 @@ def _check_1_2(auth_client: Any, subscription_id: str) -> CISCheckResult:
 
         contributor_role = "b24988ac-6180-42a0-ab88-20f7382dd24c"
 
-        contributor_count = sum(1 for ra in assignments if (getattr(ra, "role_definition_id", "") or "").split("/")[-1] == contributor_role)
-
-        result.status = CheckStatus.PASS
-        result.evidence = (
-            f"Found {contributor_count} subscription-level Contributor assignment(s). "
-            "Verify none are guest (#EXT#) accounts via Azure Portal > Access control (IAM)."
-        )
+        contributor_assignments = [
+            getattr(ra, "principal_id", "") or ""
+            for ra in assignments
+            if (getattr(ra, "role_definition_id", "") or "").split("/")[-1] == contributor_role
+        ]
+        if contributor_assignments:
+            result.status = CheckStatus.ERROR
+            result.evidence = (
+                f"Cannot evaluate guest/external identity for {len(contributor_assignments)} Contributor assignment(s): "
+                "Microsoft Graph identity evidence is unavailable. Verify the principals in Azure Portal "
+                "before treating this control as passed."
+            )
+            result.resource_ids = [principal_id for principal_id in contributor_assignments if principal_id]
+        else:
+            result.status = CheckStatus.PASS
+            result.evidence = "No subscription-level Contributor role assignments found."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not read role assignments: {exc}"
+        result.evidence = f"Could not read Contributor role assignments: {sanitize_error(exc, generic=True)}"
     return result
 
 
-def _check_1_3() -> CISCheckResult:
-    """CIS 1.3 — Ensure guest users are reviewed on a regular basis."""
+def _guest_scoped_access_reviews(graph: Any) -> tuple[int, list[str]]:
+    """Return (total definitions, names of definitions scoped to guest users).
+
+    Reads ``/identityGovernance/accessReviews/definitions`` and flags any
+    definition whose scope references guest accounts (``userType eq 'Guest'``).
+    """
+    import json as _json
+
+    definitions = graph.list(ACCESS_REVIEW_DEFINITIONS_PATH)
+    guest_reviews: list[str] = []
+    for definition in definitions:
+        scope_blob = _json.dumps(definition.get("scope") or definition).lower()
+        if "guest" in scope_blob:
+            guest_reviews.append(str(definition.get("displayName") or definition.get("id") or "access-review"))
+    return len(definitions), guest_reviews
+
+
+def _check_1_3(graph: Any) -> CISCheckResult:
+    """CIS Azure 1.3 — recurring review of guest accounts (Microsoft Graph access reviews)."""
     result = CISCheckResult(
         check_id="1.3",
-        title="Ensure that guest users are reviewed on a regular basis",
-        status=CheckStatus.NOT_APPLICABLE,
+        title="Guest users reviewed regularly",
+        status=CheckStatus.ERROR,
         severity="medium",
-        recommendation="Review guest users monthly and remove accounts that no longer require access.",
+        recommendation=(
+            "Configure a recurring Microsoft Entra access review scoped to guest users and remove access that is no longer needed."
+        ),
         cis_section=_IAM_SECTION,
     )
-    result.evidence = "This check requires Microsoft Graph API access. Verify manually in Azure AD > Users > Filter by User type = Guest."
+    try:
+        total, guest_reviews = _guest_scoped_access_reviews(graph)
+        if guest_reviews:
+            result.status = CheckStatus.PASS
+            result.evidence = (
+                f"{len(guest_reviews)} access review(s) scoped to guest accounts are configured: {', '.join(guest_reviews[:5])}."
+            )
+            result.resource_ids = guest_reviews[:10]
+        elif total:
+            result.status = CheckStatus.FAIL
+            result.evidence = f"{total} access review definition(s) exist but none is scoped to guest accounts."
+        else:
+            result.status = CheckStatus.FAIL
+            result.evidence = "No Microsoft Entra access review definitions are configured — guest access is not being reviewed."
+    except GraphError as exc:
+        return _mark_unevaluable(result, exc)
     return result
 
 
-def _check_1_4() -> CISCheckResult:
-    """CIS 1.4 — Ensure Access Review is configured for Guest users."""
+def _check_1_4(graph: Any) -> CISCheckResult:
+    """CIS Azure 1.4 — an access review is configured for guest users (Microsoft Graph)."""
     result = CISCheckResult(
         check_id="1.4",
-        title="Ensure Access Review is configured for Guest users",
-        status=CheckStatus.NOT_APPLICABLE,
+        title="Access Review configured for guest users",
+        status=CheckStatus.ERROR,
         severity="medium",
-        recommendation="Configure Azure AD Access Reviews for guest users to periodically review and recertify guest access.",
+        recommendation="Create a Microsoft Entra access review that recertifies guest user access on a recurring schedule.",
         cis_section=_IAM_SECTION,
     )
-    result.evidence = "This check requires Microsoft Graph API access. Verify manually in Azure AD > Identity Governance > Access Reviews."
+    try:
+        total, guest_reviews = _guest_scoped_access_reviews(graph)
+        if guest_reviews:
+            result.status = CheckStatus.PASS
+            result.evidence = f"A guest-scoped access review is configured ({len(guest_reviews)} definition(s))."
+            result.resource_ids = guest_reviews[:10]
+        else:
+            result.status = CheckStatus.FAIL
+            result.evidence = (
+                f"No access review is scoped to guest users ({total} definition(s) found overall)."
+                if total
+                else "No access review definitions are configured for guest users."
+            )
+    except GraphError as exc:
+        return _mark_unevaluable(result, exc)
     return result
 
 
@@ -241,7 +410,7 @@ def _check_1_5(auth_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 1.5 — Ensure no custom subscription Administrator roles exist."""
     result = CISCheckResult(
         check_id="1.5",
-        title="Ensure that no custom subscription Administrator roles are created",
+        title="No custom subscription Administrator roles",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Remove custom roles that replicate subscription-level Owner/Contributor permissions. Use built-in roles.",
@@ -270,17 +439,28 @@ def _check_1_5(auth_client: Any, subscription_id: str) -> CISCheckResult:
     return result
 
 
-def _check_1_6() -> CISCheckResult:
-    """CIS 1.6 — Ensure MFA is enforced for all users."""
+def _check_1_6(graph: Any) -> CISCheckResult:
+    """CIS Azure 1.6 — MFA enforced for all users via Conditional Access (Microsoft Graph)."""
     result = CISCheckResult(
         check_id="1.6",
-        title="Ensure that multi-factor authentication is enabled for all users",
-        status=CheckStatus.NOT_APPLICABLE,
+        title="MFA enabled for all users",
+        status=CheckStatus.ERROR,
         severity="critical",
-        recommendation="Enable MFA for all users via Conditional Access policies or Security Defaults.",
+        recommendation="Enable an enabled Conditional Access policy that requires MFA for all users (or enable Security Defaults).",
         cis_section=_IAM_SECTION,
     )
-    result.evidence = "This check requires Microsoft Graph API access. Verify manually in Azure AD > Security > MFA."
+    try:
+        policies = graph.list(CONDITIONAL_ACCESS_POLICIES_PATH)
+        matching = [p for p in policies if _ca_enabled(p) and "all" in _ca_included_users(p) and "mfa" in _ca_grant_controls(p)]
+        if matching:
+            result.status = CheckStatus.PASS
+            result.evidence = f"{len(matching)} enabled Conditional Access policy(ies) require MFA for all users."
+            result.resource_ids = [str(p.get("displayName") or p.get("id")) for p in matching[:10]]
+        else:
+            result.status = CheckStatus.FAIL
+            result.evidence = f"No enabled Conditional Access policy requires MFA for all users ({len(policies)} policy(ies) reviewed)."
+    except GraphError as exc:
+        return _mark_unevaluable(result, exc)
     return result
 
 
@@ -288,7 +468,7 @@ def _check_1_7(auth_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 1.7 — Ensure no subscription-level Custom Roles with Owner permissions."""
     result = CISCheckResult(
         check_id="1.7",
-        title="Ensure that no custom subscription-level Owner roles exist",
+        title="No custom subscription-level Owner roles",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Remove custom roles that replicate Owner permissions at subscription scope.",
@@ -321,31 +501,59 @@ def _check_1_7(auth_client: Any, subscription_id: str) -> CISCheckResult:
     return result
 
 
-def _check_1_8() -> CISCheckResult:
-    """CIS 1.8 — Ensure MFA is enforced for users accessing Azure Portal."""
+def _check_1_8(graph: Any) -> CISCheckResult:
+    """CIS Azure 1.8 — MFA required for the Azure management app via Conditional Access (Microsoft Graph)."""
     result = CISCheckResult(
         check_id="1.8",
-        title="Ensure that multi-factor authentication is enabled for Azure Portal access",
-        status=CheckStatus.NOT_APPLICABLE,
+        title="MFA enabled for Azure Portal access",
+        status=CheckStatus.ERROR,
         severity="critical",
-        recommendation="Create a Conditional Access policy requiring MFA for Azure Management cloud app.",
+        recommendation=(
+            "Create an enabled Conditional Access policy that requires MFA for the Microsoft Azure Management cloud app (or all apps)."
+        ),
         cis_section=_IAM_SECTION,
     )
-    result.evidence = "This check requires Microsoft Graph API access. Verify manually in Azure AD > Security > Conditional Access."
+    try:
+        policies = graph.list(CONDITIONAL_ACCESS_POLICIES_PATH)
+        matching = [
+            p
+            for p in policies
+            if _ca_enabled(p) and "mfa" in _ca_grant_controls(p) and ({AZURE_MANAGEMENT_APP_ID, "all"} & set(_ca_included_apps(p)))
+        ]
+        if matching:
+            result.status = CheckStatus.PASS
+            result.evidence = f"{len(matching)} enabled Conditional Access policy(ies) require MFA for the Azure management app."
+            result.resource_ids = [str(p.get("displayName") or p.get("id")) for p in matching[:10]]
+        else:
+            result.status = CheckStatus.FAIL
+            result.evidence = "No enabled Conditional Access policy requires MFA for the Microsoft Azure Management cloud app."
+    except GraphError as exc:
+        return _mark_unevaluable(result, exc)
     return result
 
 
-def _check_1_9() -> CISCheckResult:
-    """CIS 1.9 — Ensure conditional access policies require MFA for administrative roles."""
+def _check_1_9(graph: Any) -> CISCheckResult:
+    """CIS Azure 1.9 — Conditional Access requires MFA for administrative roles (Microsoft Graph)."""
     result = CISCheckResult(
         check_id="1.9",
-        title="Ensure Conditional Access policies require MFA for administrative roles",
-        status=CheckStatus.NOT_APPLICABLE,
+        title="Conditional Access requires MFA for admin roles",
+        status=CheckStatus.ERROR,
         severity="critical",
-        recommendation="Create a Conditional Access policy that requires MFA for all administrative directory roles.",
+        recommendation="Create an enabled Conditional Access policy that targets directory roles and requires MFA.",
         cis_section=_IAM_SECTION,
     )
-    result.evidence = "This check requires Microsoft Graph API access. Verify manually in Azure AD > Security > Conditional Access."
+    try:
+        policies = graph.list(CONDITIONAL_ACCESS_POLICIES_PATH)
+        matching = [p for p in policies if _ca_enabled(p) and _ca_included_roles(p) and "mfa" in _ca_grant_controls(p)]
+        if matching:
+            result.status = CheckStatus.PASS
+            result.evidence = f"{len(matching)} enabled Conditional Access policy(ies) require MFA for administrative directory roles."
+            result.resource_ids = [str(p.get("displayName") or p.get("id")) for p in matching[:10]]
+        else:
+            result.status = CheckStatus.FAIL
+            result.evidence = "No enabled Conditional Access policy requires MFA for administrative directory roles."
+    except GraphError as exc:
+        return _mark_unevaluable(result, exc)
     return result
 
 
@@ -353,73 +561,129 @@ def _check_1_10() -> CISCheckResult:
     """CIS 1.10 — Ensure 'Allow users to remember MFA on trusted devices' is disabled."""
     result = CISCheckResult(
         check_id="1.10",
-        title="Ensure 'Allow users to remember multi-factor authentication on trusted devices' is Disabled",
+        title="Remember-MFA on trusted devices disabled",
         status=CheckStatus.NOT_APPLICABLE,
         severity="medium",
         recommendation="Disable 'Remember MFA on trusted devices' to ensure MFA is prompted on every sign-in.",
         cis_section=_IAM_SECTION,
     )
-    result.evidence = "This check requires Microsoft Graph API access. Verify manually in Azure AD > Security > MFA > Additional cloud-based MFA settings."
+    result.evidence = (
+        "Manual — the legacy per-tenant 'remember MFA on trusted devices' setting is not exposed by a stable Microsoft "
+        "Graph v1.0 read API. Verify in the Microsoft Entra admin center under Security > MFA > Additional cloud-based MFA settings."
+    )
     return result
 
 
-def _check_1_11() -> CISCheckResult:
-    """CIS 1.11 — Ensure Security Defaults is enabled (or Conditional Access policies)."""
+def _check_1_11(graph: Any) -> CISCheckResult:
+    """CIS Azure 1.11 — Microsoft Entra security defaults enabled (Microsoft Graph)."""
     result = CISCheckResult(
         check_id="1.11",
-        title="Ensure Security Defaults is enabled on Azure Active Directory",
-        status=CheckStatus.NOT_APPLICABLE,
+        title="Security Defaults enabled on Azure AD",
+        status=CheckStatus.ERROR,
         severity="high",
-        recommendation="Enable Security Defaults or implement equivalent Conditional Access policies.",
+        recommendation="Enable Microsoft Entra security defaults, or enforce the equivalent controls through Conditional Access.",
         cis_section=_IAM_SECTION,
     )
-    result.evidence = "This check requires Microsoft Graph API access. Verify manually in Azure AD > Properties > Manage Security defaults."
+    try:
+        policy = graph.get(SECURITY_DEFAULTS_PATH)
+        if bool(policy.get("isEnabled")):
+            result.status = CheckStatus.PASS
+            result.evidence = "Microsoft Entra security defaults are enabled for the tenant."
+        else:
+            result.status = CheckStatus.FAIL
+            result.evidence = (
+                "Microsoft Entra security defaults are disabled. If baseline MFA/legacy-auth protection is instead enforced "
+                "via Conditional Access, confirm those policies satisfy this control."
+            )
+    except GraphError as exc:
+        return _mark_unevaluable(result, exc)
     return result
 
 
-def _check_1_12() -> CISCheckResult:
-    """CIS 1.12 — Ensure 'User consent for applications' is not allowed."""
+def _check_1_12(graph: Any) -> CISCheckResult:
+    """CIS Azure 1.12 — user consent to applications is disabled (Microsoft Graph authorization policy)."""
     result = CISCheckResult(
         check_id="1.12",
-        title="Ensure that 'User consent for applications' is set to 'Do not allow user consent'",
-        status=CheckStatus.NOT_APPLICABLE,
+        title="User consent for applications disallowed",
+        status=CheckStatus.ERROR,
         severity="high",
-        recommendation="Set User consent settings to 'Do not allow user consent' in Azure AD > Enterprise Applications > Consent and permissions.",
+        recommendation="Remove app consent grants from the default user role so only admins can consent to application permissions.",
         cis_section=_IAM_SECTION,
     )
-    result.evidence = (
-        "This check requires Microsoft Graph API access. Verify manually in Azure AD > Enterprise Applications > User settings."
-    )
+    try:
+        policy = graph.get(AUTHORIZATION_POLICY_PATH)
+        perms = policy.get("defaultUserRolePermissions") or {}
+        granted = perms.get("permissionGrantPoliciesAssigned") if isinstance(perms, dict) else None
+        assigned = [str(g) for g in granted] if isinstance(granted, list) else []
+        if not assigned:
+            result.status = CheckStatus.PASS
+            result.evidence = (
+                "User consent to applications is disabled (no app-consent grant policies are assigned to the default user role)."
+            )
+        else:
+            result.status = CheckStatus.FAIL
+            result.evidence = (
+                f"User consent to applications is permitted — {len(assigned)} app-consent "
+                f"grant policy(ies) assigned: {', '.join(assigned[:5])}."
+            )
+    except GraphError as exc:
+        return _mark_unevaluable(result, exc)
     return result
 
 
-def _check_1_13() -> CISCheckResult:
-    """CIS 1.13 — Ensure 'Users can register applications' is set to No."""
+def _check_1_13(graph: Any) -> CISCheckResult:
+    """CIS Azure 1.13 — non-admin users cannot register applications (Microsoft Graph authorization policy)."""
     result = CISCheckResult(
         check_id="1.13",
-        title="Ensure that 'Users can register applications' is set to 'No'",
-        status=CheckStatus.NOT_APPLICABLE,
+        title="User app registration disabled",
+        status=CheckStatus.ERROR,
         severity="medium",
-        recommendation="Set 'Users can register applications' to No in Azure AD > User settings.",
+        recommendation=(
+            "Set the default user role so it cannot create (register) applications; delegate app registration to specific roles."
+        ),
         cis_section=_IAM_SECTION,
     )
-    result.evidence = "This check requires Microsoft Graph API access. Verify manually in Azure AD > User settings."
+    try:
+        policy = graph.get(AUTHORIZATION_POLICY_PATH)
+        perms = policy.get("defaultUserRolePermissions") or {}
+        allowed = bool(perms.get("allowedToCreateApps")) if isinstance(perms, dict) else True
+        if not allowed:
+            result.status = CheckStatus.PASS
+            result.evidence = "The default user role cannot register applications (allowedToCreateApps is false)."
+        else:
+            result.status = CheckStatus.FAIL
+            result.evidence = (
+                "The default user role can register applications (allowedToCreateApps is true) — any user can create app registrations."
+            )
+    except GraphError as exc:
+        return _mark_unevaluable(result, exc)
     return result
 
 
-def _check_1_14() -> CISCheckResult:
-    """CIS 1.14 — Ensure 'Guest users access restrictions' is set to restrict guest access."""
+def _check_1_14(graph: Any) -> CISCheckResult:
+    """CIS Azure 1.14 — guest access is set to the most restrictive role (Microsoft Graph authorization policy)."""
     result = CISCheckResult(
         check_id="1.14",
-        title="Ensure that 'Guest users access restrictions' is set to restrict guest access",
-        status=CheckStatus.NOT_APPLICABLE,
+        title="Guest user access restricted",
+        status=CheckStatus.ERROR,
         severity="medium",
-        recommendation="Configure guest user access restrictions to 'Guest user access is restricted to properties and memberships of their own directory objects'.",
+        recommendation="Set the guest user role to 'Restricted Guest User' so guests can only read their own directory objects.",
         cis_section=_IAM_SECTION,
     )
-    result.evidence = (
-        "This check requires Microsoft Graph API access. Verify manually in Azure AD > User settings > External collaboration settings."
-    )
+    try:
+        policy = graph.get(AUTHORIZATION_POLICY_PATH)
+        guest_role = str(policy.get("guestUserRoleId") or "").strip().lower()
+        if guest_role == RESTRICTED_GUEST_ROLE_TEMPLATE_ID.lower():
+            result.status = CheckStatus.PASS
+            result.evidence = "Guest access is set to the most restrictive role (Restricted Guest User)."
+        elif guest_role:
+            result.status = CheckStatus.FAIL
+            result.evidence = f"Guest access is not restricted to the most limited role (guestUserRoleId={guest_role})."
+        else:
+            result.status = CheckStatus.FAIL
+            result.evidence = "The tenant authorization policy does not restrict guest access to the Restricted Guest User role."
+    except GraphError as exc:
+        return _mark_unevaluable(result, exc)
     return result
 
 
@@ -427,7 +691,7 @@ def _check_1_15(auth_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 1.15 — Ensure custom subscription Administrator roles are not created."""
     result = CISCheckResult(
         check_id="1.15",
-        title="Ensure that custom subscription Administrator roles are not created",
+        title="Custom subscription Administrator roles absent",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Avoid creating custom roles with subscription-level administrative permissions. Use built-in roles instead.",
@@ -460,14 +724,15 @@ def _check_1_16() -> CISCheckResult:
     """CIS 1.16 — Ensure privileged roles are reviewed on a regular basis."""
     result = CISCheckResult(
         check_id="1.16",
-        title="Ensure that privileged roles are reviewed on a regular basis",
+        title="Privileged roles reviewed regularly",
         status=CheckStatus.NOT_APPLICABLE,
         severity="high",
         recommendation="Use Azure AD Privileged Identity Management (PIM) to configure regular access reviews for privileged roles.",
         cis_section=_IAM_SECTION,
     )
     result.evidence = (
-        "This check requires Microsoft Graph API access. Verify manually in Azure AD > Privileged Identity Management > Access reviews."
+        "Manual — Privileged Identity Management access-review configuration for privileged roles is not reliably "
+        "derivable from a stable Microsoft Graph v1.0 read. Verify in the Microsoft Entra admin center under PIM > Access reviews."
     )
     return result
 
@@ -476,27 +741,44 @@ def _check_1_17() -> CISCheckResult:
     """CIS 1.17 — Ensure that 'Restrict access to Azure AD admin center' is enabled."""
     result = CISCheckResult(
         check_id="1.17",
-        title="Ensure that 'Restrict access to Azure AD administration portal' is set to Yes",
+        title="Access to Azure AD admin portal restricted",
         status=CheckStatus.NOT_APPLICABLE,
         severity="medium",
         recommendation="Set 'Restrict access to Azure AD administration portal' to Yes in Azure AD > User settings.",
         cis_section=_IAM_SECTION,
     )
-    result.evidence = "This check requires Microsoft Graph API access. Verify manually in Azure AD > User settings."
+    result.evidence = (
+        "Manual — the 'restrict access to the Microsoft Entra administration portal' user setting is not exposed by a "
+        "stable Microsoft Graph v1.0 read API. Verify in the Microsoft Entra admin center under User settings."
+    )
     return result
 
 
-def _check_1_18() -> CISCheckResult:
-    """CIS 1.18 — Ensure legacy authentication is blocked via Conditional Access."""
+def _check_1_18(graph: Any) -> CISCheckResult:
+    """CIS Azure 1.18 — legacy authentication blocked via Conditional Access (Microsoft Graph)."""
     result = CISCheckResult(
         check_id="1.18",
-        title="Ensure that legacy authentication is blocked via Conditional Access Policy",
-        status=CheckStatus.NOT_APPLICABLE,
+        title="Legacy authentication blocked via Conditional Access",
+        status=CheckStatus.ERROR,
         severity="high",
-        recommendation="Create a Conditional Access policy to block legacy authentication protocols.",
+        recommendation="Create an enabled Conditional Access policy that targets legacy client app types and blocks access.",
         cis_section=_IAM_SECTION,
     )
-    result.evidence = "This check requires Microsoft Graph API access. Verify manually in Azure AD > Security > Conditional Access."
+    _legacy_clients = {"exchangeactivesync", "other"}
+    try:
+        policies = graph.list(CONDITIONAL_ACCESS_POLICIES_PATH)
+        matching = [
+            p for p in policies if _ca_enabled(p) and (_legacy_clients & set(_ca_client_app_types(p))) and "block" in _ca_grant_controls(p)
+        ]
+        if matching:
+            result.status = CheckStatus.PASS
+            result.evidence = f"{len(matching)} enabled Conditional Access policy(ies) block legacy authentication clients."
+            result.resource_ids = [str(p.get("displayName") or p.get("id")) for p in matching[:10]]
+        else:
+            result.status = CheckStatus.FAIL
+            result.evidence = "No enabled Conditional Access policy blocks legacy authentication clients (exchangeActiveSync / other)."
+    except GraphError as exc:
+        return _mark_unevaluable(result, exc)
     return result
 
 
@@ -504,13 +786,16 @@ def _check_1_19() -> CISCheckResult:
     """CIS 1.19 — Ensure password hash sync is enabled for resiliency."""
     result = CISCheckResult(
         check_id="1.19",
-        title="Ensure that password hash sync is enabled for resiliency and leaked credential detection",
+        title="Password hash sync enabled",
         status=CheckStatus.NOT_APPLICABLE,
         severity="medium",
         recommendation="Enable password hash synchronization in Azure AD Connect to support leaked credential detection.",
         cis_section=_IAM_SECTION,
     )
-    result.evidence = "This check requires Microsoft Graph API access. Verify manually in Azure AD > Azure AD Connect."
+    result.evidence = (
+        "Manual — password hash synchronization status is only exposed by the beta Microsoft Graph "
+        "onPremisesSynchronization resource, not a stable v1.0 read. Verify in Azure AD Connect / Entra Connect Sync."
+    )
     return result
 
 
@@ -518,41 +803,66 @@ def _check_1_20() -> CISCheckResult:
     """CIS 1.20 — Ensure self-service password reset is enabled."""
     result = CISCheckResult(
         check_id="1.20",
-        title="Ensure that self-service password reset is enabled",
+        title="Self-service password reset enabled",
         status=CheckStatus.NOT_APPLICABLE,
         severity="medium",
         recommendation="Enable self-service password reset for all users in Azure AD > Password reset.",
         cis_section=_IAM_SECTION,
     )
-    result.evidence = "This check requires Microsoft Graph API access. Verify manually in Azure AD > Password reset."
+    result.evidence = (
+        "Manual — the tenant self-service password reset enablement setting is not exposed by a stable Microsoft Graph "
+        "v1.0 read API. Verify in the Microsoft Entra admin center under Password reset."
+    )
     return result
 
 
-def _check_1_21() -> CISCheckResult:
-    """CIS 1.21 — Ensure MFA is required for risky sign-ins."""
+def _check_1_21(graph: Any) -> CISCheckResult:
+    """CIS Azure 1.21 — MFA required for risky sign-ins via Conditional Access (Microsoft Graph)."""
     result = CISCheckResult(
         check_id="1.21",
-        title="Ensure that multi-factor authentication is required for risky sign-ins",
-        status=CheckStatus.NOT_APPLICABLE,
+        title="MFA required for risky sign-ins",
+        status=CheckStatus.ERROR,
         severity="high",
-        recommendation="Create a Conditional Access policy that requires MFA when sign-in risk is medium or high.",
+        recommendation="Create an enabled Conditional Access policy that requires MFA when the sign-in risk level is medium or high.",
         cis_section=_IAM_SECTION,
     )
-    result.evidence = "This check requires Microsoft Graph API access. Verify manually in Azure AD > Security > Conditional Access."
+    try:
+        policies = graph.list(CONDITIONAL_ACCESS_POLICIES_PATH)
+        matching = [p for p in policies if _ca_enabled(p) and _ca_sign_in_risk_levels(p) and "mfa" in _ca_grant_controls(p)]
+        if matching:
+            result.status = CheckStatus.PASS
+            result.evidence = f"{len(matching)} enabled Conditional Access policy(ies) require MFA for risky sign-ins."
+            result.resource_ids = [str(p.get("displayName") or p.get("id")) for p in matching[:10]]
+        else:
+            result.status = CheckStatus.FAIL
+            result.evidence = "No enabled Conditional Access policy requires MFA based on sign-in risk level."
+    except GraphError as exc:
+        return _mark_unevaluable(result, exc)
     return result
 
 
-def _check_1_22() -> CISCheckResult:
-    """CIS 1.22 — Ensure MFA is enabled for all users in administrative roles."""
+def _check_1_22(graph: Any) -> CISCheckResult:
+    """CIS Azure 1.22 — MFA enforced for administrative role holders via Conditional Access (Microsoft Graph)."""
     result = CISCheckResult(
         check_id="1.22",
-        title="Ensure that multi-factor authentication is enabled for all users in administrative roles",
-        status=CheckStatus.NOT_APPLICABLE,
+        title="MFA enabled for all admin-role users",
+        status=CheckStatus.ERROR,
         severity="critical",
-        recommendation="Ensure all administrative role holders have MFA enabled via Conditional Access or per-user MFA.",
+        recommendation="Enforce MFA for administrative directory roles with an enabled Conditional Access policy that targets those roles.",
         cis_section=_IAM_SECTION,
     )
-    result.evidence = "This check requires Microsoft Graph API access. Verify manually in Azure AD > Security > MFA."
+    try:
+        policies = graph.list(CONDITIONAL_ACCESS_POLICIES_PATH)
+        matching = [p for p in policies if _ca_enabled(p) and _ca_included_roles(p) and "mfa" in _ca_grant_controls(p)]
+        if matching:
+            result.status = CheckStatus.PASS
+            result.evidence = f"{len(matching)} enabled Conditional Access policy(ies) enforce MFA for administrative role holders."
+            result.resource_ids = [str(p.get("displayName") or p.get("id")) for p in matching[:10]]
+        else:
+            result.status = CheckStatus.FAIL
+            result.evidence = "No enabled Conditional Access policy enforces MFA for users holding administrative directory roles."
+    except GraphError as exc:
+        return _mark_unevaluable(result, exc)
     return result
 
 
@@ -565,14 +875,14 @@ def _check_2_1(security_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 2.1 — Ensure Microsoft Defender for Servers is enabled."""
     result = CISCheckResult(
         check_id="2.1",
-        title="Ensure Microsoft Defender for Servers is set to On",
+        title="Microsoft Defender for Servers enabled",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable Microsoft Defender for Servers (Standard tier) in Defender for Cloud > Environment settings.",
         cis_section=_DEFENDER_SECTION,
     )
     try:
-        pricing = security_client.pricings.get(pricing_name="VirtualMachines")
+        pricing = security_client.pricings.get(scope_id=f"/subscriptions/{subscription_id}", pricing_name="VirtualMachines")
         tier = getattr(pricing, "pricing_tier", "") or ""
         if tier.lower() == "standard":
             result.status = CheckStatus.PASS
@@ -590,14 +900,14 @@ def _check_2_2(security_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 2.2 — Ensure Microsoft Defender for App Services is enabled."""
     result = CISCheckResult(
         check_id="2.2",
-        title="Ensure Microsoft Defender for App Services is set to On",
+        title="Microsoft Defender for App Services enabled",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable Microsoft Defender for App Services (Standard tier) in Defender for Cloud > Environment settings.",
         cis_section=_DEFENDER_SECTION,
     )
     try:
-        pricing = security_client.pricings.get(pricing_name="AppServices")
+        pricing = security_client.pricings.get(scope_id=f"/subscriptions/{subscription_id}", pricing_name="AppServices")
         tier = getattr(pricing, "pricing_tier", "") or ""
         if tier.lower() == "standard":
             result.status = CheckStatus.PASS
@@ -615,14 +925,14 @@ def _check_2_3(security_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 2.3 — Ensure Microsoft Defender for SQL Servers is enabled."""
     result = CISCheckResult(
         check_id="2.3",
-        title="Ensure Microsoft Defender for Azure SQL Databases is set to On",
+        title="Microsoft Defender for Azure SQL Databases enabled",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable Microsoft Defender for SQL Servers (Standard tier) in Defender for Cloud > Environment settings.",
         cis_section=_DEFENDER_SECTION,
     )
     try:
-        pricing = security_client.pricings.get(pricing_name="SqlServers")
+        pricing = security_client.pricings.get(scope_id=f"/subscriptions/{subscription_id}", pricing_name="SqlServers")
         tier = getattr(pricing, "pricing_tier", "") or ""
         if tier.lower() == "standard":
             result.status = CheckStatus.PASS
@@ -640,14 +950,14 @@ def _check_2_4(security_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 2.4 — Ensure Microsoft Defender for Storage is enabled."""
     result = CISCheckResult(
         check_id="2.4",
-        title="Ensure Microsoft Defender for Storage is set to On",
+        title="Microsoft Defender for Storage enabled",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable Microsoft Defender for Storage (Standard tier) in Defender for Cloud > Environment settings.",
         cis_section=_DEFENDER_SECTION,
     )
     try:
-        pricing = security_client.pricings.get(pricing_name="StorageAccounts")
+        pricing = security_client.pricings.get(scope_id=f"/subscriptions/{subscription_id}", pricing_name="StorageAccounts")
         tier = getattr(pricing, "pricing_tier", "") or ""
         if tier.lower() == "standard":
             result.status = CheckStatus.PASS
@@ -665,14 +975,14 @@ def _check_2_5(security_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 2.5 — Ensure Microsoft Defender for Key Vault is enabled."""
     result = CISCheckResult(
         check_id="2.5",
-        title="Ensure Microsoft Defender for Key Vault is set to On",
+        title="Microsoft Defender for Key Vault enabled",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable Microsoft Defender for Key Vault (Standard tier) in Defender for Cloud > Environment settings.",
         cis_section=_DEFENDER_SECTION,
     )
     try:
-        pricing = security_client.pricings.get(pricing_name="KeyVaults")
+        pricing = security_client.pricings.get(scope_id=f"/subscriptions/{subscription_id}", pricing_name="KeyVaults")
         tier = getattr(pricing, "pricing_tier", "") or ""
         if tier.lower() == "standard":
             result.status = CheckStatus.PASS
@@ -690,14 +1000,14 @@ def _check_2_6(security_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 2.6 — Ensure Microsoft Defender for DNS is enabled."""
     result = CISCheckResult(
         check_id="2.6",
-        title="Ensure Microsoft Defender for DNS is set to On",
+        title="Microsoft Defender for DNS enabled",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable Microsoft Defender for DNS (Standard tier) in Defender for Cloud > Environment settings.",
         cis_section=_DEFENDER_SECTION,
     )
     try:
-        pricing = security_client.pricings.get(pricing_name="Dns")
+        pricing = security_client.pricings.get(scope_id=f"/subscriptions/{subscription_id}", pricing_name="Dns")
         tier = getattr(pricing, "pricing_tier", "") or ""
         if tier.lower() == "standard":
             result.status = CheckStatus.PASS
@@ -716,14 +1026,14 @@ def _check_2_7(security_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 2.7 — Ensure Microsoft Defender for Resource Manager is enabled."""
     result = CISCheckResult(
         check_id="2.7",
-        title="Ensure Microsoft Defender for Resource Manager is set to On",
+        title="Microsoft Defender for Resource Manager enabled",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable Microsoft Defender for Resource Manager (Standard tier) in Defender for Cloud > Environment settings.",
         cis_section=_DEFENDER_SECTION,
     )
     try:
-        pricing = security_client.pricings.get(pricing_name="Arm")
+        pricing = security_client.pricings.get(scope_id=f"/subscriptions/{subscription_id}", pricing_name="Arm")
         tier = getattr(pricing, "pricing_tier", "") or ""
         if tier.lower() == "standard":
             result.status = CheckStatus.PASS
@@ -741,14 +1051,14 @@ def _check_2_8(security_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 2.8 — Ensure Microsoft Defender for Open-Source Databases is enabled."""
     result = CISCheckResult(
         check_id="2.8",
-        title="Ensure Microsoft Defender for Open-Source Relational Databases is set to On",
+        title="Microsoft Defender for open-source relational DBs enabled",
         status=CheckStatus.ERROR,
         severity="high",
-        recommendation="Enable Microsoft Defender for Open-Source Relational Databases (Standard tier) in Defender for Cloud > Environment settings.",
+        recommendation="Enable Microsoft Defender for Open-Source Relational Databases (Standard tier) in Defender for Cloud > Environment settings.",  # noqa: E501 (CIS remediation/log-filter string — kept verbatim for copy-paste)
         cis_section=_DEFENDER_SECTION,
     )
     try:
-        pricing = security_client.pricings.get(pricing_name="OpenSourceRelationalDatabases")
+        pricing = security_client.pricings.get(scope_id=f"/subscriptions/{subscription_id}", pricing_name="OpenSourceRelationalDatabases")
         tier = getattr(pricing, "pricing_tier", "") or ""
         if tier.lower() == "standard":
             result.status = CheckStatus.PASS
@@ -766,14 +1076,14 @@ def _check_2_9(security_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 2.9 — Ensure Microsoft Defender for Cosmos DB is enabled."""
     result = CISCheckResult(
         check_id="2.9",
-        title="Ensure Microsoft Defender for Cosmos DB is set to On",
+        title="Microsoft Defender for Cosmos DB enabled",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable Microsoft Defender for Cosmos DB (Standard tier) in Defender for Cloud > Environment settings.",
         cis_section=_DEFENDER_SECTION,
     )
     try:
-        pricing = security_client.pricings.get(pricing_name="CosmosDbs")
+        pricing = security_client.pricings.get(scope_id=f"/subscriptions/{subscription_id}", pricing_name="CosmosDbs")
         tier = getattr(pricing, "pricing_tier", "") or ""
         if tier.lower() == "standard":
             result.status = CheckStatus.PASS
@@ -791,14 +1101,14 @@ def _check_2_10(security_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 2.10 — Ensure Microsoft Defender for Containers is enabled."""
     result = CISCheckResult(
         check_id="2.10",
-        title="Ensure Microsoft Defender for Containers is set to On",
+        title="Microsoft Defender for Containers enabled",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable Microsoft Defender for Containers (Standard tier) in Defender for Cloud > Environment settings.",
         cis_section=_DEFENDER_SECTION,
     )
     try:
-        pricing = security_client.pricings.get(pricing_name="Containers")
+        pricing = security_client.pricings.get(scope_id=f"/subscriptions/{subscription_id}", pricing_name="Containers")
         tier = getattr(pricing, "pricing_tier", "") or ""
         if tier.lower() == "standard":
             result.status = CheckStatus.PASS
@@ -816,10 +1126,10 @@ def _check_2_11(security_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 2.11 — Ensure auto-provisioning of Log Analytics agent is set to On."""
     result = CISCheckResult(
         check_id="2.11",
-        title="Ensure that auto-provisioning of the Log Analytics agent is set to On",
+        title="Log Analytics agent auto-provisioning enabled",
         status=CheckStatus.ERROR,
         severity="medium",
-        recommendation="Enable auto-provisioning of the Log Analytics agent in Defender for Cloud > Environment settings > Auto provisioning.",
+        recommendation="Enable auto-provisioning of the Log Analytics agent in Defender for Cloud > Environment settings > Auto provisioning.",  # noqa: E501 (CIS remediation/log-filter string — kept verbatim for copy-paste)
         cis_section=_DEFENDER_SECTION,
     )
     try:
@@ -846,7 +1156,7 @@ def _check_2_12(security_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 2.12 — Ensure additional email addresses are configured for security alerts."""
     result = CISCheckResult(
         check_id="2.12",
-        title="Ensure that additional email addresses are configured with a security contact",
+        title="Security contact email addresses configured",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Configure additional email addresses in Defender for Cloud > Environment settings > Email notifications.",
@@ -876,10 +1186,10 @@ def _check_2_13(security_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 2.13 — Ensure email notification for high severity alerts is enabled."""
     result = CISCheckResult(
         check_id="2.13",
-        title="Ensure that email notification for high severity alerts is enabled",
+        title="Email notification for high-severity alerts enabled",
         status=CheckStatus.ERROR,
         severity="medium",
-        recommendation="Enable email notifications for high severity alerts in Defender for Cloud > Environment settings > Email notifications.",
+        recommendation="Enable email notifications for high severity alerts in Defender for Cloud > Environment settings > Email notifications.",  # noqa: E501 (CIS remediation/log-filter string — kept verbatim for copy-paste)
         cis_section=_DEFENDER_SECTION,
     )
     try:
@@ -917,7 +1227,7 @@ def _check_3_1(storage_client: Any) -> CISCheckResult:
     """CIS 3.1 — Ensure 'Secure Transfer Required' is enabled on all Storage Accounts."""
     result = CISCheckResult(
         check_id="3.1",
-        title="Ensure 'Secure Transfer Required' is enabled for all Storage Accounts",
+        title="Secure transfer required on storage accounts",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable 'Secure transfer required' on all storage accounts to enforce HTTPS-only access.",
@@ -948,7 +1258,7 @@ def _check_3_7(storage_client: Any) -> CISCheckResult:
     """CIS 3.7 — Ensure public access is disabled on all Storage Account blob containers."""
     result = CISCheckResult(
         check_id="3.7",
-        title="Ensure that 'Public access level' is set to Private for all blob containers",
+        title="Blob containers set to private access",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Disable public blob access at the storage account level and audit all containers.",
@@ -979,7 +1289,7 @@ def _check_3_2(storage_client: Any) -> CISCheckResult:
     """CIS 3.2 — Ensure default network access rule for Storage Accounts is Deny."""
     result = CISCheckResult(
         check_id="3.2",
-        title="Ensure that default network access rule for Storage Accounts is set to Deny",
+        title="Storage account default network rule set to Deny",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation=(
@@ -1014,7 +1324,7 @@ def _check_3_10(storage_client: Any) -> CISCheckResult:
     """CIS 3.10 — Ensure soft delete is enabled for Azure Storage."""
     result = CISCheckResult(
         check_id="3.10",
-        title="Ensure soft delete is enabled for Azure Storage",
+        title="Soft delete enabled for Azure Storage",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable blob soft delete on all storage accounts to protect against accidental deletion.",
@@ -1023,6 +1333,8 @@ def _check_3_10(storage_client: Any) -> CISCheckResult:
     try:
         accounts = list(storage_client.storage_accounts.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for acct in accounts:
             acct_name = acct.name or "unknown"
             # Extract resource group from account ID
@@ -1037,11 +1349,14 @@ def _check_3_10(storage_client: Any) -> CISCheckResult:
 
             try:
                 blob_props = storage_client.blob_services.get_service_properties(resource_group, acct_name)
+                inspected += 1
                 retention = getattr(blob_props, "delete_retention_policy", None)
                 enabled = getattr(retention, "enabled", False) if retention else False
                 if not enabled:
                     failing.append(acct_name)
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(acct_name)
                 logger.debug("Could not check soft delete for %s: %s", acct_name, exc)
 
         if failing:
@@ -1049,8 +1364,14 @@ def _check_3_10(storage_client: Any) -> CISCheckResult:
             result.evidence = f"Storage accounts without blob soft delete: {', '.join(failing)}"
             result.resource_ids = failing
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = f"All {len(accounts)} storage account(s) have blob soft delete enabled."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.Storage/storageAccounts/blobServices/read",
+                resource_kind="storage account",
+                pass_evidence=f"All {len(accounts)} storage account(s) have blob soft delete enabled.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check storage account soft delete settings: {exc}"
@@ -1061,7 +1382,7 @@ def _check_3_3(storage_client: Any) -> CISCheckResult:
     """CIS 3.3 — Ensure storage for critical data is encrypted with Customer Managed Key."""
     result = CISCheckResult(
         check_id="3.3",
-        title="Ensure Storage for critical data are encrypted with Customer Managed Key",
+        title="Critical-data storage encrypted with customer-managed key",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Configure Customer Managed Keys (CMK) for storage accounts containing critical data.",
@@ -1093,7 +1414,7 @@ def _check_3_4(storage_client: Any) -> CISCheckResult:
     """CIS 3.4 — Ensure storage logging is enabled for Queue service."""
     result = CISCheckResult(
         check_id="3.4",
-        title="Ensure that Storage Logging is enabled for Queue Service for read, write, and delete requests",
+        title="Storage logging enabled for Queue service",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable Storage Analytics logging for Queue service read, write, and delete operations.",
@@ -1119,7 +1440,7 @@ def _check_3_5(storage_client: Any) -> CISCheckResult:
     """CIS 3.5 — Ensure storage logging is enabled for Table service."""
     result = CISCheckResult(
         check_id="3.5",
-        title="Ensure that Storage Logging is enabled for Table Service for read, write, and delete requests",
+        title="Storage logging enabled for Table service",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable Storage Analytics logging for Table service read, write, and delete operations.",
@@ -1145,7 +1466,7 @@ def _check_3_6(storage_client: Any) -> CISCheckResult:
     """CIS 3.6 — Ensure storage logging is enabled for Blob service."""
     result = CISCheckResult(
         check_id="3.6",
-        title="Ensure that Storage Logging is enabled for Blob Service for read, write, and delete requests",
+        title="Storage logging enabled for Blob service",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable Storage Analytics logging for Blob service read, write, and delete operations.",
@@ -1171,7 +1492,7 @@ def _check_3_8(storage_client: Any) -> CISCheckResult:
     """CIS 3.8 — Ensure default network access rule for Storage Accounts is set to Deny."""
     result = CISCheckResult(
         check_id="3.8",
-        title="Ensure default network access rule for Storage Accounts is set to Deny",
+        title="Default storage network access rule set to Deny",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Set the default network access rule to 'Deny' on all storage accounts.",
@@ -1203,7 +1524,7 @@ def _check_3_9(storage_client: Any) -> CISCheckResult:
     """CIS 3.9 — Ensure 'Allow Azure services on the trusted services list' is enabled."""
     result = CISCheckResult(
         check_id="3.9",
-        title="Ensure 'Allow Azure services on the trusted services list to access this storage account' is Enabled",
+        title="Trusted Azure services allowed to access storage account",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable 'Allow trusted Microsoft services to access this storage account' in the storage account firewall settings.",
@@ -1236,7 +1557,7 @@ def _check_3_11(storage_client: Any) -> CISCheckResult:
     """CIS 3.11 — Ensure private endpoints are used to access Storage Accounts."""
     result = CISCheckResult(
         check_id="3.11",
-        title="Ensure private endpoints are used to access Storage Accounts",
+        title="Private endpoints used for storage accounts",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Configure private endpoints for all storage accounts to restrict network access to approved virtual networks.",
@@ -1266,7 +1587,7 @@ def _check_3_12(storage_client: Any) -> CISCheckResult:
     """CIS 3.12 — Ensure infrastructure encryption for Storage Accounts is enabled."""
     result = CISCheckResult(
         check_id="3.12",
-        title="Ensure that infrastructure encryption for Azure Storage Accounts is enabled",
+        title="Infrastructure encryption enabled on storage accounts",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable infrastructure encryption (double encryption) for storage accounts containing sensitive data.",
@@ -1302,7 +1623,7 @@ def _check_4_1_1(sql_client: Any) -> CISCheckResult:
     """CIS 4.1.1 — Ensure auditing is set to On for SQL servers."""
     result = CISCheckResult(
         check_id="4.1.1",
-        title="Ensure that 'Auditing' is set to 'On' for SQL servers",
+        title="Auditing enabled on SQL servers",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable auditing on all Azure SQL servers to track database events and write them to an audit log.",
@@ -1311,6 +1632,8 @@ def _check_4_1_1(sql_client: Any) -> CISCheckResult:
     try:
         servers = list(sql_client.servers.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for server in servers:
             server_name = server.name or "unknown"
             server_id = getattr(server, "id", "") or ""
@@ -1324,10 +1647,13 @@ def _check_4_1_1(sql_client: Any) -> CISCheckResult:
 
             try:
                 audit_settings = sql_client.server_blob_auditing_policies.get(resource_group, server_name)
+                inspected += 1
                 state = getattr(audit_settings, "state", None)
                 if str(state or "").lower() != "enabled":
                     failing.append(server_name)
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(server_name)
                 logger.debug("Could not check auditing for SQL server %s: %s", server_name, exc)
 
         if failing:
@@ -1335,8 +1661,14 @@ def _check_4_1_1(sql_client: Any) -> CISCheckResult:
             result.evidence = f"SQL servers without auditing enabled: {', '.join(failing)}"
             result.resource_ids = failing
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = f"All {len(servers)} SQL server(s) have auditing enabled."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.Sql/servers/auditingSettings/read",
+                resource_kind="SQL server",
+                pass_evidence=f"All {len(servers)} SQL server(s) have auditing enabled.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check SQL server auditing settings: {exc}"
@@ -1347,7 +1679,7 @@ def _check_4_2_1(sql_client: Any) -> CISCheckResult:
     """CIS 4.2.1 — Ensure TLS version is set to TLSV1.2 for MySQL/PostgreSQL flexible servers."""
     result = CISCheckResult(
         check_id="4.2.1",
-        title="Ensure 'TLS Version' is set to 'TLSV1.2' (or higher) for database servers",
+        title="TLS 1.2 or higher on database servers",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Set the minimum TLS version to TLS 1.2 on all Azure SQL, MySQL, and PostgreSQL servers.",
@@ -1383,7 +1715,7 @@ def _check_4_1_2(sql_client: Any) -> CISCheckResult:
     """CIS 4.1.2 — Ensure SQL Server Transparent Data Encryption is enabled."""
     result = CISCheckResult(
         check_id="4.1.2",
-        title="Ensure that Transparent Data Encryption (TDE) is enabled for SQL servers",
+        title="Transparent Data Encryption enabled on SQL servers",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable Transparent Data Encryption on all SQL databases.",
@@ -1392,6 +1724,8 @@ def _check_4_1_2(sql_client: Any) -> CISCheckResult:
     try:
         servers = list(sql_client.servers.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for server in servers:
             server_name = server.name or "unknown"
             server_id = getattr(server, "id", "") or ""
@@ -1403,19 +1737,28 @@ def _check_4_1_2(sql_client: Any) -> CISCheckResult:
                 continue
             try:
                 enc_protectors = sql_client.encryption_protectors.get(resource_group, server_name)
+                inspected += 1
                 _ = getattr(enc_protectors, "kind", "") or ""  # noqa: F841
                 server_key_type = getattr(enc_protectors, "server_key_type", "") or ""
                 if not server_key_type:
                     failing.append(server_name)
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(server_name)
                 logger.debug("Could not check TDE for SQL server %s: %s", server_name, exc)
         if failing:
             result.status = CheckStatus.FAIL
             result.evidence = f"SQL servers without TDE configured: {', '.join(failing)}"
             result.resource_ids = failing
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = f"All {len(servers)} SQL server(s) have Transparent Data Encryption configured."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.Sql/servers/encryptionProtector/read",
+                resource_kind="SQL server",
+                pass_evidence=f"All {len(servers)} SQL server(s) have Transparent Data Encryption configured.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check SQL server TDE settings: {exc}"
@@ -1426,7 +1769,7 @@ def _check_4_1_3(sql_client: Any) -> CISCheckResult:
     """CIS 4.1.3 — Ensure SQL Server Active Directory Admin is configured."""
     result = CISCheckResult(
         check_id="4.1.3",
-        title="Ensure that Azure Active Directory Admin is configured for SQL servers",
+        title="Azure AD admin configured for SQL servers",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Configure an Azure AD administrator for each SQL server to enable centralized authentication.",
@@ -1435,6 +1778,8 @@ def _check_4_1_3(sql_client: Any) -> CISCheckResult:
     try:
         servers = list(sql_client.servers.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for server in servers:
             server_name = server.name or "unknown"
             server_id = getattr(server, "id", "") or ""
@@ -1446,17 +1791,26 @@ def _check_4_1_3(sql_client: Any) -> CISCheckResult:
                 continue
             try:
                 admins = list(sql_client.server_azure_ad_administrators.list_by_server(resource_group, server_name))
+                inspected += 1
                 if not admins:
                     failing.append(server_name)
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(server_name)
                 logger.debug("Could not check AD admin for SQL server %s: %s", server_name, exc)
         if failing:
             result.status = CheckStatus.FAIL
             result.evidence = f"SQL servers without Azure AD admin: {', '.join(failing)}"
             result.resource_ids = failing
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = f"All {len(servers)} SQL server(s) have Azure AD admin configured."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.Sql/servers/administrators/read",
+                resource_kind="SQL server",
+                pass_evidence=f"All {len(servers)} SQL server(s) have Azure AD admin configured.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check SQL server AD admin settings: {exc}"
@@ -1467,7 +1821,7 @@ def _check_4_1_4(sql_client: Any) -> CISCheckResult:
     """CIS 4.1.4 — Ensure Advanced Threat Protection is enabled for SQL servers."""
     result = CISCheckResult(
         check_id="4.1.4",
-        title="Ensure that Advanced Threat Protection (ATP) is enabled on SQL servers",
+        title="Advanced Threat Protection enabled on SQL servers",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable Advanced Threat Protection on all SQL servers.",
@@ -1476,6 +1830,8 @@ def _check_4_1_4(sql_client: Any) -> CISCheckResult:
     try:
         servers = list(sql_client.servers.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for server in servers:
             server_name = server.name or "unknown"
             server_id = getattr(server, "id", "") or ""
@@ -1487,18 +1843,27 @@ def _check_4_1_4(sql_client: Any) -> CISCheckResult:
                 continue
             try:
                 atp = sql_client.server_advanced_threat_protection_settings.get(resource_group, server_name)
+                inspected += 1
                 state = getattr(atp, "state", "") or ""
                 if str(state).lower() != "enabled":
                     failing.append(server_name)
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(server_name)
                 logger.debug("Could not check ATP for SQL server %s: %s", server_name, exc)
         if failing:
             result.status = CheckStatus.FAIL
             result.evidence = f"SQL servers without Advanced Threat Protection: {', '.join(failing)}"
             result.resource_ids = failing
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = f"All {len(servers)} SQL server(s) have Advanced Threat Protection enabled."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.Sql/servers/advancedThreatProtectionSettings/read",
+                resource_kind="SQL server",
+                pass_evidence=f"All {len(servers)} SQL server(s) have Advanced Threat Protection enabled.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check SQL server ATP settings: {exc}"
@@ -1509,7 +1874,7 @@ def _check_4_1_5(sql_client: Any) -> CISCheckResult:
     """CIS 4.1.5 — Ensure SQL Server Vulnerability Assessment is configured."""
     result = CISCheckResult(
         check_id="4.1.5",
-        title="Ensure that Vulnerability Assessment is configured on SQL servers",
+        title="Vulnerability Assessment configured on SQL servers",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Configure Vulnerability Assessment on all SQL servers with a storage account for scan results.",
@@ -1551,7 +1916,7 @@ def _check_4_1_6(sql_client: Any) -> CISCheckResult:
     """CIS 4.1.6 — Ensure SQL server public network access is disabled."""
     result = CISCheckResult(
         check_id="4.1.6",
-        title="Ensure that public network access is disabled for SQL servers",
+        title="Public network access disabled on SQL servers",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Disable public network access on SQL servers and use private endpoints for connectivity.",
@@ -1582,7 +1947,7 @@ def _check_4_2_2(mysql_client: Any) -> CISCheckResult:
     """CIS 4.2.2 — Ensure MySQL SSL enforcement is enabled."""
     result = CISCheckResult(
         check_id="4.2.2",
-        title="Ensure 'ssl_enforcement' is set to 'ENABLED' for MySQL Database servers",
+        title="SSL enforcement enabled on MySQL servers",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable SSL enforcement on all MySQL servers to ensure encrypted connections.",
@@ -1613,7 +1978,7 @@ def _check_4_2_3(mysql_client: Any) -> CISCheckResult:
     """CIS 4.2.3 — Ensure MySQL server parameter 'log_checkpoints' is enabled."""
     result = CISCheckResult(
         check_id="4.2.3",
-        title="Ensure server parameter 'log_checkpoints' is set to 'ON' for MySQL Database servers",
+        title="MySQL log_checkpoints parameter set to ON",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable the 'log_checkpoints' server parameter on all MySQL servers.",
@@ -1622,6 +1987,8 @@ def _check_4_2_3(mysql_client: Any) -> CISCheckResult:
     try:
         servers = list(mysql_client.servers.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for server in servers:
             server_name = server.name or "unknown"
             server_id = getattr(server, "id", "") or ""
@@ -1633,18 +2000,27 @@ def _check_4_2_3(mysql_client: Any) -> CISCheckResult:
                 continue
             try:
                 config = mysql_client.configurations.get(resource_group, server_name, "log_checkpoints")
+                inspected += 1
                 value = getattr(config, "value", "") or ""
                 if value.lower() != "on":
                     failing.append(server_name)
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(server_name)
                 logger.debug("Could not check log_checkpoints for MySQL server %s: %s", server_name, exc)
         if failing:
             result.status = CheckStatus.FAIL
             result.evidence = f"MySQL servers with log_checkpoints disabled: {', '.join(failing)}"
             result.resource_ids = failing
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = f"All {len(servers)} MySQL server(s) have log_checkpoints enabled."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.DBforMySQL/servers/configurations/read",
+                resource_kind="MySQL server",
+                pass_evidence=f"All {len(servers)} MySQL server(s) have log_checkpoints enabled.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check MySQL log_checkpoints setting: {exc}"
@@ -1655,7 +2031,7 @@ def _check_4_3_1(postgresql_client: Any) -> CISCheckResult:
     """CIS 4.3.1 — Ensure PostgreSQL SSL enforcement is enabled."""
     result = CISCheckResult(
         check_id="4.3.1",
-        title="Ensure 'ssl_enforcement' is set to 'ENABLED' for PostgreSQL Database servers",
+        title="SSL enforcement enabled on PostgreSQL servers",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable SSL enforcement on all PostgreSQL servers to ensure encrypted connections.",
@@ -1686,7 +2062,7 @@ def _check_4_3_2(postgresql_client: Any) -> CISCheckResult:
     """CIS 4.3.2 — Ensure PostgreSQL server parameter 'log_checkpoints' is enabled."""
     result = CISCheckResult(
         check_id="4.3.2",
-        title="Ensure server parameter 'log_checkpoints' is set to 'ON' for PostgreSQL Database servers",
+        title="PostgreSQL log_checkpoints parameter set to ON",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable the 'log_checkpoints' server parameter on all PostgreSQL servers.",
@@ -1695,6 +2071,8 @@ def _check_4_3_2(postgresql_client: Any) -> CISCheckResult:
     try:
         servers = list(postgresql_client.servers.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for server in servers:
             server_name = server.name or "unknown"
             server_id = getattr(server, "id", "") or ""
@@ -1706,18 +2084,27 @@ def _check_4_3_2(postgresql_client: Any) -> CISCheckResult:
                 continue
             try:
                 config = postgresql_client.configurations.get(resource_group, server_name, "log_checkpoints")
+                inspected += 1
                 value = getattr(config, "value", "") or ""
                 if value.lower() != "on":
                     failing.append(server_name)
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(server_name)
                 logger.debug("Could not check log_checkpoints for PostgreSQL server %s: %s", server_name, exc)
         if failing:
             result.status = CheckStatus.FAIL
             result.evidence = f"PostgreSQL servers with log_checkpoints disabled: {', '.join(failing)}"
             result.resource_ids = failing
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = f"All {len(servers)} PostgreSQL server(s) have log_checkpoints enabled."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.DBforPostgreSQL/servers/configurations/read",
+                resource_kind="PostgreSQL server",
+                pass_evidence=f"All {len(servers)} PostgreSQL server(s) have log_checkpoints enabled.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check PostgreSQL log_checkpoints setting: {exc}"
@@ -1728,7 +2115,7 @@ def _check_4_3_3(postgresql_client: Any) -> CISCheckResult:
     """CIS 4.3.3 — Ensure PostgreSQL server parameter 'log_connections' is enabled."""
     result = CISCheckResult(
         check_id="4.3.3",
-        title="Ensure server parameter 'log_connections' is set to 'ON' for PostgreSQL Database servers",
+        title="PostgreSQL log_connections parameter set to ON",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable the 'log_connections' server parameter on all PostgreSQL servers.",
@@ -1737,6 +2124,8 @@ def _check_4_3_3(postgresql_client: Any) -> CISCheckResult:
     try:
         servers = list(postgresql_client.servers.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for server in servers:
             server_name = server.name or "unknown"
             server_id = getattr(server, "id", "") or ""
@@ -1748,18 +2137,27 @@ def _check_4_3_3(postgresql_client: Any) -> CISCheckResult:
                 continue
             try:
                 config = postgresql_client.configurations.get(resource_group, server_name, "log_connections")
+                inspected += 1
                 value = getattr(config, "value", "") or ""
                 if value.lower() != "on":
                     failing.append(server_name)
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(server_name)
                 logger.debug("Could not check log_connections for PostgreSQL server %s: %s", server_name, exc)
         if failing:
             result.status = CheckStatus.FAIL
             result.evidence = f"PostgreSQL servers with log_connections disabled: {', '.join(failing)}"
             result.resource_ids = failing
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = f"All {len(servers)} PostgreSQL server(s) have log_connections enabled."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.DBforPostgreSQL/servers/configurations/read",
+                resource_kind="PostgreSQL server",
+                pass_evidence=f"All {len(servers)} PostgreSQL server(s) have log_connections enabled.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check PostgreSQL log_connections setting: {exc}"
@@ -1770,7 +2168,7 @@ def _check_4_3_4(postgresql_client: Any) -> CISCheckResult:
     """CIS 4.3.4 — Ensure PostgreSQL server parameter 'log_disconnections' is enabled."""
     result = CISCheckResult(
         check_id="4.3.4",
-        title="Ensure server parameter 'log_disconnections' is set to 'ON' for PostgreSQL Database servers",
+        title="PostgreSQL log_disconnections parameter set to ON",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable the 'log_disconnections' server parameter on all PostgreSQL servers.",
@@ -1779,6 +2177,8 @@ def _check_4_3_4(postgresql_client: Any) -> CISCheckResult:
     try:
         servers = list(postgresql_client.servers.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for server in servers:
             server_name = server.name or "unknown"
             server_id = getattr(server, "id", "") or ""
@@ -1790,18 +2190,27 @@ def _check_4_3_4(postgresql_client: Any) -> CISCheckResult:
                 continue
             try:
                 config = postgresql_client.configurations.get(resource_group, server_name, "log_disconnections")
+                inspected += 1
                 value = getattr(config, "value", "") or ""
                 if value.lower() != "on":
                     failing.append(server_name)
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(server_name)
                 logger.debug("Could not check log_disconnections for PostgreSQL server %s: %s", server_name, exc)
         if failing:
             result.status = CheckStatus.FAIL
             result.evidence = f"PostgreSQL servers with log_disconnections disabled: {', '.join(failing)}"
             result.resource_ids = failing
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = f"All {len(servers)} PostgreSQL server(s) have log_disconnections enabled."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.DBforPostgreSQL/servers/configurations/read",
+                resource_kind="PostgreSQL server",
+                pass_evidence=f"All {len(servers)} PostgreSQL server(s) have log_disconnections enabled.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check PostgreSQL log_disconnections setting: {exc}"
@@ -1812,7 +2221,7 @@ def _check_4_3_5(postgresql_client: Any) -> CISCheckResult:
     """CIS 4.3.5 — Ensure PostgreSQL server parameter 'connection_throttling' is enabled."""
     result = CISCheckResult(
         check_id="4.3.5",
-        title="Ensure server parameter 'connection_throttling' is set to 'ON' for PostgreSQL Database servers",
+        title="PostgreSQL connection_throttling parameter set to ON",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable the 'connection_throttling' server parameter on all PostgreSQL servers.",
@@ -1821,6 +2230,8 @@ def _check_4_3_5(postgresql_client: Any) -> CISCheckResult:
     try:
         servers = list(postgresql_client.servers.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for server in servers:
             server_name = server.name or "unknown"
             server_id = getattr(server, "id", "") or ""
@@ -1832,18 +2243,27 @@ def _check_4_3_5(postgresql_client: Any) -> CISCheckResult:
                 continue
             try:
                 config = postgresql_client.configurations.get(resource_group, server_name, "connection_throttling")
+                inspected += 1
                 value = getattr(config, "value", "") or ""
                 if value.lower() != "on":
                     failing.append(server_name)
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(server_name)
                 logger.debug("Could not check connection_throttling for PostgreSQL server %s: %s", server_name, exc)
         if failing:
             result.status = CheckStatus.FAIL
             result.evidence = f"PostgreSQL servers with connection_throttling disabled: {', '.join(failing)}"
             result.resource_ids = failing
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = f"All {len(servers)} PostgreSQL server(s) have connection_throttling enabled."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.DBforPostgreSQL/servers/configurations/read",
+                resource_kind="PostgreSQL server",
+                pass_evidence=f"All {len(servers)} PostgreSQL server(s) have connection_throttling enabled.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check PostgreSQL connection_throttling setting: {exc}"
@@ -1859,7 +2279,7 @@ def _check_5_1_1(monitor_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 5.1.1 — Ensure a Diagnostic Setting exists for the Activity Log."""
     result = CISCheckResult(
         check_id="5.1.1",
-        title="Ensure Diagnostic Setting exists capturing Activity Log",
+        title="Diagnostic setting captures Activity Log",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation=(
@@ -1888,7 +2308,7 @@ def _check_5_1_2(monitor_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 5.1.2 — Ensure Activity Log retention is set to at least 365 days."""
     result = CISCheckResult(
         check_id="5.1.2",
-        title="Ensure Activity Log retention is set to 365 days or greater",
+        title="Activity Log retention 365 days or greater",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation=(
@@ -1970,7 +2390,7 @@ def _check_5_1_3(monitor_client: Any, subscription_id: str) -> CISCheckResult:
     return _check_activity_log_alert(
         monitor_client,
         "5.1.3",
-        "Ensure that Activity Log alert exists for Create or Update Key Vault",
+        "Activity Log alert for Key Vault create/update",
         "Microsoft.KeyVault/vaults/write",
     )
 
@@ -1980,7 +2400,7 @@ def _check_5_1_4(monitor_client: Any, subscription_id: str) -> CISCheckResult:
     return _check_activity_log_alert(
         monitor_client,
         "5.1.4",
-        "Ensure that Activity Log alert exists for Delete Key Vault",
+        "Activity Log alert for Key Vault delete",
         "Microsoft.KeyVault/vaults/delete",
     )
 
@@ -1990,7 +2410,7 @@ def _check_5_1_5(monitor_client: Any, subscription_id: str) -> CISCheckResult:
     return _check_activity_log_alert(
         monitor_client,
         "5.1.5",
-        "Ensure that Activity Log alert exists for Create or Update Network Security Group",
+        "Activity Log alert for NSG create/update",
         "Microsoft.Network/networkSecurityGroups/write",
     )
 
@@ -2000,7 +2420,7 @@ def _check_5_1_6(monitor_client: Any, subscription_id: str) -> CISCheckResult:
     return _check_activity_log_alert(
         monitor_client,
         "5.1.6",
-        "Ensure that Activity Log alert exists for Delete Network Security Group",
+        "Activity Log alert for NSG delete",
         "Microsoft.Network/networkSecurityGroups/delete",
     )
 
@@ -2009,7 +2429,7 @@ def _check_5_2_1(postgresql_client: Any) -> CISCheckResult:
     """CIS 5.2.1 — Ensure server parameter 'log_connections' is set to ON for PostgreSQL."""
     result = CISCheckResult(
         check_id="5.2.1",
-        title="Ensure server parameter 'log_connections' is set to 'ON' for PostgreSQL Database Server",
+        title="PostgreSQL Server log_connections parameter set to ON",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Set the 'log_connections' server parameter to 'ON' on all PostgreSQL servers.",
@@ -2018,6 +2438,8 @@ def _check_5_2_1(postgresql_client: Any) -> CISCheckResult:
     try:
         servers = list(postgresql_client.servers.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for server in servers:
             server_name = server.name or "unknown"
             server_id = getattr(server, "id", "") or ""
@@ -2029,18 +2451,27 @@ def _check_5_2_1(postgresql_client: Any) -> CISCheckResult:
                 continue
             try:
                 config = postgresql_client.configurations.get(resource_group, server_name, "log_connections")
+                inspected += 1
                 value = getattr(config, "value", "") or ""
                 if value.lower() != "on":
                     failing.append(server_name)
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(server_name)
                 logger.debug("Could not check log_connections for PostgreSQL server %s: %s", server_name, exc)
         if failing:
             result.status = CheckStatus.FAIL
             result.evidence = f"PostgreSQL servers with log_connections off: {', '.join(failing)}"
             result.resource_ids = failing
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = f"All {len(servers)} PostgreSQL server(s) have log_connections enabled."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.DBforPostgreSQL/servers/configurations/read",
+                resource_kind="PostgreSQL server",
+                pass_evidence=f"All {len(servers)} PostgreSQL server(s) have log_connections enabled.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check PostgreSQL log_connections setting: {exc}"
@@ -2051,7 +2482,7 @@ def _check_5_2_2(postgresql_client: Any) -> CISCheckResult:
     """CIS 5.2.2 — Ensure server parameter 'log_disconnections' is set to ON."""
     result = CISCheckResult(
         check_id="5.2.2",
-        title="Ensure server parameter 'log_disconnections' is set to 'ON' for PostgreSQL Database Server",
+        title="PostgreSQL Server log_disconnections parameter set to ON",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Set the 'log_disconnections' server parameter to 'ON' on all PostgreSQL servers.",
@@ -2060,6 +2491,8 @@ def _check_5_2_2(postgresql_client: Any) -> CISCheckResult:
     try:
         servers = list(postgresql_client.servers.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for server in servers:
             server_name = server.name or "unknown"
             server_id = getattr(server, "id", "") or ""
@@ -2071,18 +2504,27 @@ def _check_5_2_2(postgresql_client: Any) -> CISCheckResult:
                 continue
             try:
                 config = postgresql_client.configurations.get(resource_group, server_name, "log_disconnections")
+                inspected += 1
                 value = getattr(config, "value", "") or ""
                 if value.lower() != "on":
                     failing.append(server_name)
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(server_name)
                 logger.debug("Could not check log_disconnections for PostgreSQL server %s: %s", server_name, exc)
         if failing:
             result.status = CheckStatus.FAIL
             result.evidence = f"PostgreSQL servers with log_disconnections off: {', '.join(failing)}"
             result.resource_ids = failing
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = f"All {len(servers)} PostgreSQL server(s) have log_disconnections enabled."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.DBforPostgreSQL/servers/configurations/read",
+                resource_kind="PostgreSQL server",
+                pass_evidence=f"All {len(servers)} PostgreSQL server(s) have log_disconnections enabled.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check PostgreSQL log_disconnections setting: {exc}"
@@ -2093,7 +2535,7 @@ def _check_5_2_3(postgresql_client: Any) -> CISCheckResult:
     """CIS 5.2.3 — Ensure server parameter 'connection_throttling' is set to ON."""
     result = CISCheckResult(
         check_id="5.2.3",
-        title="Ensure server parameter 'connection_throttling' is set to 'ON' for PostgreSQL Database Server",
+        title="PostgreSQL Server connection_throttling parameter set to ON",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Set the 'connection_throttling' server parameter to 'ON' on all PostgreSQL servers.",
@@ -2102,6 +2544,8 @@ def _check_5_2_3(postgresql_client: Any) -> CISCheckResult:
     try:
         servers = list(postgresql_client.servers.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for server in servers:
             server_name = server.name or "unknown"
             server_id = getattr(server, "id", "") or ""
@@ -2113,18 +2557,27 @@ def _check_5_2_3(postgresql_client: Any) -> CISCheckResult:
                 continue
             try:
                 config = postgresql_client.configurations.get(resource_group, server_name, "connection_throttling")
+                inspected += 1
                 value = getattr(config, "value", "") or ""
                 if value.lower() != "on":
                     failing.append(server_name)
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(server_name)
                 logger.debug("Could not check connection_throttling for PostgreSQL server %s: %s", server_name, exc)
         if failing:
             result.status = CheckStatus.FAIL
             result.evidence = f"PostgreSQL servers with connection_throttling off: {', '.join(failing)}"
             result.resource_ids = failing
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = f"All {len(servers)} PostgreSQL server(s) have connection_throttling enabled."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.DBforPostgreSQL/servers/configurations/read",
+                resource_kind="PostgreSQL server",
+                pass_evidence=f"All {len(servers)} PostgreSQL server(s) have connection_throttling enabled.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check PostgreSQL connection_throttling setting: {exc}"
@@ -2140,7 +2593,7 @@ def _check_6_1(network_client: Any) -> CISCheckResult:
     """CIS 6.1 — Ensure RDP access from the internet is restricted."""
     result = CISCheckResult(
         check_id="6.1",
-        title="Ensure that RDP access from the internet is evaluated and restricted",
+        title="RDP access from internet restricted",
         status=CheckStatus.ERROR,
         severity="critical",
         recommendation=(
@@ -2174,7 +2627,7 @@ def _check_6_2(network_client: Any) -> CISCheckResult:
     """CIS 6.2 — Ensure SSH access from the internet is restricted."""
     result = CISCheckResult(
         check_id="6.2",
-        title="Ensure that SSH access from the internet is evaluated and restricted",
+        title="SSH access from internet restricted",
         status=CheckStatus.ERROR,
         severity="critical",
         recommendation=(
@@ -2208,7 +2661,7 @@ def _check_6_3(network_client: Any) -> CISCheckResult:
     """CIS 6.3 — Ensure no SQL Databases allow ingress from 0.0.0.0/0 (Any IP)."""
     result = CISCheckResult(
         check_id="6.3",
-        title="Ensure no SQL Databases allow ingress from 0.0.0.0/0 (ANY IP)",
+        title="No SQL database allows ingress from any IP",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation=(
@@ -2243,7 +2696,7 @@ def _check_6_5(network_client: Any) -> CISCheckResult:
     """CIS 6.5 — Ensure Network Watcher is enabled."""
     result = CISCheckResult(
         check_id="6.5",
-        title="Ensure that Network Watcher is enabled",
+        title="Network Watcher enabled",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable Network Watcher in all regions where you have Azure resources deployed.",
@@ -2268,7 +2721,7 @@ def _check_6_4(network_client: Any) -> CISCheckResult:
     """CIS 6.4 — Ensure that UDP access from the internet is restricted."""
     result = CISCheckResult(
         check_id="6.4",
-        title="Ensure that UDP access from the internet is evaluated and restricted",
+        title="UDP access from internet restricted",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Remove or restrict NSG inbound rules allowing UDP from 0.0.0.0/0 or ::/0.",
@@ -2302,7 +2755,7 @@ def _check_6_6(network_client: Any) -> CISCheckResult:
     """CIS 6.6 — Ensure Web Application Firewall (WAF) is enabled."""
     result = CISCheckResult(
         check_id="6.6",
-        title="Ensure that Web Application Firewall (WAF) is enabled",
+        title="Web Application Firewall enabled",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable WAF on Application Gateway or Front Door for all public-facing web applications.",
@@ -2360,7 +2813,7 @@ def _check_7_1(compute_client: Any) -> CISCheckResult:
     """CIS 7.1 — Ensure Virtual Machines utilize Managed Disks."""
     result = CISCheckResult(
         check_id="7.1",
-        title="Ensure Virtual Machines utilize Managed Disks",
+        title="Virtual machines use Managed Disks",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Migrate all VM disks to Managed Disks for improved reliability, security, and simplified management.",
@@ -2394,7 +2847,7 @@ def _check_7_2(compute_client: Any) -> CISCheckResult:
     """CIS 7.2 — Ensure VMs use managed disks for OS disks."""
     result = CISCheckResult(
         check_id="7.2",
-        title="Ensure that Virtual Machines use Managed Disks for OS disks",
+        title="VM OS disks use Managed Disks",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Migrate all VM OS disks to Managed Disks.",
@@ -2427,7 +2880,7 @@ def _check_7_3(compute_client: Any) -> CISCheckResult:
     """CIS 7.3 — Ensure OS and data disks are encrypted with CMK."""
     result = CISCheckResult(
         check_id="7.3",
-        title="Ensure that OS and data disks are encrypted with Customer Managed Key (CMK)",
+        title="OS and data disks encrypted with customer-managed key",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable Customer Managed Key encryption for all VM OS and data disks.",
@@ -2462,7 +2915,7 @@ def _check_7_4(compute_client: Any) -> CISCheckResult:
     """CIS 7.4 — Ensure only approved extensions are installed on VMs."""
     result = CISCheckResult(
         check_id="7.4",
-        title="Ensure that only approved extensions are installed on Virtual Machines",
+        title="Only approved VM extensions installed",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Review all VM extensions and remove any unapproved or unnecessary extensions.",
@@ -2497,10 +2950,10 @@ def _check_7_5(compute_client: Any) -> CISCheckResult:
     """CIS 7.5 — Ensure latest OS patches are applied to VMs."""
     result = CISCheckResult(
         check_id="7.5",
-        title="Ensure that the latest OS patches for all Virtual Machines are applied",
+        title="Latest OS patches applied to VMs",
         status=CheckStatus.ERROR,
         severity="high",
-        recommendation="Enable automatic OS updates or apply latest patches to all VMs. Use Azure Update Management for compliance tracking.",
+        recommendation="Enable automatic OS updates or apply latest patches to all VMs. Use Azure Update Management for compliance tracking.",  # noqa: E501 (CIS remediation/log-filter string — kept verbatim for copy-paste)
         cis_section=_VM_SECTION,
     )
     try:
@@ -2521,7 +2974,7 @@ def _check_7_6(compute_client: Any) -> CISCheckResult:
     """CIS 7.6 — Ensure endpoint protection is installed on VMs."""
     result = CISCheckResult(
         check_id="7.6",
-        title="Ensure that endpoint protection is installed on Virtual Machines",
+        title="Endpoint protection installed on VMs",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Install an endpoint protection solution (e.g., Microsoft Defender for Endpoint) on all VMs.",
@@ -2565,7 +3018,7 @@ def _check_8_1(kv_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 8.1 — Ensure expiration date is set on all Key Vault keys."""
     result = CISCheckResult(
         check_id="8.1",
-        title="Ensure that expiration date is set on all keys in Key Vault",
+        title="Expiration date set on Key Vault keys",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Set an expiration date on all Key Vault keys to enforce key rotation.",
@@ -2574,6 +3027,8 @@ def _check_8_1(kv_client: Any, subscription_id: str) -> CISCheckResult:
     try:
         vaults = list(kv_client.vaults.list())
         failing_keys: list[str] = []
+        readable = 0
+        denied: list[str] = []
 
         for vault in vaults:
             vault_name = vault.name or "unknown"
@@ -2587,17 +3042,29 @@ def _check_8_1(kv_client: Any, subscription_id: str) -> CISCheckResult:
                     exp = getattr(key_prop, "expires_on", None)
                     if exp is None:
                         failing_keys.append(f"{vault_name}/{key_prop.name}")
+                readable += 1
             except Exception as exc:
-                # Key enumeration is best-effort per vault
+                # Data-plane read denied (Reader has no vault data-plane) — this
+                # vault is UNREADABLE, not compliant. Never let it fall through
+                # to PASS: a denied vault must not read as "keys have expiration".
+                denied.append(vault_name)
                 logger.debug("Could not enumerate keys in vault %s: %s", vault_name, exc)
 
         if failing_keys:
             result.status = CheckStatus.FAIL
             result.evidence = f"Keys without expiration: {', '.join(failing_keys[:10])}"
             result.resource_ids = failing_keys
+        elif vaults and readable == 0:
+            result.status = CheckStatus.ERROR
+            result.evidence = (
+                f"Could not read keys in any of {len(vaults)} vault(s) — data-plane access denied. "
+                "Grant the scanner 'Key Vault Reader' (RBAC vaults) or a List access policy "
+                "(access-policy vaults) to evaluate CIS 8.1."
+            )
         else:
+            note = f" ({len(denied)} vault(s) skipped — data-plane access denied)" if denied else ""
             result.status = CheckStatus.PASS
-            result.evidence = f"All keys across {len(vaults)} vault(s) have expiration dates set."
+            result.evidence = f"All keys across {readable} readable vault(s) have expiration dates set.{note}"
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not enumerate Key Vault keys: {exc}"
@@ -2608,7 +3075,7 @@ def _check_8_2(kv_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 8.2 — Ensure expiration date is set on all Key Vault secrets."""
     result = CISCheckResult(
         check_id="8.2",
-        title="Ensure that expiration date is set on all secrets in Key Vault",
+        title="Expiration date set on Key Vault secrets",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Set an expiration date on all Key Vault secrets to enforce secret rotation.",
@@ -2617,6 +3084,8 @@ def _check_8_2(kv_client: Any, subscription_id: str) -> CISCheckResult:
     try:
         vaults = list(kv_client.vaults.list())
         failing_secrets: list[str] = []
+        readable = 0
+        denied: list[str] = []
 
         for vault in vaults:
             vault_name = vault.name or "unknown"
@@ -2629,17 +3098,27 @@ def _check_8_2(kv_client: Any, subscription_id: str) -> CISCheckResult:
                 for secret_prop in secret_client.list_properties_of_secrets():
                     if getattr(secret_prop, "expires_on", None) is None:
                         failing_secrets.append(f"{vault_name}/{secret_prop.name}")
+                readable += 1
             except Exception as exc:
-                # Secret enumeration is best-effort per vault
+                # Denied vault is UNREADABLE, not compliant — never fall through to PASS.
+                denied.append(vault_name)
                 logger.debug("Could not enumerate secrets in vault %s: %s", vault_name, exc)
 
         if failing_secrets:
             result.status = CheckStatus.FAIL
             result.evidence = f"Secrets without expiration: {', '.join(failing_secrets[:10])}"
             result.resource_ids = failing_secrets
+        elif vaults and readable == 0:
+            result.status = CheckStatus.ERROR
+            result.evidence = (
+                f"Could not read secrets in any of {len(vaults)} vault(s) — data-plane access denied. "
+                "Grant the scanner 'Key Vault Reader' (RBAC vaults) or a List access policy "
+                "(access-policy vaults) to evaluate CIS 8.2."
+            )
         else:
+            note = f" ({len(denied)} vault(s) skipped — data-plane access denied)" if denied else ""
             result.status = CheckStatus.PASS
-            result.evidence = f"All secrets across {len(vaults)} vault(s) have expiration dates set."
+            result.evidence = f"All secrets across {readable} readable vault(s) have expiration dates set.{note}"
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not enumerate Key Vault secrets: {exc}"
@@ -2650,7 +3129,7 @@ def _check_8_3(kv_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 8.3 — Ensure Key Vault is recoverable (soft delete + purge protection)."""
     result = CISCheckResult(
         check_id="8.3",
-        title="Ensure that the Key Vault is recoverable (soft-delete and purge protection enabled)",
+        title="Key Vault recoverable (soft-delete and purge protection)",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable both soft-delete and purge protection on all Key Vaults.",
@@ -2659,6 +3138,8 @@ def _check_8_3(kv_client: Any, subscription_id: str) -> CISCheckResult:
     try:
         vaults = list(kv_client.vaults.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for vault in vaults:
             vault_name = vault.name or "unknown"
             vault_id = getattr(vault, "id", "") or ""
@@ -2670,6 +3151,7 @@ def _check_8_3(kv_client: Any, subscription_id: str) -> CISCheckResult:
                 continue
             try:
                 full_vault = kv_client.vaults.get(resource_group, vault_name)
+                inspected += 1
                 props = getattr(full_vault, "properties", None)
                 soft_delete = getattr(props, "enable_soft_delete", False) if props else False
                 purge_protection = getattr(props, "enable_purge_protection", False) if props else False
@@ -2681,14 +3163,22 @@ def _check_8_3(kv_client: Any, subscription_id: str) -> CISCheckResult:
                         missing.append("purge-protection")
                     failing.append(f"{vault_name} (missing: {', '.join(missing)})")
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(vault_name)
                 logger.debug("Could not check recoverability for vault %s: %s", vault_name, exc)
         if failing:
             result.status = CheckStatus.FAIL
             result.evidence = f"Key Vaults without full recoverability: {', '.join(failing[:10])}"
             result.resource_ids = [f.split(" ")[0] for f in failing]
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = "All Key Vault(s) have soft-delete and purge protection enabled."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.KeyVault/vaults/read",
+                resource_kind="Key Vault",
+                pass_evidence="All Key Vault(s) have soft-delete and purge protection enabled.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check Key Vault recoverability: {exc}"
@@ -2699,7 +3189,7 @@ def _check_8_4(kv_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 8.4 — Ensure key expiration date is set for all keys in RBAC Key Vaults."""
     result = CISCheckResult(
         check_id="8.4",
-        title="Ensure that the expiration date is set on all keys in RBAC Key Vaults",
+        title="Expiration date set on RBAC Key Vault keys",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Set an expiration date on all keys in Key Vaults using RBAC access model.",
@@ -2709,6 +3199,8 @@ def _check_8_4(kv_client: Any, subscription_id: str) -> CISCheckResult:
         vaults = list(kv_client.vaults.list())
         failing_keys: list[str] = []
         rbac_vault_count = 0
+        readable = 0
+        denied: list[str] = []
         for vault in vaults:
             vault_name = vault.name or "unknown"
             vault_id = getattr(vault, "id", "") or ""
@@ -2736,15 +3228,26 @@ def _check_8_4(kv_client: Any, subscription_id: str) -> CISCheckResult:
                 for key_prop in key_client.list_properties_of_keys():
                     if getattr(key_prop, "expires_on", None) is None:
                         failing_keys.append(f"{vault_name}/{key_prop.name}")
+                readable += 1
             except Exception as exc:
+                # Denied RBAC vault is UNREADABLE, not compliant — never PASS.
+                denied.append(vault_name)
                 logger.debug("Could not enumerate keys in RBAC vault %s: %s", vault_name, exc)
         if failing_keys:
             result.status = CheckStatus.FAIL
             result.evidence = f"Keys without expiration in RBAC vaults: {', '.join(failing_keys[:10])}"
             result.resource_ids = failing_keys
+        elif rbac_vault_count and readable == 0:
+            result.status = CheckStatus.ERROR
+            result.evidence = (
+                f"Could not read keys in any of {rbac_vault_count} RBAC vault(s) — data-plane access denied. "
+                "Grant the scanner 'Key Vault Reader' to evaluate CIS 8.4."
+            )
+            result.resource_ids = denied
         else:
+            note = f" ({len(denied)} vault(s) skipped — data-plane access denied)" if denied else ""
             result.status = CheckStatus.PASS
-            result.evidence = f"All keys in {rbac_vault_count} RBAC vault(s) have expiration dates set."
+            result.evidence = f"All keys in {readable} readable RBAC vault(s) have expiration dates set.{note}"
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check Key Vault key expiration: {exc}"
@@ -2755,7 +3258,7 @@ def _check_8_5(kv_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 8.5 — Ensure secret expiration date is set for all secrets in RBAC Key Vaults."""
     result = CISCheckResult(
         check_id="8.5",
-        title="Ensure that the expiration date is set on all secrets in RBAC Key Vaults",
+        title="Expiration date set on RBAC Key Vault secrets",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Set an expiration date on all secrets in Key Vaults using RBAC access model.",
@@ -2765,6 +3268,8 @@ def _check_8_5(kv_client: Any, subscription_id: str) -> CISCheckResult:
         vaults = list(kv_client.vaults.list())
         failing_secrets: list[str] = []
         rbac_vault_count = 0
+        readable = 0
+        denied: list[str] = []
         for vault in vaults:
             vault_name = vault.name or "unknown"
             vault_id = getattr(vault, "id", "") or ""
@@ -2792,15 +3297,26 @@ def _check_8_5(kv_client: Any, subscription_id: str) -> CISCheckResult:
                 for secret_prop in secret_client.list_properties_of_secrets():
                     if getattr(secret_prop, "expires_on", None) is None:
                         failing_secrets.append(f"{vault_name}/{secret_prop.name}")
+                readable += 1
             except Exception as exc:
+                # Denied RBAC vault is UNREADABLE, not compliant — never PASS.
+                denied.append(vault_name)
                 logger.debug("Could not enumerate secrets in RBAC vault %s: %s", vault_name, exc)
         if failing_secrets:
             result.status = CheckStatus.FAIL
             result.evidence = f"Secrets without expiration in RBAC vaults: {', '.join(failing_secrets[:10])}"
             result.resource_ids = failing_secrets
+        elif rbac_vault_count and readable == 0:
+            result.status = CheckStatus.ERROR
+            result.evidence = (
+                f"Could not read secrets in any of {rbac_vault_count} RBAC vault(s) — data-plane access denied. "
+                "Grant the scanner 'Key Vault Reader' to evaluate CIS 8.5."
+            )
+            result.resource_ids = denied
         else:
+            note = f" ({len(denied)} vault(s) skipped — data-plane access denied)" if denied else ""
             result.status = CheckStatus.PASS
-            result.evidence = f"All secrets in {rbac_vault_count} RBAC vault(s) have expiration dates set."
+            result.evidence = f"All secrets in {readable} readable RBAC vault(s) have expiration dates set.{note}"
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check Key Vault secret expiration: {exc}"
@@ -2811,7 +3327,7 @@ def _check_8_6(kv_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 8.6 — Ensure Key Vault secrets have content type set."""
     result = CISCheckResult(
         check_id="8.6",
-        title="Ensure that the Key Vault secrets have a content type set",
+        title="Key Vault secrets have a content type set",
         status=CheckStatus.ERROR,
         severity="low",
         recommendation="Set a content type on all Key Vault secrets to describe the secret's usage.",
@@ -2820,6 +3336,8 @@ def _check_8_6(kv_client: Any, subscription_id: str) -> CISCheckResult:
     try:
         vaults = list(kv_client.vaults.list())
         failing_secrets: list[str] = []
+        readable = 0
+        denied: list[str] = []
         for vault in vaults:
             vault_name = vault.name or "unknown"
             vault_url = f"https://{vault_name}.vault.azure.net/"
@@ -2832,15 +3350,27 @@ def _check_8_6(kv_client: Any, subscription_id: str) -> CISCheckResult:
                     content_type = getattr(secret_prop, "content_type", None)
                     if not content_type:
                         failing_secrets.append(f"{vault_name}/{secret_prop.name}")
+                readable += 1
             except Exception as exc:
+                # Denied vault is UNREADABLE, not compliant — never PASS.
+                denied.append(vault_name)
                 logger.debug("Could not enumerate secrets in vault %s: %s", vault_name, exc)
         if failing_secrets:
             result.status = CheckStatus.FAIL
             result.evidence = f"Secrets without content type: {', '.join(failing_secrets[:10])}"
             result.resource_ids = failing_secrets
+        elif vaults and readable == 0:
+            result.status = CheckStatus.ERROR
+            result.evidence = (
+                f"Could not read secrets in any of {len(vaults)} vault(s) — data-plane access denied. "
+                "Grant the scanner 'Key Vault Reader' (RBAC vaults) or a List access policy "
+                "(access-policy vaults) to evaluate CIS 8.6."
+            )
+            result.resource_ids = denied
         else:
+            note = f" ({len(denied)} vault(s) skipped — data-plane access denied)" if denied else ""
             result.status = CheckStatus.PASS
-            result.evidence = f"All secrets across {len(vaults)} vault(s) have content type set."
+            result.evidence = f"All secrets across {readable} readable vault(s) have content type set.{note}"
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check Key Vault secret content types: {exc}"
@@ -2851,7 +3381,7 @@ def _check_8_7(kv_client: Any, subscription_id: str) -> CISCheckResult:
     """CIS 8.7 — Ensure private endpoints are used for Key Vault."""
     result = CISCheckResult(
         check_id="8.7",
-        title="Ensure that private endpoints are used for Azure Key Vault",
+        title="Private endpoints used for Key Vault",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Configure private endpoints for all Key Vaults to restrict network access.",
@@ -2860,6 +3390,8 @@ def _check_8_7(kv_client: Any, subscription_id: str) -> CISCheckResult:
     try:
         vaults = list(kv_client.vaults.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for vault in vaults:
             vault_name = vault.name or "unknown"
             vault_id = getattr(vault, "id", "") or ""
@@ -2871,19 +3403,28 @@ def _check_8_7(kv_client: Any, subscription_id: str) -> CISCheckResult:
                 continue
             try:
                 full_vault = kv_client.vaults.get(resource_group, vault_name)
+                inspected += 1
                 props = getattr(full_vault, "properties", None)
                 pe_conns = getattr(props, "private_endpoint_connections", None) if props else None
                 if not pe_conns:
                     failing.append(vault_name)
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(vault_name)
                 logger.debug("Could not check private endpoints for vault %s: %s", vault_name, exc)
         if failing:
             result.status = CheckStatus.FAIL
             result.evidence = f"Key Vaults without private endpoints: {', '.join(failing)}"
             result.resource_ids = failing
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = "All Key Vault(s) have private endpoints configured."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.KeyVault/vaults/read",
+                resource_kind="Key Vault",
+                pass_evidence="All Key Vault(s) have private endpoints configured.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check Key Vault private endpoints: {exc}"
@@ -2899,7 +3440,7 @@ def _check_9_1(webapp_client: Any) -> CISCheckResult:
     """CIS 9.1 — Ensure App Service Authentication is set on."""
     result = CISCheckResult(
         check_id="9.1",
-        title="Ensure App Service Authentication is set up for apps in Azure App Service",
+        title="App Service Authentication configured",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable App Service Authentication (EasyAuth) on all web apps.",
@@ -2908,6 +3449,8 @@ def _check_9_1(webapp_client: Any) -> CISCheckResult:
     try:
         apps = list(webapp_client.web_apps.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for app in apps:
             app_name = app.name or "unknown"
             app_id = getattr(app, "id", "") or ""
@@ -2919,18 +3462,27 @@ def _check_9_1(webapp_client: Any) -> CISCheckResult:
                 continue
             try:
                 auth_settings = webapp_client.web_apps.get_auth_settings(resource_group, app_name)
+                inspected += 1
                 enabled = getattr(auth_settings, "enabled", False)
                 if not enabled:
                     failing.append(app_name)
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(app_name)
                 logger.debug("Could not check auth settings for app %s: %s", app_name, exc)
         if failing:
             result.status = CheckStatus.FAIL
             result.evidence = f"Web apps without authentication enabled: {', '.join(failing[:10])}"
             result.resource_ids = failing
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = f"All {len(apps)} web app(s) have App Service Authentication enabled."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.Web/sites/config/list (authsettings)",
+                resource_kind="web app",
+                pass_evidence=f"All {len(apps)} web app(s) have App Service Authentication enabled.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check App Service authentication settings: {exc}"
@@ -2941,7 +3493,7 @@ def _check_9_2(webapp_client: Any) -> CISCheckResult:
     """CIS 9.2 — Ensure web app redirects all HTTP traffic to HTTPS."""
     result = CISCheckResult(
         check_id="9.2",
-        title="Ensure web app redirects all HTTP traffic to HTTPS",
+        title="Web app redirects HTTP to HTTPS",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable 'HTTPS Only' on all web apps to redirect HTTP to HTTPS.",
@@ -2972,7 +3524,7 @@ def _check_9_3(webapp_client: Any) -> CISCheckResult:
     """CIS 9.3 — Ensure web app is using the latest TLS version."""
     result = CISCheckResult(
         check_id="9.3",
-        title="Ensure web app is using the latest version of TLS encryption",
+        title="Web app uses latest TLS version",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Set the minimum TLS version to 1.2 on all web apps.",
@@ -2981,6 +3533,8 @@ def _check_9_3(webapp_client: Any) -> CISCheckResult:
     try:
         apps = list(webapp_client.web_apps.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for app in apps:
             app_name = app.name or "unknown"
             app_id = getattr(app, "id", "") or ""
@@ -2992,18 +3546,31 @@ def _check_9_3(webapp_client: Any) -> CISCheckResult:
                 continue
             try:
                 config = webapp_client.web_apps.get_configuration(resource_group, app_name)
-                min_tls = getattr(config, "min_tls_version", "") or ""
-                if min_tls and "1.2" not in str(min_tls) and "1.3" not in str(min_tls):
+                inspected += 1
+                min_tls = str(getattr(config, "min_tls_version", "") or "").strip()
+                if not min_tls:
+                    # An unreported minimum TLS version is not a pass — the app is
+                    # not demonstrably enforcing TLS 1.2+, so flag it.
+                    failing.append(f"{app_name} (TLS version not set)")
+                elif "1.2" not in min_tls and "1.3" not in min_tls:
                     failing.append(f"{app_name} (TLS: {min_tls})")
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(app_name)
                 logger.debug("Could not check TLS for app %s: %s", app_name, exc)
         if failing:
             result.status = CheckStatus.FAIL
             result.evidence = f"Web apps not using TLS 1.2+: {', '.join(failing[:10])}"
             result.resource_ids = [f.split(" ")[0] for f in failing]
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = f"All {len(apps)} web app(s) use TLS 1.2 or higher."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.Web/sites/config/read",
+                resource_kind="web app",
+                pass_evidence=f"All {len(apps)} web app(s) use TLS 1.2 or higher.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check web app TLS settings: {exc}"
@@ -3014,7 +3581,7 @@ def _check_9_4(webapp_client: Any) -> CISCheckResult:
     """CIS 9.4 — Ensure the web app has a Managed Identity."""
     result = CISCheckResult(
         check_id="9.4",
-        title="Ensure the web app has a Managed Service Identity",
+        title="Web app has a Managed Service Identity",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable a System-Assigned or User-Assigned Managed Identity on all web apps.",
@@ -3049,7 +3616,7 @@ def _check_9_5(webapp_client: Any) -> CISCheckResult:
     """CIS 9.5 — Ensure web app has client certificates (Incoming client certificates) enabled."""
     result = CISCheckResult(
         check_id="9.5",
-        title="Ensure the web app has 'Client Certificates (Incoming client certificates)' set to On",
+        title="Web app requires incoming client certificates",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable client certificates on all web apps that require mutual TLS authentication.",
@@ -3080,7 +3647,7 @@ def _check_9_6(webapp_client: Any) -> CISCheckResult:
     """CIS 9.6 — Ensure FTP access is disabled for App Service."""
     result = CISCheckResult(
         check_id="9.6",
-        title="Ensure that FTP access is disabled for Azure App Service",
+        title="FTP access disabled for App Service",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Disable FTP/FTPS access on all web apps. Use FTPS-only or disable FTP state entirely.",
@@ -3089,6 +3656,8 @@ def _check_9_6(webapp_client: Any) -> CISCheckResult:
     try:
         apps = list(webapp_client.web_apps.list())
         failing = []
+        inspected = 0
+        denied: list[str] = []
         for app in apps:
             app_name = app.name or "unknown"
             app_id = getattr(app, "id", "") or ""
@@ -3100,18 +3669,27 @@ def _check_9_6(webapp_client: Any) -> CISCheckResult:
                 continue
             try:
                 config = webapp_client.web_apps.get_configuration(resource_group, app_name)
+                inspected += 1
                 ftp_state = getattr(config, "ftp_state", "") or ""
                 if ftp_state.lower() not in ("disabled", "ftpsonly"):
                     failing.append(f"{app_name} (FTP: {ftp_state})")
             except Exception as exc:
+                if is_access_denied_error(exc):
+                    denied.append(app_name)
                 logger.debug("Could not check FTP state for app %s: %s", app_name, exc)
         if failing:
             result.status = CheckStatus.FAIL
             result.evidence = f"Web apps with FTP enabled: {', '.join(failing[:10])}"
             result.resource_ids = [f.split(" ")[0] for f in failing]
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = f"All {len(apps)} web app(s) have FTP access disabled or FTPS-only."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="Microsoft.Web/sites/config/read",
+                resource_kind="web app",
+                pass_evidence=f"All {len(apps)} web app(s) have FTP access disabled or FTPS-only.",
+            )
     except Exception as exc:
         result.status = CheckStatus.ERROR
         result.evidence = f"Could not check App Service FTP settings: {exc}"
@@ -3126,6 +3704,7 @@ def _check_9_6(webapp_client: Any) -> CISCheckResult:
 def run_benchmark(
     subscription_id: str | None = None,
     checks: list[str] | None = None,
+    credential: Any = None,
 ) -> AzureCISReport:
     """Run CIS Azure Security Benchmark v3.0 checks.
 
@@ -3134,6 +3713,10 @@ def run_benchmark(
             AZURE_SUBSCRIPTION_ID env var.
         checks: Optional list of check IDs to run (e.g. ['1.1', '6.1']).
             Runs all checks if omitted.
+        credential: Optional Azure credential threaded into every check's
+            management client. When ``None`` a ``DefaultAzureCredential`` is
+            constructed (the prior behaviour). Passing a shared credential lets
+            the multi-subscription fan-out resolve auth once and reuse it.
 
     Returns:
         AzureCISReport with pass/fail results for each check.
@@ -3141,16 +3724,19 @@ def run_benchmark(
     Raises:
         CloudDiscoveryError: if azure-identity or azure-mgmt-* are not installed.
     """
-    try:
-        from azure.identity import DefaultAzureCredential
-    except ImportError:
-        raise CloudDiscoveryError("azure-identity is required for Azure CIS benchmark. Install with: pip install 'agent-bom[azure]'")
-
     resolved_sub = subscription_id or os.environ.get("AZURE_SUBSCRIPTION_ID", "")
     if not resolved_sub:
         raise CloudDiscoveryError("Azure subscription ID required. Set AZURE_SUBSCRIPTION_ID env var or pass subscription_id.")
 
-    credential = DefaultAzureCredential()
+    # azure-identity is only needed to build the default credential; a
+    # caller-supplied credential (including the fail-closed dead-credential
+    # path) must not require the optional SDK to be installed.
+    if credential is None:
+        try:
+            from azure.identity import DefaultAzureCredential
+        except ImportError:
+            raise CloudDiscoveryError("azure-identity is required for Azure CIS benchmark. Install with: pip install 'agent-bom[azure]'")
+        credential = DefaultAzureCredential()
     report = AzureCISReport(subscription_id=resolved_sub)
 
     # Build client map (lazy — only import what's needed)
@@ -3209,30 +3795,45 @@ def run_benchmark(
 
         return WebSiteManagementClient(credential, resolved_sub)
 
+    # Microsoft Graph reads the Entra directory state (Conditional Access, the
+    # tenant authorization policy, security defaults, access reviews) that the ARM
+    # management APIs do not expose. Built once and reused across the 1.x identity
+    # controls; the credential caches its token internally.
+    _graph_holder: dict[str, Any] = {}
+
+    def _graph_client() -> Any:
+        client = _graph_holder.get("client")
+        if client is None:
+            from .azure_graph import AzureGraphClient
+
+            client = AzureGraphClient(credential)
+            _graph_holder["client"] = client
+        return client
+
     all_checks: list[tuple[str, Any]] = [
         # Section 1 — Identity and Access Management
         ("1.1", lambda: _check_1_1(_auth_client(), resolved_sub)),
         ("1.2", lambda: _check_1_2(_auth_client(), resolved_sub)),
-        ("1.3", lambda: _check_1_3()),
-        ("1.4", lambda: _check_1_4()),
+        ("1.3", lambda: _check_1_3(_graph_client())),
+        ("1.4", lambda: _check_1_4(_graph_client())),
         ("1.5", lambda: _check_1_5(_auth_client(), resolved_sub)),
-        ("1.6", lambda: _check_1_6()),
+        ("1.6", lambda: _check_1_6(_graph_client())),
         ("1.7", lambda: _check_1_7(_auth_client(), resolved_sub)),
-        ("1.8", lambda: _check_1_8()),
-        ("1.9", lambda: _check_1_9()),
+        ("1.8", lambda: _check_1_8(_graph_client())),
+        ("1.9", lambda: _check_1_9(_graph_client())),
         ("1.10", lambda: _check_1_10()),
-        ("1.11", lambda: _check_1_11()),
-        ("1.12", lambda: _check_1_12()),
-        ("1.13", lambda: _check_1_13()),
-        ("1.14", lambda: _check_1_14()),
+        ("1.11", lambda: _check_1_11(_graph_client())),
+        ("1.12", lambda: _check_1_12(_graph_client())),
+        ("1.13", lambda: _check_1_13(_graph_client())),
+        ("1.14", lambda: _check_1_14(_graph_client())),
         ("1.15", lambda: _check_1_15(_auth_client(), resolved_sub)),
         ("1.16", lambda: _check_1_16()),
         ("1.17", lambda: _check_1_17()),
-        ("1.18", lambda: _check_1_18()),
+        ("1.18", lambda: _check_1_18(_graph_client())),
         ("1.19", lambda: _check_1_19()),
         ("1.20", lambda: _check_1_20()),
-        ("1.21", lambda: _check_1_21()),
-        ("1.22", lambda: _check_1_22()),
+        ("1.21", lambda: _check_1_21(_graph_client())),
+        ("1.22", lambda: _check_1_22(_graph_client())),
         # Section 2 — Microsoft Defender for Cloud
         ("2.1", lambda: _check_2_1(_security_client(), resolved_sub)),
         ("2.2", lambda: _check_2_2(_security_client(), resolved_sub)),
@@ -3333,4 +3934,88 @@ def run_benchmark(
                 )
             )
 
+    # Structured remediation per #665.
+    from agent_bom.cloud.cis_remediation import attach_all
+
+    attach_all(report, cloud="azure")
+
     return report
+
+
+# Bounded concurrency for the multi-subscription fan-out — mirrors the Azure
+# inventory fan-out's thread pool so a tenant-wide CIS run collapses the
+# per-subscription latencies instead of summing them.
+_MAX_CIS_FANOUT_WORKERS = 8
+
+
+def run_all_subscription_benchmarks(
+    checks: list[str] | None = None,
+    credential: Any = None,
+) -> AzureCISReport:
+    """Run the CIS Azure benchmark for EVERY subscription in the tenant.
+
+    The CIS counterpart of :func:`agent_bom.cloud.azure_inventory.discover_all_subscription_inventories`:
+    it reuses the exact same subscription enumeration
+    (:func:`agent_bom.cloud.azure_inventory.enumerate_subscription_ids`, which
+    walks the management-group tree) so the benchmark covers the identical
+    estate the inventory fan-out does. Each subscription is benchmarked
+    concurrently (bounded thread pool) and the per-subscription results are
+    aggregated into one :class:`AzureCISReport` with every check tagged by its
+    ``subscription_id``.
+
+    Read-only and partial-permission tolerant: a subscription the credential
+    cannot read is skipped with a warning rather than failing the whole run.
+
+    Raises:
+        CloudDiscoveryError: if azure-identity is not installed.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from agent_bom.cloud import azure_inventory
+
+    if credential is None:
+        try:
+            from azure.identity import DefaultAzureCredential
+        except ImportError:
+            raise CloudDiscoveryError("azure-identity is required for Azure CIS benchmark. Install with: pip install 'agent-bom[azure]'")
+        credential = DefaultAzureCredential()
+
+    sub_ids, warnings = azure_inventory.enumerate_subscription_ids(credential)
+    if not sub_ids:
+        raise CloudDiscoveryError(
+            "No Azure subscriptions resolved for the multi-subscription CIS benchmark. "
+            "Grant Management Group Reader or set AZURE_SUBSCRIPTION_ID."
+        )
+
+    aggregate = AzureCISReport(subscription_id=", ".join(sub_ids))
+    aggregate.warnings.extend(warnings)
+
+    def _run_one(sub_id: str) -> tuple[str, AzureCISReport]:
+        return sub_id, run_benchmark(subscription_id=sub_id, checks=checks, credential=credential)
+
+    # Deterministic aggregation: collect per-subscription reports keyed by id,
+    # then merge in the enumeration order so output is stable across runs.
+    reports: dict[str, AzureCISReport] = {}
+    with ThreadPoolExecutor(max_workers=min(_MAX_CIS_FANOUT_WORKERS, len(sub_ids))) as executor:
+        future_to_sub = {executor.submit(_run_one, sub_id): sub_id for sub_id in sub_ids}
+        for future in as_completed(future_to_sub):
+            sub_id = future_to_sub[future]
+            try:
+                _sid, sub_report = future.result()
+                reports[sub_id] = sub_report
+            except Exception as exc:  # noqa: BLE001 — one unreadable subscription must not sink the rest
+                from .normalization import sanitize_discovery_warning
+
+                aggregate.warnings.append(f"Subscription {sub_id} skipped: {sanitize_discovery_warning(exc)}")
+
+    for sub_id in sub_ids:
+        merged = reports.get(sub_id)
+        if merged is None:
+            continue
+        aggregate.subscriptions_scanned.append(sub_id)
+        for check in merged.checks:
+            check.account_id = sub_id
+            aggregate.checks.append(check)
+        aggregate.warnings.extend(merged.warnings)
+
+    return aggregate

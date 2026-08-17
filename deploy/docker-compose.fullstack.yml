@@ -1,33 +1,89 @@
+# ── Profile: DEV ─────────────────────────────────────────────────────────────
 # agent-bom full-stack compose — API + Dashboard UI + PostgreSQL
 #
+# Intended for local developer iteration on the API + UI together. For a
+# production-shaped deployment, see docker-compose.platform.yml (Docker
+# secrets, internal-only Postgres, separated frontend/backend networks).
+# For a single-workstation pilot, see docker-compose.pilot.yml.
+#
+# Credentials: NEVER put secrets in .env or compose env.
+# Postgres + control-plane secrets are file-mounted Docker secrets only:
+#   printf '%s' "$(openssl rand -hex 32)" > deploy/secrets/postgres_password
+#   printf '%s' "$(openssl rand -hex 32)" > deploy/secrets/postgres_app_password
+#   printf '%s' "$(openssl rand -hex 32)" > deploy/secrets/postgres_maintenance_password
+#   printf '%s' "$(openssl rand -hex 32)" > deploy/secrets/api_key
+#   printf '%s' "$(openssl rand -hex 32)" > deploy/secrets/audit_hmac_key
+#   printf '%s' "$(openssl rand -hex 32)" > deploy/secrets/browser_session_signing_key
+#   printf '%s' "$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')" \
+#     > deploy/secrets/connections_key
+#   chmod 0644 deploy/secrets/*   # world-readable: non-root container users read the bind-mount
+#
 # Usage (local dev):
-#   cp .env.example .env   # fill in POSTGRES_PASSWORD at minimum
-#   docker compose -f deploy/docker-compose.fullstack.yml up
+#   # 1. Generate the mounted secret files FIRST — `up` hard-fails without them:
+#   make secrets
+#   #    (equivalent: python scripts/deploy/hosted_poc_preflight.py --write-secret --skip-compose)
+#   # 2. cp .env.example .env   # ports / non-secret URL only
+#   # 3. docker compose -f deploy/docker-compose.fullstack.yml up   (or: make fullstack-up)
 #
 # Then open:
 #   Dashboard  →  http://localhost:3000
 #   API docs   →  http://localhost:8422/docs
 #
-# For production, swap the postgres service for a managed Postgres/Supabase URL:
-#   AGENT_BOM_POSTGRES_URL=postgresql://user:pass@db.supabase.co:5432/postgres
-#   Then remove the postgres + depends_on sections.
-
-version: '3.8'
+# The packaged profile intentionally owns its bundled Postgres service. For an
+# operator-managed database, use the Helm BYO-Postgres profile with distinct
+# app, maintenance, and migration/admin credentials; replacing only this
+# service would leave dependencies, migrations, and secret mounts inconsistent.
 
 services:
+
+  # ── One-shot schema migration ─────────────────────────────────────────────
+  # Existing local volumes do not replay docker-entrypoint-initdb.d scripts.
+  # Apply forward Alembic revisions before the API starts so upgrades preserve
+  # the same schema and role contract as the production-shaped Compose stack.
+  migrate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: agentbom/agent-bom:0.101.0
+    container_name: agent-bom-fullstack-migrate
+    working_dir: /opt/agent-bom
+    entrypoint: ["python"]
+    command: ["deploy/supabase/postgres/compose_migrate.py"]
+    environment:
+      ALEMBIC_DATABASE_URL: postgresql://${POSTGRES_USER:-agent_bom}@postgres:5432/${POSTGRES_DB:-agent_bom}
+      ALEMBIC_DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
+      AGENT_BOM_POSTGRES_URL: postgresql://agent_bom_app@postgres:5432/${POSTGRES_DB:-agent_bom}
+      AGENT_BOM_POSTGRES_PASSWORD_FILE: /run/secrets/postgres_app_password
+      AGENT_BOM_POSTGRES_MAINTENANCE_URL: postgresql://agent_bom_maintenance@postgres:5432/${POSTGRES_DB:-agent_bom}
+      AGENT_BOM_POSTGRES_MAINTENANCE_PASSWORD_FILE: /run/secrets/postgres_maintenance_password
+    secrets:
+      - postgres_password
+      - postgres_app_password
+      - postgres_maintenance_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - agent-bom
+    restart: "no"
 
   # ── FastAPI backend ────────────────────────────────────────────────────────
   api:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: agentbom/agent-bom:latest
+    image: agentbom/agent-bom:0.101.0
     container_name: agent-bom-api
     restart: unless-stopped
     command: api --host 0.0.0.0 --port 8422
     environment:
-      AGENT_BOM_POSTGRES_URL: >-
-        postgresql://${POSTGRES_USER:-agent_bom}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-agent_bom}
+      # Runtime traffic uses the non-superuser app role so FORCE ROW LEVEL
+      # SECURITY cannot be bypassed. Password comes from a mounted secret file
+      # — never from env / .env / compose interpolation.
+      AGENT_BOM_POSTGRES_URL: postgresql://agent_bom_app@postgres:5432/${POSTGRES_DB:-agent_bom}
+      AGENT_BOM_POSTGRES_PASSWORD_FILE: /run/secrets/postgres_app_password
+      AGENT_BOM_POSTGRES_MAINTENANCE_URL: postgresql://agent_bom_maintenance@postgres:5432/${POSTGRES_DB:-agent_bom}
+      AGENT_BOM_POSTGRES_MAINTENANCE_PASSWORD_FILE: /run/secrets/postgres_maintenance_password
       # Optional enrichment API keys
       NVD_API_KEY: ${NVD_API_KEY:-}
       # Optional cloud scanning
@@ -38,19 +94,36 @@ services:
       AWS_REGION: ${AWS_REGION:-us-east-1}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
-      # Optional: protect the API with a key
-      AGENT_BOM_API_KEY: ${AGENT_BOM_API_KEY:-}
+      # Control-plane secrets are Docker secret files only — never .env interpolation.
+      # Use docker-compose.pilot.yml for the explicit loopback-only no-auth workstation demo.
+      AGENT_BOM_API_KEY_FILE: /run/secrets/api_key
+      AGENT_BOM_AUDIT_HMAC_KEY_FILE: /run/secrets/audit_hmac_key
+      AGENT_BOM_BROWSER_SESSION_SIGNING_KEY_FILE: /run/secrets/browser_session_signing_key
+      AGENT_BOM_CONNECTIONS_KEY_FILE: /run/secrets/connections_key
+      # Local dev stack only: filesystem scans should be explicit in shared API setups.
+      AGENT_BOM_API_LOCAL_PATH_SCANS: ${AGENT_BOM_API_LOCAL_PATH_SCANS:-disabled}
+    secrets:
+      - postgres_app_password
+      - postgres_maintenance_password
+      - api_key
+      - audit_hmac_key
+      - browser_session_signing_key
+      - connections_key
     ports:
-      - "${API_PORT:-8422}:8422"
+      - "127.0.0.1:${API_PORT:-8422}:8422"
     volumes:
       # Mount host MCP config dirs read-only so the API can discover local agents
-      - ~/.config:/root/.config:ro
-      - ~/.claude:/root/.claude:ro
+      - ~/.config:/home/abom/.config:ro
+      - ~/.claude:/home/abom/.claude:ro
+      # Persist vuln DB, scan cache, and control-plane state for the abom user
+      - ~/.agent-bom:/home/abom/.agent-bom
     networks:
       - agent-bom
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8422/health')\""]
       interval: 15s
@@ -63,39 +136,55 @@ services:
     build:
       context: ../ui/
       dockerfile: Dockerfile
-      args:
-        # Baked into the Next.js build — must match the publicly reachable API URL
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8422}
-    image: agentbom/agent-bom-ui:latest
+    image: agentbom/agent-bom-ui:0.101.0
     container_name: agent-bom-ui
     restart: unless-stopped
+    environment:
+      # The browser same-origins to this UI; the UI's Node server proxies
+      # /v1,/health,/ws to NEXT_PUBLIC_API_URL, which must be the API
+      # container's in-network DNS name — not the browser's localhost.
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://api:8422}
     ports:
-      - "${UI_PORT:-3000}:3000"
+      - "127.0.0.1:${UI_PORT:-3000}:3000"
     networks:
       - agent-bom
     depends_on:
       api:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3000/', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   # ── PostgreSQL (dev / self-hosted) ─────────────────────────────────────────
   # For production: replace with Supabase, Railway, or any managed Postgres.
-  # Set AGENT_BOM_POSTGRES_URL env var on the api service and remove this block.
+  # Bootstrap password + app-role password are Docker secrets only.
   postgres:
     image: postgres:16-alpine
     container_name: agent-bom-db
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-agent_bom}
+      # Bootstrap role name for image init only — the API never connects as this user.
       POSTGRES_USER: ${POSTGRES_USER:-agent_bom}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_APP_PASSWORD_FILE: /run/secrets/postgres_app_password
+      POSTGRES_MAINTENANCE_PASSWORD_FILE: /run/secrets/postgres_maintenance_password
       POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    secrets:
+      - postgres_password
+      - postgres_app_password
+      - postgres_maintenance_password
     ports:
       # Only expose locally — remove in production
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./supabase/postgres/init-wrapper.sh:/docker-entrypoint-initdb.d/00-init-wrapper.sh:ro
       - ./supabase/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./supabase/postgres/runtime-schema.sql:/docker-entrypoint-initdb.d/02-runtime-schema.sql:ro
     command: >
       postgres
         -c password_encryption=scram-sha-256
@@ -116,6 +205,22 @@ services:
 
 volumes:
   postgres-data:
+
+secrets:
+  postgres_password:
+    file: ${POSTGRES_PASSWORD_FILE:-./secrets/postgres_password}
+  postgres_app_password:
+    file: ${POSTGRES_APP_PASSWORD_FILE:-./secrets/postgres_app_password}
+  postgres_maintenance_password:
+    file: ${POSTGRES_MAINTENANCE_PASSWORD_FILE:-./secrets/postgres_maintenance_password}
+  api_key:
+    file: ${API_KEY_FILE:-./secrets/api_key}
+  audit_hmac_key:
+    file: ${AUDIT_HMAC_KEY_FILE:-./secrets/audit_hmac_key}
+  browser_session_signing_key:
+    file: ${BROWSER_SESSION_SIGNING_KEY_FILE:-./secrets/browser_session_signing_key}
+  connections_key:
+    file: ${CONNECTIONS_KEY_FILE:-./secrets/connections_key}
 
 networks:
   agent-bom:

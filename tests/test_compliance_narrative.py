@@ -1,0 +1,739 @@
+"""Tests for the compliance narrative generator."""
+
+from __future__ import annotations
+
+import pytest
+
+from agent_bom.models import (
+    Agent,
+    AgentType,
+    AIBOMReport,
+    BlastRadius,
+    MCPServer,
+    Package,
+    Severity,
+    Vulnerability,
+)
+from agent_bom.output.compliance_narrative import (
+    ALL_FRAMEWORK_SLUGS,
+    ComplianceNarrative,
+    ControlNarrative,
+    RemediationImpact,
+    generate_compliance_narrative,
+)
+
+# ─── Fixtures ─────────────────────────────────────────────────────────────────
+
+
+def _make_vuln(
+    vuln_id: str = "CVE-2025-1234",
+    severity: Severity = Severity.HIGH,
+    fixed_version: str | None = "2.0.0",
+    is_kev: bool = False,
+) -> Vulnerability:
+    return Vulnerability(
+        id=vuln_id,
+        summary="Test vulnerability",
+        severity=severity,
+        fixed_version=fixed_version,
+        is_kev=is_kev,
+    )
+
+
+def _make_blast_radius(
+    vuln: Vulnerability | None = None,
+    pkg_name: str = "requests",
+    pkg_version: str = "1.0.0",
+    agents: list[str] | None = None,
+    owasp_tags: list[str] | None = None,
+    owasp_mcp_tags: list[str] | None = None,
+    nist_tags: list[str] | None = None,
+    cmmc_tags: list[str] | None = None,
+    exposed_credentials: list[str] | None = None,
+    risk_score: float = 6.0,
+) -> BlastRadius:
+    if vuln is None:
+        vuln = _make_vuln()
+    pkg = Package(name=pkg_name, version=pkg_version, ecosystem="pypi")
+    agent_objs = [Agent(name=n, agent_type=AgentType.CLAUDE_CODE, config_path="/tmp") for n in (agents or ["claude"])]
+    server = MCPServer(name="test-server")
+    return BlastRadius(
+        vulnerability=vuln,
+        package=pkg,
+        affected_servers=[server],
+        affected_agents=agent_objs,
+        exposed_credentials=exposed_credentials or [],
+        exposed_tools=[],
+        risk_score=risk_score,
+        owasp_tags=owasp_tags or ["LLM05"],
+        owasp_mcp_tags=owasp_mcp_tags or [],
+        nist_ai_rmf_tags=nist_tags or [],
+        cmmc_tags=cmmc_tags or [],
+    )
+
+
+def _make_report(blast_radii: list[BlastRadius] | None = None) -> AIBOMReport:
+    agents = [Agent(name="claude", agent_type=AgentType.CLAUDE_CODE, config_path="/tmp")]
+    return AIBOMReport(agents=agents, blast_radii=blast_radii or [])
+
+
+# ─── Dataclass structure tests ────────────────────────────────────────────────
+
+
+def test_generate_returns_compliance_narrative_type():
+    report = _make_report()
+    result = generate_compliance_narrative(report)
+    assert isinstance(result, ComplianceNarrative)
+
+
+def test_compliance_narrative_fields_present():
+    report = _make_report()
+    result = generate_compliance_narrative(report)
+    assert isinstance(result.executive_summary, str)
+    assert isinstance(result.framework_narratives, list)
+    assert isinstance(result.remediation_impact, list)
+    assert isinstance(result.risk_narrative, str)
+    assert isinstance(result.generated_at, str)
+    # ISO 8601 — should contain 'T'
+    assert "T" in result.generated_at
+
+
+# ─── Framework coverage ───────────────────────────────────────────────────────
+
+
+def test_all_frameworks_returned_when_no_filter():
+    report = _make_report()
+    result = generate_compliance_narrative(report)
+    returned_slugs = {fn.slug for fn in result.framework_narratives}
+    assert returned_slugs == set(ALL_FRAMEWORK_SLUGS)
+
+
+def test_single_framework_filter():
+    report = _make_report()
+    result = generate_compliance_narrative(report, framework="owasp-llm")
+    assert len(result.framework_narratives) == 1
+    assert result.framework_narratives[0].slug == "owasp-llm"
+    assert result.framework_narratives[0].framework == "OWASP Top 10 for LLM"
+
+
+def test_single_framework_cmmc():
+    report = _make_report()
+    result = generate_compliance_narrative(report, framework="cmmc")
+    assert result.framework_narratives[0].slug == "cmmc"
+    assert result.framework_narratives[0].framework == "CMMC 2.0"
+
+
+def test_unknown_framework_raises_value_error():
+    report = _make_report()
+    with pytest.raises(ValueError, match="Unknown framework"):
+        generate_compliance_narrative(report, framework="not-a-real-framework")
+
+
+# ─── Framework narrative content ──────────────────────────────────────────────
+
+
+def test_not_evaluated_framework_status_when_no_vulns():
+    """A scan with zero findings has no evidence — it must not read as fully compliant."""
+    report = _make_report(blast_radii=[])
+    result = generate_compliance_narrative(report, framework="owasp-llm")
+    fw = result.framework_narratives[0]
+    assert fw.status == "not_evaluated"
+    assert fw.score != 100
+    assert fw.score == 0
+    assert fw.failing_controls == []
+    lower = fw.narrative.lower()
+    assert "fully compliant" not in lower
+    assert "not-evaluated" in lower or "not evaluated" in lower or "could be evaluated" in lower
+
+
+def test_action_required_framework_status_for_critical_vuln():
+    br = _make_blast_radius(
+        vuln=_make_vuln(severity=Severity.CRITICAL),
+        owasp_tags=["LLM05"],
+    )
+    report = _make_report(blast_radii=[br])
+    result = generate_compliance_narrative(report, framework="owasp-llm")
+    fw = result.framework_narratives[0]
+    assert fw.status == "action_required"
+    assert fw.score < 100
+    assert len(fw.failing_controls) >= 1
+
+
+def test_vulnerability_mapping_never_claims_a_compliance_or_regulatory_verdict():
+    """Mapped findings are review evidence, not an audit or legal conclusion."""
+    br = _make_blast_radius(
+        vuln=_make_vuln(severity=Severity.CRITICAL),
+        owasp_tags=["LLM05"],
+    )
+    result = generate_compliance_narrative(_make_report(blast_radii=[br]), framework="owasp-llm")
+    fw = result.framework_narratives[0]
+
+    assert fw.status == "action_required"
+    assert "not a determination of compliance" in result.claim_boundary.lower()
+    rendered = " ".join(
+        [
+            result.executive_summary,
+            fw.narrative,
+            *(control.narrative for control in fw.failing_controls),
+            *fw.recommendations,
+        ]
+    ).lower()
+    for prohibited in (
+        "regulatory breach",
+        "compliance is failing",
+        "achieve compliance",
+        "active compliance gap",
+        "frameworks are failing",
+        "restore full compliance",
+    ):
+        assert prohibited not in rendered
+
+    from agent_bom.api.routes.compliance import _narrative_to_dict
+
+    api_payload = _narrative_to_dict(result)
+    assert api_payload["claim_boundary"] == result.claim_boundary
+    assert api_payload["framework_narratives"][0]["status"] == "action_required"
+
+
+def test_at_risk_framework_status_for_medium_vuln():
+    br = _make_blast_radius(
+        vuln=_make_vuln(severity=Severity.MEDIUM),
+        owasp_tags=["LLM05"],
+    )
+    report = _make_report(blast_radii=[br])
+    result = generate_compliance_narrative(report, framework="owasp-llm")
+    fw = result.framework_narratives[0]
+    assert fw.status == "review"
+
+
+def test_score_is_over_evaluated_controls_only():
+    """Score denominator is evaluated controls only, and an all-unrated control
+    is not a silent pass.
+
+    A finding with no severity (UNKNOWN) is evidence with an ungraded severity:
+    the control is not_evaluated, never a pass. So with one unrated control
+    (LLM05) and one warning control (LLM01), only LLM01 is evaluated — the
+    denominator excludes both the never-triggered controls AND the unrated one.
+    No control passes (0 / 1 evaluated), so the honest score is 0, not an
+    inflated 50.
+    """
+    unrated = _make_blast_radius(vuln=_make_vuln(severity=Severity.UNKNOWN), owasp_tags=["LLM05"])
+    warning = _make_blast_radius(vuln=_make_vuln(severity=Severity.MEDIUM), owasp_tags=["LLM01"])
+    report = _make_report(blast_radii=[unrated, warning])
+    result = generate_compliance_narrative(report, framework="owasp-llm")
+    fw = result.framework_narratives[0]
+    assert fw.status == "review"
+    # Only the medium control is evaluated (warning); the unrated control is
+    # excluded, not counted as a pass — so the score is not inflated.
+    assert fw.score == 0
+    assert {c.control_id for c in fw.failing_controls} == {"LLM01"}
+
+
+def test_framework_score_is_integer_0_to_100():
+    br = _make_blast_radius(owasp_tags=["LLM01", "LLM05"])
+    report = _make_report(blast_radii=[br])
+    result = generate_compliance_narrative(report, framework="owasp-llm")
+    fw = result.framework_narratives[0]
+    assert isinstance(fw.score, int)
+    assert 0 <= fw.score <= 100
+
+
+def test_framework_narrative_is_non_empty_string():
+    report = _make_report()
+    result = generate_compliance_narrative(report, framework="nist")
+    fw = result.framework_narratives[0]
+    assert len(fw.narrative) > 20
+
+
+def test_framework_has_recommendations():
+    br = _make_blast_radius(
+        vuln=_make_vuln(severity=Severity.HIGH),
+        owasp_tags=["LLM05"],
+    )
+    report = _make_report(blast_radii=[br])
+    result = generate_compliance_narrative(report, framework="owasp-llm")
+    fw = result.framework_narratives[0]
+    assert len(fw.recommendations) >= 1
+
+
+def test_framework_recommendation_references_real_evidence_command():
+    """The evidence-export recommendation must point at a command/endpoint that
+    actually exists — never the phantom ``agent-bom check --framework … --export
+    zip`` (``check`` has no such flags). The real evidence pack is the compliance
+    report API (#honest-cli)."""
+    br = _make_blast_radius(vuln=_make_vuln(severity=Severity.HIGH), owasp_tags=["LLM05"])
+    report = _make_report(blast_radii=[br])
+    fw = generate_compliance_narrative(report, framework="owasp-llm").framework_narratives[0]
+    joined = "\n".join(fw.recommendations)
+    # The invented flags must be gone…
+    assert "--export zip" not in joined
+    assert "check --framework" not in joined
+    # …and the real evidence-pack endpoint must be referenced with the slug.
+    assert "/v1/compliance/" in joined
+    assert f"/v1/compliance/{fw.slug}/report" in joined
+
+
+# ─── ControlNarrative tests ───────────────────────────────────────────────────
+
+
+def test_failing_control_has_correct_fields():
+    br = _make_blast_radius(
+        vuln=_make_vuln(severity=Severity.HIGH),
+        owasp_tags=["LLM05"],
+        pkg_name="requests",
+        pkg_version="1.0.0",
+        agents=["claude-agent"],
+    )
+    report = _make_report(blast_radii=[br])
+    result = generate_compliance_narrative(report, framework="owasp-llm")
+    fw = result.framework_narratives[0]
+
+    llm05 = next((c for c in fw.failing_controls if c.control_id == "LLM05"), None)
+    assert llm05 is not None
+    assert isinstance(llm05, ControlNarrative)
+    assert llm05.status in ("warning", "fail")
+    assert "requests@1.0.0" in llm05.affected_packages
+    assert "claude-agent" in llm05.affected_agents
+    assert len(llm05.narrative) > 0
+    assert len(llm05.remediation_steps) >= 1
+
+
+def test_passing_control_not_in_failing_list():
+    br = _make_blast_radius(owasp_tags=["LLM05"])
+    report = _make_report(blast_radii=[br])
+    result = generate_compliance_narrative(report, framework="owasp-llm")
+    fw = result.framework_narratives[0]
+    failing_ids = {c.control_id for c in fw.failing_controls}
+    # LLM01 was not tagged so it should not appear in failing_controls
+    assert "LLM01" not in failing_ids
+
+
+# ─── Remediation impact tests ─────────────────────────────────────────────────
+
+
+def test_remediation_impact_generated_for_tagged_vulns():
+    br = _make_blast_radius(
+        vuln=_make_vuln(fixed_version="2.0.0"),
+        owasp_tags=["LLM05"],
+        owasp_mcp_tags=["MCP04"],
+    )
+    report = _make_report(blast_radii=[br])
+    result = generate_compliance_narrative(report)
+    assert len(result.remediation_impact) >= 1
+
+
+def test_remediation_impact_fields():
+    br = _make_blast_radius(
+        vuln=_make_vuln(fixed_version="2.0.0"),
+        pkg_name="requests",
+        pkg_version="1.0.0",
+        owasp_tags=["LLM05"],
+    )
+    report = _make_report(blast_radii=[br])
+    result = generate_compliance_narrative(report)
+
+    ri = result.remediation_impact[0]
+    assert isinstance(ri, RemediationImpact)
+    assert ri.package == "requests"
+    assert ri.current_version == "1.0.0"
+    assert ri.fix_version == "2.0.0"
+    assert "LLM05" in ri.controls_fixed
+    assert "OWASP Top 10 for LLM" in ri.frameworks_impacted
+    assert "requests" in ri.narrative
+    assert "2.0.0" in ri.narrative
+
+
+def test_remediation_impact_no_fix_version():
+    br = _make_blast_radius(
+        vuln=_make_vuln(fixed_version=None),
+        owasp_tags=["LLM05"],
+    )
+    report = _make_report(blast_radii=[br])
+    result = generate_compliance_narrative(report)
+    ri = result.remediation_impact[0]
+    assert ri.fix_version == ""
+    assert "no fix available" in ri.narrative.lower()
+
+
+def test_remediation_impact_sorted_by_control_count():
+    br1 = _make_blast_radius(
+        pkg_name="pkg-a",
+        pkg_version="1.0",
+        vuln=_make_vuln("CVE-2025-001", fixed_version="2.0"),
+        owasp_tags=["LLM05"],
+    )
+    br2 = _make_blast_radius(
+        pkg_name="pkg-b",
+        pkg_version="1.0",
+        vuln=_make_vuln("CVE-2025-002", fixed_version="2.0"),
+        owasp_tags=["LLM01", "LLM05"],
+        owasp_mcp_tags=["MCP04"],
+    )
+    report = _make_report(blast_radii=[br1, br2])
+    result = generate_compliance_narrative(report)
+    # pkg-b has more controls — should appear first
+    assert result.remediation_impact[0].package == "pkg-b"
+
+
+def test_remediation_impact_empty_for_no_tags():
+    br = _make_blast_radius(owasp_tags=[], owasp_mcp_tags=[], nist_tags=[], cmmc_tags=[])
+    # manually clear all tags on the blast radius object
+    br.owasp_tags = []
+    br.owasp_mcp_tags = []
+    br.atlas_tags = []
+    br.nist_ai_rmf_tags = []
+    br.owasp_agentic_tags = []
+    br.eu_ai_act_tags = []
+    br.nist_csf_tags = []
+    br.iso_27001_tags = []
+    br.soc2_tags = []
+    br.cis_tags = []
+    br.cmmc_tags = []
+    report = _make_report(blast_radii=[br])
+    result = generate_compliance_narrative(report)
+    assert result.remediation_impact == []
+
+
+# ─── Risk narrative tests ─────────────────────────────────────────────────────
+
+
+def test_risk_narrative_empty_scan():
+    report = _make_report(blast_radii=[])
+    result = generate_compliance_narrative(report)
+    assert "no vulnerabilities" in result.risk_narrative.lower()
+
+
+def test_risk_narrative_mentions_vuln_count():
+    brs = [_make_blast_radius(vuln=_make_vuln(f"CVE-2025-{i}"), owasp_tags=["LLM05"]) for i in range(3)]
+    report = _make_report(blast_radii=brs)
+    result = generate_compliance_narrative(report)
+    assert "3" in result.risk_narrative
+
+
+def test_risk_narrative_mentions_kev():
+    br = _make_blast_radius(
+        vuln=_make_vuln(is_kev=True),
+        owasp_tags=["LLM05"],
+    )
+    report = _make_report(blast_radii=[br])
+    result = generate_compliance_narrative(report)
+    assert "kev" in result.risk_narrative.lower() or "known exploited" in result.risk_narrative.lower()
+
+
+# ─── Executive summary tests ──────────────────────────────────────────────────
+
+
+def test_executive_summary_non_empty():
+    report = _make_report()
+    result = generate_compliance_narrative(report)
+    assert len(result.executive_summary) > 50
+
+
+def test_executive_summary_mentions_scan_date():
+    report = _make_report()
+    result = generate_compliance_narrative(report)
+    # generated_at starts with YYYY-MM-DD; the first 10 chars should appear in summary
+    date_prefix = result.generated_at[:10]
+    assert date_prefix in result.executive_summary
+
+
+def test_executive_summary_mentions_agent_count():
+    agents = [Agent(name=f"agent-{i}", agent_type=AgentType.CLAUDE_CODE, config_path="/tmp") for i in range(3)]
+    report = AIBOMReport(agents=agents, blast_radii=[])
+    result = generate_compliance_narrative(report)
+    assert "3" in result.executive_summary
+
+
+def test_executive_summary_all_passing_when_no_vulns():
+    report = _make_report(blast_radii=[])
+    result = generate_compliance_narrative(report)
+    # Should mention all frameworks passing or no findings
+    lower = result.executive_summary.lower()
+    assert "current" in lower or "no vulnerabilities" in lower or "clean" in lower
+
+
+def test_executive_summary_mentions_framework_evidence_requiring_action():
+    br = _make_blast_radius(
+        vuln=_make_vuln(severity=Severity.CRITICAL),
+        owasp_tags=["LLM05"],
+    )
+    report = _make_report(blast_radii=[br])
+    result = generate_compliance_narrative(report)
+    # At least one framework mapping requires action; summary should mention it.
+    lower = result.executive_summary.lower()
+    assert "requiring action" in lower or "critical" in lower
+
+
+# ─── Multi-framework blast radius coverage ────────────────────────────────────
+
+
+def test_multi_framework_tags_affect_multiple_frameworks():
+    br = _make_blast_radius(
+        vuln=_make_vuln(severity=Severity.HIGH),
+        owasp_tags=["LLM05"],
+        owasp_mcp_tags=["MCP04"],
+        nist_tags=["MAP-3.5"],
+        cmmc_tags=["RA.L2-3.11.2"],
+    )
+    report = _make_report(blast_radii=[br])
+    result = generate_compliance_narrative(report)
+
+    status_by_slug = {fn.slug: fn.status for fn in result.framework_narratives}
+    # Frameworks with mapped findings should not report current evidence.
+    assert status_by_slug["owasp-llm"] != "evidence_current"
+    assert status_by_slug["owasp-mcp"] != "evidence_current"
+    assert status_by_slug["nist"] != "evidence_current"
+    assert status_by_slug["cmmc"] != "evidence_current"
+    # Untagged framework has no mapped findings → not-evaluated, never a silent pass
+    assert status_by_slug["soc2"] == "not_evaluated"
+
+
+def test_all_framework_slugs_covered():
+    """Ensure ALL_FRAMEWORK_SLUGS matches the tag-mapped compliance framework set."""
+    expected = {
+        "owasp-llm",
+        "owasp-mcp",
+        "owasp-agentic",
+        "nist",
+        "nist-csf",
+        "nist-800-53",
+        "fedramp",
+        "atlas",
+        "attack",
+        "eu-ai-act",
+        "iso-27001",
+        "soc2",
+        "cis",
+        "cmmc",
+        "pci-dss",
+    }
+    assert set(ALL_FRAMEWORK_SLUGS) == expected
+
+
+def test_same_control_id_does_not_bleed_between_frameworks():
+    # SI-10 is a *corrective* control carried by both the NIST 800-53 and
+    # FedRAMP catalogs, so it exercises cross-framework bleed on the branch that
+    # findings actually drive. (This previously used RA-5, which findings are
+    # never tagged onto — ``finding_taggable_controls`` drops detective controls
+    # — and which is now scored from scan-evidence freshness instead.)
+    br = _make_blast_radius(vuln=_make_vuln(severity=Severity.HIGH), owasp_tags=[])
+    br.owasp_tags = []
+    br.nist_800_53_tags = ["SI-10"]
+    br.fedramp_tags = []
+    report = _make_report(blast_radii=[br])
+
+    result = generate_compliance_narrative(report)
+    status_by_slug = {fn.slug: fn.status for fn in result.framework_narratives}
+
+    assert status_by_slug["nist-800-53"] == "action_required"
+    assert status_by_slug["fedramp"] == "not_evaluated"
+    assert result.remediation_impact
+    assert result.remediation_impact[0].frameworks_impacted == ["NIST 800-53"]
+
+
+# ─── PR4: catalog-backed NIST 800-53 line rides the narrative ─────────────────
+
+
+def test_narrative_carries_nist_800_53_catalog_line():
+    """The auditor narrative surfaces the catalog-backed NIST 800-53 line
+    (vendor-asserted), scored over evaluated controls only, with ISO-by-id
+    attribution — the SAME representation the /v1/compliance API line reports."""
+    br = _make_blast_radius(vuln=_make_vuln(severity=Severity.HIGH), owasp_tags=[])
+    br.nist_800_53_tags = ["SI-10"]  # curated CWE-backed evidencing check
+    report = _make_report(blast_radii=[br])
+
+    result = generate_compliance_narrative(report)
+    catalog = result.nist_800_53_catalog
+    assert catalog["framework_key"] == "nist_800_53_catalog"
+    assert catalog["vendor_asserted"] is True
+    assert catalog["status"] == "fail"
+    by_id = {c["control_id"]: c for c in catalog["controls"]}
+    assert by_id["SI-10"]["status"] == "fail"
+    assert by_id["SI-10"]["evidencing_checks"]
+    # ISO attribution surfaces BY ID only.
+    assert all(i.startswith("A.") for i in catalog["iso_27001_derived"]["controls"])
+
+
+def test_narrative_nist_catalog_no_data_when_unmapped():
+    """Findings that map to no NIST control yield an honest no_data catalog line,
+    never a fabricated pass."""
+    br = _make_blast_radius(vuln=_make_vuln(severity=Severity.HIGH), owasp_tags=["LLM05"])
+    br.nist_800_53_tags = []
+    report = _make_report(blast_radii=[br])
+    result = generate_compliance_narrative(report)
+    assert result.nist_800_53_catalog["status"] == "no_data"
+    assert result.nist_800_53_catalog["summary"]["evaluated"] == 0
+
+
+def test_narrative_single_framework_filter_scopes_catalog_line():
+    """A single-framework narrative for a non-NIST slug does not carry the NIST
+    catalog line; the nist-800-53 slug does."""
+    br = _make_blast_radius(vuln=_make_vuln(severity=Severity.HIGH), owasp_tags=["LLM05"])
+    br.nist_800_53_tags = ["SI-10"]
+    report = _make_report(blast_radii=[br])
+
+    owasp = generate_compliance_narrative(report, framework="owasp-llm")
+    assert owasp.nist_800_53_catalog == {}
+    nist = generate_compliance_narrative(report, framework="nist-800-53")
+    assert nist.nist_800_53_catalog["framework_key"] == "nist_800_53_catalog"
+
+
+# ─── Detective controls in the CLI narrative ─────────────────────────────────
+
+
+def _fw(result: ComplianceNarrative, slug: str):
+    return next(fn for fn in result.framework_narratives if fn.slug == slug)
+
+
+_DETECTIVE_BY_SLUG = [
+    ("nist-800-53", {"RA-5", "CM-8"}),
+    ("nist-csf", {"ID.RA-01", "ID.RA-02", "DE.CM-09"}),
+    ("cis", {"CIS-02.1", "CIS-07.1", "CIS-07.5"}),
+]
+
+
+@pytest.mark.parametrize(("slug", "detective_ids"), _DETECTIVE_BY_SLUG)
+def test_detective_controls_pass_on_a_fresh_scan(slug, detective_ids):
+    """A detective control is implemented BY the scan, so a fresh scan passes it.
+
+    Detective controls are never tagged with findings (``finding_taggable_controls``
+    drops them), so the zero-mapped-findings skip made them vanish from the
+    narrative entirely instead of being reported as the passes they are.
+    """
+    br = _make_blast_radius(vuln=_make_vuln(severity=Severity.HIGH), owasp_tags=["LLM05"])
+    report = _make_report(blast_radii=[br])
+
+    fw = _fw(generate_compliance_narrative(report), slug)
+
+    # Nothing failed, so the framework reports current scan evidence.
+    assert fw.status == "evidence_current", fw.narrative
+    assert fw.score == 100, fw.narrative
+    # The evaluated denominator has to grow by exactly the detective controls.
+    assert f"{len(detective_ids)} evaluated" in fw.narrative, fw.narrative
+    # A passing control is not a failing control.
+    assert [c.control_id for c in fw.failing_controls] == []
+
+
+@pytest.mark.parametrize(("slug", "detective_ids"), _DETECTIVE_BY_SLUG)
+def test_detective_controls_fail_once_evidence_is_stale(slug, detective_ids, monkeypatch):
+    """Past the freshness window, continuous monitoring has lapsed — that is a fail."""
+    from datetime import datetime, timedelta, timezone
+
+    from agent_bom import config
+
+    monkeypatch.setattr(config, "COMPLIANCE_DETECTIVE_EVIDENCE_MAX_AGE_DAYS", 90)
+    br = _make_blast_radius(vuln=_make_vuln(severity=Severity.HIGH), owasp_tags=["LLM05"])
+    report = _make_report(blast_radii=[br])
+    report.generated_at = datetime.now(timezone.utc) - timedelta(days=200)
+
+    fw = _fw(generate_compliance_narrative(report), slug)
+
+    assert fw.status == "action_required", fw.narrative
+    stale = {c.control_id for c in fw.failing_controls if c.status == "fail"}
+    assert stale == detective_ids, [c.control_id for c in fw.failing_controls]
+    for control in fw.failing_controls:
+        assert "stale" in control.narrative.lower(), control.narrative
+        assert control.remediation_steps
+
+
+def test_detective_controls_are_not_asserted_without_a_scan():
+    """No findings means no evidence a scan ran — never a fabricated pass.
+
+    Mirrors the ``nist_800_53_catalog`` line on the same payload so the two
+    representations in one narrative cannot contradict each other.
+    """
+    report = _make_report(blast_radii=[])
+
+    result = generate_compliance_narrative(report)
+
+    for slug in ("nist-800-53", "nist-csf", "cis"):
+        fw = _fw(result, slug)
+        assert fw.status == "not_evaluated", (slug, fw.narrative)
+        assert fw.score == 0, (slug, fw.narrative)
+    assert result.nist_800_53_catalog["status"] == "no_data"
+
+
+def test_detective_pass_coexists_with_a_corrective_failure():
+    """Detective passes must not paper over a real corrective failure."""
+    br = _make_blast_radius(vuln=_make_vuln(severity=Severity.CRITICAL), owasp_tags=[])
+    br.owasp_tags = []
+    br.nist_800_53_tags = ["SI-10"]
+    report = _make_report(blast_radii=[br])
+
+    fw = _fw(generate_compliance_narrative(report), "nist-800-53")
+
+    assert fw.status == "action_required", fw.narrative
+    assert [c.control_id for c in fw.failing_controls] == ["SI-10"]
+    # RA-5 + CM-8 pass, SI-10 fails -> 2/3.
+    assert "3 evaluated" in fw.narrative, fw.narrative
+    assert fw.score == 67, fw.narrative
+
+
+def test_a_finding_tagged_onto_a_detective_control_never_fails_it():
+    """Findings mapped to a detective control prove it works; they never fail it."""
+    br = _make_blast_radius(vuln=_make_vuln(severity=Severity.CRITICAL), owasp_tags=[])
+    br.owasp_tags = []
+    br.nist_800_53_tags = ["RA-5"]
+    report = _make_report(blast_radii=[br])
+
+    fw = _fw(generate_compliance_narrative(report), "nist-800-53")
+
+    assert fw.status == "evidence_current", fw.narrative
+    assert fw.failing_controls == []
+
+
+def test_every_framework_evaluates_the_tags_the_scanner_actually_emits():
+    """A framework's own emitted tag must match its own catalog key.
+
+    FedRAMP tags are emitted namespaced (``FedRAMP-SI-10``) while the FedRAMP
+    catalog is keyed bare (``SI-10``). The evidence exporter normalizes the
+    prefix; the narrative/status path did not, so FedRAMP could never score a
+    single control — an evidence bundle showed mapped findings per control while
+    its own summary said `evaluated: 0`. Driven off the real emitter so any
+    framework that namespaces its tags is covered, not just FedRAMP.
+    """
+    from agent_bom.compliance_coverage import TAG_MAPPED_FRAMEWORKS, control_key_for_tag
+    from agent_bom.vuln_compliance import tag_vulnerability
+
+    emitted = tag_vulnerability(
+        _make_vuln(severity=Severity.CRITICAL, is_kev=True),
+        Package(name="langchain", version="0.1.0", ecosystem="pypi"),
+    )
+
+    unmatched: dict[str, list[str]] = {}
+    for metadata in TAG_MAPPED_FRAMEWORKS:
+        tags = emitted.get(metadata.summary_prefix) or []
+        missing = [tag for tag in tags if control_key_for_tag(tag, metadata.catalog) is None]
+        if missing:
+            unmatched[metadata.slug] = missing
+    assert not unmatched, f"emitted tags that resolve to no control: {unmatched}"
+
+
+def test_fedramp_scores_the_namespaced_tags_the_scanner_emits():
+    """End-to-end: a FedRAMP-tagged finding must actually move the FedRAMP narrative."""
+    br = _make_blast_radius(vuln=_make_vuln(severity=Severity.CRITICAL), owasp_tags=[])
+    br.fedramp_tags = ["FedRAMP-SI-10"]
+    report = _make_report(blast_radii=[br])
+
+    fw = _fw(generate_compliance_narrative(report), "fedramp")
+
+    assert fw.status == "action_required", fw.narrative
+    assert [c.control_id for c in fw.failing_controls] == ["SI-10"], fw.failing_controls
+
+
+def test_a_failing_control_names_the_findings_that_failed_it():
+    """An auditor must be able to walk control -> finding, not just control -> package.
+
+    The narrative listed affected packages and agents but never a vulnerability
+    id, so `grep -c CVE- narrative.md` was 0 and nobody could tie a control
+    assertion back to the evidence. The API bundle already carries `finding_id`
+    per control; the CLI rendering was the gap.
+    """
+    first = _make_blast_radius(vuln=_make_vuln("CVE-2025-1111", severity=Severity.CRITICAL), owasp_tags=["LLM05"])
+    second = _make_blast_radius(vuln=_make_vuln("CVE-2025-2222", severity=Severity.HIGH), owasp_tags=["LLM05"])
+    report = _make_report(blast_radii=[first, second])
+
+    fw = _fw(generate_compliance_narrative(report), "owasp-llm")
+    control = next(c for c in fw.failing_controls if c.control_id == "LLM05")
+
+    assert control.affected_findings == ["CVE-2025-1111", "CVE-2025-2222"]

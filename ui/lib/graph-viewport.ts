@@ -1,0 +1,102 @@
+export type GraphViewportMode = "lineage" | "mesh" | "context";
+
+export type GraphViewportInput = {
+  nodeCount: number;
+  edgeCount?: number;
+  selectedNode?: boolean;
+  mode?: GraphViewportMode;
+  captureMode?: boolean;
+};
+
+export type GraphFitViewOptions = {
+  padding: number;
+  maxZoom: number;
+  duration: number;
+};
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function normalizedCount(value: number | undefined): number {
+  return Math.max(0, Math.floor(Number.isFinite(value) ? value ?? 0 : 0));
+}
+
+export function graphFitViewOptions(input: GraphViewportInput): GraphFitViewOptions {
+  const nodeCount = normalizedCount(input.nodeCount);
+  const edgeCount = normalizedCount(input.edgeCount);
+  const selectedBoost = input.selectedNode ? 0.1 : 0;
+
+  let padding = 0.16;
+  let maxZoom = 1.05;
+
+  // maxZoom is the readability ceiling: when a small/medium topology is wide
+  // and short, fitView is width-bound and would otherwise zoom far out and
+  // leave the nodes tiny. A higher ceiling lets fitView scale the nodes up to
+  // a legible size before it stops.
+  if (nodeCount <= 0) {
+    padding = 0.18;
+    maxZoom = 1;
+  } else if (nodeCount <= 6) {
+    padding = 0.06;
+    maxZoom = 2;
+  } else if (nodeCount <= 16) {
+    padding = 0.08;
+    maxZoom = 1.75;
+  } else if (nodeCount <= 32) {
+    padding = 0.1;
+    maxZoom = 1.5;
+  } else if (nodeCount <= 80) {
+    padding = 0.14;
+    maxZoom = 1.2;
+  } else {
+    padding = 0.18;
+    maxZoom = 1;
+  }
+
+  const density = nodeCount > 0 ? edgeCount / nodeCount : 0;
+  if (density > 3.5) {
+    maxZoom -= 0.12;
+    padding += 0.02;
+  }
+
+  if (input.mode === "mesh") {
+    maxZoom -= 0.06;
+  } else if (input.mode === "context") {
+    // Context paths are short LR chains — zoom up so the cluster is the hero,
+    // not a tiny path floating in an empty dark pane.
+    maxZoom += nodeCount <= 16 ? 0.2 : 0.08;
+    padding -= nodeCount <= 16 ? 0.03 : 0.01;
+  }
+
+  if (input.captureMode) {
+    padding += input.mode === "mesh" ? 0.05 : input.mode === "context" ? -0.04 : -0.02;
+    maxZoom += input.mode === "mesh" ? 0.25 : input.mode === "context" ? 0.22 : 0.1;
+  }
+
+  const minPadding =
+    input.mode === "context"
+      ? 0.04
+      : 0.08;
+  const maxZoomCap =
+    input.captureMode && input.mode === "mesh"
+      ? 2.25
+      : input.mode === "context"
+        ? 2.6
+        : 2.25;
+
+  return {
+    padding: clamp(padding, minPadding, 0.24),
+    maxZoom: clamp(maxZoom + selectedBoost, 0.82, maxZoomCap),
+    duration: input.captureMode ? 0 : 240,
+  };
+}
+
+export function shouldShowGraphMiniMap(input: GraphViewportInput): boolean {
+  const nodeCount = normalizedCount(input.nodeCount);
+  const edgeCount = normalizedCount(input.edgeCount);
+  if (nodeCount <= 0) return false;
+  if (input.selectedNode && nodeCount <= 28) return false;
+  if (nodeCount <= 18 && edgeCount <= 36) return false;
+  return true;
+}

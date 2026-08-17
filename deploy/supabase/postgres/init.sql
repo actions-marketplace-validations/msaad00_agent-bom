@@ -1,6 +1,8 @@
 -- agent-bom PostgreSQL initialization
 -- Runs once on first container start via docker-entrypoint-initdb.d
--- Also used as the Supabase project schema migration.
+-- Also used as the Supabase project schema bootstrap.
+-- Long-lived enterprise control planes should move forward with Alembic after
+-- this baseline is established.
 --
 -- Principle: POSTGRES_USER (admin) owns the schema and creates tables.
 -- A separate app user (agent_bom_app) gets DML-only access.
@@ -12,6 +14,7 @@
 -- Tables
 --   teams              Multi-tenant team registry
 --   scan_jobs          Async scan job lifecycle + results
+--   cis_benchmark_checks Columnar CIS benchmark check observations
 --   findings           Normalized vulnerability findings (per scan)
 --   agents             Discovered AI agents/clients (per scan)
 --   policy_results     Per-scan policy evaluation outcomes
@@ -20,12 +23,17 @@
 --   fleet_agents       Managed agent lifecycle with governance state
 --   gateway_policies   Runtime MCP enforcement policies
 --   policy_audit_log   Runtime policy audit trail
+--   llm_costs          Per-call LLM spend (FinOps)
+--   llm_cost_budgets   Tenant/agent/cost-center spend caps
+--   audit_log          API/enterprise audit trail
+--   trend_history      Historical posture trends
 --   scan_schedules     Recurring scan configuration
 --   osv_cache          OSV vulnerability response cache
 
 -- ── Extensions ────────────────────────────────────────────────────────────────
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- ── Table: teams ──────────────────────────────────────────────────────────────
 -- Central multi-tenant entity. All other tables reference team_id.
@@ -52,6 +60,13 @@ CREATE TABLE IF NOT EXISTS scan_jobs (
     created_at   TEXT NOT NULL,
     completed_at TEXT,
     team_id      TEXT NOT NULL DEFAULT 'default' REFERENCES teams(team_id) ON DELETE CASCADE,
+    batch_id     TEXT,
+    parent_job_id TEXT,
+    child_job_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    target       JSONB,
+    target_index INTEGER,
+    target_count INTEGER,
+    schedule_id  TEXT,
     triggered_by TEXT,
     data         JSONB NOT NULL
 );
@@ -66,43 +81,309 @@ DO $$ BEGIN
             ADD COLUMN team_id TEXT NOT NULL DEFAULT 'default' REFERENCES teams(team_id) ON DELETE CASCADE,
             ADD COLUMN triggered_by TEXT;
     END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'scan_jobs' AND column_name = 'schedule_id'
+    ) THEN
+        ALTER TABLE scan_jobs
+            ADD COLUMN schedule_id TEXT;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'scan_jobs' AND column_name = 'batch_id'
+    ) THEN
+        ALTER TABLE scan_jobs
+            ADD COLUMN batch_id TEXT;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'scan_jobs' AND column_name = 'parent_job_id'
+    ) THEN
+        ALTER TABLE scan_jobs
+            ADD COLUMN parent_job_id TEXT;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'scan_jobs' AND column_name = 'child_job_ids'
+    ) THEN
+        ALTER TABLE scan_jobs
+            ADD COLUMN child_job_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'scan_jobs' AND column_name = 'target'
+    ) THEN
+        ALTER TABLE scan_jobs
+            ADD COLUMN target JSONB;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'scan_jobs' AND column_name = 'target_index'
+    ) THEN
+        ALTER TABLE scan_jobs
+            ADD COLUMN target_index INTEGER;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'scan_jobs' AND column_name = 'target_count'
+    ) THEN
+        ALTER TABLE scan_jobs
+            ADD COLUMN target_count INTEGER;
+    END IF;
 END $$;
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status  ON scan_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON scan_jobs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_team_status  ON scan_jobs(team_id, status);
 CREATE INDEX IF NOT EXISTS idx_jobs_team_created ON scan_jobs(team_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_jobs_batch ON scan_jobs(team_id, batch_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_jobs_parent ON scan_jobs(team_id, parent_job_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_jobs_schedule ON scan_jobs(team_id, schedule_id, created_at DESC);
+
+-- ── Table: CIS Benchmark Checks ──────────────────────────────────────────────
+-- Normalized cloud CIS benchmark observations extracted from scan JSON blobs.
+-- This supports indexed compliance analytics without JSONB extraction hot paths.
+
+CREATE TABLE IF NOT EXISTS cis_benchmark_checks (
+    id                    BIGSERIAL PRIMARY KEY,
+    scan_id               TEXT NOT NULL REFERENCES scan_jobs(job_id) ON DELETE CASCADE,
+    team_id               TEXT NOT NULL DEFAULT 'default' REFERENCES teams(team_id) ON DELETE CASCADE,
+    cloud                 TEXT NOT NULL,
+    check_id              TEXT NOT NULL,
+    title                 TEXT NOT NULL DEFAULT '',
+    status                TEXT NOT NULL DEFAULT 'unknown',
+    severity              TEXT NOT NULL DEFAULT 'unknown',
+    cis_section           TEXT NOT NULL DEFAULT '',
+    evidence              TEXT NOT NULL DEFAULT '',
+    resource_ids          JSONB NOT NULL DEFAULT '[]'::jsonb,
+    remediation           JSONB NOT NULL DEFAULT '{}'::jsonb,
+    fix_cli               TEXT NOT NULL DEFAULT '',
+    fix_console           TEXT NOT NULL DEFAULT '',
+    effort                TEXT NOT NULL DEFAULT '',
+    priority              INTEGER NOT NULL DEFAULT 0,
+    guardrails            TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    requires_human_review BOOLEAN NOT NULL DEFAULT FALSE,
+    measured_at           TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+);
+
+CREATE INDEX IF NOT EXISTS idx_cis_checks_scan ON cis_benchmark_checks(scan_id);
+CREATE INDEX IF NOT EXISTS idx_cis_checks_team_cloud_status_priority
+    ON cis_benchmark_checks(team_id, cloud, status, priority, measured_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cis_checks_team_check
+    ON cis_benchmark_checks(team_id, cloud, check_id, measured_at DESC);
 
 -- ── Tables: Fleet Agents ──────────────────────────────────────────────────────
 
+-- Keyed by (tenant_id, agent_id): agent IDs are derived from agent content with
+-- no tenant component, so a global key lets the first tenant to register a stock
+-- agent lock every other tenant out of its own.
 CREATE TABLE IF NOT EXISTS fleet_agents (
-    agent_id        TEXT PRIMARY KEY,
+    agent_id        TEXT NOT NULL,
     name            TEXT NOT NULL,
     lifecycle_state TEXT NOT NULL,
     trust_score     REAL DEFAULT 0.0,
-    tenant_id       TEXT DEFAULT 'default',
+    tenant_id       TEXT NOT NULL DEFAULT 'default',
     updated_at      TEXT NOT NULL,
-    data            JSONB NOT NULL
+    data            JSONB NOT NULL,
+    PRIMARY KEY (tenant_id, agent_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_fleet_name ON fleet_agents(name);
 CREATE INDEX IF NOT EXISTS idx_fleet_state ON fleet_agents(lifecycle_state);
 CREATE INDEX IF NOT EXISTS idx_fleet_tenant ON fleet_agents(tenant_id);
 
+CREATE TABLE IF NOT EXISTS fleet_endpoints (
+    tenant_id    TEXT NOT NULL,
+    endpoint_id  TEXT NOT NULL,
+    completeness TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    data         JSONB NOT NULL,
+    PRIMARY KEY (tenant_id, endpoint_id)
+);
+CREATE INDEX IF NOT EXISTS idx_fleet_endpoints_tenant_updated
+    ON fleet_endpoints(tenant_id, updated_at DESC, endpoint_id);
+
 -- ── Tables: Gateway Policies ──────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS gateway_policies (
     policy_id TEXT PRIMARY KEY,
+    team_id   TEXT NOT NULL DEFAULT 'default',
     data      JSONB NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS policy_audit_log (
-    id   SERIAL PRIMARY KEY,
-    ts   TEXT NOT NULL,
-    data JSONB NOT NULL
+    id               SERIAL PRIMARY KEY,
+    entry_id         TEXT, -- tenant-derived physical key; old replicas conflict on this column
+    logical_entry_id TEXT, -- caller-visible ID, also retained in data->>'entry_id'
+    ts               TEXT NOT NULL,
+    team_id          TEXT NOT NULL DEFAULT 'default',
+    data             JSONB NOT NULL
 );
 
+-- Old application replicas use ON CONFLICT(entry_id), so that unique target
+-- must remain present throughout rolling deploys. A trigger rewrites the
+-- caller-visible ID into a tenant-derived physical key before conflict checking.
+CREATE OR REPLACE FUNCTION public.abom_policy_audit_key(
+    tenant_id TEXT,
+    logical_id TEXT
+) RETURNS TEXT
+LANGUAGE SQL
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $$
+    SELECT octet_length(tenant_id)::TEXT || ':' || tenant_id || ':' || logical_id
+$$;
+
+CREATE OR REPLACE FUNCTION public.abom_policy_audit_set_key()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    NEW.logical_entry_id := COALESCE(NEW.logical_entry_id, NEW.entry_id);
+    IF NEW.logical_entry_id IS NOT NULL THEN
+        NEW.entry_id := public.abom_policy_audit_key(NEW.team_id, NEW.logical_entry_id);
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+-- Idempotently reconcile a legacy bootstrap. The table lock and temporary RLS
+-- disable are transactional; previous RLS state is restored before the block
+-- commits, and no runtime insert can race the physical-key rewrite.
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'policy_audit_log' AND column_name = 'entry_id'
+    ) THEN
+        ALTER TABLE policy_audit_log ADD COLUMN entry_id TEXT;
+    END IF;
+END $$;
+
+DO $$
+DECLARE
+    had_rls BOOLEAN;
+    had_force_rls BOOLEAN;
+BEGIN
+    LOCK TABLE policy_audit_log IN ACCESS EXCLUSIVE MODE;
+    SELECT relrowsecurity, relforcerowsecurity
+      INTO had_rls, had_force_rls
+      FROM pg_class
+     WHERE oid = 'public.policy_audit_log'::regclass;
+
+    IF had_rls THEN
+        ALTER TABLE policy_audit_log DISABLE ROW LEVEL SECURITY;
+    END IF;
+
+    ALTER TABLE policy_audit_log
+        ADD COLUMN IF NOT EXISTS logical_entry_id TEXT;
+    DROP TRIGGER IF EXISTS policy_audit_set_key ON policy_audit_log;
+    CREATE TRIGGER policy_audit_set_key
+        BEFORE INSERT OR UPDATE OF team_id, entry_id, logical_entry_id
+        ON policy_audit_log
+        FOR EACH ROW
+        EXECUTE FUNCTION public.abom_policy_audit_set_key();
+
+    DROP INDEX IF EXISTS uq_policy_audit_log_entry;
+    UPDATE policy_audit_log
+       SET logical_entry_id = COALESCE(logical_entry_id, entry_id),
+           entry_id = public.abom_policy_audit_key(
+               team_id,
+               COALESCE(logical_entry_id, entry_id)
+           )
+     WHERE entry_id IS NOT NULL;
+    CREATE UNIQUE INDEX uq_policy_audit_log_entry
+        ON policy_audit_log(entry_id);
+    COMMENT ON INDEX uq_policy_audit_log_entry IS
+        'agent-bom policy audit tenant key v2';
+
+    IF had_rls THEN
+        ALTER TABLE policy_audit_log ENABLE ROW LEVEL SECURITY;
+    END IF;
+    IF had_force_rls THEN
+        ALTER TABLE policy_audit_log FORCE ROW LEVEL SECURITY;
+    END IF;
+END
+$$;
+
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON policy_audit_log(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_gateway_policies_team ON gateway_policies(team_id);
+CREATE INDEX IF NOT EXISTS idx_policy_audit_log_team_ts ON policy_audit_log(team_id, ts DESC);
+
+-- ── Tables: LLM Cost (FinOps) ─────────────────────────────────────────────────
+-- Per-call LLM spend + budgets for cluster-safe cost governance. Created at
+-- runtime by api/postgres_cost.py::_init_tables(); also bootstrapped here so
+-- fresh / replica deployments and migration-only paths (read-only app role
+-- that cannot run the app's CREATE TABLE) have these tables from first boot.
+-- Shapes must mirror postgres_cost.py.
+
+CREATE TABLE IF NOT EXISTS llm_costs (
+    tenant_id       TEXT NOT NULL,
+    call_id         TEXT NOT NULL,
+    agent           TEXT NOT NULL,
+    session_id      TEXT NOT NULL,
+    provider        TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    input_tokens    INTEGER NOT NULL,
+    output_tokens   INTEGER NOT NULL,
+    cost_usd        DOUBLE PRECISION NOT NULL,
+    priced          BOOLEAN NOT NULL,
+    observed_at     TEXT NOT NULL,
+    cost_center     TEXT NOT NULL DEFAULT '',
+    allocation_tags TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (tenant_id, call_id)
+);
+
+CREATE TABLE IF NOT EXISTS llm_cost_budgets (
+    tenant_id   TEXT NOT NULL,
+    agent       TEXT NOT NULL DEFAULT '',
+    limit_usd   DOUBLE PRECISION NOT NULL,
+    updated_at  TEXT NOT NULL,
+    mode        TEXT NOT NULL DEFAULT 'report',
+    cost_center TEXT NOT NULL DEFAULT '',
+    owner       TEXT NOT NULL DEFAULT '',
+    workflow    TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (tenant_id, agent, cost_center, owner, workflow)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_llm_cost_budgets_scope ON llm_cost_budgets(tenant_id, agent, cost_center, owner, workflow);
+CREATE INDEX IF NOT EXISTS idx_llm_costs_tenant_agent ON llm_costs(tenant_id, agent);
+CREATE INDEX IF NOT EXISTS idx_llm_costs_tenant_observed ON llm_costs(tenant_id, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_costs_tenant_cost_center ON llm_costs(tenant_id, cost_center);
+
+-- ── Tables: Enterprise Audit + Trend History ────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    entry_id        TEXT PRIMARY KEY,
+    timestamp       TEXT NOT NULL,
+    action          TEXT NOT NULL,
+    actor           TEXT NOT NULL DEFAULT '',
+    resource        TEXT NOT NULL DEFAULT '',
+    team_id         TEXT NOT NULL DEFAULT 'default',
+    details         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    prev_signature  TEXT NOT NULL DEFAULT '',
+    hmac_signature  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action);
+CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_resource ON audit_log(resource);
+CREATE INDEX IF NOT EXISTS idx_audit_log_team_ts ON audit_log(team_id, timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS trend_history (
+    id            BIGSERIAL PRIMARY KEY,
+    timestamp     TEXT NOT NULL,
+    team_id       TEXT NOT NULL DEFAULT 'default',
+    total_vulns   INTEGER NOT NULL,
+    critical      INTEGER NOT NULL DEFAULT 0,
+    high          INTEGER NOT NULL DEFAULT 0,
+    medium        INTEGER NOT NULL DEFAULT 0,
+    low           INTEGER NOT NULL DEFAULT 0,
+    posture_score REAL NOT NULL DEFAULT 0,
+    posture_grade TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_trend_history_team_ts ON trend_history(team_id, timestamp DESC);
 
 -- ── Tables: Scan Schedules ────────────────────────────────────────────────────
 
@@ -110,12 +391,206 @@ CREATE TABLE IF NOT EXISTS scan_schedules (
     schedule_id TEXT PRIMARY KEY,
     enabled     INTEGER DEFAULT 1,
     next_run    TEXT,
+    tenant_id   TEXT NOT NULL DEFAULT 'default',
     data        JSONB NOT NULL
 );
+
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'scan_schedules' AND column_name = 'tenant_id'
+    ) THEN
+        ALTER TABLE scan_schedules ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default';
+    END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_schedules_due
     ON scan_schedules(next_run)
     WHERE enabled = 1 AND next_run IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_schedules_tenant_due
+    ON scan_schedules(tenant_id, enabled, next_run);
+
+-- ── Tables: Unified Graph Persistence ───────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS graph_nodes (
+    id              TEXT NOT NULL,
+    entity_type     TEXT NOT NULL,
+    label           TEXT NOT NULL,
+    category_uid    INTEGER DEFAULT 0,
+    class_uid       INTEGER DEFAULT 0,
+    type_uid        INTEGER DEFAULT 0,
+    status          TEXT DEFAULT 'active',
+    risk_score      DOUBLE PRECISION DEFAULT 0.0,
+    severity        TEXT DEFAULT '',
+    severity_id     INTEGER DEFAULT 0,
+    first_seen      TEXT NOT NULL,
+    last_seen       TEXT NOT NULL,
+    attributes      JSONB DEFAULT '{}'::jsonb,
+    compliance_tags JSONB DEFAULT '[]'::jsonb,
+    data_sources    JSONB DEFAULT '[]'::jsonb,
+    dimensions      JSONB DEFAULT '{}'::jsonb,
+    scan_id         TEXT NOT NULL,
+    tenant_id       TEXT NOT NULL DEFAULT 'default',
+    PRIMARY KEY (id, scan_id, tenant_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_graph_nodes_entity_type ON graph_nodes(entity_type);
+CREATE INDEX IF NOT EXISTS idx_pg_graph_nodes_scan ON graph_nodes(tenant_id, scan_id);
+CREATE INDEX IF NOT EXISTS idx_pg_graph_nodes_scan_order
+    ON graph_nodes(tenant_id, scan_id, severity_id DESC, risk_score DESC, label);
+CREATE INDEX IF NOT EXISTS idx_pg_graph_nodes_scan_id_cover
+    ON graph_nodes(tenant_id, scan_id, id) INCLUDE (attributes);
+
+CREATE TABLE IF NOT EXISTS graph_edges (
+    source_id    TEXT NOT NULL,
+    target_id    TEXT NOT NULL,
+    relationship TEXT NOT NULL,
+    direction    TEXT DEFAULT 'directed',
+    weight       DOUBLE PRECISION DEFAULT 1.0,
+    traversable  INTEGER DEFAULT 1,
+    first_seen   TEXT NOT NULL,
+    last_seen    TEXT NOT NULL,
+    evidence     JSONB DEFAULT '{}'::jsonb,
+    activity_id  INTEGER DEFAULT 1,
+    scan_id      TEXT NOT NULL,
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    -- Edge versioning + provenance (schema v3). Must mirror the application
+    -- bootstrap in api/postgres_graph.py and the SQLite db/graph_store.py
+    -- definitions; read-only connections and migration-only deploys never run
+    -- the app's ADD COLUMN bootstrap, so the baseline must include these.
+    valid_from     TEXT DEFAULT '',
+    valid_to       TEXT DEFAULT NULL,
+    confidence     DOUBLE PRECISION DEFAULT 1.0,
+    provenance     TEXT DEFAULT '{}',
+    source_scan_id TEXT DEFAULT '',
+    source_run_id  TEXT DEFAULT '',
+    PRIMARY KEY (source_id, target_id, relationship, scan_id, tenant_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_graph_edges_scan ON graph_edges(tenant_id, scan_id);
+CREATE INDEX IF NOT EXISTS idx_pg_graph_edges_scan_source ON graph_edges(tenant_id, scan_id, source_id);
+CREATE INDEX IF NOT EXISTS idx_pg_graph_edges_snapshot_key
+    ON graph_edges(tenant_id, scan_id, source_id, target_id, relationship);
+CREATE INDEX IF NOT EXISTS idx_pg_graph_edges_scan_target ON graph_edges(tenant_id, scan_id, target_id);
+CREATE INDEX IF NOT EXISTS idx_pg_graph_edges_valid ON graph_edges(tenant_id, valid_from, valid_to);
+CREATE INDEX IF NOT EXISTS idx_pg_graph_edges_scan_source_traversable
+    ON graph_edges(tenant_id, scan_id, source_id)
+    WHERE traversable = 1;
+
+-- ── Tables: Graph build workspace ───────────────────────────────────────────
+-- Temporary, tenant-scoped staging rows used by the bounded store-backed graph
+-- producer. The application role only needs DML; Alembic/init owns this DDL.
+CREATE TABLE IF NOT EXISTS graph_build_workspace_nodes (
+    workspace_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    seq BIGSERIAL,
+    payload TEXT NOT NULL,
+    entity_type TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (workspace_id, tenant_id, node_id)
+);
+
+CREATE TABLE IF NOT EXISTS graph_build_workspace_edges (
+    workspace_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    edge_key TEXT NOT NULL,
+    seq BIGSERIAL,
+    payload TEXT NOT NULL,
+    source_id TEXT NOT NULL DEFAULT '',
+    target_id TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (workspace_id, tenant_id, edge_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gbw_nodes_seq
+    ON graph_build_workspace_nodes (workspace_id, tenant_id, seq);
+CREATE INDEX IF NOT EXISTS idx_gbw_edges_seq
+    ON graph_build_workspace_edges (workspace_id, tenant_id, seq);
+CREATE INDEX IF NOT EXISTS idx_gbw_nodes_type
+    ON graph_build_workspace_nodes (workspace_id, tenant_id, entity_type, seq);
+CREATE INDEX IF NOT EXISTS idx_gbw_edges_source
+    ON graph_build_workspace_edges (workspace_id, tenant_id, source_id, seq);
+CREATE INDEX IF NOT EXISTS idx_gbw_edges_target
+    ON graph_build_workspace_edges (workspace_id, tenant_id, target_id, seq);
+
+CREATE TABLE IF NOT EXISTS graph_snapshots (
+    scan_id      TEXT NOT NULL,
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    created_at   TEXT NOT NULL,
+    node_count   INTEGER DEFAULT 0,
+    edge_count   INTEGER DEFAULT 0,
+    risk_summary TEXT DEFAULT '{}',
+    node_type_counts TEXT DEFAULT NULL,
+    analysis_status TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (scan_id, tenant_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_graph_snapshots_recent ON graph_snapshots(tenant_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS attack_paths (
+    source_node         TEXT NOT NULL,
+    target_node         TEXT NOT NULL,
+    hop_count           INTEGER DEFAULT 0,
+    composite_risk      DOUBLE PRECISION DEFAULT 0.0,
+    summary             TEXT DEFAULT '',
+    path_nodes          JSONB DEFAULT '[]'::jsonb,
+    path_edges          JSONB DEFAULT '[]'::jsonb,
+    credential_exposure JSONB DEFAULT '[]'::jsonb,
+    tool_exposure       TEXT DEFAULT '[]',
+    vuln_ids            JSONB DEFAULT '[]'::jsonb,
+    technique_mappings  TEXT DEFAULT '[]',
+    scan_id             TEXT NOT NULL,
+    tenant_id           TEXT NOT NULL DEFAULT 'default',
+    computed_at         TEXT NOT NULL,
+    PRIMARY KEY (source_node, target_node, scan_id, tenant_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_attack_paths_scan ON attack_paths(tenant_id, scan_id);
+CREATE INDEX IF NOT EXISTS idx_pg_attack_paths_scan_risk ON attack_paths(tenant_id, scan_id, composite_risk DESC);
+CREATE INDEX IF NOT EXISTS idx_pg_attack_paths_source_risk
+    ON attack_paths(tenant_id, scan_id, source_node, composite_risk DESC, target_node);
+
+CREATE TABLE IF NOT EXISTS interaction_risks (
+    pattern           TEXT NOT NULL,
+    agents            TEXT NOT NULL,
+    risk_score        DOUBLE PRECISION DEFAULT 0.0,
+    description       TEXT DEFAULT '',
+    owasp_agentic_tag TEXT DEFAULT NULL,
+    scan_id           TEXT NOT NULL,
+    tenant_id         TEXT NOT NULL DEFAULT 'default',
+    PRIMARY KEY (pattern, agents, scan_id, tenant_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_interaction_risks_scan ON interaction_risks(tenant_id, scan_id);
+
+CREATE TABLE IF NOT EXISTS graph_filter_presets (
+    name        TEXT NOT NULL,
+    tenant_id   TEXT NOT NULL DEFAULT 'default',
+    description TEXT DEFAULT '',
+    filters     JSONB NOT NULL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (name, tenant_id)
+);
+
+CREATE TABLE IF NOT EXISTS graph_node_search (
+    node_id         TEXT NOT NULL,
+    tenant_id       TEXT NOT NULL DEFAULT 'default',
+    scan_id         TEXT NOT NULL,
+    entity_type     TEXT NOT NULL,
+    severity        TEXT DEFAULT '',
+    compliance_tags TEXT DEFAULT '',
+    data_sources    TEXT DEFAULT '',
+    search_text     TEXT NOT NULL,
+    PRIMARY KEY (node_id, scan_id, tenant_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pg_graph_node_search_scope
+    ON graph_node_search(tenant_id, scan_id, entity_type);
+CREATE INDEX IF NOT EXISTS idx_pg_graph_node_search_severity
+    ON graph_node_search(tenant_id, scan_id, severity);
+CREATE INDEX IF NOT EXISTS idx_pg_graph_node_search_trgm
+    ON graph_node_search USING gin (search_text gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_pg_graph_node_search_lower_trgm
+    ON graph_node_search USING gin (LOWER(search_text) gin_trgm_ops);
 
 -- ── Tables: OSV Scan Cache ────────────────────────────────────────────────────
 
@@ -256,12 +731,39 @@ CREATE TABLE IF NOT EXISTS api_keys (
     created_at  TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
     expires_at  TEXT,               -- NULL = never
     last_used   TEXT,
+    revoked_at  TEXT,
+    rotation_overlap_until TEXT,
+    replacement_key_id TEXT,
     revoked     BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE INDEX IF NOT EXISTS idx_api_keys_team   ON api_keys(team_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix);   -- fast lookup during auth
 CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys(team_id, revoked) WHERE revoked = FALSE;
+
+-- ── Table: exceptions ────────────────────────────────────────────────────────
+-- Persistent vulnerability exceptions and false positives. team_id keeps
+-- exception workflows tenant-scoped in hosted deployments.
+
+CREATE TABLE IF NOT EXISTS exceptions (
+    exception_id TEXT PRIMARY KEY,
+    vuln_id      TEXT NOT NULL,
+    package_name TEXT NOT NULL,
+    server_name  TEXT NOT NULL DEFAULT '',
+    reason       TEXT NOT NULL DEFAULT '',
+    requested_by TEXT NOT NULL DEFAULT '',
+    approved_by  TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'pending',
+    created_at   TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    expires_at   TEXT NOT NULL DEFAULT '',
+    approved_at  TEXT NOT NULL DEFAULT '',
+    revoked_at   TEXT NOT NULL DEFAULT '',
+    team_id      TEXT NOT NULL DEFAULT 'default' REFERENCES teams(team_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_exc_status ON exceptions(status);
+CREATE INDEX IF NOT EXISTS idx_exc_team   ON exceptions(team_id);
+CREATE INDEX IF NOT EXISTS idx_exc_vuln   ON exceptions(vuln_id);
 
 -- ── Table: job_queue ──────────────────────────────────────────────────────────
 -- Background task queue for async operations: CVE enrichment, report
@@ -291,12 +793,578 @@ CREATE INDEX IF NOT EXISTS idx_jobq_status_due ON job_queue(status, scheduled_fo
 CREATE INDEX IF NOT EXISTS idx_jobq_team       ON job_queue(team_id);
 CREATE INDEX IF NOT EXISTS idx_jobq_type       ON job_queue(job_type);
 
+-- ── Table: api_rate_limits ───────────────────────────────────────────────────
+-- Legacy fixed-window buckets (superseded by api_rate_limit_hits). Kept so
+-- existing deployments that already created the table do not fail migrations.
+
+CREATE TABLE IF NOT EXISTS api_rate_limits (
+    bucket_key      TEXT NOT NULL,
+    window_started  INTEGER NOT NULL,
+    hits            INTEGER NOT NULL DEFAULT 0,
+    updated_at      TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    PRIMARY KEY (bucket_key, window_started)
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_rate_limits_updated ON api_rate_limits(updated_at);
+
+-- ── Table: api_rate_limit_hits ───────────────────────────────────────────────
+-- Per-request timestamps for true sliding-window throttling across replicas.
+
+CREATE TABLE IF NOT EXISTS api_rate_limit_hits (
+    bucket_key TEXT NOT NULL,
+    hit_at DOUBLE PRECISION NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_rate_limit_hits_bucket_hit_at
+    ON api_rate_limit_hits (bucket_key, hit_at);
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- TENANT RLS HELPERS + POLICIES
+-- ══════════════════════════════════════════════════════════════════════════════
+--
+-- Request handlers set app.tenant_id on the Postgres session. Internal trusted
+-- scheduler tasks require both app.bypass_rls=1 and membership in the
+-- non-login maintenance marker role for cross-tenant maintenance work.
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agent_bom_rls_maintenance') THEN
+        CREATE ROLE agent_bom_rls_maintenance NOLOGIN NOSUPERUSER NOBYPASSRLS;
+    ELSE
+        ALTER ROLE agent_bom_rls_maintenance NOLOGIN NOSUPERUSER NOBYPASSRLS;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agent_bom_maintenance') THEN
+        CREATE ROLE agent_bom_maintenance LOGIN NOSUPERUSER NOBYPASSRLS;
+    ELSE
+        ALTER ROLE agent_bom_maintenance LOGIN NOSUPERUSER NOBYPASSRLS;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agent_bom_app') THEN
+        REVOKE agent_bom_rls_maintenance FROM agent_bom_app;
+    END IF;
+    GRANT agent_bom_rls_maintenance TO agent_bom_maintenance;
+    EXECUTE format('GRANT agent_bom_rls_maintenance TO %I WITH ADMIN OPTION', session_user);
+END
+$$;
+
+CREATE OR REPLACE FUNCTION public.abom_current_tenant()
+RETURNS TEXT
+LANGUAGE SQL
+STABLE
+AS $$
+    SELECT COALESCE(NULLIF(current_setting('app.tenant_id', true), ''), 'default')
+$$;
+
+CREATE OR REPLACE FUNCTION public.abom_rls_bypass()
+RETURNS BOOLEAN
+LANGUAGE SQL
+STABLE
+AS $$
+    SELECT COALESCE(NULLIF(current_setting('app.bypass_rls', true), ''), '0') = '1'
+       AND pg_has_role(session_user, 'agent_bom_rls_maintenance', 'MEMBER')
+$$;
+
+-- teams is the FK root every tenant table references ON DELETE CASCADE, and
+-- agent_bom_app holds DML on it. Without RLS an app-role session bound to one
+-- tenant can enumerate every tenant and delete another tenant's root row,
+-- cascading that tenant's whole dataset away. The maintenance purge in
+-- api/tenant_lifecycle runs under the RLS-bypass role, so it is unaffected.
+ALTER TABLE teams ENABLE ROW LEVEL SECURITY;
+ALTER TABLE teams FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE gateway_policies ENABLE ROW LEVEL SECURITY;
+ALTER TABLE gateway_policies FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE policy_audit_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE policy_audit_log FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_log FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE trend_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE trend_history FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE fleet_agents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fleet_agents FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE fleet_endpoints ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fleet_endpoints FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE scan_jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE scan_jobs FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE cis_benchmark_checks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cis_benchmark_checks FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'teams'
+          AND policyname = 'teams_tenant_isolation'
+    ) THEN
+        CREATE POLICY teams_tenant_isolation ON teams
+            USING (public.abom_rls_bypass() OR team_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR team_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'fleet_endpoints'
+          AND policyname = 'fleet_endpoints_tenant_isolation'
+    ) THEN
+        CREATE POLICY fleet_endpoints_tenant_isolation ON fleet_endpoints
+            USING (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'scan_jobs'
+          AND policyname = 'scan_jobs_tenant_isolation'
+    ) THEN
+        CREATE POLICY scan_jobs_tenant_isolation ON scan_jobs
+            USING (public.abom_rls_bypass() OR team_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR team_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'cis_benchmark_checks'
+          AND policyname = 'cis_benchmark_checks_tenant_isolation'
+    ) THEN
+        CREATE POLICY cis_benchmark_checks_tenant_isolation ON cis_benchmark_checks
+            USING (public.abom_rls_bypass() OR team_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR team_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'audit_log'
+          AND policyname = 'audit_log_tenant_isolation'
+    ) THEN
+        CREATE POLICY audit_log_tenant_isolation ON audit_log
+            USING (public.abom_rls_bypass() OR team_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR team_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'trend_history'
+          AND policyname = 'trend_history_tenant_isolation'
+    ) THEN
+        CREATE POLICY trend_history_tenant_isolation ON trend_history
+            USING (public.abom_rls_bypass() OR team_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR team_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'gateway_policies'
+          AND policyname = 'gateway_policies_tenant_isolation'
+    ) THEN
+        CREATE POLICY gateway_policies_tenant_isolation ON gateway_policies
+            USING (public.abom_rls_bypass() OR team_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR team_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'policy_audit_log'
+          AND policyname = 'policy_audit_log_tenant_isolation'
+    ) THEN
+        CREATE POLICY policy_audit_log_tenant_isolation ON policy_audit_log
+            USING (public.abom_rls_bypass() OR team_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR team_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'fleet_agents'
+          AND policyname = 'fleet_agents_tenant_isolation'
+    ) THEN
+        CREATE POLICY fleet_agents_tenant_isolation ON fleet_agents
+            USING (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE llm_costs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE llm_costs FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'llm_costs'
+          AND policyname = 'llm_costs_tenant_isolation'
+    ) THEN
+        CREATE POLICY llm_costs_tenant_isolation ON llm_costs
+            USING (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE llm_cost_budgets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE llm_cost_budgets FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'llm_cost_budgets'
+          AND policyname = 'llm_cost_budgets_tenant_isolation'
+    ) THEN
+        CREATE POLICY llm_cost_budgets_tenant_isolation ON llm_cost_budgets
+            USING (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE scan_schedules ENABLE ROW LEVEL SECURITY;
+ALTER TABLE scan_schedules FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'scan_schedules'
+          AND policyname = 'scan_schedules_tenant_isolation'
+    ) THEN
+        CREATE POLICY scan_schedules_tenant_isolation ON scan_schedules
+            USING (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE graph_nodes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE graph_nodes FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'graph_nodes'
+          AND policyname = 'graph_nodes_tenant_isolation'
+    ) THEN
+        CREATE POLICY graph_nodes_tenant_isolation ON graph_nodes
+            USING (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE graph_edges ENABLE ROW LEVEL SECURITY;
+ALTER TABLE graph_edges FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'graph_edges'
+          AND policyname = 'graph_edges_tenant_isolation'
+    ) THEN
+        CREATE POLICY graph_edges_tenant_isolation ON graph_edges
+            USING (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE graph_snapshots ENABLE ROW LEVEL SECURITY;
+ALTER TABLE graph_snapshots FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'graph_snapshots'
+          AND policyname = 'graph_snapshots_tenant_isolation'
+    ) THEN
+        CREATE POLICY graph_snapshots_tenant_isolation ON graph_snapshots
+            USING (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE attack_paths ENABLE ROW LEVEL SECURITY;
+ALTER TABLE attack_paths FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'attack_paths'
+          AND policyname = 'attack_paths_tenant_isolation'
+    ) THEN
+        CREATE POLICY attack_paths_tenant_isolation ON attack_paths
+            USING (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE interaction_risks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE interaction_risks FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'interaction_risks'
+          AND policyname = 'interaction_risks_tenant_isolation'
+    ) THEN
+        CREATE POLICY interaction_risks_tenant_isolation ON interaction_risks
+            USING (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE graph_filter_presets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE graph_filter_presets FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'graph_filter_presets'
+          AND policyname = 'graph_filter_presets_tenant_isolation'
+    ) THEN
+        CREATE POLICY graph_filter_presets_tenant_isolation ON graph_filter_presets
+            USING (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE graph_node_search ENABLE ROW LEVEL SECURITY;
+ALTER TABLE graph_node_search FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'graph_node_search'
+          AND policyname = 'graph_node_search_tenant_isolation'
+    ) THEN
+        CREATE POLICY graph_node_search_tenant_isolation ON graph_node_search
+            USING (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE graph_build_workspace_nodes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE graph_build_workspace_nodes FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'graph_build_workspace_nodes'
+          AND policyname = 'graph_build_workspace_nodes_tenant_isolation'
+    ) THEN
+        CREATE POLICY graph_build_workspace_nodes_tenant_isolation ON graph_build_workspace_nodes
+            USING (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE graph_build_workspace_edges ENABLE ROW LEVEL SECURITY;
+ALTER TABLE graph_build_workspace_edges FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'graph_build_workspace_edges'
+          AND policyname = 'graph_build_workspace_edges_tenant_isolation'
+    ) THEN
+        CREATE POLICY graph_build_workspace_edges_tenant_isolation ON graph_build_workspace_edges
+            USING (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR tenant_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY;
+ALTER TABLE api_keys FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'api_keys'
+          AND policyname = 'api_keys_tenant_isolation'
+    ) THEN
+        CREATE POLICY api_keys_tenant_isolation ON api_keys
+            USING (public.abom_rls_bypass() OR team_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR team_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE exceptions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE exceptions FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'exceptions'
+          AND policyname = 'exceptions_tenant_isolation'
+    ) THEN
+        CREATE POLICY exceptions_tenant_isolation ON exceptions
+            USING (public.abom_rls_bypass() OR team_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR team_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE findings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE findings FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'findings'
+          AND policyname = 'findings_tenant_isolation'
+    ) THEN
+        CREATE POLICY findings_tenant_isolation ON findings
+            USING (public.abom_rls_bypass() OR team_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR team_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE agents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agents FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'agents'
+          AND policyname = 'agents_tenant_isolation'
+    ) THEN
+        CREATE POLICY agents_tenant_isolation ON agents
+            USING (public.abom_rls_bypass() OR team_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR team_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE policy_results ENABLE ROW LEVEL SECURITY;
+ALTER TABLE policy_results FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'policy_results'
+          AND policyname = 'policy_results_tenant_isolation'
+    ) THEN
+        CREATE POLICY policy_results_tenant_isolation ON policy_results
+            USING (public.abom_rls_bypass() OR team_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR team_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
+ALTER TABLE job_queue ENABLE ROW LEVEL SECURITY;
+ALTER TABLE job_queue FORCE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'job_queue'
+          AND policyname = 'job_queue_tenant_isolation'
+    ) THEN
+        CREATE POLICY job_queue_tenant_isolation ON job_queue
+            USING (public.abom_rls_bypass() OR team_id = public.abom_current_tenant())
+            WITH CHECK (public.abom_rls_bypass() OR team_id = public.abom_current_tenant());
+    END IF;
+END
+$$;
+
 -- ══════════════════════════════════════════════════════════════════════════════
 -- LEAST PRIVILEGE: App user — DML only, no DDL (cannot CREATE/DROP/ALTER)
 -- ══════════════════════════════════════════════════════════════════════════════
 
--- Password is injected via POSTGRES_APP_PASSWORD env var in the wrapper script.
--- If not set, this block is skipped and the admin user is used (dev fallback).
+-- Password is injected via the init.app_password GUC by 00-init-wrapper.sh,
+-- which reads /run/secrets/postgres_app_password. An empty GUC means a
+-- misconfigured secret, so we RAISE EXCEPTION and abort loudly at the real
+-- root cause — never limp on to create a broken passwordless app role. An
+-- unset GUC (NULL) is the out-of-band path used by Alembic migrations, the
+-- integration-test bootstrap, and wrapper-less local dev, where the app role
+-- is provisioned separately — skip creation here instead of aborting.
 DO $$
 DECLARE
     app_pass TEXT;
@@ -305,11 +1373,15 @@ BEGIN
     app_pass := current_setting('init.app_password', true);
 
     IF app_pass IS NOT NULL AND app_pass != '' THEN
-        -- Create app user if not exists
+        -- Create app user if not exists.
+        -- NOSUPERUSER NOBYPASSRLS is explicit (and the CREATE ROLE default) so
+        -- FORCE ROW LEVEL SECURITY tenant policies are always enforced for the
+        -- app role. A superuser/BYPASSRLS role silently voids tenant isolation
+        -- (#3665).
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agent_bom_app') THEN
-            EXECUTE format('CREATE ROLE agent_bom_app LOGIN PASSWORD %L', app_pass);
+            EXECUTE format('CREATE ROLE agent_bom_app LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD %L', app_pass);
         ELSE
-            EXECUTE format('ALTER ROLE agent_bom_app PASSWORD %L', app_pass);
+            EXECUTE format('ALTER ROLE agent_bom_app NOSUPERUSER NOBYPASSRLS PASSWORD %L', app_pass);
         END IF;
 
         -- Connection limit: prevent app from exhausting all connections
@@ -322,7 +1394,7 @@ BEGIN
         ALTER ROLE agent_bom_app SET lock_timeout = '5s';
 
         -- DML only: SELECT, INSERT, UPDATE, DELETE on all current + future tables
-        GRANT CONNECT ON DATABASE agent_bom TO agent_bom_app;
+        EXECUTE format('GRANT CONNECT ON DATABASE %I TO agent_bom_app', current_database());
         GRANT USAGE ON SCHEMA public TO agent_bom_app;
         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO agent_bom_app;
         GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO agent_bom_app;
@@ -335,9 +1407,61 @@ BEGIN
         REVOKE CREATE ON SCHEMA public FROM agent_bom_app;
 
         RAISE NOTICE 'agent_bom_app user created with DML-only access';
+    ELSIF app_pass = '' THEN
+        -- GUC set but empty: the wrapper reads a non-empty secret and errors on
+        -- an empty file, so an empty GUC is a misconfigured deployment — fail
+        -- loud rather than create a broken passwordless role.
+        RAISE EXCEPTION 'init.app_password is empty — /run/secrets/postgres_app_password had no value; check the secret file contents and that it is readable by the postgres user';
     ELSE
-        RAISE NOTICE 'POSTGRES_APP_PASSWORD not set — skipping app user creation (dev mode)';
+        -- Unset GUC (NULL): the app role is provisioned out of band. Normal path
+        -- for Alembic migrations, the integration-test bootstrap, and local dev
+        -- that run init.sql without the secret-injecting wrapper.
+        RAISE NOTICE 'init.app_password not set — skipping app user creation (provisioned by the init-wrapper in production)';
     END IF;
+END
+$$;
+
+-- Configure the distinct cross-tenant maintenance login from its own secret.
+-- The marker role owns data privileges; the login inherits them but cannot be
+-- granted to the ordinary app role.
+DO $$
+DECLARE
+    maintenance_pass TEXT;
+BEGIN
+    maintenance_pass := current_setting('init.maintenance_password', true);
+    IF maintenance_pass IS NOT NULL AND maintenance_pass != '' THEN
+        EXECUTE format('ALTER ROLE agent_bom_maintenance LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD %L', maintenance_pass);
+    ELSIF maintenance_pass = '' THEN
+        RAISE EXCEPTION 'init.maintenance_password is empty — /run/secrets/postgres_maintenance_password had no value';
+    ELSE
+        RAISE NOTICE 'init.maintenance_password not set — maintenance login password is provisioned out of band';
+    END IF;
+
+    -- Six autoscaled API replicas may each open the bounded four-connection
+    -- maintenance pool; retain headroom for backup and operator sessions.
+    ALTER ROLE agent_bom_maintenance CONNECTION LIMIT 32;
+    ALTER ROLE agent_bom_maintenance SET statement_timeout = '30s';
+    ALTER ROLE agent_bom_maintenance SET lock_timeout = '5s';
+    EXECUTE format('GRANT CONNECT ON DATABASE %I TO agent_bom_maintenance', current_database());
+    GRANT USAGE ON SCHEMA public TO agent_bom_rls_maintenance;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO agent_bom_rls_maintenance;
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO agent_bom_rls_maintenance;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public
+        GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO agent_bom_rls_maintenance;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public
+        GRANT USAGE, SELECT ON SEQUENCES TO agent_bom_rls_maintenance;
+    REVOKE CREATE ON SCHEMA public FROM agent_bom_maintenance;
+    REVOKE CREATE ON SCHEMA public FROM agent_bom_rls_maintenance;
+END
+$$;
+
+-- Clear the runtime-password GUCs now that the roles have been created. The
+-- wrapper stores them via ALTER DATABASE ... SET, which would otherwise leave
+-- cleartext credentials readable in pg_db_role_setting.
+DO $$
+BEGIN
+    EXECUTE format('ALTER DATABASE %I RESET init.app_password', current_database());
+    EXECUTE format('ALTER DATABASE %I RESET init.maintenance_password', current_database());
 END
 $$;
 
@@ -353,10 +1477,54 @@ BEGIN
 END
 $$;
 
-GRANT CONNECT ON DATABASE agent_bom TO agent_bom_readonly;
+DO $$
+BEGIN
+    EXECUTE format('GRANT CONNECT ON DATABASE %I TO agent_bom_readonly', current_database());
+END
+$$;
+
 GRANT USAGE ON SCHEMA public TO agent_bom_readonly;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO agent_bom_readonly;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO agent_bom_readonly;
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- TENANT ISOLATION: strip RLS-bypassing attributes from the app/admin role (#3665)
+-- ══════════════════════════════════════════════════════════════════════════════
+--
+-- The bundled quickstart connects as POSTGRES_USER (default: agent_bom), which
+-- the postgres image creates as a SUPERUSER. Superusers and BYPASSRLS roles
+-- IGNORE the FORCE ROW LEVEL SECURITY clause on every table, so the tenant
+-- isolation policies become silent no-ops and cross-tenant queries return other
+-- tenants' rows.
+--
+-- This runs as the very last init step, after all extensions and tables are
+-- created and owned by agent_bom. Dropping SUPERUSER/BYPASSRLS does NOT remove
+-- table ownership: agent_bom still performs the app's runtime idempotent DDL
+-- (table creation, ENABLE/FORCE RLS, policy and function definition) as the
+-- schema owner, but is now itself subject to the tenant RLS policies.
+-- The change only takes effect on the next connection (the current bootstrap
+-- session keeps its cached superuser status), so the rest of init is unaffected.
+-- The protected cluster bootstrap role (oid 10, usually "postgres") cannot be
+-- demoted — Postgres rejects the ALTER — so the strip skips it with a loud
+-- warning instead of aborting init (this also lets the Alembic baseline replay
+-- init.sql when a deployment's migration owner IS the bootstrap role). Tenant
+-- RLS in that model depends on the runtime connecting as the dedicated
+-- non-superuser agent_bom_app role, never the bootstrap role.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_roles
+        WHERE rolname = current_user AND (rolsuper OR rolbypassrls)
+    ) THEN
+        IF (SELECT oid FROM pg_roles WHERE rolname = current_user) = 10 THEN
+            RAISE WARNING 'Connected as the protected bootstrap role %, which cannot be demoted; tenant RLS (#3665) requires the runtime to use a dedicated NOSUPERUSER role such as agent_bom_app', current_user;
+        ELSE
+            EXECUTE format('ALTER ROLE %I NOSUPERUSER NOBYPASSRLS', current_user);
+            RAISE NOTICE 'Stripped SUPERUSER/BYPASSRLS from % so tenant RLS is enforced (#3665)', current_user;
+        END IF;
+    END IF;
+END
+$$;
 
 -- ══════════════════════════════════════════════════════════════════════════════
 -- SUMMARY
@@ -364,13 +1532,13 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO agent_bom_re
 --
 --  Role               | Can do                          | Cannot do
 --  -------------------|--------------------------------|---------------------------
---  agent_bom (admin)  | DDL + DML (schema owner)       | — (superuser on this DB)
---  agent_bom_app      | SELECT, INSERT, UPDATE, DELETE  | CREATE, DROP, ALTER, TRUNCATE
+--  agent_bom (owner)  | migrations / schema ownership  | application runtime access
+--  agent_bom_app      | SELECT, INSERT, UPDATE, DELETE  | CREATE, DROP, ALTER, TRUNCATE, bypass RLS
 --  agent_bom_readonly | SELECT only                     | Any writes
 --
 --  Connection: AGENT_BOM_POSTGRES_URL=postgresql://agent_bom_app:<pw>@<host>:5432/agent_bom
 --
---  Schema (12 tables):
+--  Schema (21+ tables):
 --   teams              — multi-tenant team registry (FK root)
 --   scan_jobs          — async scan job lifecycle + full result JSONB
 --   findings           — normalized vulnerability findings (per scan, per CVE)
@@ -378,8 +1546,20 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO agent_bom_re
 --   policy_results     — per-scan policy evaluation outcomes
 --   api_keys           — persistent RBAC API key store (scrypt KDF)
 --   job_queue          — background async task queue
+--   api_rate_limits      — legacy fixed-window buckets (deprecated)
+--   api_rate_limit_hits  — shared sliding-window API rate-limiter events
 --   fleet_agents       — governed agent lifecycle (long-lived)
 --   gateway_policies   — runtime MCP enforcement policies
 --   policy_audit_log   — runtime policy audit trail (HMAC-verified)
+--   llm_costs          — per-call LLM spend for cluster-safe FinOps
+--   llm_cost_budgets   — tenant / agent / cost-center spend caps
+--   audit_log          — signed API/security audit trail
+--   trend_history      — persisted posture/vulnerability history
 --   scan_schedules     — recurring scan cron configuration
+--   graph_nodes        — per-scan graph entities with severity/risk ordering
+--   graph_edges        — per-scan traversable relationships
+--   graph_snapshots    — graph snapshot summary + recency cursor
+--   attack_paths       — persisted fix-first attack-path projections
+--   interaction_risks  — agent interaction / toxic-combo risk overlays
+--   graph_filter_presets — tenant-scoped saved graph filters
 --   osv_cache          — OSV vulnerability API response cache

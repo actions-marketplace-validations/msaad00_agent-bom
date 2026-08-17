@@ -1,0 +1,442 @@
+name: Refresh Docker Latest
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: refresh-docker-latest
+  cancel-in-progress: false
+
+jobs:
+  refresh-latest:
+    name: Rebuild and publish latest from latest release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-python
+        with:
+          python-version: '3.11'
+
+      - name: Install agent-bom scanner (snapshot from default branch)
+        # The job later checks out the released tag to rebuild the image, so the
+        # scanner is installed non-editably from the default-branch tree FIRST
+        # into an isolated venv. This keeps the image gate on the current scanner
+        # implementation regardless of which tag is being refreshed.
+        run: |
+          uv venv "${RUNNER_TEMP}/abom-scanner"
+          uv pip install --python "${RUNNER_TEMP}/abom-scanner/bin/python" .
+
+      - name: Resolve latest release tag
+        id: release
+        run: |
+          set -euo pipefail
+          MAIN_SHA=$(git rev-parse HEAD)
+          git fetch --tags --force
+          TAG=$(git tag -l 'v*.*.*' --sort=-version:refname | head -n1)
+          if [ -z "$TAG" ]; then
+            echo "::error::No semver release tag found"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "main_sha=$MAIN_SHA" >> "$GITHUB_OUTPUT"
+          git checkout "$TAG"
+
+      - name: Apply current runtime security overlay
+        run: |
+          set -euo pipefail
+          # The application code and version stay pinned to the latest release tag,
+          # but the floating `latest` image is rebuilt daily to absorb base/runtime
+          # security-only refreshes such as patched pip hashes. Without this overlay,
+          # an old release tag can keep rebuilding a known-vulnerable container even
+          # after the default branch has the safe runtime pin.
+          git checkout "${{ steps.release.outputs.main_sha }}" -- \
+            Dockerfile \
+            deploy/docker/pip-requirements.txt \
+            deploy/docker/runtime-security-requirements.txt \
+            .image-scan-ignore \
+            security/image-exceptions.yaml
+
+      - name: Verify pyproject version matches release tag
+        run: |
+          set -euo pipefail
+          VERSION=$(python3 - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path("pyproject.toml").read_text()
+          m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+          if not m:
+              raise SystemExit("pyproject.toml version not found")
+          print(m.group(1))
+          PY
+          )
+          if [ "$VERSION" != "${{ steps.release.outputs.version }}" ]; then
+            echo "::error::Checked out tag ${{ steps.release.outputs.tag }} but pyproject.toml reports $VERSION"
+            exit 1
+          fi
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build refresh candidate image
+        run: docker build -t agent-bom:latest-refresh-test .
+
+      - name: Smoke test refresh candidate
+        run: docker run --rm agent-bom:latest-refresh-test --version
+
+      - name: Image vulnerability refresh gate
+        # Self-hosted image gate (dogfood) using the snapshot scanner. Native
+        # OS-layer (apk) + app-dependency scanning at MEDIUM+ severity
+        # (agent-bom has no separate UNKNOWN tier), unfixable findings excluded
+        # (= ignore-unfixed), and the .image-scan-ignore CVE allowlist.
+        run: |
+          "${RUNNER_TEMP}/abom-scanner/bin/agent-bom" image agent-bom:latest-refresh-test \
+            --ignore .image-scan-ignore \
+            --exclude-unfixable \
+            --fail-on-severity medium
+
+      - name: Build and push refreshed latest
+        id: build-push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: VERSION=${{ steps.release.outputs.version }}
+          cache-from: type=gha,scope=refresh-api-latest
+          cache-to: type=gha,mode=max,scope=refresh-api-latest
+          provenance: true
+          sbom: true
+          tags: |
+            agentbom/agent-bom:latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.title=agent-bom
+            org.opencontainers.image.description=Open security scanner for AI supply chain and infrastructure — agents, MCP, packages, containers, cloud, GPU, and runtime.
+            org.opencontainers.image.created=${{ github.run_id }}
+            org.opencontainers.image.revision=${{ steps.release.outputs.tag }}
+
+      - name: Sync Docker Hub README
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHORT_DESCRIPTION="Open security scanner for AI supply chain and infrastructure: agents, MCP, cloud, GPU, runtime."
+          TOKEN=$(curl -sf -X POST "https://hub.docker.com/v2/users/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${DOCKERHUB_USERNAME}\",\"password\":\"${DOCKERHUB_TOKEN}\"}" \
+            | jq -r '.token')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::Docker Hub login failed"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          DESCRIPTION=$(jq -Rs . < DOCKER_HUB_README.md)
+          SHORT_DESCRIPTION_JSON=$(printf '%s' "$SHORT_DESCRIPTION" | jq -Rs .)
+          RESPONSE_FILE=$(mktemp)
+          HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" -X PATCH \
+            "https://hub.docker.com/v2/repositories/agentbom/agent-bom/" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"full_description\": ${DESCRIPTION}, \"description\": ${SHORT_DESCRIPTION_JSON}}")
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::Docker Hub README sync failed (HTTP $HTTP_CODE)"
+            cat "$RESPONSE_FILE"
+            exit 1
+          fi
+          rm -f "$RESPONSE_FILE"
+
+  refresh-ui-latest:
+    name: Rebuild and publish UI latest from latest release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-python
+        with:
+          python-version: '3.11'
+
+      - name: Install agent-bom scanner (snapshot from default branch)
+        # The job later checks out the released tag to rebuild the image, so the
+        # scanner is installed non-editably from the default-branch tree FIRST
+        # into an isolated venv. This keeps the image gate on the current scanner
+        # implementation regardless of which tag is being refreshed.
+        run: |
+          uv venv "${RUNNER_TEMP}/abom-scanner"
+          uv pip install --python "${RUNNER_TEMP}/abom-scanner/bin/python" .
+
+      - name: Resolve latest release tag
+        id: release
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          TAG=$(git tag -l 'v*.*.*' --sort=-version:refname | head -n1)
+          if [ -z "$TAG" ]; then
+            echo "::error::No semver release tag found"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          git checkout "$TAG"
+
+      - name: Verify UI package version matches release tag
+        run: |
+          set -euo pipefail
+          VERSION=$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          print(json.loads(Path("ui/package.json").read_text())["version"])
+          PY
+          )
+          if [ "$VERSION" != "${{ steps.release.outputs.version }}" ]; then
+            echo "::error::Checked out tag ${{ steps.release.outputs.tag }} but ui/package.json reports $VERSION"
+            exit 1
+          fi
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build refresh candidate UI image
+        run: docker build -f ui/Dockerfile -t agent-bom-ui:latest-refresh-test ui
+
+      - name: Smoke test refresh candidate UI
+        run: |
+          set -euo pipefail
+          cleanup() {
+            status=$?
+            if [ $status -ne 0 ]; then
+              docker logs agent-bom-ui-refresh-smoke || true
+            fi
+            docker stop agent-bom-ui-refresh-smoke >/dev/null 2>&1 || true
+            exit $status
+          }
+          docker run -d --rm --name agent-bom-ui-refresh-smoke -p 3000:3000 -e NEXT_PUBLIC_API_URL= agent-bom-ui:latest-refresh-test
+          trap cleanup EXIT
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3000/ >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:3000/ >/dev/null || {
+            echo "::error::UI container did not become healthy in time"
+            exit 1
+          }
+
+      - name: UI image vulnerability refresh gate
+        # Self-hosted image gate (dogfood) using the snapshot scanner. The UI
+        # image is Debian (node:bookworm-slim) based; native OS-layer (dpkg) +
+        # app-dependency scanning at MEDIUM+ severity (agent-bom has no separate
+        # UNKNOWN tier), unfixable findings excluded (= ignore-unfixed), and the
+        # .image-scan-ignore CVE allowlist.
+        run: |
+          "${RUNNER_TEMP}/abom-scanner/bin/agent-bom" image agent-bom-ui:latest-refresh-test \
+            --ignore .image-scan-ignore \
+            --exclude-unfixable \
+            --fail-on-severity medium
+
+      - name: Build and push refreshed UI latest
+        id: build-push-ui
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ui
+          file: ui/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            NEXT_PUBLIC_API_URL=
+          cache-from: type=gha,scope=refresh-ui-latest
+          cache-to: type=gha,mode=max,scope=refresh-ui-latest
+          provenance: true
+          sbom: true
+          tags: |
+            agentbom/agent-bom-ui:latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.title=agent-bom-ui
+            org.opencontainers.image.description=Standalone browser UI for the self-hosted agent-bom control plane. Requires the agent-bom API image.
+            org.opencontainers.image.created=${{ github.run_id }}
+            org.opencontainers.image.revision=${{ steps.release.outputs.tag }}
+
+      - name: Sync UI Docker Hub README
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHORT_DESCRIPTION="Standalone browser UI for the self-hosted agent-bom control plane. Requires the agent-bom API image."
+          TOKEN=$(curl -sf -X POST "https://hub.docker.com/v2/users/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${DOCKERHUB_USERNAME}\",\"password\":\"${DOCKERHUB_TOKEN}\"}" \
+            | jq -r '.token')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::Docker Hub login failed"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          DESCRIPTION=$(jq -Rs . < DOCKER_HUB_UI_README.md)
+          SHORT_DESCRIPTION_JSON=$(printf '%s' "$SHORT_DESCRIPTION" | jq -Rs .)
+          RESPONSE_FILE=$(mktemp)
+          HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" -X PATCH \
+            "https://hub.docker.com/v2/repositories/agentbom/agent-bom-ui/" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"full_description\": ${DESCRIPTION}, \"description\": ${SHORT_DESCRIPTION_JSON}}")
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::Docker Hub UI README sync failed (HTTP $HTTP_CODE)"
+            cat "$RESPONSE_FILE"
+            exit 1
+          fi
+          rm -f "$RESPONSE_FILE"
+
+  refresh-collector-latest:
+    name: Rebuild and publish collector latest from latest release tag
+    # Rebuild the released collector with current reviewed runtime-security
+    # overlays and base-image patches. Python/provider SDK versions stay frozen
+    # to the release tag's uv.lock; version changes require a reviewed lockfile
+    # update rather than silently drifting during a scheduled build.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-python
+        with:
+          python-version: '3.11'
+
+      - name: Install agent-bom scanner (snapshot from default branch)
+        run: |
+          uv venv "${RUNNER_TEMP}/abom-scanner"
+          uv pip install --python "${RUNNER_TEMP}/abom-scanner/bin/python" .
+
+      - name: Resolve latest release tag
+        id: release
+        run: |
+          set -euo pipefail
+          MAIN_SHA=$(git rev-parse HEAD)
+          git fetch --tags --force
+          TAG=$(git tag -l 'v*.*.*' --sort=-version:refname | head -n1)
+          if [ -z "$TAG" ]; then
+            echo "::error::No semver release tag found"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "main_sha=$MAIN_SHA" >> "$GITHUB_OUTPUT"
+          git checkout "$TAG"
+
+      - name: Apply current runtime security overlay
+        run: |
+          set -euo pipefail
+          # App code stays pinned to the release tag, but the runtime security
+          # pins (pip hashes, CVE allowlist) float to the default branch so an
+          # old tag never keeps rebuilding a known-vulnerable collector.
+          git checkout "${{ steps.release.outputs.main_sha }}" -- \
+            deploy/docker/pip-requirements.txt \
+            .image-scan-ignore \
+            security/image-exceptions.yaml
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build refresh candidate collector image
+        run: docker build -f deploy/docker/Dockerfile.collector -t agent-bom-collector:latest-refresh-test .
+
+      - name: Smoke test refresh candidate
+        run: |
+          docker run --rm agent-bom-collector:latest-refresh-test --version
+          docker run --rm --entrypoint python agent-bom-collector:latest-refresh-test -c "import boto3, azure.identity, google.cloud.resourcemanager_v3, snowflake.connector"
+
+      - name: Image vulnerability refresh gate
+        run: |
+          "${RUNNER_TEMP}/abom-scanner/bin/agent-bom" image agent-bom-collector:latest-refresh-test \
+            --ignore .image-scan-ignore \
+            --exclude-unfixable \
+            --fail-on-severity medium
+
+      - name: Build and push refreshed collector latest
+        id: build-push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.collector
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: VERSION=${{ steps.release.outputs.version }}
+          cache-from: type=gha,scope=refresh-collector-latest
+          cache-to: type=gha,mode=max,scope=refresh-collector-latest
+          provenance: true
+          sbom: true
+          tags: |
+            agentbom/agent-bom-collector:latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.title=agent-bom cloud-SDK collector
+            org.opencontainers.image.description=Read-only cloud collector — ships boto3/azure/google/snowflake SDKs independently of the control-plane release. No external MCP in the scan path.
+            org.opencontainers.image.created=${{ github.run_id }}
+            org.opencontainers.image.revision=${{ steps.release.outputs.tag }}

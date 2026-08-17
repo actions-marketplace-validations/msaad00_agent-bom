@@ -1,8 +1,62 @@
-"""agent-bom: Security scanner for AI infrastructure — from agent to runtime."""
+"""agent-bom: Security scanner for AI supply chain and infrastructure — from agent to runtime."""
 
+import re
 from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 try:
     __version__ = version("agent-bom")
 except PackageNotFoundError:
-    __version__ = "0.70.12"
+    __version__ = "0.101.0"
+
+# Cross-check against pyproject.toml for dev installs where the editable
+# install metadata may be stale (i.e. version bumped but not re-installed).
+_pyproject = Path(__file__).parent.parent.parent / "pyproject.toml"
+if _pyproject.exists():
+    try:
+        _m = re.search(r'version\s*=\s*"([^"]+)"', _pyproject.read_text())
+        if _m and _m.group(1) != __version__:
+            __version__ = _m.group(1)
+    except Exception:
+        pass  # Never block import due to pyproject read failure
+
+from agent_bom.sdk import (  # noqa: E402
+    AgentBomSDKError,
+    DiffResult,
+    InventoryResult,
+    PackageCheckResult,
+    async_check,
+    check,
+    diff,
+    scan,
+)
+
+if TYPE_CHECKING:
+    from agent_bom.client import AgentBomApiError, AgentBomClient
+
+__all__ = [
+    "__version__",
+    "AgentBomApiError",
+    "AgentBomClient",
+    "AgentBomSDKError",
+    "DiffResult",
+    "InventoryResult",
+    "PackageCheckResult",
+    "async_check",
+    "check",
+    "diff",
+    "scan",
+]
+
+
+def __getattr__(name: str) -> Any:
+    if name in {"AgentBomApiError", "AgentBomClient"}:
+        from agent_bom.client import AgentBomApiError, AgentBomClient
+
+        exports = {
+            "AgentBomApiError": AgentBomApiError,
+            "AgentBomClient": AgentBomClient,
+        }
+        return exports[name]
+    raise AttributeError(f"module 'agent_bom' has no attribute {name!r}")

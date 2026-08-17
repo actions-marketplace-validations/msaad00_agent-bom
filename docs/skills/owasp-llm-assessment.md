@@ -2,6 +2,16 @@
 
 > Systematic OWASP LLM Top 10 + MITRE ATLAS threat assessment across your AI infrastructure.
 
+```yaml
+capabilities:
+  read_findings: true
+  read_inventory: true
+  read_audit_log: false
+  write_findings: false
+  outbound_http: true
+  shell_exec: true
+```
+
 ## Goal
 
 Assess your AI infrastructure against the [OWASP Top 10 for LLM Applications](https://owasp.org/www-project-top-10-for-large-language-model-applications/) and [MITRE ATLAS](https://atlas.mitre.org/) adversarial ML framework. Identify which threat categories apply, quantify exposure per category, and prioritize remediation.
@@ -11,7 +21,7 @@ Assess your AI infrastructure against the [OWASP Top 10 for LLM Applications](ht
 ```bash
 pip install agent-bom
 # Install cloud extras for your environment:
-pip install 'agent-bom[cloud]'  # All providers
+pip install 'agent-bom[cloud]'  # Core providers; install mlflow separately if needed
 ```
 
 ## Threat Framework Reference
@@ -32,7 +42,7 @@ pip install 'agent-bom[cloud]'  # All providers
 
 | Technique | Name | agent-bom triggers when |
 |-----------|------|------------------------|
-| **AML.T0010** | ML Supply Chain Compromise | Any package CVE (always) |
+| **AML.T0010** | ML Supply Chain Compromise | Package CVE on a confirmed agent/MCP path, or in a known AI framework |
 | **AML.T0020** | Poison Training Data | AI framework + HIGH+ CVE |
 | **AML.T0043** | Craft Adversarial Data | Tools with shell/exec capability |
 | **AML.T0051** | LLM Prompt Injection | Tools can access prompts/context |
@@ -140,7 +150,7 @@ Triggered for shell/exec tools. These are the highest-risk tools:
 - `execute_command`, `run_shell`, `bash`
 - `query_database`, `execute_sql`
 
-**Remediation**: Remove shell tools if not needed. If needed, sandbox them (e.g., via ToolHive containers).
+**Remediation**: Remove shell tools if not needed. If needed, sandbox them in isolated containers.
 
 ### 4. Cloud-Specific Threat Assessment
 

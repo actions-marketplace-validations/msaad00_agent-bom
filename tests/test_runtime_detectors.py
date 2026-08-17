@@ -30,6 +30,28 @@ def test_alert_to_dict():
     assert "ts" in d
 
 
+def test_alert_to_dict_redacts_sensitive_details():
+    github_token = "ghp_" + "abcdefghijklmnopqrstuvwxyz" + "123456"
+    api_key = "sk-" + "live-" + "abcdefghijklmnopqrstuvwxyz"
+    alert = Alert(
+        detector="argument_analyzer",
+        severity=AlertSeverity.HIGH,
+        message="Dangerous argument",
+        details={
+            "url": f"https://user:pass@example.com/callback?token={github_token}",
+            "value_preview": api_key,
+            "path": "/Users/alice/prod-secrets/openai-key.env",
+        },
+    )
+
+    encoded = str(alert.to_dict())
+    assert "user:pass" not in encoded
+    assert "token=" not in encoded
+    assert "sk-live" not in encoded
+    assert "/Users/alice" not in encoded
+    assert "prod-secrets" not in encoded
+
+
 def test_alert_severity_enum():
     assert AlertSeverity.CRITICAL.value == "critical"
     assert AlertSeverity.INFO.value == "info"
@@ -201,6 +223,82 @@ def test_cred_leak_multiple_types():
     assert len(alerts) >= 2
 
 
+# ─── PII Detection ──────────────────────────────────────────────────────────
+
+
+def test_pii_email_detected():
+    d = CredentialLeakDetector()
+    alerts = d.check("read_file", "Contact: admin@example.com for support")
+    pii_alerts = [a for a in alerts if a.detector == "pii_leak"]
+    assert len(pii_alerts) >= 1
+    assert pii_alerts[0].details["pii_type"] == "Email Address"
+
+
+def test_pii_ssn_detected():
+    d = CredentialLeakDetector()
+    alerts = d.check("query", "SSN: 123-45-6789")
+    pii_alerts = [a for a in alerts if a.detector == "pii_leak"]
+    assert len(pii_alerts) >= 1
+
+
+def test_pii_credit_card_detected():
+    d = CredentialLeakDetector()
+    alerts = d.check("query", "Card: 4111111111111111")
+    pii_alerts = [a for a in alerts if a.detector == "pii_leak"]
+    assert len(pii_alerts) >= 1
+
+
+def test_pii_phone_detected():
+    d = CredentialLeakDetector()
+    alerts = d.check("read_file", "Call +1 (555) 123-4567")
+    pii_alerts = [a for a in alerts if a.detector == "pii_leak"]
+    assert len(pii_alerts) >= 1
+
+
+# ─── PII Redaction ──────────────────────────────────────────────────────────
+
+
+def test_redact_credentials():
+    text = "Key: sk-proj-abc123def456ghi789jkl012mno345pqr"
+    result = CredentialLeakDetector.redact(text)
+    assert "sk-proj" not in result
+    assert "[REDACTED:" in result
+
+
+def test_redact_pii_email():
+    text = "Send to admin@example.com"
+    result = CredentialLeakDetector.redact(text)
+    assert "admin@example.com" not in result
+    assert "[REDACTED:Email Address]" in result
+
+
+def test_redact_pii_ssn():
+    text = "SSN 123-45-6789"
+    result = CredentialLeakDetector.redact(text)
+    assert "123-45-6789" not in result
+    assert "[REDACTED:US SSN]" in result
+
+
+def test_redact_pii_credit_card():
+    text = "Card 4111111111111111"
+    result = CredentialLeakDetector.redact(text)
+    assert "4111111111111111" not in result
+
+
+def test_redact_preserves_non_sensitive():
+    text = "Hello world, this is safe text with no secrets."
+    result = CredentialLeakDetector.redact(text)
+    assert result == text
+
+
+def test_redact_multiple():
+    text = "Email: john@acme.com, key: AKIAIOSFODNN7EXAMPLE, SSN: 987-65-4321"
+    result = CredentialLeakDetector.redact(text)
+    assert "john@acme.com" not in result
+    assert "AKIAIOSFODNN7EXAMPLE" not in result
+    assert "987-65-4321" not in result
+
+
 # ─── RateLimitTracker ────────────────────────────────────────────────────────
 
 
@@ -217,7 +315,8 @@ def test_rate_limit_at_threshold():
     for _ in range(5):
         alerts = r.record("tool1")
     assert len(alerts) == 1
-    assert alerts[0].severity == AlertSeverity.MEDIUM
+    assert alerts[0].severity == AlertSeverity.HIGH
+    assert alerts[0].details.get("blocked") is True
     assert "tool1" in alerts[0].message
 
 
@@ -233,10 +332,48 @@ def test_rate_limit_different_tools_independent():
     assert len(alerts2) == 1  # tool2 hit 3
 
 
+def test_rate_limit_different_source_agents_independent():
+    r = RateLimitTracker(threshold=2, window_seconds=60.0)
+    assert r.record("tool1", source_agent="agent-a") == []
+    assert r.record("tool1", source_agent="agent-b") == []
+
+    alerts_a = r.record("tool1", source_agent="agent-a")
+    assert len(alerts_a) == 1
+    assert alerts_a[0].details["source_agent"] == "agent-a"
+    assert alerts_a[0].details["bucket"] == "agent-a:tool1"
+
+    alerts_b = r.record("tool1", source_agent="agent-b")
+    assert len(alerts_b) == 1
+    assert alerts_b[0].details["source_agent"] == "agent-b"
+
+
+def test_rate_limit_missing_source_agent_uses_anonymous_bucket():
+    r = RateLimitTracker(threshold=2, window_seconds=60.0)
+    assert r.record("tool1") == []
+    alerts = r.record("tool1")
+    assert len(alerts) == 1
+    assert alerts[0].details["source_agent"] == "anonymous"
+    assert alerts[0].details["bucket"] == "anonymous:tool1"
+
+
 def test_rate_limit_properties():
     r = RateLimitTracker(threshold=10, window_seconds=30.0)
     assert r.threshold == 10
     assert r.window == 30.0
+
+
+def test_rate_limit_dynamic_threshold_override():
+    r = RateLimitTracker(threshold=50, window_seconds=60.0)
+    assert r.record("tool1", threshold=3) == []
+    assert r.record("tool1", threshold=3) == []
+    alerts = r.record("tool1", threshold=3)
+    assert len(alerts) == 1
+    assert alerts[0].details["threshold"] == 3
+
+
+def test_rate_limit_zero_threshold_disables_check():
+    r = RateLimitTracker(threshold=0, window_seconds=60.0)
+    assert r.record("tool1", threshold=0) == []
 
 
 # ─── SequenceAnalyzer ────────────────────────────────────────────────────────

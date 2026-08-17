@@ -117,6 +117,25 @@ def test_batch_kev_and_epss(tmp_db):
     assert vuln.epss_percentile == pytest.approx(99.5)
 
 
+def test_batch_alias_cve_enrichment(tmp_db):
+    _insert_vuln(tmp_db, vuln_id="GHSA-test-alias", cvss_score=None)
+    tmp_db.execute("UPDATE vulns SET aliases='CVE-2024-TESTALIAS' WHERE id='GHSA-test-alias'")
+    _insert_affected(tmp_db, vuln_id="GHSA-test-alias")
+    tmp_db.execute(
+        "INSERT OR REPLACE INTO epss_scores(cve_id, probability, percentile, updated_at) "
+        "VALUES ('CVE-2024-TESTALIAS', 0.42, 88.0, '2024-01-01')"
+    )
+    tmp_db.execute("INSERT OR REPLACE INTO kev_entries(cve_id, date_added) VALUES ('CVE-2024-TESTALIAS', '2024-02-01')")
+    tmp_db.commit()
+
+    batch = lookup_packages_batch(tmp_db, [("pypi", "requests", "2.0.5")])
+    vuln = batch[("pypi", "requests", "2.0.5")][0]
+    assert vuln.epss_probability == pytest.approx(0.42)
+    assert vuln.epss_percentile == pytest.approx(88.0)
+    assert vuln.is_kev is True
+    assert vuln.kev_date_added == "2024-02-01"
+
+
 def test_batch_ecosystem_case_insensitive(tmp_db):
     """Batch lookup is case-insensitive on ecosystem."""
     _insert_vuln(tmp_db)
@@ -187,3 +206,131 @@ def test_batch_parity_with_individual(tmp_db):
         batch_vulns = batch[(eco, name, version)]
         assert len(batch_vulns) == len(individual), f"Mismatch for {eco}:{name}@{version}"
         assert {v.id for v in batch_vulns} == {v.id for v in individual}
+
+
+# ---------------------------------------------------------------------------
+# Regression: unparseable fixed_version must not silently drop CVEs
+# ---------------------------------------------------------------------------
+
+
+def test_unparseable_fixed_version_reports_affected(tmp_db):
+    """Regression: when fixed version is a git hash, package is still reported as affected.
+
+    Previously, InvalidVersion caused a silent return False (not affected),
+    meaning real CVEs were dropped from scan results.
+    """
+    _insert_vuln(tmp_db, vuln_id="CVE-2024-HASH")
+    # Insert with a git commit hash as the fixed version — non-parseable by packaging.version
+    tmp_db.execute(
+        "INSERT OR REPLACE INTO affected(vuln_id,ecosystem,package_name,introduced,fixed,last_affected) VALUES (?,?,?,?,?,'')",
+        ("CVE-2024-HASH", "pypi", "some-lib", "1.0.0", "abc123def456git"),
+    )
+    tmp_db.commit()
+
+    # Package is at version 1.5.0 — AFTER "introduced" but fix version is unparseable
+    vulns = lookup_package(tmp_db, "pypi", "some-lib", "1.5.0")
+    # Must be reported as affected (not silently dropped)
+    cve_ids = {v.id for v in vulns}
+    assert "CVE-2024-HASH" in cve_ids, (
+        "CVE with unparseable fixed version (git hash) was silently dropped; should be conservatively reported as affected"
+    )
+
+
+def test_duplicate_sha_row_does_not_override_semver_unaffected(tmp_db):
+    """A duplicate SHA-based row must not resurrect a vuln once a semver row excludes it."""
+    _insert_vuln(tmp_db, vuln_id="CVE-2024-DUPE")
+    tmp_db.execute(
+        "INSERT OR REPLACE INTO affected(vuln_id,ecosystem,package_name,introduced,fixed,last_affected) VALUES (?,?,?,?,?,'')",
+        ("CVE-2024-DUPE", "pypi", "requests", "0", "3bd8afbff29e50b38f889b2f688785a669b9aafc"),
+    )
+    tmp_db.execute(
+        "INSERT OR REPLACE INTO affected(vuln_id,ecosystem,package_name,introduced,fixed,last_affected) VALUES (?,?,?,?,?,'')",
+        ("CVE-2024-DUPE", "pypi", "requests", "2.1.0", "2.6.0"),
+    )
+    tmp_db.commit()
+
+    vulns = lookup_package(tmp_db, "pypi", "requests", "2.33.0")
+    assert "CVE-2024-DUPE" not in {v.id for v in vulns}
+
+    batch = lookup_packages_batch(tmp_db, [("pypi", "requests", "2.33.0")])
+    assert "CVE-2024-DUPE" not in {v.id for v in batch[("pypi", "requests", "2.33.0")]}
+
+
+# ---------------------------------------------------------------------------
+# Fix-version merge across advisory aliases (PYSEC fix=None + GHSA fix=X)
+# ---------------------------------------------------------------------------
+
+
+def _insert_alias_pair(conn):
+    """Mirror of the real DB shape for CVE-2025-2999: PYSEC row without a fix
+    and its GHSA alias row carrying fixed=2.9.1, both for pypi/torch."""
+    conn.execute(
+        "INSERT OR REPLACE INTO vulns(id,summary,severity,cvss_score,fixed_version,aliases,source) VALUES (?,?,?,?,?,?,'osv')",
+        ("PYSEC-2025-193", "torch DoS", "high", 7.5, None, "BIT-pytorch-2025-2999,CVE-2025-2999,GHSA-vgrw-7cvw-pwgx"),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO vulns(id,summary,severity,cvss_score,fixed_version,aliases,source) VALUES (?,?,?,?,?,?,'osv')",
+        ("GHSA-vgrw-7cvw-pwgx", "torch DoS", "high", 7.5, "2.9.1", "BIT-pytorch-2025-2999,CVE-2025-2999,PYSEC-2025-193"),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO affected(vuln_id,ecosystem,package_name,introduced,fixed,last_affected) VALUES (?,?,?,?,?,?)",
+        ("PYSEC-2025-193", "pypi", "torch", "0", "", "2.6.0-NA"),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO affected(vuln_id,ecosystem,package_name,introduced,fixed,last_affected) VALUES (?,?,?,?,?,?)",
+        ("GHSA-vgrw-7cvw-pwgx", "pypi", "torch", "0", "2.9.1", ""),
+    )
+    conn.commit()
+
+
+def test_alias_cluster_recovers_missing_fix_version(tmp_db):
+    """A fix-less advisory row must inherit the fix its alias sibling carries.
+
+    Reporting the PYSEC row as fix=None over-claims "no fix available" and
+    lets --exclude-unfixable silently drop a fixable finding.
+    """
+    _insert_alias_pair(tmp_db)
+
+    vulns = lookup_package(tmp_db, "pypi", "torch", "2.4.0")
+    by_id = {v.id: v for v in vulns}
+    assert "PYSEC-2025-193" in by_id
+    assert by_id["PYSEC-2025-193"].fixed_version == "2.9.1", (
+        "fix-less PYSEC row must inherit the GHSA alias fix instead of over-claiming 'no fix'"
+    )
+    assert all(v.fixed_version == "2.9.1" for v in vulns)
+
+    batch = lookup_packages_batch(tmp_db, [("pypi", "torch", "2.4.0")])
+    batch_vulns = batch[("pypi", "torch", "2.4.0")]
+    assert batch_vulns and all(v.fixed_version == "2.9.1" for v in batch_vulns)
+
+
+def test_alias_fix_merge_ignores_unrelated_rows(tmp_db):
+    """Rows without a shared alias id must not donate their fix version."""
+    _insert_alias_pair(tmp_db)
+    tmp_db.execute(
+        "INSERT OR REPLACE INTO vulns(id,summary,severity,cvss_score,fixed_version,aliases,source) VALUES (?,?,?,?,?,?,'osv')",
+        ("PYSEC-2099-1", "unrelated torch vuln", "high", 7.5, None, "CVE-2099-1"),
+    )
+    tmp_db.execute(
+        "INSERT OR REPLACE INTO affected(vuln_id,ecosystem,package_name,introduced,fixed,last_affected) VALUES (?,?,?,?,?,?)",
+        ("PYSEC-2099-1", "pypi", "torch", "0", "", "2.6.0"),
+    )
+    tmp_db.commit()
+
+    vulns = lookup_package(tmp_db, "pypi", "torch", "2.4.0")
+    by_id = {v.id: v for v in vulns}
+    assert by_id["PYSEC-2099-1"].fixed_version is None
+
+
+def test_alias_fix_merge_ignores_sibling_with_disjoint_affected_range(tmp_db):
+    """An alias sibling covering another release must not donate its fix."""
+    _insert_alias_pair(tmp_db)
+    tmp_db.execute(
+        "UPDATE affected SET introduced = ?, fixed = ? WHERE vuln_id = ?",
+        ("3.0.0", "3.1.0", "GHSA-vgrw-7cvw-pwgx"),
+    )
+    tmp_db.commit()
+
+    vulns = lookup_package(tmp_db, "pypi", "torch", "2.4.0")
+    by_id = {v.id: v for v in vulns}
+    assert by_id["PYSEC-2025-193"].fixed_version is None

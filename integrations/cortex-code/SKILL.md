@@ -1,18 +1,19 @@
 ---
 name: agent-bom
 description: >-
-  Security scanner for AI infrastructure — scan MCP servers and packages for CVEs,
-  map blast radius from packages to credentials and tools, detect credential exposure,
-  and enforce runtime policy. Works with Cortex Code's MCP servers, skills, and agents.
+  Open security scanner for agentic infrastructure — agents, MCP, packages,
+  blast radius, runtime, and trust across MCP servers, skills, packages,
+  and agents in Cortex Code.
 tools:
   - bash
 ---
 
-# agent-bom — Security Scanner for AI Infrastructure
+# agent-bom — Security Platform for Agentic Infrastructure
 
-Scan your MCP servers, packages, and AI agent configurations for CVEs,
-credential exposure, and supply chain risks. Maps blast radius from
-vulnerable packages to the credentials and tools they can reach.
+Scan your MCP servers, AI agents, and their packages: CVEs and supply-chain
+risk (malicious/typosquat) in the packages, plus credential exposure,
+identity/auth/access posture, and MCP config risk on the servers and agents.
+Maps blast radius from a finding to the credentials and tools it can reach.
 
 ## When to Use
 
@@ -26,9 +27,9 @@ vulnerable packages to the credentials and tools they can reach.
 ## What This Skill Provides
 
 - **CVE scanning** with enrichment from OSV, NVD, EPSS, CISA KEV
-- **MCP server discovery** across 21 AI tools (including Cortex Code)
+- **MCP server discovery** across real AI developer tools, including Cortex Code
 - **Blast radius mapping** — which agents, credentials, and tools are exposed
-- **13 compliance frameworks** per finding (OWASP LLM/MCP/Agentic, MITRE ATLAS, NIST, EU AI Act)
+- **Compliance mapping** across OWASP, NIST, MITRE, EU AI Act, and related frameworks
 - **Runtime proxy** for MCP traffic interception and policy enforcement
 - **SKILL.md trust assessment** with 17 behavioral risk patterns
 
@@ -82,13 +83,13 @@ agent-bom scan --gpu-scan
 ### Run as MCP server (for other AI tools)
 
 ```bash
-agent-bom mcp-server
+agent-bom mcp server
 ```
 
 ### Proxy MCP traffic with policy enforcement
 
 ```bash
-agent-bom proxy --command "npx @modelcontextprotocol/server-filesystem /tmp" --policy policy.yml
+agent-bom proxy "npx @modelcontextprotocol/server-filesystem /workspace" --policy policy.yml
 ```
 
 ## Common Patterns
@@ -109,7 +110,7 @@ When a user asks for a security review:
 ### Compliance report
 When compliance documentation is needed:
 1. Run `agent-bom scan -f cyclonedx -o sbom.json`
-2. Run `agent-bom scan --enrich` for compliance framework mapping
+2. Run `agent-bom scan --enrich --compliance` for compliance framework mapping
 3. Report maps to OWASP, NIST, EU AI Act, ISO 27001, SOC 2
 
 ## Best Practices

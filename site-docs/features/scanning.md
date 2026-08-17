@@ -36,7 +36,7 @@ Linux paths use `~/.config/` equivalents.
 | [EPSS](https://www.first.org/epss/) | Exploit probability scores (0.0–1.0) |
 | [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) | Known exploited vulnerabilities catalog |
 | [GitHub Advisories](https://github.com/advisories) | Supplemental advisory data |
-| [Snyk](https://snyk.io) | Optional enrichment (requires `SNYK_TOKEN`) |
+| Commercial vuln API | Optional enrichment when a vendor API token is configured |
 
 ## Credential exposure detection
 
@@ -52,7 +52,34 @@ Config files are parsed for server definitions. Environment variable **values** 
 ## Container image scanning
 
 ```bash
-agent-bom scan --image python:3.12-slim
+agent-bom image python:3.12-slim
 ```
 
-Uses Grype/Syft under the hood for OS and language package scanning within container images.
+Uses agent-bom's native image scanning pipeline to enumerate OS and language packages within container images.
+The native parser reads Debian dpkg, Alpine apk, modern SQLite RPM databases,
+and legacy RPM BerkeleyDB/NDB databases without requiring a scanner binary.
+Malformed legacy RPM databases fail the scan instead of producing a clean
+zero-package result.
+
+The default OS result remains precision-first and reports distro-confirmed
+advisories. To include unfixed, pending, no-DSA, and end-of-life distro
+advisories for an exhaustive review, run:
+
+```bash
+AGENT_BOM_INCLUDE_UNFIXED=1 agent-bom image python:3.12-slim
+```
+
+The artifact is the same findings report with lower-confidence unfixed distro
+rows included; review their match-confidence tier before using them as a CI
+block. Language-package coverage is unaffected by this switch.
+
+## IaC and cloud posture
+
+Use `agent-bom iac` as the pre-cloud gate for Terraform, CloudFormation,
+Kubernetes, Helm-rendered manifests, and Dockerfiles. Use `agent-bom
+cis-benchmark` as the runtime posture check for deployed cloud state. The
+combined workflow catches proposed misconfiguration before apply and drift
+after deployment.
+
+See [Cloud Posture and IaC Gates](cloud-posture.md) for the recommended lane
+split and CI example.

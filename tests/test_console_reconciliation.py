@@ -1,0 +1,142 @@
+"""End-to-end console honesty: every severity total on the demo scan screen
+states its scope, and the headline reconciles with the unified findings stream
+(the same stream the JSON/API report carries).
+
+Runs the real curated demo scan offline (no network), once per output format.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+
+import pytest
+from click.testing import CliRunner
+
+from agent_bom.cli import main
+
+
+@pytest.fixture(scope="module")
+def demo_console_output(tmp_path_factory) -> str:
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["scan", "--demo", "--offline", "--no-auto-update-db", "-f", "console"],
+        catch_exceptions=False,
+    )
+    return re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+
+
+@pytest.fixture(scope="module")
+def demo_verbose_console_output(tmp_path_factory) -> str:
+    """The ``--verbose`` screen, which renders a different summary path.
+
+    ``--verbose`` swaps the compact headline for ``print_summary`` +
+    ``print_posture_summary``; the non-verbose fixture above never exercises
+    either, so the two paths need their own reconciliation check.
+    """
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["scan", "--demo", "--offline", "--no-auto-update-db", "-f", "console", "--verbose"],
+        catch_exceptions=False,
+    )
+    return re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+
+
+@pytest.fixture(scope="module")
+def demo_json_report(tmp_path_factory) -> dict:
+    out = tmp_path_factory.mktemp("demo") / "report.json"
+    runner = CliRunner()
+    runner.invoke(
+        main,
+        ["scan", "--demo", "--offline", "--no-auto-update-db", "-f", "json", "-o", str(out)],
+        catch_exceptions=False,
+    )
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+def test_headline_counts_match_unified_stream(demo_console_output, demo_json_report):
+    """The complete bundled-demo headline equals the unified findings stream."""
+    by_sev = demo_json_report["finding_summary"]["by_severity"]
+    match = re.search(r"CRIT\s+(\d+)\s+HIGH\s+(\d+)\s+MED\s+(\d+)", demo_console_output)
+    assert match, "complete bundled-demo summary headline missing"
+    assert "PARTIAL COVERAGE" not in demo_console_output
+    assert demo_json_report["scan_run"]["outcome"] == "complete"
+    assert int(match.group(1)) == by_sev["critical"]
+    assert int(match.group(2)) == by_sev["high"]
+    assert int(match.group(3)) == by_sev["medium"]
+
+
+def test_progress_severity_line_is_scope_labeled(demo_console_output):
+    """The scan-progress severity breakdown is package-CVE-scoped and says so."""
+    assert re.search(r"Scan complete — package CVEs: \d+ critical", demo_console_output)
+
+
+def test_unified_totals_line_reconciles_progress_with_summary(demo_console_output, demo_json_report):
+    """A labeled all-categories totals line bridges the package-CVE progress
+    line and the unified summary box — no unlabeled second denominator."""
+    by_sev = demo_json_report["finding_summary"]["by_severity"]
+    pattern = rf"all finding categories.*{by_sev['critical']} critical.*{by_sev['high']} high.*{by_sev['medium']} medium"
+    assert re.search(pattern, demo_console_output) or re.search(
+        rf"{by_sev['critical']} critical · {by_sev['high']} high · {by_sev['medium']} medium.*all finding categories",
+        demo_console_output,
+    )
+
+
+def test_graph_derived_findings_drill_to_titles(demo_console_output):
+    """COMBINATION findings list titles in the console, not just a count."""
+    assert "AI agent can reach a credential or privileged tool" in demo_console_output
+
+
+def test_bad_news_counts_do_not_use_checkmark(demo_console_output):
+    """A non-zero toxic-combination count is a warning, not a success glyph."""
+    assert not re.search(r"✓\s*Toxic combinations: [1-9]", demo_console_output)
+    assert re.search(r"⚠\s*Toxic combinations: \d+", demo_console_output)
+
+
+def test_package_cve_instance_total_is_scope_labeled(demo_console_output):
+    """The per-package CVE-instance total cannot read as the finding count."""
+    assert re.search(r"\d+ package CVE instance", demo_console_output)
+
+
+def test_no_wrap_artifact_in_summary_box(demo_console_output):
+    """No stray wrapped '—…' cell fragment at the default 80-col width."""
+    assert not re.search(r"^│\s*—…", demo_console_output, flags=re.MULTILINE)
+
+
+def test_findings_table_never_truncates_cve_ids(demo_console_output, demo_json_report):
+    """Every CVE id shown in the findings table renders in full."""
+    assert "CVE-2020-14343" in demo_console_output
+    assert not re.search(r"CVE-[\d-]*…", demo_console_output)
+
+
+def test_verbose_summary_critical_row_states_its_scope(demo_verbose_console_output, demo_json_report):
+    """The verbose summary box counted package CVEs while calling them "findings".
+
+    ``print_summary`` renders ``len(report.critical_vulns)`` — blast radii only,
+    so a critical MALICIOUS_PACKAGE finding is excluded — seven lines above
+    ``print_posture_summary``'s ``N CRITICAL`` headline, which counts every
+    finding category. Two different denominators, one unscoped label.
+    """
+    by_sev = demo_json_report["finding_summary"]["by_severity"]
+    critical_cves = demo_json_report["summary"]["critical_findings"]
+    # The demo estate is only useful as a regression lock while the two bases
+    # genuinely differ; if they converge this test stops proving anything.
+    assert critical_cves != by_sev["critical"], "demo estate no longer exercises the two bases"
+
+    row = re.search(r"^\s*(Critical\b[^\d]*?)\s{2,}(\d+)\s*$", demo_verbose_console_output, flags=re.MULTILINE)
+    assert row, "verbose summary box has no critical row"
+    label, value = row.group(1).strip(), int(row.group(2))
+    assert value == critical_cves, "the row still counts package CVEs"
+    assert "CVE" in label, f"package-CVE-scoped row must say so, got {label!r}"
+
+
+def test_verbose_posture_headline_matches_unified_stream(demo_verbose_console_output, demo_json_report):
+    """The verbose posture headline is the all-categories count, like the compact one."""
+    by_sev = demo_json_report["finding_summary"]["by_severity"]
+    match = re.search(r"SECURITY POSTURE:\s+(\d+) CRITICAL,\s+(\d+) HIGH,\s+(\d+) MEDIUM", demo_verbose_console_output)
+    assert match, "verbose posture headline missing"
+    assert int(match.group(1)) == by_sev["critical"]
+    assert int(match.group(2)) == by_sev["high"]
+    assert int(match.group(3)) == by_sev["medium"]

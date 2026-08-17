@@ -1,0 +1,230 @@
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+
+import CompliancePage from "@/app/compliance/page";
+
+vi.mock("next/navigation", () => ({
+  useSearchParams: () => new URLSearchParams(""),
+}));
+
+// Render next/link as a plain anchor so href assertions are deterministic and
+// no app-router context is required in the test environment.
+vi.mock("next/link", () => ({
+  default: ({
+    children,
+    href,
+    ...rest
+  }: {
+    children: React.ReactNode;
+    href: string;
+  } & React.AnchorHTMLAttributes<HTMLAnchorElement>) => (
+    <a href={href} {...rest}>
+      {children}
+    </a>
+  ),
+}));
+
+// CIS drill-down fetches its own benchmark data on mount — stub it so the
+// compliance page test stays focused on the dense framework/control surface.
+vi.mock("@/components/cis-benchmark-detail", () => ({
+  CISBenchmarkDetail: () => <div>cis benchmark</div>,
+}));
+
+// The catalog panel fetches its own /v1/compliance/nist-800-53 drill on mount —
+// stub it so this test stays focused on the tag-mapped framework surface.
+vi.mock("@/components/compliance-nist-catalog", () => ({
+  ComplianceNistCatalog: () => <div>nist catalog</div>,
+}));
+
+const { compliance } = vi.hoisted(() => {
+  const control = (
+    code: string,
+    name: string,
+    status: string,
+    findings: number,
+    evidence_reason?: string,
+  ) => ({
+    code,
+    name,
+    findings,
+    status,
+    evidence_reason,
+    severity_breakdown: {},
+    affected_packages: [],
+    affected_agents: [],
+  });
+  const emptySummary = Object.fromEntries(
+    [
+      "owasp",
+      "owasp_mcp",
+      "atlas",
+      "nist",
+      "owasp_agentic",
+      "eu_ai_act",
+      "nist_csf",
+      "iso_27001",
+      "soc2",
+      "cis",
+      "cmmc",
+      "nist_800_53",
+      "fedramp",
+      "pci_dss",
+    ].flatMap((k) => [
+      [`${k}_pass`, 0],
+      [`${k}_warn`, 0],
+      [`${k}_fail`, 0],
+    ]),
+  ) as Record<string, number>;
+  return {
+    compliance: {
+      overall_score: 72,
+      overall_status: "warning" as const,
+      evaluated_controls: 25,
+      total_controls: 931,
+      coverage_pct: 2.69,
+      scan_count: 3,
+      latest_scan: "2026-07-14T00:00:00Z",
+      has_mcp_context: true,
+      has_agent_context: true,
+      owasp_llm_top10: [
+        control("LLM01", "Prompt Injection", "fail", 4),
+        control("LLM02", "Insecure Output Handling", "pass", 0),
+        control("LLM03", "Training Data Poisoning", "not_evaluated", 0, "no_completed_scan"),
+      ],
+      owasp_mcp_top10: [control("MCP01", "Tool Poisoning", "warning", 1)],
+      mitre_atlas: [],
+      nist_ai_rmf: [],
+      owasp_agentic_top10: [],
+      eu_ai_act: [],
+      nist_csf: [],
+      iso_27001: [],
+      soc2: [],
+      cis_controls: [],
+      cmmc: [],
+      nist_800_53: [],
+      fedramp: [],
+      pci_dss: [],
+      aisvs_benchmark: { checks: [], summary: {} },
+      summary: {
+        ...emptySummary,
+        owasp_pass: 1,
+        owasp_fail: 1,
+        owasp_mcp_warn: 1,
+        aisvs_pass: 0,
+        aisvs_fail: 0,
+        aisvs_error: 0,
+        aisvs_not_applicable: 0,
+      },
+    },
+  };
+});
+
+vi.mock("@/lib/api", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
+  return {
+    ...actual,
+    api: {
+      getCompliance: vi.fn().mockResolvedValue(compliance),
+      getFrameworkCatalogs: vi.fn().mockResolvedValue({ frameworks: {} }),
+      getHubPosture: vi
+        .fn()
+        .mockResolvedValue({ totals: { combined: 0, native: 0, hub: 0 } }),
+    },
+  };
+});
+
+describe("CompliancePage (dense restyle)", () => {
+  it("renders KPI strip, frameworks table, and control detail via split layout", async () => {
+    render(<CompliancePage />);
+
+    const strip = await screen.findByTestId("compliance-kpi-strip");
+    expect(within(strip).getByText("Overall")).toBeInTheDocument();
+    expect(within(strip).getByText("Passing")).toBeInTheDocument();
+    expect(within(strip).getByText("Failing")).toBeInTheDocument();
+
+    // The headline percentage must never ship without its denominator: 72% of
+    // 25 evaluated controls is not "72% of the estate is compliant".
+    expect(within(strip).getByText(/25 of 931 controls evaluated/i)).toBeInTheDocument();
+
+    const disclaimer = screen.getByTestId("compliance-helper-disclaimer");
+    expect(disclaimer).toHaveTextContent(/not a certification/i);
+    expect(disclaimer).toHaveTextContent(/evidence helper/i);
+
+    const table = screen.getByTestId("compliance-frameworks-table");
+    // Short labels appear as the primary framework name.
+    expect(within(table).getByText("LLM")).toBeInTheDocument();
+
+    // The first failing framework (OWASP LLM) is auto-selected, so its
+    // controls render in the detail pane.
+    await waitFor(() =>
+      expect(screen.getByText("Prompt Injection")).toBeInTheDocument(),
+    );
+  });
+
+  it("links a non-zero findings count to the framework/control-filtered queue", async () => {
+    render(<CompliancePage />);
+    await screen.findByTestId("compliance-kpi-strip");
+    await screen.findByText("Prompt Injection");
+
+    // LLM01 has 4 findings → a click-through into the findings queue.
+    const link = screen.getByRole("link", { name: /4 findings for LLM01/i });
+    expect(link).toHaveAttribute(
+      "href",
+      "/findings?framework=owasp-llm&control=LLM01",
+    );
+  });
+
+  it("keeps a zero findings count non-interactive", async () => {
+    render(<CompliancePage />);
+    await screen.findByTestId("compliance-kpi-strip");
+    await screen.findByText("Prompt Injection");
+
+    // LLM02 has 0 findings → plain text, no link.
+    expect(
+      screen.queryByRole("link", { name: /findings for LLM02/i }),
+    ).toBeNull();
+  });
+
+  it("surfaces WHY a not-evaluated control was not scored in the dense list", async () => {
+    render(<CompliancePage />);
+    await screen.findByTestId("compliance-kpi-strip");
+    // LLM03 is not_evaluated with reason no_completed_scan → the row shows the
+    // provenance, not a bare "Not evaluated".
+    await screen.findByText("Training Data Poisoning");
+    const reasons = screen.getAllByTestId("control-evidence-reason");
+    expect(reasons.some((el) => el.textContent === "No completed scan")).toBe(true);
+  });
+
+  it("offers a next-step CTA in the drawer for a not-evaluated control", async () => {
+    render(<CompliancePage />);
+    await screen.findByTestId("compliance-kpi-strip");
+
+    const poisoning = await screen.findByText("Training Data Poisoning");
+    fireEvent.click(poisoning);
+
+    const drawer = await screen.findByRole("dialog", {
+      name: /Control details for LLM03/i,
+    });
+    // Honest provenance line + an actionable "New Scan" link into /scan.
+    expect(within(drawer).getByTestId("control-unscored-provenance")).toHaveTextContent(
+      /not evaluated — no completed scan/i,
+    );
+    const cta = within(drawer).getByTestId("control-evidence-cta");
+    expect(cta).toHaveAttribute("href", "/scan");
+    expect(cta).toHaveTextContent("New Scan");
+  });
+
+  it("opens the control drawer when a control row is clicked", async () => {
+    render(<CompliancePage />);
+    await screen.findByTestId("compliance-kpi-strip");
+
+    const injection = await screen.findByText("Prompt Injection");
+    fireEvent.click(injection);
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("dialog", { name: /Control details for LLM01/i }),
+      ).toBeInTheDocument(),
+    );
+  });
+});

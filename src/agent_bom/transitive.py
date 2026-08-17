@@ -18,11 +18,13 @@ _logger = logging.getLogger(__name__)
 
 NPM_REGISTRY = "https://registry.npmjs.org"
 PYPI_API = "https://pypi.org/pypi"
+GO_PROXY = "https://proxy.golang.org"
 
 # Cache to avoid re-fetching the same package metadata (bounded)
 _MAX_TRANSITIVE_CACHE = 5_000
 _npm_cache: dict[str, dict] = {}
 _pypi_cache: dict[str, dict] = {}
+_go_cache: dict[str, str] = {}
 
 
 def _cache_put(cache: dict[str, dict], key: str, value: dict) -> None:
@@ -41,12 +43,71 @@ def _is_prerelease(version_str: str) -> bool:
     return "-" in base
 
 
+def _semver_tuple(version_str: str) -> tuple[int, int, int] | None:
+    """Parse an npm version core into a (major, minor, patch) tuple, or None.
+
+    Strips pre-release / build metadata and pads to three components so
+    comparisons are well-defined (``1.2`` → ``(1, 2, 0)``).
+    """
+    base = version_str.split("+")[0].split("-")[0].strip()
+    parts = base.split(".")
+    try:
+        nums = [int(p) for p in parts[:3]]
+    except ValueError:
+        return None
+    if not nums:
+        return None
+    while len(nums) < 3:
+        nums.append(0)
+    return (nums[0], nums[1], nums[2])
+
+
+def _npm_caret_tilde_bounds(version_range: str) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+    """Return ``(lo_inclusive, hi_exclusive)`` for an npm ``^``/``~`` range.
+
+    Implements npm's real caret/tilde semantics, including the 0.x special
+    cases the previous matcher got wrong:
+
+    - ``^1.2.3`` → ``>=1.2.3 <2.0.0``
+    - ``^0.2.3`` → ``>=0.2.3 <0.3.0``   (caret pins minor when major is 0)
+    - ``^0.0.3`` → ``>=0.0.3 <0.0.4``   (caret pins patch when major.minor are 0)
+    - ``~1.2.3`` / ``~1.2`` → ``>=… <1.3.0``
+    - ``~1``     → ``>=1.0.0 <2.0.0``
+    """
+    if not version_range or version_range[0] not in "^~":
+        return None
+    op = version_range[0]
+    body = version_range[1:].split(" ")[0]
+    comps = body.split(".")
+    try:
+        nums = [int(x) for x in comps if x.lstrip("-").isdigit()]
+    except ValueError:
+        return None
+    if not nums:
+        return None
+    major = nums[0]
+    minor = nums[1] if len(nums) > 1 else 0
+    patch = nums[2] if len(nums) > 2 else 0
+    lo = (major, minor, patch)
+    if op == "^":
+        if major > 0:
+            hi = (major + 1, 0, 0)
+        elif minor > 0:
+            hi = (0, minor + 1, 0)
+        else:
+            hi = (0, 0, patch + 1)
+    else:  # "~": ~X.Y[.Z] pins the minor; bare ~X pins the major.
+        hi = (major, minor + 1, 0) if len(nums) >= 2 else (major + 1, 0, 0)
+    return lo, hi
+
+
 def _resolve_npm_version(version_range: str, pkg_data: dict) -> str:
     """Pick the best npm version satisfying a semver range.
 
-    Uses a simplified semver matcher sufficient for most ^X.Y.Z / ~X.Y.Z / >=X patterns.
-    Excludes pre-release versions (e.g., 1.0.0-beta) unless no stable match is found.
-    Falls back to dist-tags.latest if no match found.
+    Resolves ``^X.Y.Z`` / ``~X.Y.Z`` / ``>=X`` ranges to the highest stable
+    version inside the range's real semver bounds (caret/tilde 0.x semantics
+    included). Excludes pre-releases unless no stable match exists. Falls back
+    to ``dist-tags.latest`` when nothing matches.
     """
     latest = pkg_data.get("dist-tags", {}).get("latest", "")
 
@@ -57,57 +118,30 @@ def _resolve_npm_version(version_range: str, pkg_data: dict) -> str:
     if not available:
         return latest
 
-    # Strip leading ^, ~, =, >, < to get the minimum version
-    stripped = version_range.lstrip("^~>=<").split(" ")[0]
-    try:
-        # Parse minimum as tuple of ints for comparison
-        min_parts = tuple(int(x) for x in stripped.split(".") if x.isdigit())
-    except ValueError:
-        return latest
-
-    # Parse operator
-    if version_range.startswith("^"):
-        # Compatible: same major, >= minor.patch
-        major = min_parts[0] if min_parts else 0
+    bounds = _npm_caret_tilde_bounds(version_range)
+    if bounds is not None:
+        lo, hi = bounds
         candidates = []
         for v in available:
             if _is_prerelease(v):
                 continue
-            try:
-                parts = tuple(int(x) for x in v.split(".") if x.isdigit())
-                if parts[0] == major and parts >= min_parts:
-                    candidates.append((parts, v))
-            except (ValueError, IndexError):
-                continue
+            parts = _semver_tuple(v)
+            if parts is not None and lo <= parts < hi:
+                candidates.append((parts, v))
         return max(candidates)[1] if candidates else latest
 
-    elif version_range.startswith("~"):
-        # Approximately: same major.minor, >= patch
-        major = min_parts[0] if len(min_parts) > 0 else 0
-        minor = min_parts[1] if len(min_parts) > 1 else 0
+    if ">=" in version_range:
+        stripped = version_range.lstrip("^~>=< ").split(" ")[0]
+        floor = _semver_tuple(stripped)
+        if floor is None:
+            return latest
         candidates = []
         for v in available:
             if _is_prerelease(v):
                 continue
-            try:
-                parts = tuple(int(x) for x in v.split(".") if x.isdigit())
-                if len(parts) >= 2 and parts[0] == major and parts[1] == minor and parts >= min_parts:
-                    candidates.append((parts, v))
-            except (ValueError, IndexError):
-                continue
-        return max(candidates)[1] if candidates else latest
-
-    elif ">=" in version_range:
-        candidates = []
-        for v in available:
-            if _is_prerelease(v):
-                continue
-            try:
-                parts = tuple(int(x) for x in v.split(".") if x.isdigit())
-                if parts >= min_parts:
-                    candidates.append((parts, v))
-            except (ValueError, IndexError):
-                continue
+            parts = _semver_tuple(v)
+            if parts is not None and parts >= floor:
+                candidates.append((parts, v))
         return max(candidates)[1] if candidates else latest
 
     return latest
@@ -167,8 +201,8 @@ async def fetch_npm_metadata(package_name: str, version: str, client: httpx.Asyn
                 if metadata:
                     _cache_put(_npm_cache, cache_key, metadata)
                     return metadata
-            except (ValueError, KeyError):
-                pass
+            except (ValueError, KeyError) as exc:
+                _logger.warning("Failed to parse npm metadata for %s@%s: %s", package_name, version, exc)
     else:
         response = await request_with_retry(
             client,
@@ -180,8 +214,8 @@ async def fetch_npm_metadata(package_name: str, version: str, client: httpx.Asyn
                 metadata = response.json()
                 _cache_put(_npm_cache, cache_key, metadata)
                 return metadata
-            except (ValueError, KeyError):
-                pass
+            except (ValueError, KeyError) as exc:
+                _logger.warning("Failed to parse npm metadata for %s@%s: %s", package_name, version, exc)
 
     return None
 
@@ -217,8 +251,8 @@ async def fetch_pypi_metadata(package_name: str, version: str, client: httpx.Asy
                         return data
                 _cache_put(_pypi_cache, cache_key, pkg_data)
                 return pkg_data
-            except (ValueError, KeyError):
-                pass
+            except (ValueError, KeyError) as exc:
+                _logger.warning("Failed to parse PyPI metadata for %s@%s: %s", package_name, version, exc)
     else:
         response = await request_with_retry(
             client,
@@ -230,8 +264,8 @@ async def fetch_pypi_metadata(package_name: str, version: str, client: httpx.Asy
                 data = response.json()
                 _cache_put(_pypi_cache, cache_key, data)
                 return data
-            except (ValueError, KeyError):
-                pass
+            except (ValueError, KeyError) as exc:
+                _logger.warning("Failed to parse PyPI metadata for %s@%s: %s", package_name, version, exc)
 
     return None
 
@@ -261,35 +295,66 @@ async def resolve_npm_dependencies(
         return []
 
     dependencies = []
-    dep_dict = metadata.get("dependencies", {})
+    dependency_sections = (
+        ("dependencies", "runtime", "runtime_dependency", True),
+        ("optionalDependencies", "optional", "declaration_only", False),
+        ("peerDependencies", "peer", "declaration_only", False),
+    )
 
-    for dep_name, dep_version in dep_dict.items():
-        # Clean version spec (remove ^, ~, etc.)
-        clean_version = dep_version.lstrip("^~>=<")
+    for section, dependency_scope, reachability_evidence, recurse in dependency_sections:
+        dep_dict = metadata.get(section, {}) or {}
+        for dep_name, dep_version in dep_dict.items():
+            # Clean version spec (remove ^, ~, etc.)
+            clean_version = dep_version.lstrip("^~>=<")
 
-        transitive_pkg = Package(
-            name=dep_name,
-            version=clean_version,
-            ecosystem="npm",
-            purl=f"pkg:npm/{dep_name}@{clean_version}",
-            is_direct=False,
-            parent_package=package.name,
-            dependency_depth=current_depth + 1,
-            resolved_from_registry=True,
-        )
-        dependencies.append(transitive_pkg)
+            transitive_pkg = Package(
+                name=dep_name,
+                version=clean_version,
+                ecosystem="npm",
+                purl=f"pkg:npm/{dep_name}@{clean_version}",
+                is_direct=False,
+                parent_package=package.name,
+                dependency_depth=current_depth + 1,
+                dependency_scope=dependency_scope,
+                reachability_evidence=reachability_evidence,
+                resolved_from_registry=True,
+            )
+            dependencies.append(transitive_pkg)
 
-        # Recursively resolve this package's dependencies
-        nested_deps = await resolve_npm_dependencies(
-            transitive_pkg,
-            client,
-            max_depth,
-            current_depth + 1,
-            seen,
-        )
-        dependencies.extend(nested_deps)
+            if not recurse:
+                continue
+
+            # Recursively resolve this package's runtime dependencies. Optional
+            # and peer declarations are surfaced as evidence, but not expanded
+            # as confirmed runtime paths.
+            nested_deps = await resolve_npm_dependencies(
+                transitive_pkg,
+                client,
+                max_depth,
+                current_depth + 1,
+                seen,
+            )
+            dependencies.extend(nested_deps)
 
     return dependencies
+
+
+def _split_requires_dist_marker(dep_spec: str) -> tuple[str, str]:
+    """Return the requirement body and optional PEP 508 marker."""
+    if ";" not in dep_spec:
+        return dep_spec.strip(), ""
+    requirement, marker = dep_spec.split(";", 1)
+    return requirement.strip(), marker.strip()
+
+
+def _scope_for_pypi_marker(marker: str) -> tuple[str, str]:
+    """Classify PyPI dependency markers without evaluating the local runtime."""
+    normalized = marker.lower().replace('"', "'")
+    if "extra ==" in normalized:
+        return "extra", "declaration_only"
+    if marker:
+        return "conditional", "declaration_only"
+    return "runtime", "runtime_dependency"
 
 
 async def resolve_pypi_dependencies(
@@ -327,12 +392,8 @@ async def resolve_pypi_dependencies(
 
     for dep_spec in requires_dist:
         # Parse dependency specification (e.g., "requests>=2.28.0")
-        # Skip extras and environment markers
-        if ";" in dep_spec:
-            dep_spec = dep_spec.split(";")[0].strip()
-
-        if "extra ==" in dep_spec:
-            continue  # Skip optional dependencies
+        dep_spec, marker = _split_requires_dist_marker(dep_spec)
+        dependency_scope, reachability_evidence = _scope_for_pypi_marker(marker)
 
         # Extract package name and version
         match = re.match(r"^([a-zA-Z0-9_.-]+)\s*([<>=!~]+)?\s*([a-zA-Z0-9_.*+-]+)?", dep_spec)
@@ -350,12 +411,137 @@ async def resolve_pypi_dependencies(
             is_direct=False,
             parent_package=package.name,
             dependency_depth=current_depth + 1,
+            dependency_scope=dependency_scope,
+            reachability_evidence=reachability_evidence,
             resolved_from_registry=True,
         )
         dependencies.append(transitive_pkg)
 
+        if reachability_evidence == "declaration_only":
+            continue
+
         # Recursively resolve this package's dependencies
         nested_deps = await resolve_pypi_dependencies(
+            transitive_pkg,
+            client,
+            max_depth,
+            current_depth + 1,
+            seen,
+        )
+        dependencies.extend(nested_deps)
+
+    return dependencies
+
+
+def _go_encode_module(module: str) -> str:
+    """Encode a Go module path for proxy.golang.org.
+
+    The Go module proxy uses case-encoding: uppercase letters become
+    ``!`` + lowercase (e.g., ``GitHub.com`` → ``!github.com``).
+    Forward slashes are kept as literal path separators in the URL.
+    """
+    parts: list[str] = []
+    for ch in module:
+        if ch.isupper():
+            parts.append("!")
+            parts.append(ch.lower())
+        else:
+            parts.append(ch)
+    return "".join(parts)
+
+
+def _parse_go_mod_requires(go_mod_text: str) -> list[tuple[str, str]]:
+    """Parse ``require`` directives from go.mod content.
+
+    Handles both single-line (``require module version``) and
+    block-style (``require ( ... )``) forms.  Lines ending with
+    ``// indirect`` are included — callers decide what to do with them.
+
+    Returns a list of ``(module, version)`` tuples.
+    """
+    requires: list[tuple[str, str]] = []
+    in_block = False
+    for raw_line in go_mod_text.splitlines():
+        line = raw_line.strip()
+        # Strip inline comments
+        if "//" in line:
+            line = line[: line.index("//")].strip()
+        if not line:
+            continue
+        if line.startswith("require ("):
+            in_block = True
+            continue
+        if in_block:
+            if line == ")":
+                in_block = False
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                requires.append((parts[0], parts[1]))
+        elif line.startswith("require "):
+            parts = line[len("require ") :].split()
+            if len(parts) >= 2:
+                requires.append((parts[0], parts[1]))
+    return requires
+
+
+async def fetch_go_mod(module: str, version: str, client: httpx.AsyncClient) -> Optional[str]:
+    """Fetch the go.mod file for a specific Go module version from the module proxy.
+
+    Returns the raw go.mod text on success, or ``None`` on any failure.
+    """
+    cache_key = f"{module}@{version}"
+    if cache_key in _go_cache:
+        return _go_cache[cache_key]
+
+    encoded = _go_encode_module(module)
+    url = f"{GO_PROXY}/{encoded}/@v/{version}.mod"
+    response = await request_with_retry(client, "GET", url)
+    if response and response.status_code == 200:
+        text = response.text
+        _cache_put(_go_cache, cache_key, text)  # type: ignore[arg-type]
+        return text
+    return None
+
+
+async def resolve_go_dependencies(
+    package: Package,
+    client: httpx.AsyncClient,
+    max_depth: int = 3,
+    current_depth: int = 0,
+    seen: Optional[set] = None,
+) -> list[Package]:
+    """Recursively resolve Go module dependencies via proxy.golang.org."""
+    if seen is None:
+        seen = set()
+
+    if current_depth >= max_depth:
+        return []
+
+    pkg_key = f"{package.name}@{package.version}"
+    if pkg_key in seen:
+        return []
+    seen.add(pkg_key)
+
+    go_mod_text = await fetch_go_mod(package.name, package.version, client)
+    if not go_mod_text:
+        return []
+
+    dependencies: list[Package] = []
+    for dep_module, dep_version in _parse_go_mod_requires(go_mod_text):
+        transitive_pkg = Package(
+            name=dep_module,
+            version=dep_version,
+            ecosystem="go",
+            purl=f"pkg:golang/{dep_module}@{dep_version}",
+            is_direct=False,
+            parent_package=package.name,
+            dependency_depth=current_depth + 1,
+            resolved_from_registry=True,
+        )
+        dependencies.append(transitive_pkg)
+
+        nested_deps = await resolve_go_dependencies(
             transitive_pkg,
             client,
             max_depth,
@@ -377,11 +563,21 @@ async def resolve_transitive_dependencies(
     async with create_client(timeout=30.0) as client:
         tasks = []
 
+        unsupported_logged: set[str] = set()
         for pkg in packages:
             if pkg.ecosystem == "npm":
                 tasks.append(resolve_npm_dependencies(pkg, client, max_depth))
             elif pkg.ecosystem == "pypi":
                 tasks.append(resolve_pypi_dependencies(pkg, client, max_depth))
+            elif pkg.ecosystem in ("go", "golang"):
+                tasks.append(resolve_go_dependencies(pkg, client, max_depth))
+            elif pkg.ecosystem not in unsupported_logged:
+                _logger.debug(
+                    "Transitive resolution not available for ecosystem %r — skipping %s",
+                    pkg.ecosystem,
+                    pkg.name,
+                )
+                unsupported_logged.add(pkg.ecosystem)
 
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -390,6 +586,7 @@ async def resolve_transitive_dependencies(
                 if isinstance(result, list):
                     all_transitive.extend(result)
                 elif isinstance(result, Exception):
+                    _logger.warning("Error resolving transitive deps: %s", result)
                     console.print(f"  [yellow]⚠ Error resolving transitive deps: {result}[/yellow]")
 
     # Deduplicate

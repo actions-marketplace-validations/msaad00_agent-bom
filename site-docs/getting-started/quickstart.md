@@ -1,57 +1,131 @@
 # Quick Start
 
-## Scan your environment
+## Install
 
 ```bash
-agent-bom scan
+pip install agent-bom
 ```
 
-This auto-discovers MCP clients on your machine (Claude Desktop, Cursor, VS Code, Windsurf, etc.), extracts configured servers and packages, and scans for CVEs.
-
-## Check a specific package
+## Scan your local AI environment
 
 ```bash
-agent-bom check langchain
-agent-bom check express --ecosystem npm
-agent-bom check tensorflow --ecosystem pypi
+agent-bom scan .
 ```
 
-## See what was discovered
+This auto-discovers local MCP clients and AI agent configs, extracts configured
+servers and packages, and scans for CVEs.
+
+## Scan a project plus local agent context
 
 ```bash
-agent-bom where    # show all discovery paths
-agent-bom scan -f json -o report.json   # full JSON report
+agent-bom scan -p .
 ```
 
-## Generate an SBOM
+Use this when you want one scan to cover both:
+- project manifests and lockfiles in the current repo
+- local MCP / agent context on your machine
+
+## Scan instruction and skill files
 
 ```bash
-agent-bom scan --sbom cyclonedx -o sbom.json
-agent-bom scan --sbom spdx -o sbom.spdx.json
+agent-bom skills scan .
+agent-bom skills verify .
 ```
 
-## Run compliance checks
+This covers `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, and supported `skills/*`
+instruction surfaces.
+
+## Check a specific package before installing
 
 ```bash
-agent-bom scan --compliance owasp-llm
-agent-bom scan --compliance eu-ai-act
-agent-bom scan --compliance all
+agent-bom check langchain@0.2.17 --ecosystem pypi
+agent-bom check express@4.18.2 --ecosystem npm
+agent-bom check tensorflow@2.17.0 --ecosystem pypi
 ```
+
+## Export machine-readable output
+
+```bash
+agent-bom scan -f json -o report.json
+agent-bom scan -f sarif -o findings.sarif
+agent-bom scan -f cyclonedx -o bom.json
+```
+
+## Ingest external scanner or SARIF evidence
+
+When an SCA, SBOM, or SAST tool already
+produced a report, run full local scan depth without a control plane:
+
+```bash
+agent-bom scan --external-scan trivy.json -f json -o report.json
+agent-bom scan --external-scan findings.sarif -f json -o report.json  # tool-agnostic import; no producer execution
+```
+
+For bulk push into a running control plane instead, use
+`agent-bom findings push <file>`. See
+[docs/INGEST_PATHS.md](https://github.com/msaad00/agent-bom/blob/main/docs/INGEST_PATHS.md)
+for the VM/registry matrix and push vs `--external-scan` tradeoff.
+
+## LLM FinOps (cost forecast)
+
+Project LLM burn rate from OpenTelemetry GenAI spans (read-only, no secret values):
+
+```bash
+agent-bom cost forecast
+```
+
+Price model and OTel ingest path: [docs/COST_MODEL.md](https://github.com/msaad00/agent-bom/blob/main/docs/COST_MODEL.md).
+
+## Run compliance mapping
+
+```bash
+agent-bom scan . --compliance
+agent-bom scan . --compliance --compliance-export owasp-llm
+agent-bom scan . --compliance --compliance-export eu-ai-act
+```
+
+`--compliance` adds all mapped framework tags to findings. Use
+`--compliance-export <framework>` when you also need one framework-specific
+evidence bundle.
 
 ## Scan a container image
 
 ```bash
-agent-bom scan --image python:3.12-slim
+agent-bom image python:3.12-slim
 ```
 
-Requires Grype and Syft installed locally.
+## Scan infrastructure as code
+
+```bash
+agent-bom iac Dockerfile k8s/ infra/main.tf
+```
+
+`iac` accepts one or more paths in a single run, so the example above scans:
+- a Dockerfile
+- a Kubernetes directory
+- a Terraform file
+
+## Inspect discovery paths
+
+```bash
+agent-bom where
+agent-bom mcp inventory
+```
+
+`agent-bom mcp where` still works when you want the grouped MCP subcommand form.
 
 ## Output formats
 
 ```bash
-agent-bom scan -f table    # terminal table (default)
+agent-bom scan -f console  # terminal output (default)
 agent-bom scan -f json     # JSON report
 agent-bom scan -f html     # HTML dashboard
 agent-bom scan -f sarif    # SARIF for GitHub Code Scanning
 agent-bom scan -f csv      # CSV export
+agent-bom check requests@2.33.0 -e pypi -f json   # single-package JSON verdict
+agent-bom report history -f json                  # saved scan metadata for CI
 ```
+
+If a GitHub Action produces SARIF but no Code Scanning alert appears, check the
+[SARIF upload troubleshooting guide](https://github.com/msaad00/agent-bom/blob/main/docs/GITHUB_ACTION_SARIF_TROUBLESHOOTING.md)
+for token permissions, fork PR behavior, report paths, and category settings.

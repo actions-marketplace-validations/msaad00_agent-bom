@@ -6,7 +6,8 @@ invocations, compares actual usage against declared capabilities, and
 optionally enforces security policy in real-time.
 
 Usage:
-    agent-bom proxy [--policy policy.json] [--log audit.jsonl] -- npx @mcp/server-filesystem /tmp
+    agent-bom proxy --no-isolate [--policy policy.json] [--log audit.jsonl] -- npx @mcp/server-filesystem /tmp
+    agent-bom proxy --sandbox-image ghcr.io/acme/mcp-runtime@sha256:<digest> -- npx @mcp/server-filesystem /tmp
 """
 
 from __future__ import annotations
@@ -17,299 +18,98 @@ import hmac
 import json
 import logging
 import os
-import re
+import platform
 import sys
+import tempfile
 import time
-from collections import defaultdict
-from dataclasses import dataclass, field
+import uuid
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import IO, Optional
+from typing import TYPE_CHECKING, Mapping, Optional
 
-from agent_bom.agent_identity import ANONYMOUS, check_identity
+from agent_bom import proxy_audit as _proxy_audit
+from agent_bom import proxy_policy as _proxy_policy
+from agent_bom.agent_identity import check_identity
+from agent_bom.api.tracing import (
+    build_traceparent,
+    get_tracer,
+    inject_current_trace_headers,
+    inject_trace_headers,
+    parse_baggage,
+    parse_traceparent,
+    parse_tracestate,
+)
+from agent_bom.async_stdin import create_async_stdin_reader, read_async_stdin_line
+from agent_bom.langfuse_otel import set_langfuse_runtime_attributes
+from agent_bom.proxy_sandbox import SandboxConfig, build_sandboxed_command
 from agent_bom.proxy_scanner import ScanConfig, load_scan_config, scan_tool_call, scan_tool_response
-from agent_bom.security import validate_arguments, validate_command
+from agent_bom.security import redact_secret_url, require_recognized_launcher, sanitize_text, validate_arguments
 
 logger = logging.getLogger(__name__)
 
-# Maximum JSON-RPC message size accepted from client or server (10 MB).
+if TYPE_CHECKING:
+    from agent_bom.api.policy_store import GatewayPolicy
+
+# Re-export stable helper names for tests and existing callers while keeping the
+# implementation split across dedicated proxy helper modules.
+ProxyMetrics = _proxy_audit.ProxyMetrics
+ProxyMetricsServer = _proxy_audit.ProxyMetricsServer
+ReplayDetector = _proxy_audit.ReplayDetector
+RotatingAuditLog = _proxy_audit.RotatingAuditLog
+AuditDeliveryController = _proxy_audit.AuditDeliveryController
+AuditSpilloverStore = _proxy_audit.AuditSpilloverStore
+_truncate_args = _proxy_audit._truncate_args
+compute_payload_hash = _proxy_audit.compute_payload_hash
+compute_response_hmac = _proxy_audit.compute_response_hmac
+log_tool_call = _proxy_audit.log_tool_call
+summarize_runtime_alerts = _proxy_audit.summarize_runtime_alerts
+write_audit_record = _proxy_audit.write_audit_record
+
+_safe_compile = _proxy_policy._safe_compile
+_safe_regex_match = _proxy_policy._safe_regex_match
+_safe_regex_search = _proxy_policy._safe_regex_search
+check_policy = _proxy_policy.check_policy
+resolve_rate_limit_threshold = _proxy_policy.resolve_rate_limit_threshold
+
+# Maximum JSON-RPC message size accepted from client or server (2 MiB).
 # Guards against DoS via oversized payloads in the stdio relay loop.
-_MAX_MESSAGE_BYTES = 10 * 1024 * 1024  # 10 MB
-
-# Regex execution timeout (seconds) — mitigates ReDoS from user-supplied patterns.
-_REGEX_TIMEOUT_SECONDS = 0.1
-
-# Pre-compiled pattern cache to avoid recompiling on every policy check.
-_compiled_patterns: dict[str, re.Pattern] = {}
+_MAX_MESSAGE_BYTES = 2 * 1024 * 1024
+_PROXY_TRACER = get_tracer("agent_bom.proxy")
+_PROXY_POLICY_CACHE_SIGNING_ENV_VAR = "AGENT_BOM_PROXY_POLICY_CACHE_ED25519_PRIVATE_KEY_PEM"
 
 
-def _safe_compile(pattern: str) -> re.Pattern:
-    """Compile and cache a regex pattern, raising re.error on invalid syntax."""
-    if pattern not in _compiled_patterns:
-        compiled = re.compile(pattern)
-        _compiled_patterns[pattern] = compiled
-    return _compiled_patterns[pattern]
+def _proxy_policy_cache_signing_pem() -> str:
+    """Resolve the cache-signing PEM file-first without retaining it in process env."""
+    from agent_bom.api.secret_source import resolve_secret
+
+    return resolve_secret(_PROXY_POLICY_CACHE_SIGNING_ENV_VAR).strip()
 
 
-def _safe_regex_match(pattern: str, text: str) -> bool:
-    """Run re.match with pre-compilation and input length guard against ReDoS."""
-    if len(text) > 10_000:
-        logger.warning("Skipping regex match on oversized input (%d chars)", len(text))
-        return False
-    compiled = _safe_compile(pattern)
-    return compiled.match(text) is not None
-
-
-def _safe_regex_search(pattern: str, text: str) -> bool:
-    """Run re.search with pre-compilation and input length guard against ReDoS."""
-    if len(text) > 10_000:
-        logger.warning("Skipping regex search on oversized input (%d chars)", len(text))
-        return False
-    compiled = _safe_compile(pattern)
-    return compiled.search(text) is not None
-
-
-# ─── Rotating audit log ─────────────────────────────────────────────────────
-
-# Maximum audit log size before rotation (100 MB). Prevents disk exhaustion
-# on long-running proxy instances.
-_AUDIT_LOG_MAX_BYTES = 100 * 1024 * 1024
-
-
-class RotatingAuditLog:
-    """File-like wrapper that rotates the JSONL audit log at a size threshold.
-
-    Checks file size every 1000 writes (not every line) to minimize stat() overhead.
-    Keeps one rotated backup (.1). Rejects symlinks on open.
-    """
-
-    def __init__(self, path: str, max_bytes: int = _AUDIT_LOG_MAX_BYTES) -> None:
-        self._path = path
-        self._max_bytes = max_bytes
-        self._writes = 0
-        self._file = self._open(path)
-
-    @staticmethod
-    def _open(path: str) -> IO[str]:
-        p = Path(path)
-        if p.is_symlink():
-            raise ValueError(f"Audit log path must not be a symlink: {path}")
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        return os.fdopen(fd, "a")
-
-    def write(self, data: str) -> int:
-        result = self._file.write(data)
-        self._writes += 1
-        if self._writes % 1000 == 0:
-            self._maybe_rotate()
-        return result
-
-    def flush(self) -> None:
-        self._file.flush()
-
-    def close(self) -> None:
-        self._file.close()
-
-    def _maybe_rotate(self) -> None:
+async def _read_bounded_line(reader: asyncio.StreamReader, *, max_bytes: int = _MAX_MESSAGE_BYTES) -> bytes | None:
+    """Read one newline-delimited message without accepting an oversized line."""
+    try:
+        line = await reader.readuntil(b"\n")
+    except asyncio.IncompleteReadError as exc:
+        return exc.partial or b""
+    except asyncio.LimitOverrunError as exc:
+        if exc.consumed:
+            await reader.readexactly(exc.consumed)
         try:
-            size = Path(self._path).stat().st_size
-            if size >= self._max_bytes:
-                self._file.close()
-                rotated = self._path + ".1"
-                if Path(rotated).exists():
-                    Path(rotated).unlink()
-                Path(self._path).rename(rotated)
-                self._file = self._open(self._path)
-                logger.info("Rotated audit log at %d bytes", size)
-        except OSError:
+            await reader.readuntil(b"\n")
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, ValueError):
             pass
+        return None
+    except ValueError:
+        while True:
+            chunk = await reader.read(1)
+            if not chunk or b"\n" in chunk:
+                break
+        return None
 
-
-# ─── Proxy metrics ──────────────────────────────────────────────────────────
-
-
-@dataclass
-class ProxyMetrics:
-    """Runtime observability metrics collected during proxy operation."""
-
-    start_time: float = field(default_factory=time.monotonic)
-    tool_calls: dict[str, int] = field(default_factory=lambda: defaultdict(int))
-    blocked_calls: dict[str, int] = field(default_factory=lambda: defaultdict(int))
-    latencies_ms: list[float] = field(default_factory=list)
-    total_messages_client_to_server: int = 0
-    total_messages_server_to_client: int = 0
-    replay_rejections: int = 0
-    relay_errors: int = 0
-
-    def record_call(self, tool_name: str) -> None:
-        """Record an allowed tool call."""
-        self.tool_calls[tool_name] += 1
-
-    def record_blocked(self, reason: str) -> None:
-        """Record a blocked tool call by reason category."""
-        self.blocked_calls[reason] += 1
-
-    _MAX_LATENCY_ENTRIES = 10_000
-
-    def record_latency(self, duration_ms: float) -> None:
-        """Record tool call round-trip latency in milliseconds (bounded)."""
-        self.latencies_ms.append(duration_ms)
-        if len(self.latencies_ms) > self._MAX_LATENCY_ENTRIES:
-            # Keep only the most recent half
-            self.latencies_ms = self.latencies_ms[self._MAX_LATENCY_ENTRIES // 2 :]
-
-    def summary(self) -> dict:
-        """Generate a metrics summary dict for JSONL export."""
-        elapsed = time.monotonic() - self.start_time
-        total_calls = sum(self.tool_calls.values())
-        total_blocked = sum(self.blocked_calls.values())
-
-        latency_stats: dict = {}
-        if self.latencies_ms:
-            sorted_lat = sorted(self.latencies_ms)
-            latency_stats = {
-                "min_ms": round(sorted_lat[0], 2),
-                "max_ms": round(sorted_lat[-1], 2),
-                "avg_ms": round(sum(sorted_lat) / len(sorted_lat), 2),
-                "p50_ms": round(sorted_lat[len(sorted_lat) // 2], 2),
-                "p95_ms": round(sorted_lat[int(len(sorted_lat) * 0.95)], 2),
-                "count": len(sorted_lat),
-            }
-
-        return {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "type": "proxy_summary",
-            "uptime_seconds": round(elapsed, 2),
-            "total_tool_calls": total_calls,
-            "total_blocked": total_blocked,
-            "calls_by_tool": dict(self.tool_calls),
-            "blocked_by_reason": dict(self.blocked_calls),
-            "latency": latency_stats,
-            "messages_client_to_server": self.total_messages_client_to_server,
-            "messages_server_to_client": self.total_messages_server_to_client,
-            "replay_rejections": self.replay_rejections,
-            "relay_errors": self.relay_errors,
-        }
-
-
-# ─── Prometheus metrics server ────────────────────────────────────────────────
-
-
-class ProxyMetricsServer:
-    """Lightweight HTTP server exposing Prometheus text exposition format on /metrics."""
-
-    def __init__(self, metrics: ProxyMetrics, port: int = 8422, token: Optional[str] = None, host: str = "127.0.0.1") -> None:
-        self.metrics = metrics
-        self.port = port
-        self.token = token
-        self.host = host
-        self._server: Optional[asyncio.AbstractServer] = None
-
-    def render_metrics(self) -> str:
-        """Render ProxyMetrics as Prometheus text exposition format."""
-        summary = self.metrics.summary()
-        lines: list[str] = []
-
-        # Tool call counters
-        lines.append("# HELP agent_bom_proxy_tool_calls_total Total tool calls proxied")
-        lines.append("# TYPE agent_bom_proxy_tool_calls_total counter")
-        for tool, count in summary.get("calls_by_tool", {}).items():
-            lines.append(f'agent_bom_proxy_tool_calls_total{{tool="{tool}"}} {count}')
-
-        # Blocked counters
-        lines.append("# HELP agent_bom_proxy_blocked_total Total blocked tool calls")
-        lines.append("# TYPE agent_bom_proxy_blocked_total counter")
-        for reason, count in summary.get("blocked_by_reason", {}).items():
-            lines.append(f'agent_bom_proxy_blocked_total{{reason="{reason}"}} {count}')
-
-        # Uptime
-        lines.append("# HELP agent_bom_proxy_uptime_seconds Proxy uptime in seconds")
-        lines.append("# TYPE agent_bom_proxy_uptime_seconds gauge")
-        lines.append(f"agent_bom_proxy_uptime_seconds {summary.get('uptime_seconds', 0)}")
-
-        # Totals
-        lines.append("# HELP agent_bom_proxy_total_tool_calls Total tool calls")
-        lines.append("# TYPE agent_bom_proxy_total_tool_calls counter")
-        lines.append(f"agent_bom_proxy_total_tool_calls {summary.get('total_tool_calls', 0)}")
-
-        lines.append("# HELP agent_bom_proxy_total_blocked Total blocked calls")
-        lines.append("# TYPE agent_bom_proxy_total_blocked counter")
-        lines.append(f"agent_bom_proxy_total_blocked {summary.get('total_blocked', 0)}")
-
-        # Latency
-        latency = summary.get("latency", {})
-        if latency:
-            lines.append("# HELP agent_bom_proxy_latency_ms Tool call round-trip latency")
-            lines.append("# TYPE agent_bom_proxy_latency_ms summary")
-            if "p50_ms" in latency:
-                lines.append(f'agent_bom_proxy_latency_ms{{quantile="0.5"}} {latency["p50_ms"]}')
-            if "p95_ms" in latency:
-                lines.append(f'agent_bom_proxy_latency_ms{{quantile="0.95"}} {latency["p95_ms"]}')
-
-        # Replay rejections
-        lines.append("# HELP agent_bom_proxy_replay_rejections_total Replay attack rejections")
-        lines.append("# TYPE agent_bom_proxy_replay_rejections_total counter")
-        lines.append(f"agent_bom_proxy_replay_rejections_total {summary.get('replay_rejections', 0)}")
-
-        # Messages
-        lines.append("# HELP agent_bom_proxy_messages_total Total JSON-RPC messages")
-        lines.append("# TYPE agent_bom_proxy_messages_total counter")
-        lines.append(f'agent_bom_proxy_messages_total{{direction="client_to_server"}} {summary.get("messages_client_to_server", 0)}')
-        lines.append(f'agent_bom_proxy_messages_total{{direction="server_to_client"}} {summary.get("messages_server_to_client", 0)}')
-
-        return "\n".join(lines) + "\n"
-
-    async def start(self) -> None:
-        """Start the metrics HTTP server."""
-        if self.port <= 0:
-            return
-
-        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            try:
-                await asyncio.wait_for(reader.readline(), timeout=10)
-                # Read remaining headers and capture Authorization
-                auth_header = ""
-                while True:
-                    header = await asyncio.wait_for(reader.readline(), timeout=5)
-                    if not header or header == b"\r\n":
-                        break
-                    header_str = header.decode("utf-8", errors="replace").strip()
-                    if header_str.lower().startswith("authorization:"):
-                        auth_header = header_str.split(":", 1)[1].strip()
-
-                # Bearer token auth (optional — enabled via --metrics-token).
-                # hmac.compare_digest prevents timing-based token enumeration.
-                if self.token:
-                    expected = f"Bearer {self.token}"
-                    if not hmac.compare_digest(auth_header or "", expected):
-                        response = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\n\r\nUnauthorized"
-                        writer.write(response.encode())
-                        await writer.drain()
-                        return
-
-                body = self.render_metrics()
-                response = (
-                    "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
-                    f"Content-Length: {len(body)}\r\n"
-                    "\r\n"
-                    f"{body}"
-                )
-                writer.write(response.encode())
-                await writer.drain()
-            except (asyncio.TimeoutError, ConnectionResetError):
-                pass
-            finally:
-                writer.close()
-
-        self._server = await asyncio.start_server(handle, self.host, self.port)
-        logger.info("Prometheus metrics server listening on %s:%d", self.host, self.port)
-
-    async def stop(self) -> None:
-        """Stop the metrics server."""
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
+    if len(line) > max_bytes:
+        return None
+    return line
 
 
 # ─── JSON-RPC parsing ────────────────────────────────────────────────────────
@@ -337,6 +137,30 @@ def is_tools_call(msg: dict) -> bool:
     return msg.get("method") == "tools/call"
 
 
+_POLICY_GATED_METHODS = {
+    "prompts/get",
+    "resources/read",
+    "sampling/createMessage",
+}
+
+
+def policy_subject_from_message(msg: dict) -> tuple[str, dict] | None:
+    """Return the policy subject and arguments for gated JSON-RPC methods."""
+    if is_tools_call(msg):
+        return extract_tool_name(msg) or "unknown", extract_tool_arguments(msg)
+
+    method = msg.get("method")
+    if not isinstance(method, str):
+        return None
+    if method not in _POLICY_GATED_METHODS and not method.startswith("mcp_extension/"):
+        return None
+
+    params = msg.get("params", {})
+    if isinstance(params, dict):
+        return method, params
+    return method, {"params": params}
+
+
 def is_tools_list_response(msg: dict, request_id: Optional[int | str] = None) -> bool:
     """Check if a JSON-RPC message is a tools/list response."""
     if "result" not in msg:
@@ -348,15 +172,31 @@ def is_tools_list_response(msg: dict, request_id: Optional[int | str] = None) ->
 
 
 def extract_tool_name(msg: dict) -> Optional[str]:
-    """Extract the tool name from a tools/call request."""
+    """Extract the tool name from a tools/call request.
+
+    A caller controls these types. A non-dict ``params`` or a non-string
+    ``name`` used to raise ``AttributeError`` out of the relay: a 500 with no
+    policy decision, no audit event, and no ledger record. Ill-typed is not
+    unnameable — it resolves to no name, and the caller is still governed.
+    """
     params = msg.get("params", {})
-    return params.get("name")
+    if not isinstance(params, dict):
+        return None
+    name = params.get("name")
+    return name if isinstance(name, str) else None
 
 
 def extract_tool_arguments(msg: dict) -> dict:
-    """Extract tool arguments from a tools/call request."""
+    """Extract tool arguments from a tools/call request.
+
+    Coerces a caller-supplied non-dict to an empty mapping for the same reason
+    as :func:`extract_tool_name`.
+    """
     params = msg.get("params", {})
-    return params.get("arguments", {})
+    if not isinstance(params, dict):
+        return {}
+    arguments = params.get("arguments", {})
+    return arguments if isinstance(arguments, dict) else {}
 
 
 def extract_declared_tools(msg: dict) -> list[str]:
@@ -378,208 +218,33 @@ def make_error_response(request_id: int | str | None, code: int, message: str) -
     }
 
 
-# ─── Audit logging ───────────────────────────────────────────────────────────
+def undeclared_tool_block_reason(block_undeclared: bool, declared_tools: set[str], tool_name: str) -> str | None:
+    """Return a hard-block reason for undeclared tools when enforcement is on."""
+    if not block_undeclared:
+        return None
+    if tool_name in declared_tools:
+        return None
+    if declared_tools:
+        return f"Tool '{tool_name}' not in declared tools/list"
+    return f"Tool '{tool_name}' blocked because no tools/list declarations are available"
 
 
-def log_tool_call(
-    log_file: IO[str],
-    tool_name: str,
-    arguments: dict,
-    policy_result: str = "allowed",
-    reason: str = "",
-    payload_sha256: str = "",
-    message_id: int | str | None = None,
-    agent_id: str = ANONYMOUS,
-) -> None:
-    """Append a tool call record to the audit JSONL log.
-
-    Args:
-        log_file: File-like object opened for writing/appending.
-        tool_name: Name of the tool being called.
-        arguments: Tool call arguments.
-        policy_result: "allowed" or "blocked".
-        reason: Reason for blocking (if blocked).
-        payload_sha256: SHA-256 hash of the full JSON-RPC payload.
-        message_id: JSON-RPC ``id`` field for correlation.
-        agent_id: Resolved caller identity (from _meta.agent_identity).
-    """
-    record: dict = {
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "type": "tools/call",
-        "tool": tool_name,
-        "agent_id": agent_id,
-        "args": _truncate_args(arguments),
-        "policy": policy_result,
-    }
-    if reason:
-        record["reason"] = reason
-    if payload_sha256:
-        record["payload_sha256"] = payload_sha256
-    if message_id is not None:
-        record["message_id"] = message_id
-
-    log_file.write(json.dumps(record) + "\n")
-    log_file.flush()
+def sandbox_posture_warning(sandbox_evidence: Mapping[str, object]) -> str | None:
+    """Return an operator-visible warning when proxy isolation is not active."""
+    if sandbox_evidence.get("enabled"):
+        return None
+    return (
+        "agent-bom proxy warning: sandbox isolation is disabled; the MCP server "
+        "runs as the current host user. Remove --no-isolate or set "
+        "AGENT_BOM_MCP_SANDBOX=1 to run the server in a restricted container."
+    )
 
 
-def _truncate_args(args: dict, max_value_len: int = 200) -> dict:
-    """Truncate long argument values for logging."""
-    result = {}
-    for k, v in args.items():
-        if isinstance(v, str) and len(v) > max_value_len:
-            result[k] = v[:max_value_len] + "...<truncated>"
-        else:
-            result[k] = v
-    return result
-
-
-# ─── Payload integrity ───────────────────────────────────────────────────────
-
-
-def compute_payload_hash(payload: dict) -> str:
-    """SHA-256 hash of the canonical JSON representation of a payload.
-
-    Uses sorted keys and compact separators so identical payloads always
-    produce the same digest regardless of dict ordering.
-    """
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def compute_response_hmac(payload: dict, key: str) -> str:
-    """HMAC-SHA256 of the canonical JSON response payload.
-
-    Written to the audit log so operators can verify responses were not
-    tampered with between the MCP server and this proxy.  The signature is
-    NOT inserted into the wire protocol (that would break the MCP spec).
-
-    Args:
-        payload: The parsed JSON-RPC response dict.
-        key: A shared secret known to both the proxy operator and the
-             verification tool.  Must be non-empty.
-
-    Returns:
-        Hex-encoded HMAC-SHA256 digest.
-    """
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hmac.new(key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-@dataclass
-class ReplayDetector:
-    """Detect replayed JSON-RPC messages by tracking payload hashes.
-
-    Maintains a bounded dict of ``hash → timestamp`` with a sliding time
-    window.  Messages whose hash was already seen within the window are
-    flagged as replays.
-    """
-
-    window_seconds: float = 300.0  # 5-minute sliding window
-    max_entries: int = 10_000
-    _seen: dict[str, float] = field(default_factory=dict)
-
-    def check(self, msg: dict) -> bool:
-        """Return *True* if *msg* is a replay (duplicate within the window)."""
-        h = compute_payload_hash(msg)
-        now = time.monotonic()
-
-        # Evict stale entries when approaching the cap.
-        # Only evict the oldest half to prevent flood-based eviction attacks —
-        # an attacker cannot flush the entire history by sending many unique messages.
-        if len(self._seen) >= self.max_entries:
-            # First try time-based eviction
-            self._seen = {k: v for k, v in self._seen.items() if (now - v) < self.window_seconds}
-            # If still over capacity (all entries are within window), evict oldest half
-            if len(self._seen) >= self.max_entries:
-                sorted_entries = sorted(self._seen.items(), key=lambda x: x[1])
-                keep_from = len(sorted_entries) // 2
-                self._seen = dict(sorted_entries[keep_from:])
-
-        if h in self._seen and (now - self._seen[h]) < self.window_seconds:
-            return True
-
-        self._seen[h] = now
-        return False
-
-
-# ─── Policy checking ─────────────────────────────────────────────────────────
-
-
-def check_policy(
-    policy: dict,
-    tool_name: str,
-    arguments: dict,
-) -> tuple[bool, str]:
-    """Evaluate runtime policy against a tools/call request.
-
-    Args:
-        policy: Policy dict with runtime rules.
-        tool_name: Name of the tool being called.
-        arguments: Tool call arguments.
-
-    Returns:
-        (allowed, reason) tuple. If blocked, reason explains why.
-    """
-    rules = policy.get("rules", [])
-
-    # Allowlist mode: if a rule has mode=allowlist, only listed tools pass.
-    # Checked first — allowlist takes precedence over blocklist rules.
-    for rule in rules:
-        if rule.get("mode") != "allowlist":
-            continue
-        action = rule.get("action", "warn")
-        if action not in ("fail", "block"):
-            continue
-        allowed_tools = rule.get("allow_tools", [])
-        if tool_name not in allowed_tools:
-            return False, f"Tool '{tool_name}' not in allowlist for rule '{rule.get('id', '?')}'"
-        # Tool is in the allowlist — still fall through to arg_pattern checks
-        break
-
-    for rule in rules:
-        action = rule.get("action", "warn")
-        if action not in ("fail", "block"):
-            continue  # Only enforce blocking rules at runtime
-
-        # Skip allowlist rules in the blocklist loop (already handled above)
-        if rule.get("mode") == "allowlist":
-            continue
-
-        # block_tools: list of tool names to block entirely
-        blocked = rule.get("block_tools", [])
-        if blocked and tool_name in blocked:
-            return False, f"Tool '{tool_name}' is blocked by rule '{rule.get('id', '?')}'"
-
-        # tool_name match (exact)
-        rule_tool = rule.get("tool_name")
-        if rule_tool and rule_tool == tool_name:
-            return False, f"Tool '{tool_name}' blocked by rule '{rule.get('id', '?')}'"
-
-        # tool_name_pattern match (regex) — compile with length + timeout guard to mitigate ReDoS
-        pattern = rule.get("tool_name_pattern")
-        if pattern:
-            try:
-                if len(pattern) > 500:
-                    logger.warning("Skipping oversized tool_name_pattern (%d chars)", len(pattern))
-                elif _safe_regex_match(pattern, tool_name):
-                    return False, f"Tool '{tool_name}' matches blocked pattern '{pattern}'"
-            except re.error:
-                pass
-
-        # arg_pattern: {arg_name: regex_pattern} — length + timeout guard to mitigate ReDoS
-        arg_patterns = rule.get("arg_pattern", {})
-        for arg_name, arg_regex in arg_patterns.items():
-            arg_value = str(arguments.get(arg_name, ""))
-            try:
-                if len(arg_regex) > 500:
-                    logger.warning("Skipping oversized arg_pattern for '%s' (%d chars)", arg_name, len(arg_regex))
-                    continue
-                if _safe_regex_search(arg_regex, arg_value):
-                    return False, f"Argument '{arg_name}' matches blocked pattern '{arg_regex}'"
-            except re.error:
-                pass
-
-    return True, ""
+def _command_name_for_validation(command: str, sandbox_evidence: Mapping[str, object]) -> str:
+    """Validate sandbox-generated container runtimes by name, not resolved path."""
+    if sandbox_evidence.get("enabled") and sandbox_evidence.get("mode") in {"wrap_command_in_image", "harden_existing_container"}:
+        return Path(command).name
+    return command
 
 
 # ─── Proxy core ──────────────────────────────────────────────────────────────
@@ -601,6 +266,506 @@ def set_gateway_evaluator(fn) -> None:  # noqa: ANN001
     _gateway_evaluator = fn
 
 
+# ─── Inter-agent firewall evaluator hook (#982 PR 3) ─────────────────────────
+
+_firewall_evaluator = None  # type: ignore[var-annotated]
+_firewall_target_id: str | None = None
+
+
+def set_firewall_evaluator(fn, *, target_id: str | None = None) -> None:  # noqa: ANN001
+    """Register an async inter-agent firewall evaluator.
+
+    The callable signature must be
+    ``async (source_agent: str, target_agent: str, source_roles: frozenset[str],
+              target_roles: frozenset[str]) -> FirewallEvaluation``.
+
+    `target_id` is the agent identity this proxy is wrapping (the *target*
+    side of the source -> target firewall pair). When set, the proxy uses
+    it for every firewall lookup; when unset, the firewall is not consulted.
+    """
+    global _firewall_evaluator
+    global _firewall_target_id
+    _firewall_evaluator = fn
+    _firewall_target_id = target_id
+
+
+def clear_firewall_evaluator() -> None:
+    """Test/teardown helper — drop the registered evaluator."""
+    global _firewall_evaluator
+    global _firewall_target_id
+    _firewall_evaluator = None
+    _firewall_target_id = None
+
+
+def _firewall_target_for_proxy() -> str | None:
+    return _firewall_target_id
+
+
+async def _maybe_block_on_firewall(
+    *,
+    source_agent: str,
+    target_agent: str,
+    tool_name: str,
+    arguments: dict,
+    log_file,  # noqa: ANN001 — proxy uses an open file handle / RotatingAuditLog
+    payload_sha256: str | None,
+    message_id,  # noqa: ANN001 — JSON-RPC id can be int / str / None
+    tenant_id: str | None,
+    metrics=None,  # noqa: ANN001 — ProxyMetrics; SSE proxy path doesn't track metrics
+) -> str | None:
+    """Run the registered firewall evaluator for source -> target.
+
+    Returns:
+        - the reason string when the call should be blocked (caller emits the
+          JSON-RPC error response so this helper stays decision-only),
+        - None when the call may proceed.
+
+    On exception inside the evaluator the proxy fails open here. The
+    `FirewallClient` already encodes the gateway fail-mode (open / closed)
+    internally, so unexpected raises here are out-of-policy errors.
+    """
+
+    from agent_bom.firewall import FirewallDecision
+
+    if _firewall_evaluator is None:
+        return None
+    try:
+        evaluation = await _firewall_evaluator(
+            source_agent,
+            target_agent,
+            frozenset(),
+            frozenset(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "firewall evaluator raised; allowing call (source=%s, target=%s): %s",
+            source_agent,
+            target_agent,
+            exc,
+        )
+        return None
+
+    effective = evaluation.effective_decision
+    if effective == FirewallDecision.ALLOW:
+        return None
+
+    matched = evaluation.matched_rule
+    rule_desc = (
+        f"{matched.source} -> {matched.target} ({matched.decision.value})" + (f" · {matched.description}" if matched.description else "")
+        if matched is not None
+        else "default"
+    )
+
+    if effective == FirewallDecision.WARN:
+        if metrics is not None:
+            metrics.record_blocked("firewall_warn")
+        if log_file:
+            log_tool_call(
+                log_file,
+                tool_name,
+                arguments,
+                "warn",
+                f"firewall warn: {source_agent} -> {target_agent} [{rule_desc}]",
+                payload_sha256=payload_sha256 or "",
+                message_id=message_id,
+                agent_id=source_agent,
+                tenant_id=tenant_id or "default",
+            )
+        return None
+
+    # DENY
+    reason = f"firewall: {source_agent} -> {target_agent} blocked [{rule_desc}]"
+    if metrics is not None:
+        metrics.record_blocked("firewall")
+    if log_file:
+        log_tool_call(
+            log_file,
+            tool_name,
+            arguments,
+            "blocked",
+            reason,
+            payload_sha256=payload_sha256 or "",
+            message_id=message_id,
+            agent_id=source_agent,
+            tenant_id=tenant_id or "default",
+        )
+    return reason
+
+
+def _sanitize_for_log(value: object) -> str:
+    return str(value).replace("\r", "").replace("\n", "")
+
+
+def _generate_proxy_source_id() -> str:
+    hostname = platform.node() or "unknown"
+    return hashlib.sha256(hostname.encode()).hexdigest()[:12]
+
+
+def _control_plane_headers(token: str | None, etag: str | None = None) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if etag:
+        headers["If-None-Match"] = etag
+    return inject_current_trace_headers(headers)
+
+
+def _proxy_request_headers(
+    headers: dict[str, str] | None = None,
+    *,
+    traceparent: str | None = None,
+    tracestate: str | None = None,
+    baggage: str | None = None,
+) -> dict[str, str]:
+    if traceparent or tracestate or baggage:
+        return inject_trace_headers(
+            headers,
+            traceparent=traceparent,
+            tracestate=tracestate,
+            baggage=baggage,
+        )
+    return inject_current_trace_headers(headers)
+
+
+def _extract_jsonrpc_trace_meta(message: dict[str, object]) -> dict[str, str]:
+    """Return bounded W3C trace metadata carried in JSON-RPC `_meta`.
+
+    stdio JSON-RPC has no native header channel, so `_meta` is the least
+    surprising place to preserve trace context across proxy boundaries.
+    """
+    raw_meta = message.get("_meta")
+    if not isinstance(raw_meta, dict):
+        return {}
+    trace_meta: dict[str, str] = {}
+    traceparent = parse_traceparent(str(raw_meta.get("traceparent", "")).strip())
+    if traceparent:
+        trace_meta["traceparent"] = build_traceparent(
+            traceparent["trace_id"],
+            traceparent["parent_span_id"],
+            traceparent["trace_flags"],
+        )
+    tracestate = parse_tracestate(str(raw_meta.get("tracestate", "")).strip())
+    if tracestate:
+        trace_meta["tracestate"] = tracestate
+    baggage = parse_baggage(str(raw_meta.get("baggage", "")).strip())
+    if baggage:
+        trace_meta["baggage"] = baggage
+    return trace_meta
+
+
+def _inject_jsonrpc_trace_meta(
+    message: dict[str, object],
+    *,
+    traceparent: str | None = None,
+    tracestate: str | None = None,
+    baggage: str | None = None,
+) -> dict[str, object]:
+    """Return a JSON-RPC message with bounded W3C trace context in `_meta`."""
+    if not traceparent and not tracestate and not baggage:
+        return message
+    enriched = dict(message)
+    raw_meta = message.get("_meta")
+    meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+    if traceparent:
+        meta["traceparent"] = traceparent
+    if tracestate:
+        meta["tracestate"] = tracestate
+    if baggage:
+        meta["baggage"] = baggage
+    enriched["_meta"] = meta
+    return enriched
+
+
+def _stitch_jsonrpc_trace_meta(
+    message: dict[str, object],
+    fallback_trace_meta: dict[str, str] | None,
+) -> dict[str, object]:
+    """Preserve response trace metadata or rehydrate it from the paired request."""
+    response_trace_meta = _extract_jsonrpc_trace_meta(message)
+    merged = {
+        "traceparent": response_trace_meta.get("traceparent") or (fallback_trace_meta or {}).get("traceparent"),
+        "tracestate": response_trace_meta.get("tracestate") or (fallback_trace_meta or {}).get("tracestate"),
+        "baggage": response_trace_meta.get("baggage") or (fallback_trace_meta or {}).get("baggage"),
+    }
+    return _inject_jsonrpc_trace_meta(
+        message,
+        traceparent=merged["traceparent"],
+        tracestate=merged["tracestate"],
+        baggage=merged["baggage"],
+    )
+
+
+def _gateway_policy_cache_path() -> Path:
+    configured = os.environ.get("AGENT_BOM_PROXY_POLICY_CACHE_PATH")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".agent-bom" / "cache" / "gateway-policies.json"
+
+
+def _gateway_policy_cache_signature_path(cache_path: Path) -> Path:
+    return cache_path.with_name(f"{cache_path.name}.sig")
+
+
+class _GatewayPolicyCacheSigner:
+    def __init__(self, pem: str) -> None:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        loaded = serialization.load_pem_private_key(pem.encode(), password=None)
+        if not isinstance(loaded, Ed25519PrivateKey):
+            raise ValueError(f"{_PROXY_POLICY_CACHE_SIGNING_ENV_VAR} is not an Ed25519 key")
+        self._private_key = loaded
+        public_bytes: bytes = loaded.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        self.key_id = hashlib.sha256(public_bytes).hexdigest()[:16]
+
+    def sign(self, payload: bytes) -> str:
+        return self._private_key.sign(payload).hex()
+
+    def verify(self, payload: bytes, signature_hex: str) -> None:
+        self._private_key.public_key().verify(bytes.fromhex(signature_hex), payload)
+
+
+_gateway_policy_cache_signer: _GatewayPolicyCacheSigner | None = None
+_gateway_policy_cache_signer_error: str | None = None
+
+
+def _load_gateway_policy_cache_signer() -> _GatewayPolicyCacheSigner | None:
+    global _gateway_policy_cache_signer, _gateway_policy_cache_signer_error
+    if _gateway_policy_cache_signer is not None:
+        return _gateway_policy_cache_signer
+    pem = _proxy_policy_cache_signing_pem()
+    if not pem:
+        return None
+    if _gateway_policy_cache_signer_error is not None:
+        return None
+    try:
+        _gateway_policy_cache_signer = _GatewayPolicyCacheSigner(pem)
+        logger.info(
+            "proxy gateway policy cache signing enabled (key_id=%s)",
+            _gateway_policy_cache_signer.key_id,
+        )
+        return _gateway_policy_cache_signer
+    except Exception as exc:  # noqa: BLE001
+        _gateway_policy_cache_signer_error = str(exc)
+        logger.error("%s could not be parsed: %s", _PROXY_POLICY_CACHE_SIGNING_ENV_VAR, sanitize_text(exc))
+        return None
+
+
+def _reset_gateway_policy_cache_signer_for_tests() -> None:
+    global _gateway_policy_cache_signer, _gateway_policy_cache_signer_error
+    _gateway_policy_cache_signer = None
+    _gateway_policy_cache_signer_error = None
+
+
+def _canonicalize_gateway_policy_cache(payload: Mapping[str, object]) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _load_cached_gateway_policies(
+    cache_path: Path,
+    max_age_seconds: int,
+) -> tuple[list["GatewayPolicy"] | None, str | None]:
+    from agent_bom.api.policy_store import GatewayPolicy
+
+    try:
+        payload = json.loads(cache_path.read_text())
+    except FileNotFoundError:
+        return None, None
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Ignoring unreadable gateway policy cache %s: %s", cache_path, sanitize_text(exc))
+        return None, None
+
+    fetched_at = payload.get("fetched_at")
+    if not isinstance(fetched_at, (int, float)):
+        logger.warning("Ignoring gateway policy cache %s with missing fetched_at", cache_path)
+        return None, None
+    age_seconds = time.time() - float(fetched_at)
+    if age_seconds > max(max_age_seconds, 0):
+        logger.warning(
+            "Ignoring stale gateway policy cache %s (age=%ss, max=%ss)",
+            cache_path,
+            int(age_seconds),
+            max(max_age_seconds, 0),
+        )
+        return None, None
+
+    signer = _load_gateway_policy_cache_signer()
+    if _proxy_policy_cache_signing_pem():
+        if signer is None:
+            logger.warning("Ignoring gateway policy cache %s because cache signing is misconfigured", cache_path)
+            return None, None
+        signature_path = _gateway_policy_cache_signature_path(cache_path)
+        try:
+            signature_payload = json.loads(signature_path.read_text())
+            signature_hex = str(signature_payload["signature_hex"])
+            key_id = str(signature_payload["key_id"])
+        except FileNotFoundError:
+            logger.warning("Ignoring unsigned gateway policy cache %s because signing is required", cache_path)
+            return None, None
+        except (KeyError, TypeError, json.JSONDecodeError, OSError) as exc:
+            logger.warning("Ignoring unreadable gateway policy cache signature %s: %s", signature_path, sanitize_text(exc))
+            return None, None
+        if key_id != signer.key_id:
+            logger.warning(
+                "Ignoring gateway policy cache %s signed with unexpected key_id=%s (expected %s)",
+                cache_path,
+                key_id,
+                signer.key_id,
+            )
+            return None, None
+        try:
+            signer.verify(_canonicalize_gateway_policy_cache(payload), signature_hex)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Ignoring gateway policy cache %s with invalid signature: %s", cache_path, sanitize_text(exc))
+            return None, None
+
+    try:
+        policies = [GatewayPolicy(**item) for item in payload.get("policies", [])]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Ignoring invalid gateway policy cache %s: %s", cache_path, sanitize_text(exc))
+        return None, None
+    return policies, payload.get("etag")
+
+
+def _persist_gateway_policies_cache(
+    cache_path: Path,
+    policies: list["GatewayPolicy"],
+    etag: str | None,
+) -> None:
+    payload = {
+        "fetched_at": time.time(),
+        "etag": etag,
+        "policies": [policy.model_dump(mode="json") for policy in policies],
+    }
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        signature_path = _gateway_policy_cache_signature_path(cache_path)
+        signer = _load_gateway_policy_cache_signer()
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(cache_path.parent),
+            prefix=f"{cache_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temp_path = Path(handle.name)
+        temp_path.replace(cache_path)
+        if signer is not None:
+            signature_payload = {
+                "algorithm": "Ed25519",
+                "key_id": signer.key_id,
+                "signature_hex": signer.sign(_canonicalize_gateway_policy_cache(payload)),
+            }
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=str(signature_path.parent),
+                prefix=f"{signature_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                json.dump(signature_payload, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+                temp_sig_path = Path(handle.name)
+            temp_sig_path.replace(signature_path)
+    except OSError as exc:
+        logger.warning("Failed to persist gateway policy cache %s: %s", cache_path, sanitize_text(exc))
+
+
+async def _fetch_enabled_gateway_policies(
+    base_url: str,
+    token: str | None,
+    etag: str | None = None,
+) -> tuple[list["GatewayPolicy"] | None, str | None]:
+    from agent_bom.api.policy_store import GatewayPolicy
+    from agent_bom.http_client import create_client
+
+    url = base_url.rstrip("/") + "/v1/gateway/policies?enabled=true"
+    span_cm = _PROXY_TRACER.start_as_current_span("proxy.fetch_gateway_policies") if _PROXY_TRACER else nullcontext()
+    with span_cm as span:
+        if span is not None:
+            span.set_attribute("agent_bom.proxy.control_plane_url", base_url.rstrip("/"))
+            span.set_attribute("agent_bom.proxy.gateway_policy_etag_present", bool(etag))
+        async with create_client(timeout=15.0) as client:
+            response = await client.get(url, headers=_control_plane_headers(token, etag))
+    if response.status_code == 304:
+        return None, response.headers.get("ETag", etag)
+    response.raise_for_status()
+    payload = response.json()
+    policies = [GatewayPolicy(**item) for item in payload.get("policies", [])]
+    if span is not None:
+        span.set_attribute("agent_bom.proxy.gateway_policy_count", len(policies))
+    return policies, response.headers.get("ETag")
+
+
+def _resolve_control_plane_rate_limit_threshold(policies: list["GatewayPolicy"], agent_name: str | None = None) -> int | None:
+    from agent_bom.gateway import gateway_policy_to_proxy_format
+
+    limits: list[int] = []
+    for policy in policies:
+        if not getattr(policy, "enabled", False):
+            continue
+        if agent_name and getattr(policy, "bound_agents", None) and agent_name not in getattr(policy, "bound_agents", []):
+            continue
+        proxy_fmt = gateway_policy_to_proxy_format(policy)
+        limit = resolve_rate_limit_threshold(proxy_fmt)
+        if limit is not None:
+            limits.append(limit)
+    return min(limits) if limits else None
+
+
+async def _push_proxy_audit_batch(
+    base_url: str,
+    token: str | None,
+    source_id: str,
+    session_id: str,
+    alerts: list[dict],
+    summary: dict | None = None,
+) -> bool:
+    from agent_bom.http_client import create_client
+
+    if not alerts and summary is None:
+        return True
+    url = base_url.rstrip("/") + "/v1/proxy/audit"
+    payload = {
+        "source_id": source_id,
+        "session_id": session_id,
+        "alerts": alerts,
+        "summary": summary,
+    }
+    span_cm = _PROXY_TRACER.start_as_current_span("proxy.push_audit_batch") if _PROXY_TRACER else nullcontext()
+    with span_cm as span:
+        if span is not None:
+            span.set_attribute("agent_bom.proxy.audit_alert_count", len(alerts))
+            span.set_attribute("agent_bom.proxy.audit_has_summary", summary is not None)
+        async with create_client(timeout=15.0) as client:
+            response = await client.post(url, json=payload, headers=_control_plane_headers(token))
+    response.raise_for_status()
+    return True
+
+
+# Strong references to in-flight webhook tasks. asyncio holds only a weak
+# reference to a running task, so a bare ensure_future(_send_webhook(...)) can be
+# garbage-collected mid-send and silently drop the alert ("Task was destroyed but
+# it is pending"). Retaining the task until it completes fixes that (#3911).
+_WEBHOOK_TASKS: set[asyncio.Task] = set()
+
+
+def _fire_webhook(url: str, payload: dict) -> None:
+    """Dispatch an alert webhook without letting the task be GC'd mid-flight."""
+    task = asyncio.ensure_future(_send_webhook(url, payload))
+    _WEBHOOK_TASKS.add(task)
+    task.add_done_callback(_WEBHOOK_TASKS.discard)
+
+
 async def _send_webhook(url: str, payload: dict) -> None:
     """Fire-and-forget POST to an alert webhook URL.
 
@@ -611,7 +776,7 @@ async def _send_webhook(url: str, payload: dict) -> None:
     try:
         validate_url(url)
     except SecurityError as e:
-        logger.warning("Webhook URL rejected: %s", e)
+        logger.warning("Webhook URL rejected: %s", sanitize_text(e))
         return
 
     try:
@@ -620,7 +785,369 @@ async def _send_webhook(url: str, payload: dict) -> None:
         async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)) as client:
             await client.post(url, json=payload)
     except Exception:  # noqa: BLE001
-        logger.debug("Failed to send webhook to %s", url)
+        logger.debug("Failed to send webhook to %s", redact_secret_url(url))
+
+
+async def _proxy_sse_server(
+    url: str,
+    policy_path: Optional[str] = None,
+    log_path: Optional[str] = None,
+    block_undeclared: bool = False,
+    alert_webhook: Optional[str] = None,
+) -> int:
+    """Proxy an SSE/HTTP MCP server through the protection engine.
+
+    Connects to a remote MCP server that exposes an SSE or HTTP transport
+    instead of spawning a subprocess.  Tool calls received on stdin are
+    forwarded through the protection engine then POSTed to the server URL.
+    Responses are written back to stdout.
+
+    Args:
+        url: Base URL of the remote SSE/HTTP MCP server.
+        policy_path: Optional path to a runtime policy JSON file.
+        log_path: Optional path to audit JSONL log.
+        block_undeclared: Block tools not in initial tools/list.
+        alert_webhook: Optional webhook URL for alert notifications.
+
+    Returns:
+        0 on clean shutdown, 1 on connection or policy load error.
+    """
+    import httpx
+
+    from agent_bom.runtime.detectors import (
+        ArgumentAnalyzer,
+        SequenceAnalyzer,
+    )
+
+    # Load policy
+    policy: dict = {}
+    if policy_path:
+        try:
+            from agent_bom.security import SecurityError, validate_json_file
+
+            policy = validate_json_file(Path(policy_path))
+        except (json.JSONDecodeError, OSError, SecurityError) as exc:
+            logger.error("Failed to load policy from %s: %s", policy_path, sanitize_text(exc))
+            return 1
+
+    # Open audit log
+    log_file = None
+    if log_path:
+        log_file = RotatingAuditLog(log_path)
+
+    arg_analyzer = ArgumentAnalyzer()
+    seq_analyzer = SequenceAnalyzer()
+    replay_detector = ReplayDetector()
+    scan_config = load_scan_config(policy) if policy else ScanConfig()
+    runtime_alerts: list[dict] = []
+    control_plane_tenant_id = (os.environ.get("AGENT_BOM_TENANT_ID") or "default").strip() or "default"
+
+    def _handle_alerts_sse(alerts, log_f=None):
+        for alert in alerts:
+            alert_dict = alert.to_dict()
+            runtime_alerts.append(alert_dict)
+            logger.warning("Runtime alert: %s", alert_dict.get("message", "runtime alert"))
+            if log_f:
+                write_audit_record(log_f, alert_dict)
+                log_f.flush()
+            if alert_webhook:
+                _fire_webhook(alert_webhook, alert_dict)
+
+    declared_tools: set[str] = set()
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Fetch tool list from the remote server
+            try:
+                span_cm = _PROXY_TRACER.start_as_current_span("proxy.sse_tools_list") if _PROXY_TRACER else nullcontext()
+                with span_cm as span:
+                    if span is not None:
+                        span.set_attribute("agent_bom.proxy.upstream_url", url.rstrip("/"))
+                    tools_resp = await client.post(
+                        url.rstrip("/") + "/tools/list",
+                        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                        headers=_proxy_request_headers(),
+                    )
+                tools_resp.raise_for_status()
+                tools_data = tools_resp.json()
+                if isinstance(tools_data, dict) and "result" in tools_data:
+                    result = tools_data["result"]
+                    if isinstance(result, dict) and "tools" in result:
+                        declared_tools = {t["name"] for t in result["tools"] if isinstance(t, dict) and "name" in t}
+                        if span is not None:
+                            span.set_attribute("agent_bom.proxy.declared_tool_count", len(declared_tools))
+                        logger.info("SSE proxy: discovered %d declared tools", len(declared_tools))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("SSE proxy: could not fetch tools/list from %s: %s", url, sanitize_text(exc))
+
+            # Read JSON-RPC from stdin and forward through protection engine
+            reader = await create_async_stdin_reader()
+
+            call_counter = 0
+            while True:
+                try:
+                    line = await asyncio.wait_for(read_async_stdin_line(reader), timeout=120.0)
+                except asyncio.TimeoutError:
+                    logger.debug("SSE proxy: client readline timed out")
+                    break
+                if not line:
+                    break
+
+                if len(line) > _MAX_MESSAGE_BYTES:
+                    logger.warning("SSE proxy: oversized message from client (%d bytes) — dropped", len(line))
+                    continue
+
+                line_str = line.decode("utf-8", errors="replace")
+                msg = parse_jsonrpc(line_str)
+
+                policy_subject = policy_subject_from_message(msg) if msg else None
+                if not msg or not policy_subject:
+                    # Non-tool-call messages (initialize, notifications, etc.) — pass through
+                    try:
+                        fwd = await client.post(
+                            url.rstrip("/") + "/message",
+                            json=msg or json.loads(line_str),
+                            timeout=30,
+                            headers=_proxy_request_headers(),
+                        )
+                        sys.stdout.buffer.write((json.dumps(fwd.json()) + "\n").encode())
+                        sys.stdout.buffer.flush()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("SSE proxy: pass-through failed: %s", sanitize_text(exc))
+                    continue
+
+                tool_name, arguments = policy_subject
+                is_tool_call = is_tools_call(msg)
+                request_trace_meta = _extract_jsonrpc_trace_meta(msg)
+                msg_id = msg.get("id")
+                p_hash = compute_payload_hash(msg)
+                agent_id, identity_block_reason = check_identity(msg, policy)
+
+                if identity_block_reason:
+                    if log_file:
+                        log_tool_call(
+                            log_file,
+                            tool_name,
+                            arguments,
+                            "blocked",
+                            identity_block_reason,
+                            payload_sha256=p_hash,
+                            message_id=msg_id,
+                            agent_id=agent_id,
+                            tenant_id=control_plane_tenant_id,
+                        )
+                    error_resp = make_error_response(msg_id, -32600, identity_block_reason)
+                    sys.stdout.buffer.write((json.dumps(error_resp) + "\n").encode())
+                    sys.stdout.buffer.flush()
+                    continue
+
+                if replay_detector.check(msg):
+                    reason = "Replayed payload detected"
+                    if log_file:
+                        log_tool_call(
+                            log_file,
+                            tool_name,
+                            arguments,
+                            "blocked",
+                            reason,
+                            payload_sha256=p_hash,
+                            message_id=msg_id,
+                            agent_id=agent_id,
+                            tenant_id=control_plane_tenant_id,
+                        )
+                    error_resp = make_error_response(msg_id, -32600, reason)
+                    sys.stdout.buffer.write((json.dumps(error_resp) + "\n").encode())
+                    sys.stdout.buffer.flush()
+                    continue
+
+                undeclared_reason = undeclared_tool_block_reason(block_undeclared and is_tool_call, declared_tools, tool_name)
+                if undeclared_reason:
+                    if log_file:
+                        log_tool_call(
+                            log_file,
+                            tool_name,
+                            arguments,
+                            "blocked",
+                            undeclared_reason,
+                            payload_sha256=p_hash,
+                            message_id=msg_id,
+                            agent_id=agent_id,
+                            tenant_id=control_plane_tenant_id,
+                        )
+                    error_resp = make_error_response(msg_id, -32600, undeclared_reason)
+                    sys.stdout.buffer.write((json.dumps(error_resp) + "\n").encode())
+                    sys.stdout.buffer.flush()
+                    continue
+
+                if policy:
+                    allowed, reason = check_policy(policy, tool_name, arguments)
+                    if not allowed:
+                        if log_file:
+                            log_tool_call(
+                                log_file,
+                                tool_name,
+                                arguments,
+                                "blocked",
+                                reason,
+                                payload_sha256=p_hash,
+                                message_id=msg_id,
+                                agent_id=agent_id,
+                                tenant_id=control_plane_tenant_id,
+                            )
+                        error_resp = make_error_response(msg_id, -32600, reason)
+                        sys.stdout.buffer.write((json.dumps(error_resp) + "\n").encode())
+                        sys.stdout.buffer.flush()
+                        continue
+
+                # Inter-agent firewall (#982 PR 3) — same hook as the stdio path.
+                # SSE proxy doesn't carry a ProxyMetrics object so metrics arg is omitted.
+                fw_target_id = _firewall_target_for_proxy()
+                if _firewall_evaluator is not None and fw_target_id:
+                    fw_outcome = await _maybe_block_on_firewall(
+                        source_agent=agent_id or "unknown",
+                        target_agent=fw_target_id,
+                        tool_name=tool_name,
+                        arguments=arguments,
+                        log_file=log_file,
+                        payload_sha256=p_hash,
+                        message_id=msg_id,
+                        tenant_id=control_plane_tenant_id,
+                    )
+                    if fw_outcome is not None:
+                        error_resp = make_error_response(msg_id, -32600, fw_outcome)
+                        sys.stdout.buffer.write((json.dumps(error_resp) + "\n").encode())
+                        sys.stdout.buffer.flush()
+                        continue
+
+                # Argument analysis
+                arg_alerts = arg_analyzer.check(tool_name, arguments)
+                _handle_alerts_sse(arg_alerts, log_file)
+
+                # Sequence analysis
+                seq_alerts = seq_analyzer.record(tool_name)
+                _handle_alerts_sse(seq_alerts, log_file)
+
+                # Inline content scanning
+                if scan_config.enabled:
+                    from agent_bom.runtime.detectors import Alert, AlertSeverity
+
+                    s_results = scan_tool_call(tool_name, arguments, scan_config)
+                    for sr in s_results:
+                        alert = Alert(
+                            detector=f"scanner:{sr.scanner}",
+                            severity=AlertSeverity.CRITICAL
+                            if sr.severity == "critical"
+                            else (AlertSeverity.HIGH if sr.severity == "high" else AlertSeverity.MEDIUM),
+                            message=f"Inline scan: {sr.scanner}/{sr.rule_id} in tool '{tool_name}'",
+                            details={"rule_id": sr.rule_id, "excerpt": sr.excerpt, "confidence": sr.confidence},
+                        )
+                        _handle_alerts_sse([alert], log_file)
+                    if scan_config.mode == "enforce" and any(sr.blocked for sr in s_results):
+                        first = next(sr for sr in s_results if sr.blocked)
+                        reason = f"Blocked by inline scanner: {first.scanner}/{first.rule_id}"
+                        if log_file:
+                            log_tool_call(
+                                log_file,
+                                tool_name,
+                                arguments,
+                                "blocked",
+                                reason,
+                                payload_sha256=p_hash,
+                                message_id=msg_id,
+                                agent_id=agent_id,
+                                tenant_id=control_plane_tenant_id,
+                            )
+                        error_resp = make_error_response(msg_id, -32600, reason)
+                        sys.stdout.buffer.write((json.dumps(error_resp) + "\n").encode())
+                        sys.stdout.buffer.flush()
+                        continue
+
+                if log_file:
+                    log_tool_call(
+                        log_file,
+                        tool_name,
+                        arguments,
+                        "allowed",
+                        payload_sha256=p_hash,
+                        message_id=msg_id,
+                        agent_id=agent_id,
+                        tenant_id=control_plane_tenant_id,
+                    )  # type: ignore[arg-type]
+
+                # Forward the gated JSON-RPC request to the remote SSE/HTTP
+                # server. Tool calls use the compatibility /tools/call path;
+                # resources/prompts/sampling/extension methods retain their
+                # original method and go through the generic /message path.
+                call_counter += 1
+                try:
+                    span_name = "proxy.sse_tools_call" if is_tool_call else "proxy.sse_gated_message"
+                    span_cm = _PROXY_TRACER.start_as_current_span(span_name) if _PROXY_TRACER else nullcontext()
+                    with span_cm as span:
+                        if span is not None:
+                            span.set_attribute("agent_bom.proxy.subject", tool_name)
+                            span.set_attribute("agent_bom.proxy.method", msg.get("method", "unknown"))
+                            span.set_attribute("agent_bom.proxy.call_counter", call_counter)
+                            set_langfuse_runtime_attributes(
+                                span,
+                                surface="proxy",
+                                tenant_id=control_plane_tenant_id,
+                                method=str(msg.get("method", "unknown")),
+                                tool_name=tool_name,
+                                decision="allowed",
+                                agent_id=agent_id,
+                                trace_id=str(request_trace_meta.get("trace_id") or ""),
+                                arguments=arguments,
+                            )
+                        forwarded_message = _inject_jsonrpc_trace_meta(
+                            msg,
+                            traceparent=request_trace_meta.get("traceparent"),
+                            tracestate=request_trace_meta.get("tracestate"),
+                            baggage=request_trace_meta.get("baggage"),
+                        )
+                        forward_path = "/tools/call" if is_tool_call else "/message"
+                        resp = await client.post(
+                            url.rstrip("/") + forward_path,
+                            json=forwarded_message,
+                            timeout=30,
+                            headers=_proxy_request_headers(
+                                traceparent=request_trace_meta.get("traceparent"),
+                                tracestate=request_trace_meta.get("tracestate"),
+                                baggage=request_trace_meta.get("baggage"),
+                            ),
+                        )
+                    resp.raise_for_status()
+                    response_data = resp.json()
+                except httpx.HTTPStatusError as exc:
+                    logger.warning("SSE proxy: server returned %d for %s: %s", exc.response.status_code, tool_name, sanitize_text(exc))
+                    error_resp = make_error_response(msg_id, -32603, f"Upstream server error: {exc.response.status_code}")
+                    sys.stdout.buffer.write((json.dumps(error_resp) + "\n").encode())
+                    sys.stdout.buffer.flush()
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("SSE proxy: connection error for %s: %s", tool_name, sanitize_text(exc))
+                    error_resp = make_error_response(msg_id, -32603, f"Upstream connection error: {exc}")
+                    sys.stdout.buffer.write((json.dumps(error_resp) + "\n").encode())
+                    sys.stdout.buffer.flush()
+                    continue
+
+                # Process response through protection engine
+                resp_text = json.dumps(response_data.get("result", response_data))
+                from agent_bom.runtime.detectors import CredentialLeakDetector, ResponseInspector
+
+                cred_alerts = CredentialLeakDetector().check(tool_name, resp_text)
+                _handle_alerts_sse(cred_alerts, log_file)
+                ri_alerts = ResponseInspector().check(tool_name, resp_text)
+                _handle_alerts_sse(ri_alerts, log_file)
+
+                response_data = _stitch_jsonrpc_trace_meta(response_data, request_trace_meta)
+                sys.stdout.buffer.write((json.dumps(response_data) + "\n").encode())
+                sys.stdout.buffer.flush()
+
+    finally:
+        if log_file:
+            log_file.close()
+
+    return 0
 
 
 async def run_proxy(
@@ -629,12 +1156,24 @@ async def run_proxy(
     log_path: Optional[str] = None,
     block_undeclared: bool = False,
     detect_credentials: bool = False,
+    detect_visual_leaks: bool = False,
     rate_limit_threshold: int = 0,
     log_only: bool = False,
     alert_webhook: Optional[str] = None,
     metrics_port: int = 8422,
     metrics_token: Optional[str] = None,
+    control_plane_url: Optional[str] = None,
+    control_plane_token: Optional[str] = None,
+    policy_refresh_seconds: int = 30,
+    audit_push_interval: int = 10,
     response_signing_key: Optional[str] = None,
+    sandbox_config: SandboxConfig | None = None,
+    firewall_gateway_url: Optional[str] = None,
+    firewall_gateway_token: Optional[str] = None,
+    firewall_local_policy_path: Optional[str] = None,
+    firewall_target_id: Optional[str] = None,
+    firewall_cache_ttl_seconds: float = 60.0,
+    firewall_fail_mode: str = "open",
 ) -> int:
     """Main proxy loop. Spawns server subprocess, relays JSON-RPC.
 
@@ -644,17 +1183,32 @@ async def run_proxy(
         log_path: Path to audit JSONL log.
         block_undeclared: Block tools not in initial tools/list.
         detect_credentials: Enable credential leak detection in responses.
+        detect_visual_leaks: Enable OCR-based credential/PII detection on
+            image tool responses (Playwright-MCP, Puppeteer-MCP, screen
+            capture tools — see issue #1568). Requires the ``visual`` extra
+            and tesseract on PATH; startup now fails closed when requested
+            without the OCR runtime.
         rate_limit_threshold: Max calls per tool per 60s (0 = disabled).
         log_only: Log alerts without blocking (advisory mode).
         alert_webhook: Optional webhook URL for runtime alert notifications.
         metrics_token: Optional bearer token for Prometheus /metrics endpoint.
+        control_plane_url: Optional control-plane URL for policy pull and audit push.
+        control_plane_token: Optional bearer/API token for control-plane auth.
+        sandbox_config: Optional container isolation posture for stdio MCP servers.
 
     Returns the server process exit code.
     """
-    # Load policy if provided
+    # Load policy if provided — use validate_json_file for path validation,
+    # 10 MB size cap (DoS prevention), and safe JSON parsing.
     policy: dict = {}
     if policy_path:
-        policy = json.loads(Path(policy_path).read_text())
+        try:
+            from agent_bom.security import SecurityError, validate_json_file
+
+            policy = validate_json_file(Path(policy_path))
+        except (json.JSONDecodeError, OSError, SecurityError) as exc:
+            logger.error("Failed to load policy from %s: %s", policy_path, sanitize_text(exc))
+            raise SystemExit(1) from exc
 
     # Open audit log with restricted permissions (0o600)
     # Reject symlinks to prevent log injection attacks (attacker creates
@@ -666,6 +1220,12 @@ async def run_proxy(
 
     # Metrics
     metrics = ProxyMetrics()
+    from agent_bom.cli._runtime_status import proxy_metrics_status_callback
+
+    status_strip_active, status_update = proxy_metrics_status_callback(surface="proxy")
+    if status_strip_active:
+        metrics.set_update_callback(status_update)
+        status_update(metrics)
 
     # Prometheus metrics server
     metrics_server = ProxyMetricsServer(metrics, port=metrics_port, token=metrics_token)
@@ -685,37 +1245,320 @@ async def run_proxy(
     drift_detector = ToolDriftDetector()
     arg_analyzer = ArgumentAnalyzer()
     cred_detector = CredentialLeakDetector() if detect_credentials else None
-    rate_tracker = RateLimitTracker(threshold=rate_limit_threshold) if rate_limit_threshold > 0 else None
+    visual_detector = None
+    if detect_visual_leaks:
+        from agent_bom.runtime.visual_leak_detector import VisualLeakDetector, require_visual_leak_runtime
+
+        require_visual_leak_runtime()
+        visual_detector = VisualLeakDetector()
+    local_policy_rate_limit = resolve_rate_limit_threshold(policy) if policy else None
+    effective_rate_limit_threshold = rate_limit_threshold or local_policy_rate_limit or 0
+    rate_tracker = RateLimitTracker(threshold=max(effective_rate_limit_threshold, 0))
     seq_analyzer = SequenceAnalyzer()
     response_inspector = ResponseInspector()
     vector_detector = VectorDBInjectionDetector()
     replay_detector = ReplayDetector()
     scan_config = load_scan_config(policy) if policy else ScanConfig()
     runtime_alerts: list[dict] = []
+    control_plane_source_id = _generate_proxy_source_id()
+    control_plane_session_id = str(uuid.uuid4())
+    control_plane_tenant_id = (os.environ.get("AGENT_BOM_TENANT_ID") or "default").strip() or "default"
+    control_plane_policies: list["GatewayPolicy"] = []
+    control_plane_etag: str | None = None
+    control_plane_policy_cache_path = _gateway_policy_cache_path()
+    control_plane_policy_cache_max_age_seconds = max(
+        60,
+        int(os.environ.get("AGENT_BOM_PROXY_POLICY_CACHE_MAX_AGE_SECONDS", "3600")),
+    )
+    audit_buffer: list[dict] = []
+    audit_buffer_bytes = 0
+    audit_lock = asyncio.Lock()
+    max_audit_buffer_bytes = max(64 * 1024, int(os.environ.get("AGENT_BOM_PROXY_AUDIT_BUFFER_MAX_BYTES", "1048576")))
+    max_audit_spillover_bytes = max(
+        max_audit_buffer_bytes,
+        int(os.environ.get("AGENT_BOM_PROXY_AUDIT_SPILLOVER_MAX_BYTES", str(max_audit_buffer_bytes * 8))),
+    )
+    audit_spill_path = Path(
+        os.environ.get(
+            "AGENT_BOM_PROXY_AUDIT_SPILLOVER_PATH",
+            str(Path(tempfile.gettempdir()) / f"agent-bom-proxy-audit-{control_plane_session_id}.jsonl"),
+        )
+    )
+    audit_dlq_path = Path(
+        os.environ.get(
+            "AGENT_BOM_PROXY_AUDIT_DLQ_PATH",
+            str(Path(tempfile.gettempdir()) / f"agent-bom-proxy-audit-{control_plane_session_id}.dlq.jsonl"),
+        )
+    )
+    audit_delivery = AuditDeliveryController(
+        base_interval_seconds=max(audit_push_interval, 5),
+        max_backoff_seconds=max(
+            max(audit_push_interval, 5),
+            int(os.environ.get("AGENT_BOM_PROXY_AUDIT_PUSH_BACKOFF_MAX_SECONDS", "300")),
+        ),
+        breaker_failure_threshold=max(
+            1,
+            int(os.environ.get("AGENT_BOM_PROXY_AUDIT_CIRCUIT_BREAKER_THRESHOLD", "3")),
+        ),
+        breaker_cooldown_seconds=max(
+            max(audit_push_interval, 5),
+            int(os.environ.get("AGENT_BOM_PROXY_AUDIT_CIRCUIT_BREAKER_COOLDOWN_SECONDS", "60")),
+        ),
+    )
+    audit_spillover = AuditSpilloverStore(
+        spill_path=audit_spill_path,
+        dlq_path=audit_dlq_path,
+        max_spillover_bytes=max_audit_spillover_bytes,
+    )
 
-    def _handle_alerts(alerts, log_f=None):
+    def _event_size_bytes(payload: dict) -> int:
+        return len(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+
+    def _sync_audit_metrics() -> None:
+        metrics.set_audit_buffer_bytes(audit_buffer_bytes)
+        metrics.set_audit_spillover_bytes(audit_spillover.spillover_size_bytes())
+        metrics.set_audit_dlq_bytes(audit_spillover.dlq_size_bytes())
+        metrics.set_audit_push_backoff_seconds(audit_delivery.current_backoff_seconds())
+        metrics.set_audit_circuit_open(audit_delivery.is_circuit_open())
+
+    async def _queue_control_plane_alert(alert_payload: dict) -> None:
+        nonlocal audit_buffer_bytes
+        event_size = _event_size_bytes(alert_payload)
+        async with audit_lock:
+            if audit_buffer_bytes + event_size <= max_audit_buffer_bytes:
+                audit_buffer.append(alert_payload)
+                audit_buffer_bytes += event_size
+            else:
+                destination = audit_spillover.append_events([alert_payload])
+                if destination == "dlq":
+                    logger.error(
+                        "Proxy audit spillover exceeded %s bytes; diverting alert backlog to DLQ %s",
+                        max_audit_spillover_bytes,
+                        audit_dlq_path,
+                    )
+                else:
+                    logger.warning(
+                        "Proxy audit buffer exceeded %s bytes; spilling alert backlog to %s",
+                        max_audit_buffer_bytes,
+                        audit_spill_path,
+                    )
+            _sync_audit_metrics()
+
+    async def _refresh_control_plane_policies(initial: bool = False) -> None:
+        nonlocal control_plane_policies, control_plane_etag
+        if not control_plane_url:
+            return
+        try:
+            policies, next_etag = await _fetch_enabled_gateway_policies(
+                control_plane_url,
+                control_plane_token,
+                control_plane_etag,
+            )
+        except Exception as exc:  # noqa: BLE001
+            metrics.record_policy_fetch_failure()
+            if initial:
+                cached_policies, cached_etag = _load_cached_gateway_policies(
+                    control_plane_policy_cache_path,
+                    control_plane_policy_cache_max_age_seconds,
+                )
+                if cached_policies is not None:
+                    control_plane_policies = cached_policies
+                    control_plane_etag = cached_etag
+                    logger.warning(
+                        "Gateway policy fetch failed from %s; using cached bundle from %s: %s",
+                        control_plane_url,
+                        control_plane_policy_cache_path,
+                        exc,
+                    )
+                else:
+                    logger.error("Failed to load enabled gateway policies from %s: %s", control_plane_url, sanitize_text(exc))
+                    raise SystemExit(1) from exc
+            else:
+                logger.warning("Gateway policy refresh failed: %s", sanitize_text(exc))
+                return
+        if policies is not None:
+            control_plane_policies = policies
+            _persist_gateway_policies_cache(control_plane_policy_cache_path, policies, next_etag)
+        if next_etag:
+            control_plane_etag = next_etag
+        if rate_limit_threshold <= 0:
+            control_plane_limit = _resolve_control_plane_rate_limit_threshold(control_plane_policies)
+            if control_plane_limit and control_plane_limit > 0:
+                rate_tracker._threshold = control_plane_limit
+            else:
+                rate_tracker._threshold = local_policy_rate_limit or 0
+
+    async def _flush_audit_buffer(summary: dict | None = None) -> bool:
+        nonlocal audit_buffer_bytes
+        if not control_plane_url:
+            return True
+        async with audit_lock:
+            alerts = list(audit_buffer)
+            in_memory_bytes = audit_buffer_bytes
+            spillover_alerts = audit_spillover.read_spillover()
+            audit_buffer.clear()
+            audit_buffer_bytes = 0
+            _sync_audit_metrics()
+        combined_alerts = spillover_alerts + alerts
+        if not combined_alerts and summary is None:
+            return True
+        spillover_had_data = bool(spillover_alerts)
+        try:
+            await _push_proxy_audit_batch(
+                control_plane_url,
+                control_plane_token,
+                control_plane_source_id,
+                control_plane_session_id,
+                combined_alerts,
+                summary,
+            )
+        except Exception as exc:  # noqa: BLE001
+            metrics.record_audit_push_failure()
+            logger.warning("Proxy audit push failed: %s", sanitize_text(exc))
+            async with audit_lock:
+                audit_buffer[:0] = alerts
+                audit_buffer_bytes += in_memory_bytes
+                _sync_audit_metrics()
+            return False
+        else:
+            if spillover_had_data:
+                audit_spillover.clear_spillover()
+            _sync_audit_metrics()
+            return True
+
+    if control_plane_url:
+        await _refresh_control_plane_policies(initial=True)
+
+        def _control_plane_gateway_evaluator(agent_id, tool_name, arguments):
+            from agent_bom.gateway import evaluate_gateway_policy_bundle
+
+            return evaluate_gateway_policy_bundle(control_plane_policies, agent_id, tool_name, arguments)
+
+        set_gateway_evaluator(_control_plane_gateway_evaluator)
+
+    # ── Inter-agent firewall (#982 PR 3) ───────────────────────────────────
+    # Activated when --firewall-target-id is set together with at least one of
+    # --firewall-gateway-url or --firewall-policy. The FirewallClient is
+    # cache-first; the gateway is consulted on cache miss / TTL expiry.
+    firewall_client = None
+    if firewall_target_id and (firewall_gateway_url or firewall_local_policy_path):
+        from agent_bom.firewall import FirewallPolicyError, load_firewall_policy_file
+        from agent_bom.firewall_client import FirewallClient, FirewallFailMode
+
+        firewall_local_policy = None
+        if firewall_local_policy_path:
+            try:
+                firewall_local_policy = load_firewall_policy_file(Path(firewall_local_policy_path))
+            except FirewallPolicyError as exc:
+                logger.error("invalid firewall policy at %s: %s", firewall_local_policy_path, sanitize_text(exc))
+                raise SystemExit(1) from exc
+        try:
+            fw_fail_mode = FirewallFailMode(firewall_fail_mode)
+        except ValueError as exc:
+            raise SystemExit(f"invalid --firewall-fail-mode {firewall_fail_mode!r}") from exc
+        firewall_client = FirewallClient(
+            gateway_url=firewall_gateway_url,
+            bearer_token=firewall_gateway_token,
+            cache_ttl_seconds=max(0.0, firewall_cache_ttl_seconds),
+            fail_mode=fw_fail_mode,
+            local_policy=firewall_local_policy,
+        )
+
+        async def _firewall_evaluator_fn(source, target, source_roles, target_roles):
+            return await firewall_client.decision(
+                source_agent=source,
+                target_agent=target,
+                source_roles=source_roles,
+                target_roles=target_roles,
+            )
+
+        set_firewall_evaluator(_firewall_evaluator_fn, target_id=firewall_target_id)
+
+    async def _policy_refresh_loop() -> None:
+        if not control_plane_url:
+            return
+        while True:
+            await asyncio.sleep(max(policy_refresh_seconds, 5))
+            await _refresh_control_plane_policies()
+
+    async def _audit_push_loop() -> None:
+        if not control_plane_url:
+            return
+        while True:
+            await asyncio.sleep(audit_delivery.current_backoff_seconds())
+            if audit_delivery.is_circuit_open():
+                _sync_audit_metrics()
+                continue
+            if await _flush_audit_buffer():
+                audit_delivery.record_success()
+            else:
+                audit_delivery.record_failure()
+            _sync_audit_metrics()
+
+    async def _handle_alerts(alerts, log_f=None):
         """Log alerts and optionally record them + dispatch webhook."""
         for alert in alerts:
             alert_dict = alert.to_dict()
             runtime_alerts.append(alert_dict)
             logger.warning("Runtime alert: %s", alert.message)
             if log_f:
-                log_f.write(json.dumps(alert_dict) + "\n")
+                write_audit_record(log_f, alert_dict)
                 log_f.flush()
             if alert_webhook:
-                asyncio.ensure_future(_send_webhook(alert_webhook, alert_dict))
+                _fire_webhook(alert_webhook, alert_dict)
+            if control_plane_url:
+                enriched = dict(alert_dict)
+                enriched.setdefault("source_id", control_plane_source_id)
+                enriched.setdefault("session_id", control_plane_session_id)
+                await _queue_control_plane_alert(enriched)
 
     # Track declared tools from tools/list responses
     declared_tools: set[str] = set()
     tools_list_request_ids: set[int | str] = set()
     # Track in-flight tool calls for latency measurement (with TTL cleanup)
-    pending_calls: dict[int | str, tuple[str, float]] = {}  # id → (tool_name, start_time)
+    pending_calls: dict[int | str, tuple[str, float, dict[str, str]]] = {}  # id → (tool_name, start_time, trace_meta)
     pending_call_ttl = 300.0  # 5 minutes — evict orphaned entries
 
-    # Validate the server command before spawning
-    validate_command(server_cmd[0])
+    sandbox_evidence: dict[str, object] = {"enabled": False}
+    if sandbox_config and sandbox_config.enabled:
+        server_cmd, sandbox_evidence = build_sandboxed_command(server_cmd, sandbox_config)
+        logger.info(
+            "MCP server isolation enabled using %s (%s)",
+            sandbox_evidence.get("runtime"),
+            sandbox_evidence.get("mode"),
+        )
+    elif sandbox_config:
+        sandbox_evidence = sandbox_config.evidence()
+
+    if warning := sandbox_posture_warning(sandbox_evidence):
+        # Single emission via the logger (#2197 audit P3). The previous code
+        # printed to both `sys.stderr` and `logger.warning(...)`, which
+        # duplicated the message in the operator's terminal because the
+        # default logging handler ALSO writes to stderr. The structured
+        # `mcp_execution_posture` audit event in the audit log already
+        # carries the same posture detail in machine-readable form.
+        logger.warning(warning)
+
+    # Launch-hygiene checks on the effective server command before spawning.
+    # These catch typos and shell-interpolation configs; they are NOT the
+    # isolation boundary — that is the container sandbox wired above
+    # (agent_bom.proxy_sandbox, --isolate).
+    require_recognized_launcher(_command_name_for_validation(server_cmd[0], sandbox_evidence))
     if len(server_cmd) > 1:
         validate_arguments(list(server_cmd[1:]))
+
+    if log_file:
+        write_audit_record(
+            log_file,
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "type": "mcp_execution_posture",
+                "execution_posture": {
+                    "mode": "container_isolated" if sandbox_evidence.get("enabled") else "observation_only",
+                    "sandbox_evidence": sandbox_evidence,
+                },
+            },
+        )
 
     # Spawn the actual MCP server
     process = await asyncio.create_subprocess_exec(
@@ -723,17 +1566,39 @@ async def run_proxy(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=_MAX_MESSAGE_BYTES + 1,
     )
+    sandbox_timeout_task = None
+    if sandbox_config and sandbox_config.enabled and sandbox_config.timeout_seconds:
+
+        async def _sandbox_timeout_watchdog() -> None:
+            await asyncio.sleep(sandbox_config.timeout_seconds or 0)
+            if process.returncode is None:
+                logger.error("MCP sandbox timeout reached after %s seconds; terminating server", sandbox_config.timeout_seconds)
+                if log_file:
+                    write_audit_record(
+                        log_file,
+                        {
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "type": "mcp_sandbox_timeout",
+                            "timeout_seconds": sandbox_config.timeout_seconds,
+                            "execution_posture": {
+                                "mode": "container_isolated",
+                                "sandbox_evidence": sandbox_evidence,
+                            },
+                        },
+                    )
+                process.terminate()
+
+        sandbox_timeout_task = asyncio.create_task(_sandbox_timeout_watchdog())
 
     async def relay_client_to_server():
         """Read from our stdin, forward to server stdin."""
-        reader = asyncio.StreamReader()
-        protocol = asyncio.StreamReaderProtocol(reader)
-        await asyncio.get_running_loop().connect_read_pipe(lambda: protocol, sys.stdin.buffer)
+        reader = await create_async_stdin_reader()
 
         while True:
             try:
-                line = await asyncio.wait_for(reader.readline(), timeout=120.0)
+                line = await asyncio.wait_for(read_async_stdin_line(reader), timeout=120.0)
             except asyncio.TimeoutError:
                 logger.debug("Client readline timed out — closing relay")
                 break
@@ -746,6 +1611,7 @@ async def run_proxy(
 
             line_str = line.decode("utf-8", errors="replace")
             msg = parse_jsonrpc(line_str)
+            request_trace_meta = _extract_jsonrpc_trace_meta(msg) if msg else {}
 
             if msg:
                 metrics.total_messages_client_to_server += 1
@@ -754,10 +1620,10 @@ async def run_proxy(
                 if msg.get("method") == "tools/list" and "id" in msg:
                     tools_list_request_ids.add(msg["id"])
 
-                # Intercept tools/call requests
-                if is_tools_call(msg):
-                    tool_name = extract_tool_name(msg) or "unknown"
-                    arguments = extract_tool_arguments(msg)
+                # Intercept policy-gated JSON-RPC requests.
+                policy_subject = policy_subject_from_message(msg)
+                if policy_subject:
+                    tool_name, arguments = policy_subject
                     msg_id = msg.get("id")
 
                     # Payload integrity: hash the full message
@@ -777,6 +1643,7 @@ async def run_proxy(
                                 payload_sha256=p_hash,
                                 message_id=msg_id,
                                 agent_id=agent_id,
+                                tenant_id=control_plane_tenant_id,
                             )
                         error_resp = make_error_response(msg_id, -32600, identity_block_reason)
                         sys.stdout.buffer.write((json.dumps(error_resp) + "\n").encode())
@@ -799,6 +1666,7 @@ async def run_proxy(
                                     payload_sha256=p_hash,
                                     message_id=msg_id,
                                     agent_id=agent_id,
+                                    tenant_id=control_plane_tenant_id,
                                 )
                             error_resp = make_error_response(msg_id, -32600, reason)
                             sys.stdout.buffer.write((json.dumps(error_resp) + "\n").encode())
@@ -807,9 +1675,10 @@ async def run_proxy(
                         # log_only: warn but don't block
                         logger.warning("Replay detected (advisory): %s", tool_name)
 
-                    # Check if tool is declared
-                    if block_undeclared and declared_tools and tool_name not in declared_tools:
-                        reason = f"Tool '{tool_name}' not in declared tools/list"
+                    # Check if tool is declared. With --block-undeclared, missing
+                    # tools/list evidence is treated as deny rather than advisory.
+                    undeclared_reason = undeclared_tool_block_reason(block_undeclared, declared_tools, tool_name)
+                    if undeclared_reason:
                         metrics.record_blocked("undeclared")
                         if log_file:
                             log_tool_call(
@@ -817,12 +1686,13 @@ async def run_proxy(
                                 tool_name,
                                 arguments,
                                 "blocked",
-                                reason,
+                                undeclared_reason,
                                 payload_sha256=p_hash,
                                 message_id=msg_id,
                                 agent_id=agent_id,
+                                tenant_id=control_plane_tenant_id,
                             )
-                        error_resp = make_error_response(msg_id, -32600, reason)
+                        error_resp = make_error_response(msg_id, -32600, undeclared_reason)
                         sys.stdout.buffer.write((json.dumps(error_resp) + "\n").encode())
                         sys.stdout.buffer.flush()
                         continue
@@ -842,6 +1712,7 @@ async def run_proxy(
                                     payload_sha256=p_hash,
                                     message_id=msg_id,
                                     agent_id=agent_id,
+                                    tenant_id=control_plane_tenant_id,
                                 )
                             error_resp = make_error_response(msg.get("id"), -32600, reason)
                             sys.stdout.buffer.write((json.dumps(error_resp) + "\n").encode())
@@ -863,24 +1734,76 @@ async def run_proxy(
                                     payload_sha256=p_hash,
                                     message_id=msg_id,
                                     agent_id=agent_id,
+                                    tenant_id=control_plane_tenant_id,
                                 )
                             error_resp = make_error_response(msg.get("id"), -32600, gw_reason)
                             sys.stdout.buffer.write((json.dumps(error_resp) + "\n").encode())
                             sys.stdout.buffer.flush()
                             continue
 
+                    # Inter-agent firewall (#982 PR 3) — gateway is authoritative,
+                    # FirewallClient handles cache + fail-mode + local-policy fallback.
+                    fw_target_id = _firewall_target_for_proxy()
+                    if _firewall_evaluator is not None and fw_target_id:
+                        fw_outcome = await _maybe_block_on_firewall(
+                            source_agent=agent_id or "unknown",
+                            target_agent=fw_target_id,
+                            tool_name=tool_name,
+                            arguments=arguments,
+                            log_file=log_file,
+                            payload_sha256=p_hash,
+                            message_id=msg_id,
+                            tenant_id=control_plane_tenant_id,
+                            metrics=metrics,
+                        )
+                        if fw_outcome is not None:
+                            error_resp = make_error_response(msg.get("id"), -32600, fw_outcome)
+                            sys.stdout.buffer.write((json.dumps(error_resp) + "\n").encode())
+                            sys.stdout.buffer.flush()
+                            continue
+
                     # Runtime detectors: argument analysis
                     arg_alerts = arg_analyzer.check(tool_name, arguments)
-                    _handle_alerts(arg_alerts, log_file)
+                    await _handle_alerts(arg_alerts, log_file)
 
                     # Runtime detectors: rate limiting
-                    if rate_tracker:
-                        rate_alerts = rate_tracker.record(tool_name)
-                        _handle_alerts(rate_alerts, log_file)
+                    effective_rule_rate_limit = 0
+                    if _gateway_evaluator is not None and control_plane_policies:
+                        effective_rule_rate_limit = _resolve_control_plane_rate_limit_threshold(control_plane_policies, agent_id) or 0
+                    if effective_rule_rate_limit <= 0 and local_policy_rate_limit:
+                        effective_rule_rate_limit = local_policy_rate_limit
+                    if rate_limit_threshold > 0:
+                        effective_rule_rate_limit = rate_limit_threshold
+                    if rate_tracker and effective_rule_rate_limit > 0:
+                        rate_alerts = rate_tracker.record(
+                            tool_name,
+                            threshold=effective_rule_rate_limit,
+                            source_agent=agent_id or "anonymous",
+                        )
+                        await _handle_alerts(rate_alerts, log_file)
+                        if rate_alerts and not log_only:
+                            rl_reason = rate_alerts[0].message
+                            metrics.record_blocked("rate_limit")
+                            if log_file:
+                                log_tool_call(
+                                    log_file,
+                                    tool_name,
+                                    arguments,
+                                    "blocked",
+                                    rl_reason,
+                                    payload_sha256=p_hash,
+                                    message_id=msg_id,
+                                    agent_id=agent_id,
+                                    tenant_id=control_plane_tenant_id,
+                                )
+                            error_resp = make_error_response(msg_id, -32600, rl_reason)
+                            sys.stdout.buffer.write((json.dumps(error_resp) + "\n").encode())
+                            sys.stdout.buffer.flush()
+                            continue
 
                     # Runtime detectors: sequence analysis
                     seq_alerts = seq_analyzer.record(tool_name)
-                    _handle_alerts(seq_alerts, log_file)
+                    await _handle_alerts(seq_alerts, log_file)
 
                     # Inline content scanning (prompt injection, PII, secrets, payload vuln)
                     if scan_config.enabled:
@@ -896,7 +1819,7 @@ async def run_proxy(
                                 message=f"Inline scan: {sr.scanner}/{sr.rule_id} in tool '{tool_name}'",
                                 details={"rule_id": sr.rule_id, "excerpt": sr.excerpt, "confidence": sr.confidence},
                             )
-                            _handle_alerts([alert], log_file)
+                            await _handle_alerts([alert], log_file)
                         if scan_config.mode == "enforce" and any(sr.blocked for sr in s_results):
                             first = next(sr for sr in s_results if sr.blocked)
                             reason = f"Blocked by inline scanner: {first.scanner}/{first.rule_id}"
@@ -911,6 +1834,7 @@ async def run_proxy(
                                     payload_sha256=p_hash,
                                     message_id=msg_id,
                                     agent_id=agent_id,
+                                    tenant_id=control_plane_tenant_id,
                                 )
                             error_resp = make_error_response(msg_id, -32600, reason)
                             sys.stdout.buffer.write((json.dumps(error_resp) + "\n").encode())
@@ -920,7 +1844,7 @@ async def run_proxy(
                     # Record allowed call + start latency timer
                     metrics.record_call(tool_name)
                     if "id" in msg:
-                        pending_calls[msg["id"]] = (tool_name, time.monotonic())
+                        pending_calls[msg["id"]] = (tool_name, time.monotonic(), request_trace_meta)
 
                     # Log allowed call with integrity fields
                     if log_file:
@@ -932,25 +1856,51 @@ async def run_proxy(
                             payload_sha256=p_hash,
                             message_id=msg_id,
                             agent_id=agent_id,
+                            tenant_id=control_plane_tenant_id,
                         )
 
-            # Forward to server
-            if process.stdin:
-                process.stdin.write(line)
-                await process.stdin.drain()
+            span_cm = _PROXY_TRACER.start_as_current_span("proxy.relay_client_to_server") if (msg and _PROXY_TRACER) else nullcontext()
+            with span_cm as span:
+                if span is not None and msg is not None:
+                    span.set_attribute("agent_bom.proxy.message_kind", msg.get("method", "unknown"))
+                    if is_tools_call(msg):
+                        tool_name = extract_tool_name(msg) or "unknown"
+                        span.set_attribute("agent_bom.proxy.tool_name", tool_name)
+                        set_langfuse_runtime_attributes(
+                            span,
+                            surface="proxy",
+                            tenant_id=control_plane_tenant_id,
+                            method=str(msg.get("method", "unknown")),
+                            tool_name=tool_name,
+                            decision="allowed",
+                            agent_id=agent_id,
+                            trace_id=str(request_trace_meta.get("trace_id") or ""),
+                            arguments=extract_tool_arguments(msg),
+                        )
+                # Forward to server
+                if process.stdin:
+                    if msg is not None:
+                        forwarded_message = _inject_jsonrpc_trace_meta(
+                            msg,
+                            traceparent=request_trace_meta.get("traceparent"),
+                            tracestate=request_trace_meta.get("tracestate"),
+                            baggage=request_trace_meta.get("baggage"),
+                        )
+                        line = (json.dumps(forwarded_message) + "\n").encode()
+                    process.stdin.write(line)
+                    await process.stdin.drain()
 
     async def relay_server_to_client():
         """Read from server stdout, forward to our stdout."""
         while True:
             if not process.stdout:
                 break
-            line = await process.stdout.readline()
+            line = await _read_bounded_line(process.stdout)
+            if line is None:
+                logger.warning("Oversized message from server exceeded %d bytes; dropped", _MAX_MESSAGE_BYTES)
+                continue
             if not line:
                 break
-
-            if len(line) > _MAX_MESSAGE_BYTES:
-                logger.warning("Oversized message from server (%d bytes) — dropped", len(line))
-                continue
 
             line_str = line.decode("utf-8", errors="replace")
             msg = parse_jsonrpc(line_str)
@@ -966,17 +1916,33 @@ async def run_proxy(
 
                     # Runtime detector: tool drift
                     drift_alerts = drift_detector.check(new_tools)
-                    _handle_alerts(drift_alerts, log_file)
+                    await _handle_alerts(drift_alerts, log_file)
 
-                # Runtime detector: credential leak in responses
-                if cred_detector and "result" in msg:
-                    result_text = json.dumps(msg.get("result", ""))
+                # Runtime detector: credential leak in responses AND errors
+                # Error fields can contain exception messages that include secrets.
+                if cred_detector and ("result" in msg or "error" in msg):
+                    resp_content = msg.get("result") if "result" in msg else msg.get("error", "")
+                    result_text = json.dumps(resp_content)
                     resp_id = msg.get("id")
                     tool_for_resp = ""
                     if resp_id is not None and resp_id in pending_calls:
                         tool_for_resp = pending_calls[resp_id][0]
                     cred_alerts = cred_detector.check(tool_for_resp or "unknown", result_text)
-                    _handle_alerts(cred_alerts, log_file)
+                    await _handle_alerts(cred_alerts, log_file)
+                    if cred_alerts and not log_only:
+                        from agent_bom.runtime.detectors import CredentialLeakDetector
+
+                        redacted_text = CredentialLeakDetector.redact(result_text)
+                        if "result" in msg:
+                            try:
+                                msg["result"] = json.loads(redacted_text)
+                            except json.JSONDecodeError:
+                                msg["result"] = redacted_text
+                        else:
+                            try:
+                                msg["error"] = json.loads(redacted_text)
+                            except json.JSONDecodeError:
+                                msg["error"] = redacted_text
 
                 # Runtime detector: response content inspection (cloaking, SVG, invisible chars,
                 # prompt injection). For confirmed vector DB / RAG retrieval tools, also run
@@ -990,29 +1956,71 @@ async def run_proxy(
                     if ri_id is not None and ri_id in pending_calls:
                         ri_tool = pending_calls[ri_id][0]
                     ri_alerts = response_inspector.check(ri_tool or "unknown", ri_text)
-                    _handle_alerts(ri_alerts, log_file)
+                    await _handle_alerts(ri_alerts, log_file)
                     # Vector DB / RAG tools get specialized cache-poison detection on top
                     if vector_detector.is_vector_tool(ri_tool or ""):
                         vec_alerts = vector_detector.check(ri_tool or "unknown", ri_text)
-                        _handle_alerts(vec_alerts, log_file)
+                        await _handle_alerts(vec_alerts, log_file)
 
                 # Response signing — compute HMAC on ORIGINAL response before
                 # inline scanning may modify msg (tamper detection must sign
                 # the server's actual response, not a scanner-modified version).
                 if response_signing_key and log_file:
-                    sig = compute_response_hmac(msg, response_signing_key)
-                    sig_entry = (
-                        json.dumps(
-                            {
-                                "ts": datetime.now(timezone.utc).isoformat(),
-                                "type": "response_hmac",
-                                "id": msg.get("id"),
-                                "hmac_sha256": sig,
-                            }
-                        )
-                        + "\n"
+                    # The proxy persists a sha256 of the canonical response
+                    # alongside an HMAC-of-hash so an offline verifier (the
+                    # `agent-bom audit --verify-hmac --sign-key` flow) can
+                    # recompute the HMAC without needing the original wire
+                    # response body. Any byte-level tamper of the response
+                    # changes the hash and therefore the HMAC.
+                    response_hash = compute_payload_hash(msg)
+                    sig = hmac.new(
+                        response_signing_key.encode("utf-8"),
+                        response_hash.encode("utf-8"),
+                        hashlib.sha256,
+                    ).hexdigest()
+                    sig_entry = {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "type": "response_hmac",
+                        "id": msg.get("id"),
+                        "response_sha256": response_hash,
+                        "hmac_sha256": sig,
+                    }
+                    write_audit_record(
+                        log_file,
+                        sig_entry,
                     )
-                    log_file.write(sig_entry)
+
+                # Visual leak detection — OCR-scan image blocks in the result
+                # and either log (log_only) or paint redactions over the
+                # matched regions, then re-encode the line so the client
+                # never sees the raw pixels. Runs after HMAC so the signature
+                # still pins the server's actual response.
+                if visual_detector is not None and visual_detector.enabled and "result" in msg:
+                    vis_result = msg.get("result")
+                    vis_content = vis_result.get("content") if isinstance(vis_result, dict) else None
+                    if isinstance(vis_content, list) and vis_content:
+                        from agent_bom.runtime.visual_leak_detector import run_visual_leak_check, run_visual_leak_redact
+
+                        vis_id = msg.get("id")
+                        vis_tool = ""
+                        if vis_id is not None and vis_id in pending_calls:
+                            vis_tool = pending_calls[vis_id][0]
+                        safe_vis_tool = _sanitize_for_log(vis_tool or "unknown")
+                        try:
+                            vis_alerts = await run_visual_leak_check(visual_detector, vis_tool or "unknown", vis_content)
+                        except asyncio.TimeoutError:
+                            logger.warning("Visual leak scan timed out for tool=%s", safe_vis_tool)
+                            vis_alerts = []
+                        if vis_alerts:
+                            await _handle_alerts(vis_alerts, log_file)
+                            if not log_only:
+                                try:
+                                    redacted = await run_visual_leak_redact(visual_detector, vis_content)
+                                except asyncio.TimeoutError:
+                                    logger.warning("Visual leak redaction timed out for tool=%s", safe_vis_tool)
+                                else:
+                                    msg["result"]["content"] = redacted
+                                    line = (json.dumps(msg) + "\n").encode()
 
                 # Inline response scanning (PII, secrets, payload vuln)
                 if scan_config.enabled and "result" in msg:
@@ -1034,7 +2042,7 @@ async def run_proxy(
                             message=f"Inline scan (response): {sr.scanner}/{sr.rule_id} from '{tool_for_scan or 'unknown'}'",
                             details={"rule_id": sr.rule_id, "excerpt": sr.excerpt, "confidence": sr.confidence},
                         )
-                        _handle_alerts([alert], log_file)
+                        await _handle_alerts([alert], log_file)
                     if scan_config.mode == "enforce" and any(sr.blocked for sr in resp_results):
                         # Return a JSON-RPC error instead of modifying the result structure,
                         # which preserves protocol compatibility with all MCP clients.
@@ -1044,16 +2052,35 @@ async def run_proxy(
                             "message": "[BLOCKED] Security scanner detected sensitive content in response",
                         }
                         line = (json.dumps(msg) + "\n").encode()
+                    elif (
+                        scan_config.mode == "enforce"
+                        and scan_config.pii_action == "redact"
+                        and any(sr.scanner == "pii" for sr in resp_results)
+                    ):
+                        from agent_bom.proxy_scanner import redact_pii
+
+                        if isinstance(msg.get("result"), str):
+                            msg["result"] = redact_pii(msg["result"])
+                        elif isinstance(msg.get("result"), dict):
+                            redacted_text = redact_pii(json.dumps(msg["result"]))
+                            try:
+                                msg["result"] = json.loads(redacted_text)
+                            except json.JSONDecodeError:
+                                pass
+                        line = (json.dumps(msg) + "\n").encode()
 
                 # Complete latency tracking for tool call responses
                 resp_id = msg.get("id")
+                fallback_trace_meta: dict[str, str] | None = None
                 if resp_id is not None and resp_id in pending_calls:
-                    _tool_name, start = pending_calls.pop(resp_id)
+                    _tool_name, start, fallback_trace_meta = pending_calls.pop(resp_id)
                     metrics.record_latency((time.monotonic() - start) * 1000)
+                msg = _stitch_jsonrpc_trace_meta(msg, fallback_trace_meta)
+                line = (json.dumps(msg) + "\n").encode()
 
                 # Evict orphaned pending_calls older than TTL
                 now_mono = time.monotonic()
-                stale = [k for k, (_, t) in pending_calls.items() if now_mono - t > pending_call_ttl]
+                stale = [k for k, (_tool, t, _trace) in pending_calls.items() if now_mono - t > pending_call_ttl]
                 for k in stale:
                     pending_calls.pop(k, None)
 
@@ -1072,6 +2099,9 @@ async def run_proxy(
             sys.stderr.buffer.write(line)
             sys.stderr.buffer.flush()
 
+    refresh_task = asyncio.create_task(_policy_refresh_loop()) if control_plane_url else None
+    audit_task = asyncio.create_task(_audit_push_loop()) if control_plane_url else None
+
     try:
         results = await asyncio.gather(
             relay_client_to_server(),
@@ -1082,29 +2112,45 @@ async def run_proxy(
         for result in results:
             if isinstance(result, Exception) and not isinstance(result, (BrokenPipeError, ConnectionResetError, asyncio.CancelledError)):
                 metrics.relay_errors += 1
-                logger.warning("Relay task exited with unexpected error: %s", result)
+                logger.warning("Relay task exited with unexpected error: %s", sanitize_text(result))
                 if log_file:
-                    err_entry = (
-                        json.dumps(
-                            {
-                                "ts": datetime.now(timezone.utc).isoformat(),
-                                "type": "relay_error",
-                                "error": str(result),
-                                "error_type": type(result).__name__,
-                            }
-                        )
-                        + "\n"
+                    err_entry = {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "type": "relay_error",
+                        "error": str(result),
+                        "error_type": type(result).__name__,
+                    }
+                    write_audit_record(
+                        log_file,
+                        err_entry,
                     )
-                    log_file.write(err_entry)
     finally:
+        if status_strip_active:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
         # Write metrics summary + runtime alerts to audit log before closing
+        summary = metrics.summary()
+        summary.update(summarize_runtime_alerts(runtime_alerts))
+        summary["execution_posture"] = {
+            "mode": "container_isolated" if sandbox_evidence.get("enabled") else "observation_only",
+            "sandbox_evidence": sandbox_evidence,
+        }
+        if audit_task:
+            audit_task.cancel()
+        if refresh_task:
+            refresh_task.cancel()
+        if sandbox_timeout_task:
+            sandbox_timeout_task.cancel()
+        if control_plane_url:
+            await _flush_audit_buffer(summary=summary)
         if log_file:
-            summary = metrics.summary()
-            summary["runtime_alerts"] = len(runtime_alerts)
-            summary_line = json.dumps(summary) + "\n"
-            log_file.write(summary_line)
+            write_audit_record(log_file, summary)
             log_file.close()
         await metrics_server.stop()
+        set_gateway_evaluator(None)
+        clear_firewall_evaluator()
+        if firewall_client is not None:
+            await firewall_client.aclose()
         if process.returncode is None:
             process.terminate()
             try:

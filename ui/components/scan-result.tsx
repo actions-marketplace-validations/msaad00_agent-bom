@@ -1,58 +1,107 @@
 "use client";
 
-import { useState, useRef, useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { api, type ScanJob, type ScanResult, type BlastRadius, type RemediationItem, formatDate, OWASP_LLM_TOP10, MITRE_ATLAS, severityColor } from "@/lib/api";
-import type { StepEvent, SSEEvent } from "@/lib/api";
+import { api, type ScanJob, type ScanJobStatus, type ScanResult, type BlastRadius, type RemediationItem, type GraphExportFormat, formatDate, OWASP_LLM_TOP10, MITRE_ATLAS, severityColor } from "@/lib/api";
+import { useScanStream } from "@/lib/use-scan-stream";
+import { mergePipelineSteps, parsePipelineStepsFromProgress } from "@/lib/scan-pipeline-progress";
+import { domainFindingsForScan } from "@/lib/scan-domain-findings";
 import { ScanPipeline } from "@/components/scan-pipeline";
+import { RepoScanOverviewPanel } from "@/components/repo-scan-overview-panel";
+import { FrameworkTagChips } from "@/components/framework-tag-chips";
 import { SeverityBadge } from "@/components/severity-badge";
+import { StatCard } from "@/components/stat-card";
+import { PaginationBar } from "@/components/pagination-bar";
 import {
   ArrowLeft, Loader2, CheckCircle, Clock, Zap, Key, Wrench,
-  ArrowUpCircle, AlertTriangle, ChevronDown, ChevronRight, GitBranch, Server,
+  ArrowUpCircle, AlertTriangle, ChevronDown, ChevronRight, Download, GitBranch, Server,
+  Cloud, Database, ShieldCheck,
 } from "lucide-react";
+
+const BLAST_RADIUS_PAGE_SIZE = 8;
+
+function scanArtifactDescriptor(format: string | undefined): { label: string; fileSuffix: string } {
+  if (format === "cyclonedx") return { label: "CycloneDX SBOM", fileSuffix: "cdx.json" };
+  if (format === "spdx") return { label: "SPDX 3 SBOM", fileSuffix: "spdx.json" };
+  return { label: "AI-BOM JSON", fileSuffix: "ai-bom.json" };
+}
 
 // ─── Scan Result View ───────────────────────────────────────────────────────
 
+function mergeScanStatus(prev: ScanJob | null, status: ScanJobStatus): ScanJob {
+  return {
+    job_id: status.job_id,
+    tenant_id: status.tenant_id ?? prev?.tenant_id,
+    status: status.status,
+    created_at: status.created_at,
+    completed_at: status.completed_at ?? prev?.completed_at,
+    request: status.request ?? prev?.request ?? {},
+    progress: prev?.progress ?? [],
+    result: prev?.result,
+    error: status.error ?? prev?.error,
+  };
+}
+
 export function ScanResultView({ id }: { id: string }) {
   const [job, setJob] = useState<ScanJob | null>(null);
-  const [messages, setMessages] = useState<string[]>([]);
-  const [streaming, setStreaming] = useState(true);
-  const [pipelineSteps, setPipelineSteps] = useState<Map<string, StepEvent>>(new Map());
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
   const logRef = useRef<HTMLDivElement>(null);
+  const fetchedResultRef = useRef(false);
+  const fetchingResultRef = useRef(false);
+  const activeJobIdRef = useRef(id);
+
+  const fetchFullResultOnce = useCallback(async () => {
+    if (fetchedResultRef.current || fetchingResultRef.current) return;
+    fetchingResultRef.current = true;
+    try {
+      const fullJob = await api.getScan(id);
+      if (activeJobIdRef.current === id) {
+        setJob(fullJob);
+        fetchedResultRef.current = true;
+      }
+    } finally {
+      fetchingResultRef.current = false;
+    }
+  }, [id]);
+
+  const refreshStatus = useCallback(async () => {
+    const status = await api.getScanStatus(id);
+    if (activeJobIdRef.current !== id) return;
+    setJob((prev) => mergeScanStatus(prev, status));
+    if (status.status === "done" || status.status === "failed" || status.status === "cancelled") {
+      await fetchFullResultOnce();
+    }
+  }, [fetchFullResultOnce, id]);
 
   useEffect(() => {
-    api.getScan(id).then(setJob).catch(() => {});
+    activeJobIdRef.current = id;
+    fetchedResultRef.current = false;
+    fetchingResultRef.current = false;
+    refreshStatus().catch(() => {});
+  }, [id, refreshStatus]);
 
-    const cleanup = api.streamScan(
-      id,
-      (data: SSEEvent) => {
-        if (data.type === "step") {
-          const step = data as StepEvent;
-          setPipelineSteps((prev) => {
-            const next = new Map(prev);
-            next.set(step.step_id, step);
-            return next;
-          });
-          setMessages((m) => [...m, step.message]);
-        } else if (data.type === "progress") {
-          const d = data as { message?: string };
-          if (d.message) setMessages((m) => [...m, d.message!]);
-        }
-        api.getScan(id).then(setJob).catch(() => {});
-      },
-      () => {
-        setStreaming(false);
-        api.getScan(id).then(setJob).catch(() => {});
-      }
-    );
-    return cleanup;
-  }, [id]);
+  const handleStreamUpdate = useCallback(() => {
+    refreshStatus().catch(() => {});
+  }, [refreshStatus]);
+
+  const { messages, pipelineSteps, streaming } = useScanStream(id, {
+    onDone: handleStreamUpdate,
+    onEvent: handleStreamUpdate,
+  });
+
+  const replayedSteps = useMemo(
+    () => mergePipelineSteps(parsePipelineStepsFromProgress(job?.progress ?? []), pipelineSteps),
+    [job?.progress, pipelineSteps],
+  );
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [messages]);
 
   const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
+  const [blastSeverity, setBlastSeverity] = useState("all");
+  const [blastPage, setBlastPage] = useState(1);
 
   function toggleSection(key: string) {
     setCollapsedSections((prev) => {
@@ -65,54 +114,138 @@ export function ScanResultView({ id }: { id: string }) {
 
   const result = job?.result as ScanResult | undefined;
   const summary = result?.summary;
-  const blastRadius = result?.blast_radius ?? [];
+  const pipelineLanes = useMemo(
+    () =>
+      job?.status === "done"
+        ? domainFindingsForScan({ result, summary }).lanes
+        : undefined,
+    [job?.status, result, summary],
+  );
+  const blastRadius = useMemo(() => result?.blast_radius ?? [], [result]);
+  const filteredBlastRadius = useMemo(
+    () =>
+      [...blastRadius]
+        .filter((path) => blastSeverity === "all" || path.severity.toLowerCase() === blastSeverity)
+        .sort((a, b) => b.blast_score - a.blast_score),
+    [blastRadius, blastSeverity],
+  );
+  const blastTotalPages = Math.max(1, Math.ceil(filteredBlastRadius.length / BLAST_RADIUS_PAGE_SIZE));
+  const visibleBlastRadius = useMemo(
+    () => filteredBlastRadius.slice((blastPage - 1) * BLAST_RADIUS_PAGE_SIZE, blastPage * BLAST_RADIUS_PAGE_SIZE),
+    [blastPage, filteredBlastRadius],
+  );
+  const cloudEvidence = result ? summarizeCloudEvidence(result) : null;
+  const repoUrl =
+    typeof job?.request?.repo_url === "string" && job.request.repo_url.trim()
+      ? job.request.repo_url.trim()
+      : null;
+  const scanArtifact = scanArtifactDescriptor(job?.request?.format);
+
+  useEffect(() => {
+    setBlastPage(1);
+  }, [blastSeverity, id]);
+
+  async function handleExport(format: GraphExportFormat = "json") {
+    setExporting(true);
+    setExportError("");
+    try {
+      const blob = await api.downloadScanGraph(id, format);
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `scan-${id}-graph.${format === "json" ? "json" : format}`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setExportError(err instanceof Error ? err.message : "Failed to export graph");
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  function handleArtifactDownload() {
+    const format = job?.request?.format ?? "json";
+    const artifactDocument = format === "json" ? result : job?.result_document;
+    if (artifactDocument == null) return;
+    const content = typeof artifactDocument === "string" ? artifactDocument : JSON.stringify(artifactDocument, null, 2);
+    const blob = new Blob([content], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `scan-${id}.${scanArtifact.fileSuffix}`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  }
 
   return (
     <div className="space-y-8">
       {/* Back + header */}
-      <div className="flex items-center gap-4">
-        <Link href="/" className="text-zinc-500 hover:text-zinc-300 transition-colors">
-          <ArrowLeft className="w-4 h-4" />
-        </Link>
-        <div>
-          <div className="flex items-center gap-3">
-            <h1 className="text-xl font-semibold">Scan Results</h1>
-            <JobStatusBadge status={job?.status ?? "pending"} streaming={streaming} />
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-center gap-4">
+          <Link href="/" className="text-[color:var(--text-tertiary)] hover:text-[color:var(--foreground)] transition-colors">
+            <ArrowLeft className="w-4 h-4" />
+          </Link>
+          <div>
+            <div className="flex items-center gap-3">
+              <h1 className="text-xl font-semibold">Scan Results</h1>
+              <JobStatusBadge status={job?.status ?? "pending"} streaming={streaming} />
+            </div>
+            <p className="text-xs text-[color:var(--text-tertiary)] font-mono mt-0.5">{id}</p>
           </div>
-          <p className="text-xs text-zinc-500 font-mono mt-0.5">{id}</p>
         </div>
+        {job?.status === "done" ? (
+          <button
+            type="button"
+            onClick={() => void handleExport("json")}
+            disabled={exporting}
+            className="inline-flex items-center gap-2 rounded-lg border border-cyan-500/30 dark:border-cyan-900/60 bg-cyan-500/10 dark:bg-cyan-950/30 px-3 py-2 text-sm font-medium text-cyan-700 dark:text-cyan-200 transition-colors hover:border-cyan-500/30 dark:hover:border-cyan-800 hover:bg-cyan-500/10 dark:hover:bg-cyan-950/50 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+            Export graph JSON
+          </button>
+        ) : null}
       </div>
 
+      {exportError ? (
+        <div className="rounded-xl border border-red-500/30 dark:border-red-900/50 bg-red-500/10 dark:bg-red-950/20 px-4 py-3 text-sm text-red-700 dark:text-red-300">
+          {exportError}
+        </div>
+      ) : null}
+
       {/* Scan Pipeline DAG */}
-      {(streaming || pipelineSteps.size > 0) && (
-        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
+      {(streaming || replayedSteps.size > 0) && (
+        <div className="bg-[color:var(--surface)] border border-[color:var(--border-subtle)] rounded-xl p-4">
           <div className="flex items-center gap-2 mb-3">
             {streaming ? (
               <Loader2 className="w-3.5 h-3.5 text-emerald-400 animate-spin" />
             ) : (
               <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />
             )}
-            <span className="text-xs font-semibold text-zinc-400">
+            <span className="text-xs font-semibold text-[color:var(--text-secondary)]">
               {streaming ? "Scanning..." : "Complete"}
             </span>
           </div>
-          {pipelineSteps.size > 0 ? (
-            <ScanPipeline steps={pipelineSteps} />
+          {replayedSteps.size > 0 ? (
+            <ScanPipeline steps={replayedSteps} lanes={pipelineLanes} className="h-[300px]" />
           ) : (
-            <p className="text-xs font-mono text-zinc-600 animate-pulse">Waiting for scan to start...</p>
+            <p className="text-xs font-mono text-[color:var(--text-tertiary)] animate-pulse">Waiting for scan to start...</p>
           )}
         </div>
       )}
 
       {/* Collapsible raw log */}
       {messages.length > 0 && (
-        <details className="bg-zinc-900 border border-zinc-800 rounded-xl">
-          <summary className="px-4 py-3 text-xs font-semibold text-zinc-500 cursor-pointer hover:text-zinc-400">
+        <details className="bg-[color:var(--surface)] border border-[color:var(--border-subtle)] rounded-xl">
+          <summary className="px-4 py-3 text-xs font-semibold text-[color:var(--text-tertiary)] cursor-pointer hover:text-[color:var(--text-secondary)]">
             Raw log ({messages.length} messages)
           </summary>
           <div ref={logRef} className="max-h-48 overflow-y-auto px-4 pb-3 space-y-1">
-            {messages.map((m, i) => (
-              <p key={i} className="text-xs font-mono text-zinc-400">{m}</p>
+            {messages?.map((m, i) => (
+              <p key={i} className="text-xs font-mono text-[color:var(--text-secondary)]">{m}</p>
             ))}
           </div>
         </details>
@@ -135,36 +268,86 @@ export function ScanResultView({ id }: { id: string }) {
         </div>
       )}
 
+      {repoUrl && result ? (
+        <RepoScanOverviewPanel
+          scanId={id}
+          repoUrl={repoUrl}
+          result={result}
+          artifactLabel={scanArtifact.label}
+          onDownloadArtifact={handleArtifactDownload}
+        />
+      ) : null}
+
+      {cloudEvidence ? <CloudEvidencePanel evidence={cloudEvidence} /> : null}
+
       {/* Blast radius */}
       {blastRadius.length > 0 && (
         <section>
-          <div className="flex items-center justify-between mb-3">
-            <button type="button" onClick={() => toggleSection("blast")} className="flex items-center gap-2 group">
-              {collapsedSections.has("blast") ? <ChevronRight className="w-4 h-4 text-zinc-500" /> : <ChevronDown className="w-4 h-4 text-zinc-500" />}
-              <h2 className="text-sm font-semibold text-zinc-400 uppercase tracking-widest group-hover:text-zinc-300 transition-colors">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <button
+              type="button"
+              aria-controls="blast-radius-paths"
+              aria-expanded={!collapsedSections.has("blast")}
+              onClick={() => toggleSection("blast")}
+              className="group flex items-center gap-2"
+            >
+              {collapsedSections.has("blast") ? <ChevronRight className="w-4 h-4 text-[color:var(--text-tertiary)]" /> : <ChevronDown className="w-4 h-4 text-[color:var(--text-tertiary)]" />}
+              <h2 className="text-sm font-semibold text-[color:var(--text-secondary)] uppercase tracking-widest group-hover:text-[color:var(--foreground)] transition-colors">
                 Blast Radius ({blastRadius.length})
               </h2>
             </button>
-            <Link
-              href={`/scan?id=${id}&view=mesh`}
-              className="flex items-center gap-1.5 text-xs text-cyan-400 hover:text-cyan-300 transition-colors bg-cyan-950/30 border border-cyan-900/50 rounded-lg px-3 py-1.5"
-            >
-              <Server className="w-3 h-3" />
-              View Mesh
-            </Link>
-            <Link
-              href={`/scan?id=${id}&view=attack-flow`}
-              className="flex items-center gap-1.5 text-xs text-emerald-400 hover:text-emerald-300 transition-colors bg-emerald-950/30 border border-emerald-900/50 rounded-lg px-3 py-1.5"
-            >
-              <GitBranch className="w-3 h-3" />
-              View Attack Flow
-            </Link>
+            <div className="flex flex-wrap items-center gap-2">
+              <Link
+                href={`/scan?id=${id}&view=mesh`}
+                className="flex items-center gap-1.5 rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-3 py-1.5 text-xs text-cyan-700 transition-colors hover:text-cyan-900 dark:border-cyan-900/50 dark:bg-cyan-950/30 dark:text-cyan-300 dark:hover:text-cyan-200"
+              >
+                <Server className="w-3 h-3" />
+                View Mesh
+              </Link>
+              <Link
+                href={`/scan?id=${id}&view=attack-flow`}
+                className="flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs text-emerald-700 transition-colors hover:text-emerald-900 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-300 dark:hover:text-emerald-200"
+              >
+                <GitBranch className="w-3 h-3" />
+                View Attack Flow
+              </Link>
+            </div>
           </div>
           {!collapsedSections.has("blast") && (
-            <div className="space-y-3">
-              {blastRadius.sort((a, b) => b.blast_score - a.blast_score).map((b) => (
-                <BlastRadiusCard key={b.vulnerability_id} blast={b} />
-              ))}
+            <div id="blast-radius-paths" className="space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[color:var(--border-subtle)] bg-[color:var(--surface-muted)] px-3 py-2">
+                <label className="flex items-center gap-2 text-xs text-[color:var(--text-secondary)]">
+                  Severity
+                  <select
+                    aria-label="Filter blast-radius paths by severity"
+                    value={blastSeverity}
+                    onChange={(event) => setBlastSeverity(event.target.value)}
+                    className="rounded-md border border-[color:var(--border-subtle)] bg-[color:var(--surface)] px-2 py-1 text-xs text-[color:var(--foreground)]"
+                  >
+                    <option value="all">All</option>
+                    <option value="critical">Critical</option>
+                    <option value="high">High</option>
+                    <option value="medium">Medium</option>
+                    <option value="low">Low</option>
+                  </select>
+                </label>
+                <span className="text-xs text-[color:var(--text-tertiary)]">
+                  {filteredBlastRadius.length.toLocaleString()} matching paths
+                </span>
+              </div>
+              <div className="grid gap-3 xl:grid-cols-2">
+                {visibleBlastRadius.map((b, index) => (
+                  <BlastRadiusCard key={`${b.vulnerability_id}:${b.package ?? "unknown"}:${index}`} blast={b} />
+                ))}
+              </div>
+              <PaginationBar
+                page={blastPage}
+                totalPages={blastTotalPages}
+                totalItems={filteredBlastRadius.length}
+                itemLabel="paths"
+                onPrevious={() => setBlastPage((current) => Math.max(1, current - 1))}
+                onNext={() => setBlastPage((current) => Math.min(blastTotalPages, current + 1))}
+              />
             </div>
           )}
         </section>
@@ -177,8 +360,8 @@ export function ScanResultView({ id }: { id: string }) {
       {result?.remediation_plan && result.remediation_plan.length > 0 && (
         <section>
           <button type="button" onClick={() => toggleSection("remediation")} className="flex items-center gap-2 mb-3 group">
-            {collapsedSections.has("remediation") ? <ChevronRight className="w-4 h-4 text-zinc-500" /> : <ChevronDown className="w-4 h-4 text-zinc-500" />}
-            <h2 className="text-sm font-semibold text-zinc-400 uppercase tracking-widest group-hover:text-zinc-300 transition-colors">
+            {collapsedSections.has("remediation") ? <ChevronRight className="w-4 h-4 text-[color:var(--text-tertiary)]" /> : <ChevronDown className="w-4 h-4 text-[color:var(--text-tertiary)]" />}
+            <h2 className="text-sm font-semibold text-[color:var(--text-secondary)] uppercase tracking-widest group-hover:text-[color:var(--foreground)] transition-colors">
               Remediation Plan ({result.remediation_plan.filter((i) => i.fixed_version).length} fixable)
             </h2>
           </button>
@@ -190,31 +373,31 @@ export function ScanResultView({ id }: { id: string }) {
       {result && result.agents.length > 0 && (
         <section>
           <button type="button" onClick={() => toggleSection("agents")} className="flex items-center gap-2 mb-3 group">
-            {collapsedSections.has("agents") ? <ChevronRight className="w-4 h-4 text-zinc-500" /> : <ChevronDown className="w-4 h-4 text-zinc-500" />}
-            <h2 className="text-sm font-semibold text-zinc-400 uppercase tracking-widest group-hover:text-zinc-300 transition-colors">
+            {collapsedSections.has("agents") ? <ChevronRight className="w-4 h-4 text-[color:var(--text-tertiary)]" /> : <ChevronDown className="w-4 h-4 text-[color:var(--text-tertiary)]" />}
+            <h2 className="text-sm font-semibold text-[color:var(--text-secondary)] uppercase tracking-widest group-hover:text-[color:var(--foreground)] transition-colors">
               Agents ({result.agents.length})
             </h2>
           </button>
           {!collapsedSections.has("agents") && (
             <div className="space-y-3">
-              {result.agents.map((agent, i) => (
-                <div key={i} className={`bg-zinc-900 border rounded-xl p-4 ${agent.status === "installed-not-configured" ? "border-dashed border-zinc-800" : "border-zinc-800"}`}>
+              {result.agents?.map((agent, i) => (
+                <div key={i} className={`bg-[color:var(--surface)] border rounded-xl p-4 ${agent.status === "installed-not-configured" ? "border-dashed border-[color:var(--border-subtle)]" : "border-[color:var(--border-subtle)]"}`}>
                   <div className="flex items-center justify-between mb-2">
                     <div className="flex items-center gap-2">
                       <span className="font-semibold text-sm">{agent.name}</span>
-                      <span className="text-xs text-zinc-500 font-mono">{agent.agent_type}</span>
+                      <span className="text-xs text-[color:var(--text-tertiary)] font-mono">{agent.agent_type}</span>
                       {agent.status === "installed-not-configured" ? (
                         <span className="text-[10px] font-mono bg-yellow-950 border border-yellow-800 text-yellow-400 rounded px-1.5 py-0.5">not configured</span>
                       ) : (
                         <span className="text-[10px] font-mono bg-emerald-950 border border-emerald-800 text-emerald-400 rounded px-1.5 py-0.5">configured</span>
                       )}
                     </div>
-                    <span className="text-xs text-zinc-600">{agent.source}</span>
+                    <span className="text-xs text-[color:var(--text-tertiary)]">{agent.source}</span>
                   </div>
                   <div className="space-y-2">
-                    {agent.mcp_servers.map((srv, j) => (
-                      <div key={j} className="bg-zinc-800 rounded-lg p-3">
-                        <div className="text-xs font-mono text-zinc-300 mb-1.5">{srv.name}</div>
+                    {agent.mcp_servers?.map((srv, j) => (
+                      <div key={j} className="bg-[color:var(--surface-muted)] rounded-lg p-3">
+                        <div className="text-xs font-mono text-[color:var(--text-secondary)] mb-1.5">{srv.name}</div>
                         <div className="flex flex-wrap gap-2">
                           {srv.packages.slice(0, 8).map((pkg, k) => {
                             const hasCrit = pkg.vulnerabilities?.some((v) => v.severity === "critical");
@@ -225,7 +408,7 @@ export function ScanResultView({ id }: { id: string }) {
                                 className={`text-xs font-mono px-2 py-0.5 rounded ${
                                   hasCrit ? "bg-red-950 border border-red-900 text-red-300"
                                   : hasHigh ? "bg-orange-950 border border-orange-900 text-orange-300"
-                                  : "bg-zinc-700 border border-zinc-600 text-zinc-400"
+                                  : "bg-[color:var(--surface-elevated)] border border-[color:var(--border-subtle)] text-[color:var(--text-secondary)]"
                                 }`}
                               >
                                 {pkg.name}@{pkg.version}
@@ -235,7 +418,7 @@ export function ScanResultView({ id }: { id: string }) {
                               </span>
                             );
                           })}
-                          {srv.packages.length > 8 && <span className="text-xs text-zinc-600">+{srv.packages.length - 8} more</span>}
+                          {srv.packages.length > 8 && <span className="text-xs text-[color:var(--text-tertiary)]">+{srv.packages.length - 8} more</span>}
                         </div>
                       </div>
                     ))}
@@ -250,18 +433,25 @@ export function ScanResultView({ id }: { id: string }) {
       {/* Warnings */}
       {result?.warnings && result.warnings.length > 0 && (
         <section>
-          <h2 className="text-sm font-semibold text-zinc-400 uppercase tracking-widest mb-3">Warnings</h2>
+          <h2 className="text-sm font-semibold text-[color:var(--text-secondary)] uppercase tracking-widest mb-3">Warnings</h2>
           <div className="space-y-1">
-            {result.warnings.map((w, i) => (
+            {result.warnings?.map((w, i) => (
               <p key={i} className="text-xs text-yellow-400 font-mono bg-yellow-950/30 rounded px-3 py-2">{w}</p>
             ))}
           </div>
         </section>
       )}
 
+      {result && cloudEvidence && blastRadius.length === 0 && (!result.agents || result.agents.length === 0) ? (
+        <div className="rounded-xl border border-cyan-600/35 bg-cyan-500/10 px-4 py-3 text-sm text-cyan-950 dark:border-cyan-900/50 dark:bg-cyan-950/20 dark:text-cyan-100">
+          Cloud inventory and posture evidence was persisted for this scan. No
+          package attack-path findings were produced for this evidence set.
+        </div>
+      ) : null}
+
       {/* Scan metadata */}
       {job?.completed_at && (
-        <div className="text-xs text-zinc-600 flex items-center gap-2">
+        <div className="text-xs text-[color:var(--text-tertiary)] flex items-center gap-2">
           <Clock className="w-3 h-3" />
           Completed {formatDate(job.completed_at)}
         </div>
@@ -272,6 +462,206 @@ export function ScanResultView({ id }: { id: string }) {
 
 // ─── Sub-Components ─────────────────────────────────────────────────────────
 
+interface CloudBenchmarkDisplay {
+  key: string;
+  label: string;
+  passed: number | null;
+  failed: number | null;
+  total: number | null;
+  passRate: number | null;
+}
+
+interface CloudEvidenceDisplay {
+  providers: string[];
+  resourceCount: number | null;
+  identityCount: number | null;
+  agentCount: number | null;
+  inventoryItems: number | null;
+  benchmarks: CloudBenchmarkDisplay[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function asNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function uniqueValues(values: Array<string | null | undefined>): string[] {
+  return Array.from(new Set(values.filter((value): value is string => Boolean(value)))).sort();
+}
+
+function countChecksByStatus(checks: unknown): Pick<CloudBenchmarkDisplay, "passed" | "failed" | "total"> {
+  if (!Array.isArray(checks)) return { passed: null, failed: null, total: null };
+  let passed = 0;
+  let failed = 0;
+  for (const raw of checks) {
+    if (!isRecord(raw)) continue;
+    const status = String(raw.status ?? raw.result ?? "").toLowerCase();
+    if (["pass", "passed", "ok", "success"].includes(status)) passed += 1;
+    if (["fail", "failed", "error"].includes(status)) failed += 1;
+  }
+  return { passed, failed, total: checks.length };
+}
+
+function benchmarkDisplay(key: string, label: string, data: unknown): CloudBenchmarkDisplay | null {
+  if (!isRecord(data)) return null;
+  const counted = countChecksByStatus(data.checks);
+  const passed = asNumber(data.passed) ?? counted.passed;
+  const failed = asNumber(data.failed) ?? counted.failed;
+  const total = asNumber(data.total) ?? counted.total;
+  const passRate = asNumber(data.pass_rate);
+  return { key, label, passed, failed, total, passRate };
+}
+
+function summarizeCloudInventory(inventory: unknown): Pick<
+  CloudEvidenceDisplay,
+  "providers" | "resourceCount" | "identityCount" | "agentCount" | "inventoryItems"
+> {
+  if (Array.isArray(inventory)) {
+    const providers = uniqueValues(
+      inventory.map((item) => (isRecord(item) ? String(item.provider ?? item.cloud ?? "") : "")),
+    );
+    let resourceCount = 0;
+    let identityCount = 0;
+    let agentCount = 0;
+    for (const item of inventory) {
+      if (!isRecord(item)) continue;
+      resourceCount += asNumber(item.resource_count) ?? 0;
+      identityCount += asNumber(item.identity_count) ?? 0;
+      agentCount += asNumber(item.agent_count) ?? 0;
+    }
+    return {
+      providers,
+      resourceCount: resourceCount || null,
+      identityCount: identityCount || null,
+      agentCount: agentCount || null,
+      inventoryItems: inventory.length,
+    };
+  }
+
+  if (!isRecord(inventory)) {
+    return { providers: [], resourceCount: null, identityCount: null, agentCount: null, inventoryItems: null };
+  }
+
+  let resourceCount = asNumber(inventory.resource_count);
+  const nodeSummary = inventory.node_summary;
+  if (resourceCount == null && isRecord(nodeSummary)) {
+    resourceCount = Object.values(nodeSummary).reduce<number>(
+      (sum, value) => sum + (asNumber(value) ?? 0),
+      0,
+    );
+  }
+
+  return {
+    providers: uniqueValues([String(inventory.provider ?? inventory.cloud ?? "")]),
+    resourceCount,
+    identityCount: asNumber(inventory.identity_count),
+    agentCount: asNumber(inventory.agent_count),
+    inventoryItems: null,
+  };
+}
+
+function summarizeCloudEvidence(result: ScanResult): CloudEvidenceDisplay | null {
+  const inventory = summarizeCloudInventory(result.cloud_inventory);
+  const benchmarks = [
+    benchmarkDisplay("aws", "AWS CIS", result.cis_benchmark),
+    benchmarkDisplay("azure", "Azure CIS", result.azure_cis_benchmark),
+    benchmarkDisplay("gcp", "GCP CIS", result.gcp_cis_benchmark),
+    benchmarkDisplay("snowflake", "Snowflake CIS", result.snowflake_cis_benchmark),
+    benchmarkDisplay("databricks", "Databricks", result.databricks_cis_benchmark),
+  ].filter((item): item is CloudBenchmarkDisplay => item !== null);
+
+  const hasInventory =
+    inventory.providers.length > 0 ||
+    inventory.resourceCount != null ||
+    inventory.identityCount != null ||
+    inventory.agentCount != null ||
+    inventory.inventoryItems != null;
+  if (!hasInventory && benchmarks.length === 0) return null;
+  return { ...inventory, benchmarks };
+}
+
+function formatEvidenceCount(value: number | null): string {
+  return value == null ? "—" : value.toLocaleString();
+}
+
+function formatBenchmarkRate(benchmark: CloudBenchmarkDisplay): string {
+  if (benchmark.passRate != null) {
+    const pct = benchmark.passRate <= 1 ? benchmark.passRate * 100 : benchmark.passRate;
+    return `${pct.toFixed(0)}%`;
+  }
+  if (benchmark.total && benchmark.passed != null) {
+    return `${((benchmark.passed / benchmark.total) * 100).toFixed(0)}%`;
+  }
+  return "—";
+}
+
+function CloudEvidencePanel({ evidence }: { evidence: CloudEvidenceDisplay }) {
+  const providerLabel = evidence.providers.length > 0 ? evidence.providers.join(", ").toUpperCase() : "Cloud";
+  return (
+    <section
+      aria-label="Cloud evidence"
+      className="rounded-xl border border-cyan-600/35 bg-[color:var(--surface)] p-4 dark:border-cyan-900/50 dark:bg-cyan-950/20"
+    >
+      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-center gap-2">
+          <Cloud className="h-4 w-4 text-cyan-700 dark:text-cyan-300" />
+          <h2 className="text-sm font-semibold text-cyan-950 dark:text-cyan-100">Cloud evidence</h2>
+        </div>
+        <span className="font-mono text-[11px] uppercase tracking-wide text-cyan-800 dark:text-cyan-200">{providerLabel}</span>
+      </div>
+      <div className="mt-4 grid grid-cols-2 gap-3 md:grid-cols-4">
+        <EvidenceMetric icon={Database} label="Resources" value={formatEvidenceCount(evidence.resourceCount ?? evidence.inventoryItems)} />
+        <EvidenceMetric icon={Key} label="Identities" value={formatEvidenceCount(evidence.identityCount)} />
+        <EvidenceMetric icon={Server} label="Agents" value={formatEvidenceCount(evidence.agentCount)} />
+        <EvidenceMetric icon={ShieldCheck} label="Benchmarks" value={formatEvidenceCount(evidence.benchmarks.length)} />
+      </div>
+      {evidence.benchmarks.length > 0 ? (
+        <div className="mt-4 grid gap-2 lg:grid-cols-2">
+          {evidence.benchmarks.map((benchmark) => (
+            <div
+              key={benchmark.key}
+              className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-cyan-600/25 bg-[color:var(--surface-muted)] px-3 py-2 dark:border-cyan-900/40"
+            >
+              <span className="text-xs font-medium text-[color:var(--foreground)]">{benchmark.label}</span>
+              <span className="font-mono text-xs text-cyan-800 dark:text-cyan-200">
+                {benchmark.passed ?? "—"}/{benchmark.total ?? "—"} passed · {formatBenchmarkRate(benchmark)}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function EvidenceMetric({
+  icon: Icon,
+  label,
+  value,
+}: {
+  icon: React.ElementType;
+  label: string;
+  value: string;
+}) {
+  return (
+    <div className="rounded-lg border border-cyan-600/25 bg-[color:var(--surface-muted)] p-3 dark:border-cyan-900/40">
+      <div className="flex items-center gap-2 text-[10px] uppercase tracking-[0.16em] text-cyan-800 dark:text-cyan-200">
+        <Icon className="h-3.5 w-3.5" />
+        {label}
+      </div>
+      <p className="mt-1.5 text-lg font-semibold text-[color:var(--foreground)]">{value}</p>
+    </div>
+  );
+}
+
 function JobStatusBadge({ status, streaming }: { status: string; streaming: boolean }) {
   if (status === "done") return <span className="text-xs bg-emerald-950 border border-emerald-900 text-emerald-400 rounded-full px-2 py-0.5 font-mono">done</span>;
   if (status === "failed") return <span className="text-xs bg-red-950 border border-red-900 text-red-400 rounded-full px-2 py-0.5 font-mono">failed</span>;
@@ -280,21 +670,16 @@ function JobStatusBadge({ status, streaming }: { status: string; streaming: bool
       <Loader2 className="w-3 h-3 animate-spin" /> running
     </span>
   );
-  return <span className="text-xs bg-zinc-800 border border-zinc-700 text-zinc-400 rounded-full px-2 py-0.5 font-mono">{status}</span>;
+  return <span className="text-xs bg-[color:var(--surface-muted)] border border-[color:var(--border-subtle)] text-[color:var(--text-secondary)] rounded-full px-2 py-0.5 font-mono">{status}</span>;
 }
 
 function MiniStat({ label, value, accent }: { label: string; value: number; accent?: string }) {
-  return (
-    <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4 text-center">
-      <div className={`text-2xl font-bold font-mono ${accent === "red" && value > 0 ? "text-red-400" : ""}`}>{value}</div>
-      <div className="text-xs text-zinc-500 mt-1">{label}</div>
-    </div>
-  );
+  return <StatCard label={label} value={value} accent={accent === "red" ? "critical" : "neutral"} />;
 }
 
 function BlastRadiusCard({ blast }: { blast: BlastRadius }) {
   return (
-    <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
+    <div className="bg-[color:var(--surface)] border border-[color:var(--border-subtle)] rounded-xl p-5">
       <div className="flex items-start justify-between gap-4 mb-4">
         <div>
           <div className="flex items-center gap-3 mb-1">
@@ -303,56 +688,49 @@ function BlastRadiusCard({ blast }: { blast: BlastRadius }) {
               <span className="text-xs bg-red-950 border border-red-900 text-red-400 rounded px-2 py-0.5 font-mono font-semibold">CISA KEV</span>
             )}
           </div>
-          <h3 className="font-mono font-semibold text-zinc-100">{blast.vulnerability_id}</h3>
+          <h3 className="font-mono font-semibold text-[color:var(--foreground)]">{blast.vulnerability_id}</h3>
         </div>
         <div className="text-right flex-shrink-0">
           {blast.blast_score > 0 && (
             <>
               <div className="text-2xl font-bold font-mono text-red-400">{blast.blast_score.toFixed(0)}</div>
-              <div className="text-xs text-zinc-600">blast score</div>
+              <div className="text-xs text-[color:var(--text-tertiary)]">blast score</div>
             </>
           )}
-          {blast.cvss_score && <div className="text-xs text-zinc-500 mt-1">CVSS {blast.cvss_score.toFixed(1)}</div>}
-          {blast.epss_score && <div className="text-xs text-zinc-500">EPSS {(blast.epss_score * 100).toFixed(1)}%</div>}
+          {blast.cvss_score && <div className="text-xs text-[color:var(--text-tertiary)] mt-1">CVSS {blast.cvss_score.toFixed(1)}</div>}
+          {blast.epss_score && <div className="text-xs text-[color:var(--text-tertiary)]">EPSS {(blast.epss_score * 100).toFixed(1)}%</div>}
         </div>
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-        <ImpactPill icon={Zap} label="Agents affected" items={blast.affected_agents} />
-        <ImpactPill icon={Key} label="Credentials exposed" items={blast.exposed_credentials} accent="orange" />
-        <ImpactPill icon={Wrench} label="Tools reachable" items={blast.reachable_tools} />
+        <ImpactPill icon={Zap} label="Agents affected" items={blast.affected_agents ?? []} />
+        <ImpactPill icon={Key} label="Credentials exposed" items={blast.exposed_credentials ?? []} accent="orange" />
+        <ImpactPill icon={Wrench} label="Tools reachable" items={blast.reachable_tools ?? blast.exposed_tools ?? []} />
       </div>
       {((blast.owasp_tags && blast.owasp_tags.length > 0) || (blast.atlas_tags && blast.atlas_tags.length > 0)) && (
-        <div className="mt-3 flex flex-wrap gap-1.5">
-          {blast.owasp_tags?.map((tag) => (
-            <span key={tag} title={OWASP_LLM_TOP10[tag] ?? tag} className="text-xs font-mono bg-purple-950 border border-purple-800 text-purple-400 rounded px-1.5 py-0.5 cursor-help">
-              {tag}<span className="ml-1 text-purple-600 font-sans">{OWASP_LLM_TOP10[tag]}</span>
-            </span>
-          ))}
-          {blast.atlas_tags?.map((tag) => (
-            <span key={tag} title={MITRE_ATLAS[tag] ?? tag} className="text-xs font-mono bg-cyan-950 border border-cyan-800 text-cyan-400 rounded px-1.5 py-0.5 cursor-help">
-              {tag}<span className="ml-1 text-cyan-600 font-sans">{MITRE_ATLAS[tag]}</span>
-            </span>
-          ))}
+        <div className="mt-3 flex flex-wrap items-center gap-1.5">
+          <FrameworkTagChips tags={blast.owasp_tags} catalog={OWASP_LLM_TOP10} tone="owasp" showNames />
+          <FrameworkTagChips tags={blast.atlas_tags} catalog={MITRE_ATLAS} tone="atlas" showNames />
         </div>
       )}
     </div>
   );
 }
 
-function ImpactPill({ icon: Icon, label, items, accent }: { icon: React.ElementType; label: string; items: string[]; accent?: string }) {
-  const accentClass = accent === "orange" && items.length > 0 ? "text-orange-400" : "text-zinc-300";
+function ImpactPill({ icon: Icon, label, items, accent }: { icon: React.ElementType; label: string; items?: string[]; accent?: string }) {
+  const safeItems = items ?? [];
+  const accentClass = accent === "orange" && safeItems.length > 0 ? "text-orange-400" : "text-[color:var(--text-secondary)]";
   return (
-    <div className="bg-zinc-800 rounded-lg p-3">
+    <div className="bg-[color:var(--surface-muted)] rounded-lg p-3">
       <div className={`flex items-center gap-1.5 text-xs font-semibold mb-2 ${accentClass}`}>
-        <Icon className="w-3.5 h-3.5" /><span>{label} ({items.length})</span>
+        <Icon className="w-3.5 h-3.5" /><span>{label} ({safeItems.length})</span>
       </div>
-      {items.length > 0 ? (
+      {safeItems.length > 0 ? (
         <div className="space-y-1">
-          {items.slice(0, 4).map((item, i) => <p key={i} className="text-xs font-mono text-zinc-400 truncate">{item}</p>)}
-          {items.length > 4 && <p className="text-xs text-zinc-600">+{items.length - 4} more</p>}
+          {safeItems.slice(0, 4).map((item, i) => <p key={i} className="text-xs font-mono text-[color:var(--text-secondary)] truncate">{item}</p>)}
+          {safeItems.length > 4 && <p className="text-xs text-[color:var(--text-tertiary)]">+{safeItems.length - 4} more</p>}
         </div>
       ) : (
-        <p className="text-xs text-zinc-600">None</p>
+        <p className="text-xs text-[color:var(--text-tertiary)]">None</p>
       )}
     </div>
   );
@@ -364,26 +742,26 @@ function RemediationPlan({ items }: { items: RemediationItem[] }) {
 
   return (
     <div className="space-y-3">
-      {fixable.map((item, i) => (
-        <div key={i} className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
+      {fixable?.map((item, i) => (
+        <div key={i} className="bg-[color:var(--surface)] border border-[color:var(--border-subtle)] rounded-xl p-5">
           <div className="flex items-start justify-between gap-4 mb-3">
             <div className="flex items-center gap-3">
               <ArrowUpCircle className="w-5 h-5 text-emerald-400 flex-shrink-0" />
               <div>
                 <div className="flex items-center gap-2 flex-wrap">
-                  <span className="font-mono text-sm font-semibold text-zinc-100">{item.package}</span>
-                  <span className="text-xs text-zinc-500 font-mono">{item.current_version}</span>
-                  <span className="text-zinc-600">&rarr;</span>
+                  <span className="font-mono text-sm font-semibold text-[color:var(--foreground)]">{item.package}</span>
+                  <span className="text-xs text-[color:var(--text-tertiary)] font-mono">{item.current_version}</span>
+                  <span className="text-[color:var(--text-tertiary)]">&rarr;</span>
                   <span className="text-xs text-emerald-400 font-mono font-semibold">{item.fixed_version}</span>
                   <span className={`text-xs font-medium px-2 py-0.5 rounded border ${severityColor(item.severity)}`}>{item.severity}</span>
                   {item.is_kev && <span className="text-xs font-mono bg-red-950 border border-red-800 text-red-400 rounded px-1.5 py-0.5">KEV</span>}
                 </div>
-                <p className="text-xs text-zinc-500 mt-0.5">Clears {item.vulnerabilities.length} vuln{item.vulnerabilities.length !== 1 ? "s" : ""} · {item.ecosystem}</p>
+                <p className="text-xs text-[color:var(--text-tertiary)] mt-0.5">Clears {item.vulnerabilities.length} vuln{item.vulnerabilities.length !== 1 ? "s" : ""} · {item.ecosystem}</p>
               </div>
             </div>
             <div className="text-right flex-shrink-0">
-              <div className="text-lg font-bold font-mono text-emerald-400">{item.impact_score}</div>
-              <div className="text-xs text-zinc-600">impact</div>
+              <div className="text-lg font-bold font-mono text-emerald-400">{item.impact_score.toFixed(1)}</div>
+              <div className="text-xs text-[color:var(--text-tertiary)]">risk</div>
             </div>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-3">
@@ -392,14 +770,10 @@ function RemediationPlan({ items }: { items: RemediationItem[] }) {
             <ImpactBox label="Tools secured" items={item.reachable_tools} pct={item.tools_pct} color="blue" />
           </div>
           {(item.owasp_tags.length > 0 || item.atlas_tags.length > 0) && (
-            <div className="flex flex-wrap gap-1.5 mb-3">
-              <span className="text-xs text-zinc-500 mr-1">mitigates:</span>
-              {item.owasp_tags.map((tag) => (
-                <span key={tag} title={OWASP_LLM_TOP10[tag] ?? tag} className="text-xs font-mono bg-purple-950 border border-purple-800 text-purple-400 rounded px-1.5 py-0.5 cursor-help">{tag}</span>
-              ))}
-              {item.atlas_tags.map((tag) => (
-                <span key={tag} title={MITRE_ATLAS[tag] ?? tag} className="text-xs font-mono bg-cyan-950 border border-cyan-800 text-cyan-400 rounded px-1.5 py-0.5 cursor-help">{tag}</span>
-              ))}
+            <div className="flex flex-wrap items-center gap-1.5 mb-3">
+              <span className="text-xs text-[color:var(--text-tertiary)] mr-1">mitigates:</span>
+              <FrameworkTagChips tags={item.owasp_tags} catalog={OWASP_LLM_TOP10} tone="owasp" />
+              <FrameworkTagChips tags={item.atlas_tags} catalog={MITRE_ATLAS} tone="atlas" />
             </div>
           )}
           <div className="flex items-start gap-2 bg-red-950/20 border border-red-900/30 rounded-lg px-3 py-2">
@@ -409,11 +783,11 @@ function RemediationPlan({ items }: { items: RemediationItem[] }) {
         </div>
       ))}
       {unfixable.length > 0 && (
-        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
+        <div className="bg-[color:var(--surface)] border border-[color:var(--border-subtle)] rounded-xl p-4">
           <p className="text-xs text-yellow-400 font-semibold mb-2">{unfixable.length} package{unfixable.length !== 1 ? "s" : ""} with no fix available -- monitor upstream</p>
           <div className="space-y-1">
             {unfixable.slice(0, 5).map((item, i) => (
-              <p key={i} className="text-xs font-mono text-zinc-500">{item.package}@{item.current_version} -- {item.vulnerabilities.slice(0, 3).join(", ")}</p>
+              <p key={i} className="text-xs font-mono text-[color:var(--text-tertiary)]">{item.package}@{item.current_version} -- {item.vulnerabilities.slice(0, 3).join(", ")}</p>
             ))}
           </div>
         </div>
@@ -433,18 +807,18 @@ function ImpactBox({ label, items, pct, color }: { label: string; items: string[
     <div className={`${c.bg} border ${c.border} rounded-lg p-3`}>
       <div className="flex items-center justify-between mb-1.5">
         <span className={`text-xs font-semibold ${c.text}`}>{label}</span>
-        <span className="text-xs font-mono text-zinc-400">{pct}%</span>
+        <span className="text-xs font-mono text-[color:var(--text-secondary)]">{pct}%</span>
       </div>
-      <div className="h-1.5 rounded-full bg-zinc-800 mb-2">
+      <div className="h-1.5 rounded-full bg-[color:var(--surface-muted)] mb-2">
         <div className={`h-1.5 rounded-full ${c.bar} transition-all duration-500`} style={{ width: `${Math.min(pct, 100)}%` }} />
       </div>
       {items.length > 0 ? (
         <div className="space-y-0.5">
-          {items.slice(0, 3).map((item, i) => <p key={i} className="text-xs font-mono text-zinc-400 truncate">{item}</p>)}
-          {items.length > 3 && <p className="text-xs text-zinc-600">+{items.length - 3} more</p>}
+          {items.slice(0, 3).map((item, i) => <p key={i} className="text-xs font-mono text-[color:var(--text-secondary)] truncate">{item}</p>)}
+          {items.length > 3 && <p className="text-xs text-[color:var(--text-tertiary)]">+{items.length - 3} more</p>}
         </div>
       ) : (
-        <p className="text-xs text-zinc-600">None</p>
+        <p className="text-xs text-[color:var(--text-tertiary)]">None</p>
       )}
     </div>
   );
@@ -463,7 +837,7 @@ function ThreatMatrix({ blastRadius }: { blastRadius: BlastRadius[] }) {
 
   return (
     <section>
-      <h2 className="text-sm font-semibold text-zinc-400 uppercase tracking-widest mb-3">Threat Framework Coverage</h2>
+      <h2 className="text-sm font-semibold text-[color:var(--text-secondary)] uppercase tracking-widest mb-3">Threat Framework Coverage</h2>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <FrameworkPanel title="OWASP LLM Top 10" color="purple" counts={owaspCounts} catalog={OWASP_LLM_TOP10} triggered={owaspTriggered} />
         <FrameworkPanel title="MITRE ATLAS" color="cyan" counts={atlasCounts} catalog={MITRE_ATLAS} triggered={atlasTriggered} />
@@ -487,10 +861,10 @@ function FrameworkPanel({
   const codeWidth = color === "purple" ? "w-12" : "w-20";
 
   return (
-    <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
+    <div className="bg-[color:var(--surface)] border border-[color:var(--border-subtle)] rounded-xl p-4">
       <div className="flex items-center justify-between mb-3">
         <h3 className={`text-xs font-semibold ${textActive} uppercase tracking-wider`}>{title}</h3>
-        <span className="text-xs text-zinc-500">{triggered}/{Object.keys(catalog).length} triggered</span>
+        <span className="text-xs text-[color:var(--text-tertiary)]">{triggered}/{Object.keys(catalog).length} triggered</span>
       </div>
       <div className="space-y-1.5">
         {Object.entries(catalog).map(([code, name]) => {
@@ -498,9 +872,9 @@ function FrameworkPanel({
           const on = count > 0;
           return (
             <div key={code} className={`flex items-center gap-3 px-2.5 py-1.5 rounded-md ${on ? bgActive : "opacity-40"}`}>
-              <span className={`w-2 h-2 rounded-full flex-shrink-0 ${on ? dotActive : "bg-zinc-700"}`} />
-              <span className={`text-xs font-mono ${codeWidth} flex-shrink-0 ${on ? textActive : "text-zinc-600"}`}>{code}</span>
-              <span className={`text-xs flex-1 ${on ? "text-zinc-300" : "text-zinc-600"}`}>{name}</span>
+              <span className={`w-2 h-2 rounded-full flex-shrink-0 ${on ? dotActive : "bg-[color:var(--border-strong)]"}`} />
+              <span className={`text-xs font-mono ${codeWidth} flex-shrink-0 ${on ? textActive : "text-[color:var(--text-tertiary)]"}`}>{code}</span>
+              <span className={`text-xs flex-1 ${on ? "text-[color:var(--text-secondary)]" : "text-[color:var(--text-tertiary)]"}`}>{name}</span>
               {on && <span className={`text-xs font-mono font-semibold ${textActive}`}>{count}</span>}
             </div>
           );

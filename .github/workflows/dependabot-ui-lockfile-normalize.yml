@@ -1,0 +1,115 @@
+name: Dependabot UI Lockfile Normalize
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'ui/package.json'
+      - 'ui/package-lock.json'
+
+permissions: {}
+
+concurrency:
+  group: dependabot-ui-lockfile-normalize-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  normalize-ui-lockfile:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (
+        github.actor == 'dependabot[bot]' ||
+        github.actor == 'app/dependabot' ||
+        github.event.pull_request.user.login == 'dependabot[bot]' ||
+        github.event.pull_request.user.login == 'app/dependabot'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out trusted base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # `pull_request_target` runs with a privileged token, so never check
+          # out the PR head. The default checkout for this event is trusted
+          # base code; we copy only the manifest files needed for lockfile
+          # resolution in a later step.
+          persist-credentials: false
+
+      - name: Set up UI toolchain
+        uses: ./.github/actions/setup-ui
+
+      - name: Copy Dependabot UI manifests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          for path in ui/package.json ui/package-lock.json; do
+            gh api "repos/${HEAD_REPO}/contents/${path}?ref=${HEAD_SHA}" \
+              --jq '.content' | base64 --decode > "${path}"
+          done
+
+      - name: Normalize UI lockfile
+        # We invoke `npm install --package-lock-only --ignore-scripts` directly
+        # instead of `npm run lock:normalize`. This is a `pull_request_target`
+        # workflow with a privileged GITHUB_TOKEN; running an npm script
+        # defined in the PR-supplied `ui/package.json` would let a Dependabot
+        # branch redefine `scripts.lock:normalize` and execute arbitrary code
+        # with that token. The inline form keeps the resolver behavior
+        # identical (lockfile-only resolve, no install scripts) without
+        # trusting the PR's `scripts` block.
+        run: |
+          cd ui
+          cp package-lock.json /tmp/ui-package-lock.from-pr.json
+          npm install --package-lock-only --ignore-scripts
+
+      - name: Commit normalized lockfile
+        # HEAD_REF goes through the env (not direct `${{ }}` expansion in the
+        # shell body) so a maliciously named branch can't inject shell
+        # metacharacters. Checkout credentials are disabled above, so this step
+        # pushes back to the same-repo Dependabot branch with an explicit token
+        # URL and full refspec.
+        env:
+          AUTOMATION_SSH_SIGNING_KEY: ${{ secrets.AUTOMATION_SSH_SIGNING_KEY }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if cmp -s /tmp/ui-package-lock.from-pr.json ui/package-lock.json; then
+            echo "No normalized lockfile changes to commit."
+            exit 0
+          fi
+
+          case "${HEAD_REF}" in
+            *$'\n'*|*$'\r'*|*..*|/*)
+              echo "Refusing unsafe branch ref."
+              exit 1
+              ;;
+          esac
+
+          if [ -z "${AUTOMATION_SSH_SIGNING_KEY:-}" ]; then
+            echo "::error::AUTOMATION_SSH_SIGNING_KEY is required before pushing normalized lockfiles to signed-commit protected PR branches."
+            exit 1
+          fi
+
+          eval "$(ssh-agent -s)"
+          ssh-add - <<< "${AUTOMATION_SSH_SIGNING_KEY}"
+          pubkey_path="${RUNNER_TEMP}/automation_signing_key.pub"
+          ssh-keygen -y -f <(printf '%s\n' "${AUTOMATION_SSH_SIGNING_KEY}") > "${pubkey_path}"
+          git config user.name "github-actions[bot]"
+          git config user.email "34316639+msaad00@users.noreply.github.com"
+          git config gpg.format ssh
+          git config user.signingkey "${pubkey_path}"
+          git config commit.gpgsign true
+          git add ui/package-lock.json
+          git commit -S -m "chore(ui): normalize package-lock under pinned npm"
+          git push \
+            --force-with-lease="refs/heads/${HEAD_REF}:${HEAD_SHA}" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git" \
+            "HEAD:refs/heads/${HEAD_REF}"

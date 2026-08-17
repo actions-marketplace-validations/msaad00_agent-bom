@@ -1,0 +1,2102 @@
+"""Tests for API server hardening — auth, rate limiting, CORS, body size."""
+
+import base64
+import json
+import time
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+from fastapi import Response
+from starlette.testclient import TestClient
+
+from agent_bom.api.auth import KeyStore, Role, create_api_key, create_api_key_record, get_key_store, set_key_store
+from agent_bom.api.browser_session import (
+    CSRF_COOKIE_NAME,
+    CSRF_HEADER_NAME,
+    SESSION_COOKIE_NAME,
+    BrowserSessionError,
+    create_browser_session_token,
+    revoke_browser_session_token,
+)
+from agent_bom.api.middleware import InMemoryRateLimitStore
+from agent_bom.api.oidc import OIDCConfig
+from agent_bom.api.server import (
+    DEFAULT_RATE_LIMIT_RPM,
+    MAX_RATE_LIMIT_RPM,
+    APIKeyMiddleware,
+    MaxBodySizeMiddleware,
+    RateLimitMiddleware,
+    app,
+    configure_api,
+    configure_api_from_env,
+)
+
+
+def _unsigned_test_jwt(claims: dict[str, str]) -> str:
+    header = base64.urlsafe_b64encode(json.dumps({"alg": "none"}).encode()).decode().rstrip("=")
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return f"{header}.{payload}."
+
+
+def test_health_no_auth():
+    """Health endpoint should be accessible without authentication."""
+    client = TestClient(app)
+    resp = client.get("/health")
+    assert resp.status_code == 200
+
+
+def test_kubernetes_probe_aliases_no_auth():
+    """Kubernetes-style probe aliases should be reachable without credentials."""
+    client = TestClient(app)
+    expected_statuses = {
+        "/healthz": "ok",
+        "/livez": "ok",
+        "/ping": "ok",
+    }
+    for path, status in expected_statuses.items():
+        resp = client.get(path)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == status
+
+
+def test_direct_asgi_import_fails_closed_without_auth_config(monkeypatch):
+    """Raw ASGI imports must not expose protected routes without explicit auth or dev opt-out."""
+    for name in (
+        "AGENT_BOM_API_KEY",
+        "AGENT_BOM_API_KEYS",
+        "AGENT_BOM_OIDC_ISSUER",
+        "AGENT_BOM_OIDC_TENANT_PROVIDERS_JSON",
+        "AGENT_BOM_TRUST_PROXY_AUTH",
+        "AGENT_BOM_SCIM_BEARER_TOKEN",
+        "AGENT_BOM_ALLOW_UNAUTHENTICATED_API",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    configure_api_from_env()
+    try:
+        client = TestClient(app)
+        health = client.get("/health")
+        assert health.status_code == 200
+        assert health.json()["auth_required"] is True
+        assert health.json()["auth_configured"] is False
+        assert health.json()["unauthenticated_allowed"] is False
+        assert client.get("/v1/auth/policy").status_code == 401
+    finally:
+        monkeypatch.setenv("AGENT_BOM_ALLOW_UNAUTHENTICATED_API", "1")
+        configure_api(api_key=None)
+
+
+def test_saml_only_config_counts_as_auth_configured(monkeypatch):
+    """SAML-only config makes the control plane auth-configured and fail-closed (#3803).
+
+    Before the fix `configure_api` ignored SAML, so a SAML-only deployment reported
+    `auth_configured=False` and `saml_sso` was absent from `configured_auth_modes` —
+    even though anonymous requests still (correctly) fail closed. Assert the runtime
+    now advertises SAML and that protected routes reject anonymous callers.
+    """
+    for name in (
+        "AGENT_BOM_API_KEY",
+        "AGENT_BOM_API_KEYS",
+        "AGENT_BOM_OIDC_ISSUER",
+        "AGENT_BOM_OIDC_TENANT_PROVIDERS_JSON",
+        "AGENT_BOM_TRUST_PROXY_AUTH",
+        "AGENT_BOM_SCIM_BEARER_TOKEN",
+        "AGENT_BOM_ALLOW_UNAUTHENTICATED_API",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AGENT_BOM_SAML_IDP_ENTITY_ID", "https://idp.example.com/metadata")
+    monkeypatch.setenv("AGENT_BOM_SAML_IDP_SSO_URL", "https://idp.example.com/sso")
+    monkeypatch.setenv("AGENT_BOM_SAML_IDP_X509_CERT", "-----BEGIN CERTIFICATE-----test-----END CERTIFICATE-----")
+    monkeypatch.setenv("AGENT_BOM_SAML_SP_ENTITY_ID", "https://agent-bom.example.com/saml/metadata")
+    monkeypatch.setenv("AGENT_BOM_SAML_SP_ACS_URL", "https://agent-bom.example.com/v1/auth/saml/login")
+    configure_api(api_key=None)
+    try:
+        client = TestClient(app)
+        health = client.get("/health").json()
+        assert health["auth_required"] is True
+        assert health["auth_configured"] is True
+        assert "saml_sso" in health["configured_auth_modes"]
+        assert health["unauthenticated_allowed"] is False
+        # Anonymous callers still fail closed — SAML mints the session key first.
+        assert client.get("/v1/auth/policy").status_code == 401
+    finally:
+        monkeypatch.setenv("AGENT_BOM_ALLOW_UNAUTHENTICATED_API", "1")
+        configure_api(api_key=None)
+
+
+def test_explicit_unauthenticated_dev_opt_out(monkeypatch):
+    """Local development can still opt into the legacy unauthenticated mode explicitly."""
+    monkeypatch.setenv("AGENT_BOM_ALLOW_UNAUTHENTICATED_API", "1")
+    configure_api(api_key=None)
+    client = TestClient(app)
+
+    health = client.get("/health")
+    assert health.status_code == 200
+    assert health.json()["auth_required"] is False
+    assert health.json()["auth_configured"] is False
+    assert health.json()["unauthenticated_allowed"] is True
+    assert client.get("/v1/auth/policy").status_code == 200
+
+
+def test_env_opt_out_honored_when_flag_passed_explicitly(monkeypatch):
+    """`serve`/`api` pass --allow-insecure-no-auth as an explicit bool.
+
+    A ``False`` flag must NOT mask AGENT_BOM_ALLOW_UNAUTHENTICATED_API=1: otherwise
+    the loopback banner claims unauthenticated access while the API fails closed.
+    """
+    for name in (
+        "AGENT_BOM_API_KEY",
+        "AGENT_BOM_API_KEYS",
+        "AGENT_BOM_OIDC_ISSUER",
+        "AGENT_BOM_OIDC_TENANT_PROVIDERS_JSON",
+        "AGENT_BOM_TRUST_PROXY_AUTH",
+        "AGENT_BOM_SCIM_BEARER_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AGENT_BOM_ALLOW_UNAUTHENTICATED_API", "1")
+    # Mirror the exact call the serve/api CLI wrappers make (flag defaults to False).
+    configure_api(api_key=None, allow_unauthenticated=False)
+    try:
+        client = TestClient(app)
+        health = client.get("/health")
+        assert health.status_code == 200
+        assert health.json()["unauthenticated_allowed"] is True
+        assert health.json()["auth_required"] is False
+        assert client.get("/v1/auth/policy").status_code == 200
+    finally:
+        configure_api(api_key=None)
+
+
+def test_direct_asgi_import_configures_static_api_key_from_env(monkeypatch):
+    """Raw uvicorn imports must honor AGENT_BOM_API_KEY without the CLI wrapper."""
+    raw_key = "raw-uvicorn-static-key"
+    monkeypatch.setenv("AGENT_BOM_API_KEY", raw_key)
+    # Assert fail-closed credentialed auth; the shared harness enables the
+    # anonymous opt-in by default, so disable it for this posture.
+    monkeypatch.delenv("AGENT_BOM_ALLOW_UNAUTHENTICATED_API", raising=False)
+    configure_api_from_env()
+    try:
+        client = TestClient(app)
+        assert client.get("/v1/auth/policy").status_code == 401
+        assert client.get("/v1/auth/policy", headers={"Authorization": f"Bearer {raw_key}"}).status_code == 200
+    finally:
+        monkeypatch.delenv("AGENT_BOM_API_KEY", raising=False)
+        configure_api(api_key=None)
+
+
+def test_file_api_key_remains_visible_in_runtime_auth_posture(tmp_path, monkeypatch):
+    """A mounted API-key secret must remain visible after CLI reconfiguration.
+
+    Compose starts the API with ``AGENT_BOM_API_KEY_FILE`` and the CLI calls
+    ``configure_api(api_key=None)`` after the initial ASGI import.  Enforcement
+    already resolves the mounted key; the health/session posture must not
+    regress to ``auth_configured=false`` during that second configuration.
+    """
+    secret_file = tmp_path / "api-key"
+    secret_file.write_text("mounted-control-plane-key\n", encoding="utf-8")
+    monkeypatch.setenv("AGENT_BOM_API_KEY_FILE", str(secret_file))
+    monkeypatch.delenv("AGENT_BOM_API_KEY", raising=False)
+    monkeypatch.delenv("AGENT_BOM_API_KEYS", raising=False)
+    monkeypatch.delenv("AGENT_BOM_ALLOW_UNAUTHENTICATED_API", raising=False)
+
+    configure_api_from_env()
+    configure_api(api_key=None)
+    try:
+        client = TestClient(app)
+        health = client.get("/health").json()
+        assert health["auth_required"] is True
+        assert health["auth_configured"] is True
+        assert "api_key" in health["configured_auth_modes"]
+        assert (
+            client.get(
+                "/v1/auth/policy",
+                headers={"Authorization": "Bearer mounted-control-plane-key"},
+            ).status_code
+            == 200
+        )
+    finally:
+        monkeypatch.delenv("AGENT_BOM_API_KEY_FILE", raising=False)
+        monkeypatch.setenv("AGENT_BOM_ALLOW_UNAUTHENTICATED_API", "1")
+        configure_api(api_key=None)
+
+
+@pytest.mark.parametrize("secret", [None, "too-short"])
+def test_unusable_trusted_proxy_is_not_advertised_as_configured(monkeypatch, secret):
+    """Health must not label a missing/weak proxy attestation secret as auth."""
+    monkeypatch.setenv("AGENT_BOM_TRUST_PROXY_AUTH", "1")
+    monkeypatch.delenv("AGENT_BOM_TRUST_PROXY_AUTH_SECRET_FILE", raising=False)
+    if secret is None:
+        monkeypatch.delenv("AGENT_BOM_TRUST_PROXY_AUTH_SECRET", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_BOM_TRUST_PROXY_AUTH_SECRET", secret)
+    monkeypatch.delenv("AGENT_BOM_ALLOW_UNAUTHENTICATED_API", raising=False)
+
+    configure_api(api_key=None)
+    try:
+        health = TestClient(app).get("/health").json()
+        assert health["auth_required"] is True
+        assert health["auth_configured"] is False
+        assert "trusted_proxy" not in health["configured_auth_modes"]
+    finally:
+        monkeypatch.delenv("AGENT_BOM_TRUST_PROXY_AUTH", raising=False)
+        monkeypatch.delenv("AGENT_BOM_TRUST_PROXY_AUTH_SECRET", raising=False)
+        monkeypatch.setenv("AGENT_BOM_ALLOW_UNAUTHENTICATED_API", "1")
+        configure_api(api_key=None)
+
+
+def test_trusted_proxy_file_secret_is_advertised_as_configured(tmp_path, monkeypatch):
+    """Health should report trusted proxy only when its mounted secret is usable."""
+    secret_file = tmp_path / "trusted-proxy-secret"
+    secret_file.write_text("trusted-proxy-secret-material-32-bytes\n", encoding="utf-8")
+    monkeypatch.setenv("AGENT_BOM_TRUST_PROXY_AUTH", "1")
+    monkeypatch.setenv("AGENT_BOM_TRUST_PROXY_AUTH_SECRET_FILE", str(secret_file))
+    monkeypatch.delenv("AGENT_BOM_TRUST_PROXY_AUTH_SECRET", raising=False)
+    monkeypatch.delenv("AGENT_BOM_ALLOW_UNAUTHENTICATED_API", raising=False)
+
+    configure_api(api_key=None)
+    try:
+        health = TestClient(app).get("/health").json()
+        assert health["auth_configured"] is True
+        assert "trusted_proxy" in health["configured_auth_modes"]
+    finally:
+        monkeypatch.delenv("AGENT_BOM_TRUST_PROXY_AUTH", raising=False)
+        monkeypatch.delenv("AGENT_BOM_TRUST_PROXY_AUTH_SECRET_FILE", raising=False)
+        monkeypatch.setenv("AGENT_BOM_ALLOW_UNAUTHENTICATED_API", "1")
+        configure_api(api_key=None)
+
+
+def test_direct_asgi_import_configures_rbac_api_keys_from_env(monkeypatch):
+    """AGENT_BOM_API_KEYS should fail closed and preserve per-key roles."""
+    raw_admin = "raw-uvicorn-admin-key"
+    raw_viewer = "raw-uvicorn-viewer-key"
+    original_store = get_key_store()
+    set_key_store(KeyStore())
+    monkeypatch.setattr("agent_bom.api.server._env_api_keys_seeded", False)
+    monkeypatch.setenv("AGENT_BOM_API_KEYS", f"{raw_admin}:admin,{raw_viewer}:viewer")
+    # Assert fail-closed credentialed auth; the shared harness enables the
+    # anonymous opt-in by default, so disable it for this posture.
+    monkeypatch.delenv("AGENT_BOM_ALLOW_UNAUTHENTICATED_API", raising=False)
+    configure_api_from_env()
+    try:
+        client = TestClient(app)
+        assert client.get("/v1/auth/policy").status_code == 401
+        assert client.get("/v1/auth/policy", headers={"Authorization": f"Bearer {raw_admin}"}).status_code == 200
+        denied = client.post("/v1/auth/keys", json={"name": "new", "role": "viewer"}, headers={"Authorization": f"Bearer {raw_viewer}"})
+        assert denied.status_code == 403
+        allowed = client.post("/v1/auth/keys", json={"name": "new", "role": "viewer"}, headers={"Authorization": f"Bearer {raw_admin}"})
+        assert allowed.status_code == 201
+    finally:
+        monkeypatch.delenv("AGENT_BOM_API_KEYS", raising=False)
+        set_key_store(original_store)
+        monkeypatch.setattr("agent_bom.api.server._env_api_keys_seeded", False)
+        configure_api(api_key=None)
+
+
+class TestAnonymousViewerAlongsideCredentials:
+    """Opt-in anonymous read-only surface coexisting with configured credentials.
+
+    AGENT_BOM_ALLOW_UNAUTHENTICATED_API=1 must let a credential-less caller act
+    as NO_AUTH_ROLE (default viewer) even while API keys are configured, without
+    weakening any credentialed path: valid keys still authenticate to their
+    role, and present-but-invalid credentials are still rejected.
+    """
+
+    _RAW_ADMIN = "raw-anon-coexist-admin-key"
+
+    def _configure(self, monkeypatch, *, allow_unauthenticated: bool, no_auth_role: str = "viewer"):
+        original_store = get_key_store()
+        set_key_store(KeyStore())
+        monkeypatch.setattr("agent_bom.api.server._env_api_keys_seeded", False)
+        monkeypatch.setenv("AGENT_BOM_API_KEYS", f"{self._RAW_ADMIN}:admin")
+        # conftest pins AGENT_BOM_NO_AUTH_ROLE=admin session-wide for legacy
+        # unauthenticated tests; pin the product default (viewer) here so these
+        # cases assert the shipped anonymous role rather than the test harness.
+        monkeypatch.setenv("AGENT_BOM_NO_AUTH_ROLE", no_auth_role)
+        if allow_unauthenticated:
+            monkeypatch.setenv("AGENT_BOM_ALLOW_UNAUTHENTICATED_API", "1")
+        else:
+            monkeypatch.delenv("AGENT_BOM_ALLOW_UNAUTHENTICATED_API", raising=False)
+        configure_api_from_env()
+        return original_store
+
+    @staticmethod
+    def _restore(monkeypatch, original_store):
+        monkeypatch.delenv("AGENT_BOM_API_KEYS", raising=False)
+        set_key_store(original_store)
+        monkeypatch.setattr("agent_bom.api.server._env_api_keys_seeded", False)
+        configure_api(api_key=None)
+
+    def test_flag_on_no_credential_serves_viewer(self, monkeypatch):
+        original_store = self._configure(monkeypatch, allow_unauthenticated=True)
+        try:
+            client = TestClient(app)
+            resp = client.get("/v1/auth/me")
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["role"] == "viewer"
+            assert body["auth_method"] == "anonymous"
+        finally:
+            self._restore(monkeypatch, original_store)
+
+    def test_flag_on_valid_admin_key_authenticates_admin(self, monkeypatch):
+        original_store = self._configure(monkeypatch, allow_unauthenticated=True)
+        try:
+            client = TestClient(app)
+            me = client.get("/v1/auth/me", headers={"Authorization": f"Bearer {self._RAW_ADMIN}"})
+            assert me.status_code == 200
+            assert me.json()["role"] == "admin"
+            # A protected admin write still succeeds with the admin key …
+            created = client.post(
+                "/v1/auth/keys",
+                json={"name": "spawned", "role": "viewer"},
+                headers={"Authorization": f"Bearer {self._RAW_ADMIN}"},
+            )
+            assert created.status_code == 201
+            # … while the anonymous viewer is forbidden from the same write.
+            assert client.post("/v1/auth/keys", json={"name": "nope", "role": "viewer"}).status_code == 403
+        finally:
+            self._restore(monkeypatch, original_store)
+
+    def test_flag_on_invalid_credential_is_rejected_not_anonymous(self, monkeypatch):
+        original_store = self._configure(monkeypatch, allow_unauthenticated=True)
+        try:
+            client = TestClient(app)
+            # Bad bearer key, unsupported scheme, and bad X-API-Key must all 401 —
+            # a presented-but-invalid credential must never fall through to viewer.
+            assert client.get("/v1/auth/me", headers={"Authorization": "Bearer totally-wrong-key"}).status_code == 401
+            assert client.get("/v1/auth/me", headers={"Authorization": "Basic dXNlcjpwYXNz"}).status_code == 401
+            assert client.get("/v1/auth/me", headers={"X-API-Key": "totally-wrong-key"}).status_code == 401
+        finally:
+            self._restore(monkeypatch, original_store)
+
+    def test_flag_off_no_credential_still_401(self, monkeypatch):
+        """Default (flag OFF) fails closed exactly as before — no regression."""
+        original_store = self._configure(monkeypatch, allow_unauthenticated=False)
+        try:
+            client = TestClient(app)
+            assert client.get("/v1/auth/me").status_code == 401
+            # A valid credential still works under the default posture.
+            assert client.get("/v1/auth/me", headers={"Authorization": f"Bearer {self._RAW_ADMIN}"}).status_code == 200
+            assert client.get("/health").json()["auth_required"] is True
+            assert client.get("/v1/system/health").status_code == 401
+            assert client.get("/status").status_code == 401
+        finally:
+            self._restore(monkeypatch, original_store)
+
+    def test_flag_on_demo_estate_clamps_anonymous_to_viewer(self, monkeypatch):
+        """DEMO_ESTATE clamps the anonymous NO_AUTH_ROLE to viewer, winning over
+        an operator-set AGENT_BOM_NO_AUTH_ROLE=admin."""
+        import agent_bom.config as config
+
+        monkeypatch.setenv("AGENT_BOM_DEMO_ESTATE", "1")
+        monkeypatch.setattr(config, "DEMO_ESTATE", True)
+        # NO_AUTH_ROLE=admin would grant admin anonymously, but DEMO_ESTATE must
+        # clamp to viewer regardless.
+        original_store = self._configure(monkeypatch, allow_unauthenticated=True, no_auth_role="admin")
+        try:
+            client = TestClient(app)
+            me = client.get("/v1/auth/me")
+            assert me.status_code == 200
+            assert me.json()["role"] == "viewer"
+            # The clamped anonymous viewer cannot reach an admin write.
+            assert client.post("/v1/auth/keys", json={"name": "z", "role": "viewer"}).status_code == 403
+        finally:
+            self._restore(monkeypatch, original_store)
+
+    def test_flag_on_combined_mode_clamps_no_auth_admin_to_viewer(self, monkeypatch):
+        """Combined mode (credentials configured + anonymous allowed) must clamp
+        the anonymous fallback to viewer even when AGENT_BOM_NO_AUTH_ROLE=admin.
+
+        Without the clamp, NO_AUTH_ROLE=admin would hand an unauthenticated caller
+        admin — they could then mint admin keys. This is the footgun, and it must
+        be closed independently of DEMO_ESTATE.
+        """
+        original_store = self._configure(monkeypatch, allow_unauthenticated=True, no_auth_role="admin")
+        try:
+            client = TestClient(app)
+            me = client.get("/v1/auth/me")
+            assert me.status_code == 200
+            assert me.json()["role"] == "viewer"
+            assert me.json()["auth_method"] == "anonymous"
+            # The clamped anonymous caller cannot mint an admin (or any) key.
+            assert client.post("/v1/auth/keys", json={"name": "escalate", "role": "admin"}).status_code == 403
+        finally:
+            self._restore(monkeypatch, original_store)
+
+    def test_flag_on_session_discovery_reports_auth_not_required(self, monkeypatch):
+        original_store = self._configure(monkeypatch, allow_unauthenticated=True)
+        try:
+            client = TestClient(app)
+            health = client.get("/health").json()
+            assert health["auth_required"] is False
+            assert health["auth_configured"] is True
+            assert health["unauthenticated_allowed"] is True
+            # Authenticated users are still pointed at the right elevation path.
+            me = client.get("/v1/auth/me").json()
+            assert me["auth_required"] is False
+            assert me["recommended_ui_mode"] == "session_api_key"
+        finally:
+            self._restore(monkeypatch, original_store)
+
+
+def test_create_api_key_record_verifies_operator_supplied_key():
+    """Operator-supplied env keys must be stored as hashes, not raw material."""
+    raw_key = "operator-provided-api-key"
+    store = KeyStore()
+    record = create_api_key_record(raw_key, "env:admin:1", Role.ADMIN)
+    store.add(record)
+
+    assert record.key_hash != raw_key
+    assert store.verify(raw_key) == record
+    assert store.verify("wrong") is None
+
+
+@pytest.mark.asyncio
+async def test_browser_session_exchange_has_targeted_rate_limit(monkeypatch):
+    from fastapi import HTTPException
+
+    from agent_bom.api.routes import enterprise
+    from agent_bom.api.shared_auth_state import reset_auth_state_for_tests
+
+    reset_auth_state_for_tests()
+    monkeypatch.setenv("AGENT_BOM_AUTH_SESSION_ATTEMPTS_PER_MINUTE", "2")
+    monkeypatch.setenv("AGENT_BOM_API_KEY", "valid-key")
+    request = SimpleNamespace(headers={}, client=SimpleNamespace(host="203.0.113.10"))
+
+    with pytest.raises(HTTPException) as first:
+        await enterprise.create_browser_session(request, Response(), enterprise.BrowserSessionRequest(api_key="bad-1"))
+    assert first.value.status_code == 401
+    with pytest.raises(HTTPException) as second:
+        await enterprise.create_browser_session(request, Response(), enterprise.BrowserSessionRequest(api_key="bad-2"))
+    assert second.value.status_code == 401
+    with pytest.raises(HTTPException) as error:
+        await enterprise.create_browser_session(request, Response(), enterprise.BrowserSessionRequest(api_key="valid-key"))
+
+    assert error.value.status_code == 429
+
+
+def test_browser_session_cookies_use_strict_samesite(monkeypatch):
+    from agent_bom.api.routes import enterprise
+
+    monkeypatch.setenv("AGENT_BOM_BROWSER_SESSION_SIGNING_KEY", "test-browser-session-signing-key")
+    request = SimpleNamespace(headers={}, url=SimpleNamespace(scheme="https"))
+    response = Response()
+
+    enterprise._set_browser_session_cookie(
+        response,
+        request,
+        subject="dashboard-user",
+        role="admin",
+        tenant_id="tenant-alpha",
+        auth_method="browser_session_static_api_key",
+    )
+
+    set_cookie_values = [value.decode("latin-1") for key, value in response.raw_headers if key.lower() == b"set-cookie"]
+    assert len(set_cookie_values) == 2
+    assert all("SameSite=strict" in value for value in set_cookie_values)
+    assert any("HttpOnly" in value and SESSION_COOKIE_NAME in value for value in set_cookie_values)
+    assert any(CSRF_COOKIE_NAME in value for value in set_cookie_values)
+
+
+def test_browser_session_cookie_secure_defaults_on_in_production(monkeypatch):
+    from agent_bom.api.routes import enterprise
+
+    monkeypatch.setenv("AGENT_BOM_BROWSER_SESSION_SIGNING_KEY", "test-browser-session-signing-key")
+    monkeypatch.setenv("AGENT_BOM_ENV", "production")
+    monkeypatch.delenv("AGENT_BOM_SESSION_COOKIE_SECURE", raising=False)
+    request = SimpleNamespace(headers={}, url=SimpleNamespace(scheme="http"))
+    response = Response()
+
+    enterprise._set_browser_session_cookie(
+        response,
+        request,
+        subject="dashboard-user",
+        role="admin",
+        tenant_id="tenant-alpha",
+        auth_method="browser_session_static_api_key",
+    )
+
+    set_cookie_values = [value.decode("latin-1") for key, value in response.raw_headers if key.lower() == b"set-cookie"]
+    assert all("Secure" in value for value in set_cookie_values)
+
+
+def test_browser_session_cookie_secure_off_on_local_http(monkeypatch):
+    from agent_bom.api.routes import enterprise
+
+    monkeypatch.setenv("AGENT_BOM_BROWSER_SESSION_SIGNING_KEY", "test-browser-session-signing-key")
+    monkeypatch.delenv("AGENT_BOM_ENV", raising=False)
+    monkeypatch.delenv("AGENT_BOM_DEPLOYMENT_ENV", raising=False)
+    monkeypatch.delenv("AGENT_BOM_CONTROL_PLANE_REPLICAS", raising=False)
+    monkeypatch.delenv("AGENT_BOM_SESSION_COOKIE_SECURE", raising=False)
+    request = SimpleNamespace(headers={}, url=SimpleNamespace(scheme="http"))
+    response = Response()
+
+    enterprise._set_browser_session_cookie(
+        response,
+        request,
+        subject="dashboard-user",
+        role="admin",
+        tenant_id="tenant-alpha",
+        auth_method="browser_session_static_api_key",
+    )
+
+    set_cookie_values = [value.decode("latin-1") for key, value in response.raw_headers if key.lower() == b"set-cookie"]
+    assert all("Secure" not in value for value in set_cookie_values)
+
+
+def test_browser_session_requires_persistent_key_when_clustered(monkeypatch):
+    monkeypatch.delenv("AGENT_BOM_BROWSER_SESSION_SIGNING_KEY", raising=False)
+    monkeypatch.setenv("AGENT_BOM_CONTROL_PLANE_REPLICAS", "2")
+
+    with pytest.raises(BrowserSessionError, match="BROWSER_SESSION_SIGNING_KEY is required"):
+        create_browser_session_token(
+            subject="dashboard-user",
+            role="admin",
+            tenant_id="tenant-alpha",
+            auth_method="browser_session",
+            max_age_seconds=300,
+        )
+
+
+@pytest.mark.asyncio
+async def test_static_browser_session_exchange_fails_closed_when_clustered(monkeypatch):
+    from fastapi import HTTPException
+
+    from agent_bom.api.routes import enterprise
+    from agent_bom.api.shared_auth_state import reset_auth_state_for_tests
+
+    reset_auth_state_for_tests()
+    monkeypatch.setenv("AGENT_BOM_API_KEY", "valid-key")
+    monkeypatch.setenv("AGENT_BOM_BROWSER_SESSION_SIGNING_KEY", "stable-browser-session-key")
+    monkeypatch.setenv("AGENT_BOM_CONTROL_PLANE_REPLICAS", "2")
+    request = SimpleNamespace(headers={}, client=SimpleNamespace(host="203.0.113.20"))
+
+    with pytest.raises(HTTPException) as error:
+        await enterprise.create_browser_session(request, Response(), enterprise.BrowserSessionRequest(api_key="valid-key"))
+
+    assert error.value.status_code == 503
+    assert "static-key auth is disabled" in error.value.detail
+
+
+def test_trust_headers_present():
+    """Every response should include read-only trust headers."""
+    client = TestClient(app)
+    resp = client.get("/health")
+    assert resp.headers.get("x-agent-bom-read-only") == "true"
+    assert resp.headers.get("x-agent-bom-no-credential-storage") == "true"
+
+
+def test_configure_api_refreshes_cors_policy():
+    """configure_api() should update the live CORS middleware, not just a module variable."""
+    configure_api(cors_allow_all=True)
+    client = TestClient(app)
+    resp = client.get("/health", headers={"Origin": "http://127.0.0.1:3001"})
+    assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") == "*"
+
+    configure_api(cors_origins=["http://127.0.0.1:3000"])
+    client = TestClient(app)
+    resp = client.get("/health", headers={"Origin": "http://127.0.0.1:3001"})
+    assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") is None
+
+
+def test_configure_api_defaults_to_release_safe_rate_limit():
+    """The packaged API should not default to a tiny demo-only rate limit."""
+    configure_api(api_key=None)
+    rate_limit = next(m for m in app.user_middleware if m.cls is RateLimitMiddleware)
+    assert rate_limit.kwargs["scan_rpm"] == DEFAULT_RATE_LIMIT_RPM
+    assert rate_limit.kwargs["read_rpm"] == DEFAULT_RATE_LIMIT_RPM * 5
+
+
+@pytest.mark.parametrize("value", [0, -1, MAX_RATE_LIMIT_RPM + 1])
+def test_configure_api_rejects_invalid_rate_limit(value: int):
+    """Invalid operator-provided rate limits should fail at configuration time."""
+    with pytest.raises(ValueError):
+        configure_api(api_key=None, rate_limit_rpm=value)
+
+
+def test_rate_limit_middleware_rejects_invalid_limits():
+    """Direct middleware use should get the same bounded operator inputs."""
+    from starlette.applications import Starlette
+
+    with pytest.raises(ValueError):
+        RateLimitMiddleware(Starlette(), scan_rpm=0)
+    with pytest.raises(ValueError):
+        RateLimitMiddleware(Starlette(), read_rpm=MAX_RATE_LIMIT_RPM * 5 + 1)
+
+
+def test_api_key_middleware_blocks_without_key():
+    """Requests without API key should get 401 when middleware is active."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    test_app = Starlette(routes=[Route("/v1/test", dummy), Route("/health", dummy)])
+    test_app.add_middleware(APIKeyMiddleware, api_key="test-key-123")
+
+    client = TestClient(test_app)
+    resp = client.get("/v1/test")
+    assert resp.status_code == 401
+
+
+def test_api_key_middleware_exempts_only_minimal_probes_without_key():
+    """Detailed operator status must remain protected while probes stay public."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    test_app = Starlette(
+        routes=[
+            Route("/healthz", dummy),
+            Route("/livez", dummy),
+            Route("/ping", dummy),
+            Route("/status", dummy),
+        ]
+    )
+    test_app.add_middleware(APIKeyMiddleware, api_key="test-key-123")
+
+    client = TestClient(test_app)
+    for path in ("/healthz", "/livez", "/ping"):
+        assert client.get(path).status_code == 200
+    assert client.get("/status").status_code == 401
+
+
+def test_api_key_middleware_exempts_cors_preflight():
+    """CORS preflight (OPTIONS) MUST bypass auth.
+
+    Browsers do not attach Authorization headers to preflight requests
+    (CORS spec / Fetch §3.2.2). Rejecting OPTIONS with 401 before
+    CORSMiddleware runs blocks every cross-origin dashboard / SaaS UI
+    / SDK from talking to the API — the actual request never fires
+    because the preflight failed. The auth boundary stays enforced for
+    the real request methods (GET/POST/PUT/DELETE/PATCH).
+    """
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    test_app = Starlette(routes=[Route("/v1/test", dummy, methods=["GET", "OPTIONS"])])
+    test_app.add_middleware(APIKeyMiddleware, api_key="test-key-cors")
+
+    client = TestClient(test_app)
+    # Preflight without bearer — must NOT 401; CORSMiddleware (in real
+    # app stack) will then add Access-Control-Allow-* headers.
+    resp = client.options(
+        "/v1/test",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "authorization",
+        },
+    )
+    assert resp.status_code != 401, "OPTIONS preflight must bypass APIKeyMiddleware"
+    # Real request (GET) without bearer still 401 — auth boundary intact.
+    assert client.get("/v1/test").status_code == 401
+    # Real request with bearer succeeds.
+    assert client.get("/v1/test", headers={"X-API-Key": "test-key-cors"}).status_code == 200
+
+
+def test_configured_app_cors_preflight_survives_auth_and_rate_limit(monkeypatch):
+    """The real middleware stack must let browser preflights reach CORSMiddleware."""
+    original = list(app.user_middleware)
+    try:
+        monkeypatch.delenv("AGENT_BOM_OIDC_ISSUER", raising=False)
+        monkeypatch.delenv("AGENT_BOM_OIDC_AUDIENCE", raising=False)
+        monkeypatch.delenv("AGENT_BOM_TRUST_PROXY_AUTH", raising=False)
+        monkeypatch.delenv("AGENT_BOM_POSTGRES_URL", raising=False)
+        monkeypatch.delenv("AGENT_BOM_REQUIRE_SHARED_RATE_LIMIT", raising=False)
+        # This test asserts fail-closed auth for a credentialed real request; the
+        # shared harness enables the anonymous opt-in by default, so disable it.
+        monkeypatch.delenv("AGENT_BOM_ALLOW_UNAUTHENTICATED_API", raising=False)
+        configure_api(
+            cors_origins=["http://localhost:3000"],
+            api_key="test-key-cors",
+            rate_limit_rpm=10,
+        )
+        client = TestClient(app)
+
+        resp = client.options(
+            "/v1/graph/snapshots",
+            headers={
+                "Origin": "http://localhost:3000",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization,x-api-key",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.headers.get("access-control-allow-origin") == "http://localhost:3000"
+        assert "GET" in resp.headers.get("access-control-allow-methods", "")
+        allow_headers = resp.headers.get("access-control-allow-headers", "").lower()
+        assert "authorization" in allow_headers
+        assert "x-api-key" in allow_headers
+
+        real_request = client.get(
+            "/v1/graph/snapshots",
+            headers={"Origin": "http://localhost:3000"},
+        )
+        assert real_request.status_code == 401
+    finally:
+        app.user_middleware = original
+        if app.middleware_stack is not None:
+            app.middleware_stack = app.build_middleware_stack()
+
+
+def test_api_key_middleware_exempts_packaged_dashboard_assets(monkeypatch):
+    """Dashboard shell assets must load before browser auth/bootstrap completes.
+
+    The public-route set is derived from the dashboard files the server ships
+    (``register_dashboard_spa_routes``), so this fixes a representative export
+    rather than restating a hand-maintained list. ``/dashboard`` and
+    ``/settings``, which the old hardcoded list allowlisted even though no such
+    page exists, are asserted 401 here.
+    """
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    from agent_bom.api import middleware as middleware_module
+
+    monkeypatch.setattr(
+        middleware_module,
+        "_DASHBOARD_SPA_ROUTES",
+        middleware_module.dashboard_spa_routes_from_files(["index.html", "agents/index.html", "manifest/index.html", "vulns.html"]),
+    )
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    test_app = Starlette(
+        routes=[
+            Route("/_next/static/app.js", dummy),
+            Route("/agents/index.html", dummy),
+            Route("/dashboard", dummy),
+            Route("/manifest", dummy),
+            Route("/manifest/index.html", dummy),
+            Route("/settings", dummy),
+            Route("/vulns.html", dummy),
+            Route("/admin.js", dummy),
+            Route("/v1/test.js", dummy),
+        ]
+    )
+    test_app.add_middleware(APIKeyMiddleware, api_key="test-key-123")
+
+    client = TestClient(test_app)
+    assert client.get("/_next/static/app.js").status_code == 200
+    assert client.get("/agents/index.html").status_code == 200
+    assert client.get("/manifest").status_code == 200
+    assert client.get("/manifest/index.html").status_code == 200
+    assert client.get("/vulns.html").status_code == 200
+    assert client.get("/dashboard").status_code == 401
+    assert client.get("/settings").status_code == 401
+    assert client.get("/admin.js").status_code == 401
+    assert client.get("/v1/test.js").status_code == 401
+
+
+def test_api_key_middleware_bearer():
+    """Bearer token should authenticate successfully."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    test_app = Starlette(routes=[Route("/v1/test", dummy)])
+    test_app.add_middleware(APIKeyMiddleware, api_key="test-key-123")
+
+    client = TestClient(test_app)
+    resp = client.get("/v1/test", headers={"Authorization": "Bearer test-key-123"})
+    assert resp.status_code == 200
+
+
+def test_configure_api_orders_auth_before_rate_limit_for_tenant_scoping(monkeypatch):
+    """Auth must populate tenant state before rate limiting resolves buckets."""
+    from agent_bom.api.server import app, configure_api
+
+    original = list(app.user_middleware)
+    try:
+        monkeypatch.delenv("AGENT_BOM_OIDC_ISSUER", raising=False)
+        configure_api(api_key="test-key-123", rate_limit_rpm=10)
+        order = [middleware.cls for middleware in app.user_middleware]
+        assert order.index(MaxBodySizeMiddleware) < order.index(APIKeyMiddleware) < order.index(RateLimitMiddleware)
+    finally:
+        app.user_middleware = original
+        if app.middleware_stack is not None:
+            app.middleware_stack = app.build_middleware_stack()
+
+
+def test_api_key_middleware_x_api_key():
+    """X-API-Key header should authenticate successfully."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    test_app = Starlette(routes=[Route("/v1/test", dummy)])
+    test_app.add_middleware(APIKeyMiddleware, api_key="test-key-123")
+
+    client = TestClient(test_app)
+    resp = client.get("/v1/test", headers={"X-API-Key": "test-key-123"})
+    assert resp.status_code == 200
+
+
+def test_api_key_middleware_wrong_key():
+    """Wrong API key should get 401."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    test_app = Starlette(routes=[Route("/v1/test", dummy)])
+    test_app.add_middleware(APIKeyMiddleware, api_key="correct-key")
+
+    client = TestClient(test_app)
+    resp = client.get("/v1/test", headers={"Authorization": "Bearer wrong-key"})
+    assert resp.status_code == 401
+
+
+def test_api_key_middleware_accepts_signed_browser_session(monkeypatch):
+    """Signed httpOnly-cookie sessions authenticate browsers without raw key reuse."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    monkeypatch.setenv("AGENT_BOM_BROWSER_SESSION_SIGNING_KEY", "test-browser-session-signing-key")
+
+    async def dummy(request):
+        return StarletteJSONResponse(
+            {
+                "ok": True,
+                "role": request.state.api_key_role,
+                "tenant": request.state.tenant_id,
+                "method": request.state.auth_method,
+            }
+        )
+
+    token, csrf = create_browser_session_token(
+        subject="dashboard-user",
+        role="admin",
+        tenant_id="tenant-alpha",
+        auth_method="browser_session_static_api_key",
+        max_age_seconds=300,
+    )
+    test_app = Starlette(routes=[Route("/v1/scan", dummy, methods=["POST"])])
+    test_app.add_middleware(APIKeyMiddleware, api_key="static-key")
+
+    client = TestClient(test_app)
+    client.cookies.set(SESSION_COOKIE_NAME, token)
+    client.cookies.set(CSRF_COOKIE_NAME, csrf)
+    resp = client.post(
+        "/v1/scan",
+        headers={CSRF_HEADER_NAME: csrf},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "ok": True,
+        "role": "admin",
+        "tenant": "tenant-alpha",
+        "method": "browser_session_static_api_key",
+    }
+
+
+def test_static_api_key_middleware_fails_closed_when_clustered(monkeypatch):
+    """The static key shortcut must not pin all tenants to default in clustered mode."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    monkeypatch.setenv("AGENT_BOM_CONTROL_PLANE_REPLICAS", "2")
+    test_app = Starlette(routes=[Route("/v1/test", dummy)])
+    test_app.add_middleware(APIKeyMiddleware, api_key="static-key")
+    client = TestClient(test_app)
+
+    with pytest.raises(RuntimeError, match="static-key auth is disabled"):
+        client.get("/v1/test", headers={"Authorization": "Bearer static-key"})
+
+
+def test_api_key_middleware_rejects_browser_session_without_csrf(monkeypatch):
+    """Unsafe browser-session requests need the CSRF cookie/header pair."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    monkeypatch.setenv("AGENT_BOM_BROWSER_SESSION_SIGNING_KEY", "test-browser-session-signing-key")
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    token, csrf = create_browser_session_token(
+        subject="dashboard-user",
+        role="admin",
+        tenant_id="tenant-alpha",
+        auth_method="browser_session_static_api_key",
+        max_age_seconds=300,
+    )
+    test_app = Starlette(routes=[Route("/v1/scan", dummy, methods=["POST"])])
+    test_app.add_middleware(APIKeyMiddleware, api_key="static-key")
+
+    client = TestClient(test_app)
+    client.cookies.set(SESSION_COOKIE_NAME, token)
+    client.cookies.set(CSRF_COOKIE_NAME, csrf)
+    resp = client.post("/v1/scan")
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Forbidden — missing or invalid CSRF token"
+
+
+def test_api_key_middleware_rejects_csrf_from_another_session(monkeypatch):
+    """CSRF tokens are bound to the signed browser-session nonce."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    monkeypatch.setenv("AGENT_BOM_BROWSER_SESSION_SIGNING_KEY", "test-browser-session-signing-key")
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    token_a, _csrf_a = create_browser_session_token(
+        subject="dashboard-user",
+        role="admin",
+        tenant_id="tenant-alpha",
+        auth_method="browser_session_static_api_key",
+        max_age_seconds=300,
+    )
+    _token_b, csrf_b = create_browser_session_token(
+        subject="dashboard-user",
+        role="admin",
+        tenant_id="tenant-alpha",
+        auth_method="browser_session_static_api_key",
+        max_age_seconds=300,
+    )
+    test_app = Starlette(routes=[Route("/v1/scan", dummy, methods=["POST"])])
+    test_app.add_middleware(APIKeyMiddleware, api_key="static-key")
+
+    client = TestClient(test_app)
+    client.cookies.set(SESSION_COOKIE_NAME, token_a)
+    client.cookies.set(CSRF_COOKIE_NAME, csrf_b)
+    resp = client.post(
+        "/v1/scan",
+        headers={CSRF_HEADER_NAME: csrf_b},
+    )
+    assert resp.status_code == 403
+
+
+def test_api_key_middleware_rejects_revoked_browser_session(monkeypatch):
+    """Logout-side nonce revocation should invalidate a live signed session."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    monkeypatch.setenv("AGENT_BOM_BROWSER_SESSION_SIGNING_KEY", "test-browser-session-signing-key")
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    token, csrf = create_browser_session_token(
+        subject="dashboard-user",
+        role="admin",
+        tenant_id="tenant-alpha",
+        auth_method="browser_session_static_api_key",
+        max_age_seconds=300,
+    )
+    assert revoke_browser_session_token(token) is True
+    test_app = Starlette(routes=[Route("/v1/scan", dummy, methods=["POST"])])
+    test_app.add_middleware(APIKeyMiddleware, api_key="static-key")
+
+    client = TestClient(test_app)
+    client.cookies.set(SESSION_COOKIE_NAME, token)
+    client.cookies.set(CSRF_COOKIE_NAME, csrf)
+    resp = client.post(
+        "/v1/scan",
+        headers={CSRF_HEADER_NAME: csrf},
+    )
+    assert resp.status_code == 401
+
+
+def test_api_key_middleware_health_exempt():
+    """Health endpoint should be exempt from auth."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    test_app = Starlette(routes=[Route("/health", dummy)])
+    test_app.add_middleware(APIKeyMiddleware, api_key="test-key-123")
+
+    client = TestClient(test_app)
+    resp = client.get("/health")
+    assert resp.status_code == 200
+
+
+def test_api_key_middleware_proxy_headers_authenticate_when_enabled(monkeypatch):
+    """Trusted proxy headers should satisfy auth when explicitly enabled."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse(
+            {
+                "role": request.state.api_key_role,
+                "tenant_id": request.state.tenant_id,
+                "method": request.state.auth_method,
+            }
+        )
+
+    monkeypatch.setenv("AGENT_BOM_TRUST_PROXY_AUTH", "1")
+    monkeypatch.setenv("AGENT_BOM_TRUST_PROXY_AUTH_SECRET", "test-proxy-secret-with-32-plus-bytes")
+    test_app = Starlette(routes=[Route("/v1/test", dummy)])
+    test_app.add_middleware(APIKeyMiddleware, api_key="")
+
+    client = TestClient(test_app)
+    resp = client.get(
+        "/v1/test",
+        headers={
+            "X-Agent-Bom-Role": "analyst",
+            "X-Agent-Bom-Tenant-ID": "tenant-alpha",
+            "X-Agent-Bom-Proxy-Secret": "test-proxy-secret-with-32-plus-bytes",
+            "X-Agent-Bom-Subject": "alice@corp.example",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"role": "analyst", "tenant_id": "tenant-alpha", "method": "proxy_header"}
+
+
+def test_api_key_middleware_proxy_headers_require_tenant(monkeypatch):
+    """Trusted proxy auth must fail closed when the tenant header is missing."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    monkeypatch.setenv("AGENT_BOM_TRUST_PROXY_AUTH", "1")
+    monkeypatch.setenv("AGENT_BOM_TRUST_PROXY_AUTH_SECRET", "test-proxy-secret-with-32-plus-bytes")
+    test_app = Starlette(routes=[Route("/v1/test", dummy)])
+    test_app.add_middleware(APIKeyMiddleware, api_key="")
+
+    client = TestClient(test_app)
+    resp = client.get(
+        "/v1/test",
+        headers={"X-Agent-Bom-Role": "viewer", "X-Agent-Bom-Proxy-Secret": "test-proxy-secret-with-32-plus-bytes"},
+    )
+    assert resp.status_code == 401
+    assert "X-Agent-Bom-Tenant-ID" in resp.json()["detail"]
+
+
+def test_api_key_middleware_proxy_headers_reject_weak_secret(monkeypatch):
+    """Trusted proxy auth must fail closed when attestation secret is too weak."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    monkeypatch.setenv("AGENT_BOM_TRUST_PROXY_AUTH", "1")
+    monkeypatch.setenv("AGENT_BOM_TRUST_PROXY_AUTH_SECRET", "short")
+    test_app = Starlette(routes=[Route("/v1/test", dummy)])
+    test_app.add_middleware(APIKeyMiddleware, api_key="")
+
+    client = TestClient(test_app)
+    resp = client.get(
+        "/v1/test",
+        headers={
+            "X-Agent-Bom-Role": "viewer",
+            "X-Agent-Bom-Tenant-ID": "tenant-alpha",
+            "X-Agent-Bom-Proxy-Secret": "short",
+        },
+    )
+    assert resp.status_code == 503
+
+
+def test_api_key_middleware_proxy_headers_require_pinned_issuer(monkeypatch):
+    """When configured, trusted proxy auth must bind to the expected upstream issuer."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    secret = "test-proxy-secret-with-32-plus-bytes"
+    monkeypatch.setenv("AGENT_BOM_TRUST_PROXY_AUTH", "1")
+    monkeypatch.setenv("AGENT_BOM_TRUST_PROXY_AUTH_SECRET", secret)
+    monkeypatch.setenv("AGENT_BOM_TRUST_PROXY_AUTH_ISSUER", "corp-oidc-proxy")
+    test_app = Starlette(routes=[Route("/v1/test", dummy)])
+    test_app.add_middleware(APIKeyMiddleware, api_key="")
+
+    client = TestClient(test_app)
+    resp = client.get(
+        "/v1/test",
+        headers={
+            "X-Agent-Bom-Role": "viewer",
+            "X-Agent-Bom-Tenant-ID": "tenant-alpha",
+            "X-Agent-Bom-Proxy-Secret": secret,
+            "X-Agent-Bom-Auth-Issuer": "other-proxy",
+        },
+    )
+    assert resp.status_code == 401
+
+
+def test_api_key_middleware_exception_create_allows_analyst_role():
+    """Analyst API keys should keep write access to exception creation paths."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"tenant_id": getattr(request.state, "tenant_id", "default"), "role": request.state.api_key_role})
+
+    original_store = get_key_store()
+    store = KeyStore()
+    raw_key, analyst = create_api_key("analyst", Role.ANALYST, tenant_id="tenant-alpha")
+    store.add(analyst)
+    set_key_store(store)
+    try:
+        test_app = Starlette(routes=[Route("/v1/exceptions", dummy, methods=["POST"])])
+        test_app.add_middleware(APIKeyMiddleware, api_key="test-key-123")
+        client = TestClient(test_app)
+        resp = client.post("/v1/exceptions", headers={"Authorization": f"Bearer {raw_key}"})
+        assert resp.status_code == 200
+        assert resp.json() == {"tenant_id": "tenant-alpha", "role": "analyst"}
+    finally:
+        set_key_store(original_store)
+
+
+def test_api_key_middleware_auth_key_list_requires_admin_role():
+    """Viewer API keys should not be able to list API keys."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    original_store = get_key_store()
+    store = KeyStore()
+    raw_key, viewer = create_api_key("viewer", Role.VIEWER, tenant_id="tenant-alpha")
+    store.add(viewer)
+    set_key_store(store)
+    try:
+        test_app = Starlette(routes=[Route("/v1/auth/keys", dummy)])
+        test_app.add_middleware(APIKeyMiddleware, api_key="test-key-123")
+        client = TestClient(test_app)
+        resp = client.get("/v1/auth/keys", headers={"Authorization": f"Bearer {raw_key}"})
+        assert resp.status_code == 403
+        assert "requires admin role" in resp.json()["detail"]
+    finally:
+        set_key_store(original_store)
+
+
+def test_api_key_middleware_auth_key_rotate_requires_admin_role():
+    """Analyst API keys must not be able to rotate enterprise API keys."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    original_store = get_key_store()
+    store = KeyStore()
+    raw_key, analyst = create_api_key("analyst", Role.ANALYST, tenant_id="tenant-alpha")
+    store.add(analyst)
+    set_key_store(store)
+    try:
+        test_app = Starlette(routes=[Route("/v1/auth/keys/key-123/rotate", dummy, methods=["POST"])])
+        test_app.add_middleware(APIKeyMiddleware, api_key="test-key-123")
+        client = TestClient(test_app)
+        resp = client.post("/v1/auth/keys/key-123/rotate", headers={"Authorization": f"Bearer {raw_key}"})
+        assert resp.status_code == 403
+        assert "requires admin role" in resp.json()["detail"]
+    finally:
+        set_key_store(original_store)
+
+
+def test_api_key_middleware_exception_approve_requires_admin_role():
+    """Analyst API keys must not be able to approve exceptions."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    original_store = get_key_store()
+    store = KeyStore()
+    raw_key, analyst = create_api_key("analyst", Role.ANALYST, tenant_id="tenant-alpha")
+    store.add(analyst)
+    set_key_store(store)
+    try:
+        test_app = Starlette(routes=[Route("/v1/exceptions/exc-1/approve", dummy, methods=["PUT"])])
+        test_app.add_middleware(APIKeyMiddleware, api_key="test-key-123")
+        client = TestClient(test_app)
+        resp = client.put("/v1/exceptions/exc-1/approve", headers={"Authorization": f"Bearer {raw_key}"})
+        assert resp.status_code == 403
+        assert "requires admin role" in resp.json()["detail"]
+    finally:
+        set_key_store(original_store)
+
+
+def test_api_key_middleware_graph_preset_mutation_requires_analyst_role():
+    """Viewer API keys must not be able to create graph presets."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    original_store = get_key_store()
+    store = KeyStore()
+    raw_key, viewer = create_api_key("viewer", Role.VIEWER, tenant_id="tenant-alpha")
+    store.add(viewer)
+    set_key_store(store)
+    try:
+        test_app = Starlette(routes=[Route("/v1/graph/presets", dummy, methods=["POST"])])
+        test_app.add_middleware(APIKeyMiddleware, api_key="test-key-123")
+        client = TestClient(test_app)
+        resp = client.post("/v1/graph/presets", headers={"Authorization": f"Bearer {raw_key}"})
+        assert resp.status_code == 403
+        assert "requires analyst role" in resp.json()["detail"]
+    finally:
+        set_key_store(original_store)
+
+
+def test_api_key_middleware_enforces_scopes_when_present():
+    """Scoped keys should be denied when the route needs a missing scope."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    original_store = get_key_store()
+    store = KeyStore()
+    raw_key, analyst = create_api_key("analyst", Role.ANALYST, tenant_id="tenant-alpha", scopes=["graph.preset:write"])
+    store.add(analyst)
+    set_key_store(store)
+    try:
+        test_app = Starlette(routes=[Route("/v1/scan", dummy, methods=["POST"])])
+        test_app.add_middleware(APIKeyMiddleware, api_key="test-key-123")
+        client = TestClient(test_app)
+        resp = client.post("/v1/scan", headers={"Authorization": f"Bearer {raw_key}"})
+        assert resp.status_code == 403
+        assert "requires scope scan:write" in resp.json()["detail"]
+    finally:
+        set_key_store(original_store)
+
+
+def test_api_key_middleware_requires_shield_write_scope_for_shield_writes():
+    """Scoped admin keys should need shield:write for Shield write routes."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    original_store = get_key_store()
+    store = KeyStore()
+    raw_missing_scope, missing_scope = create_api_key(
+        "admin-with-scan-scope",
+        Role.ADMIN,
+        tenant_id="tenant-alpha",
+        scopes=["scan:write"],
+    )
+    raw_allowed, allowed = create_api_key(
+        "admin-with-shield-scope",
+        Role.ADMIN,
+        tenant_id="tenant-alpha",
+        scopes=["shield:write"],
+    )
+    store.add(missing_scope)
+    store.add(allowed)
+    set_key_store(store)
+    try:
+        test_app = Starlette(
+            routes=[
+                Route("/v1/shield/start", dummy, methods=["POST"]),
+                Route("/v1/shield/unblock", dummy, methods=["POST"]),
+                Route("/v1/shield/break-glass", dummy, methods=["POST"]),
+            ]
+        )
+        test_app.add_middleware(APIKeyMiddleware, api_key="test-key-123")
+        client = TestClient(test_app)
+
+        for path in ("/v1/shield/start", "/v1/shield/unblock", "/v1/shield/break-glass"):
+            denied = client.post(path, headers={"Authorization": f"Bearer {raw_missing_scope}"})
+            assert denied.status_code == 403
+            assert "requires scope shield:write" in denied.json()["detail"]
+
+            allowed_resp = client.post(path, headers={"Authorization": f"Bearer {raw_allowed}"})
+            assert allowed_resp.status_code == 200
+    finally:
+        set_key_store(original_store)
+
+
+def test_api_key_middleware_empty_scopes_keep_legacy_access():
+    """Keys without scopes should preserve the legacy unrestricted behavior."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    original_store = get_key_store()
+    store = KeyStore()
+    raw_key, analyst = create_api_key("analyst", Role.ANALYST, tenant_id="tenant-alpha")
+    store.add(analyst)
+    set_key_store(store)
+    try:
+        test_app = Starlette(routes=[Route("/v1/scan", dummy, methods=["POST"])])
+        test_app.add_middleware(APIKeyMiddleware, api_key="test-key-123")
+        client = TestClient(test_app)
+        resp = client.post("/v1/scan", headers={"Authorization": f"Bearer {raw_key}"})
+        assert resp.status_code == 200
+    finally:
+        set_key_store(original_store)
+
+
+def test_api_key_middleware_oidc_sets_tenant_from_custom_claim():
+    """OIDC tenant scoping should honor AGENT_BOM_OIDC_TENANT_CLAIM semantics."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"tenant_id": request.state.tenant_id, "role": request.state.api_key_role})
+
+    test_app = Starlette(routes=[Route("/v1/test", dummy)])
+    test_app.add_middleware(APIKeyMiddleware, api_key="test-key-123")
+
+    cfg = OIDCConfig(issuer="https://corp.okta.com", audience="agent-bom", tenant_claim="org_slug")
+    with (
+        patch("agent_bom.api.oidc.OIDCConfig.from_env", return_value=cfg),
+        patch(
+            "agent_bom.api.oidc.verify_oidc_token",
+            return_value={"sub": "u1", "email": "alice@corp.com", "agent_bom_role": "analyst", "org_slug": "tenant-zeta"},
+        ),
+    ):
+        client = TestClient(test_app)
+        resp = client.get("/v1/test", headers={"Authorization": "Bearer oidc.jwt"})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"tenant_id": "tenant-zeta", "role": "analyst"}
+
+
+def test_api_key_middleware_oidc_routes_token_to_tenant_bound_issuer():
+    """Tenant-bound OIDC config should resolve issuer-specific tenant context."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"tenant_id": request.state.tenant_id, "role": request.state.api_key_role})
+
+    test_app = Starlette(routes=[Route("/v1/test", dummy)])
+    test_app.add_middleware(APIKeyMiddleware, api_key="test-key-123")
+
+    cfg = OIDCConfig(
+        tenant_providers={
+            "tenant-alpha": OIDCConfig(
+                issuer="https://alpha.okta.example",
+                audience="agent-bom",
+                tenant_id="tenant-alpha",
+                require_tenant_claim=True,
+            )
+        }
+    )
+    token = _unsigned_test_jwt({"iss": "https://alpha.okta.example"})
+    with (
+        patch("agent_bom.api.oidc.OIDCConfig.from_env", return_value=cfg),
+        patch(
+            "agent_bom.api.oidc.verify_oidc_token",
+            return_value={"iss": "https://alpha.okta.example", "sub": "u1", "agent_bom_role": "analyst", "tenant_id": "tenant-alpha"},
+        ),
+    ):
+        client = TestClient(test_app)
+        resp = client.get("/v1/test", headers={"Authorization": f"Bearer {token}"})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"tenant_id": "tenant-alpha", "role": "analyst"}
+
+
+def test_configure_api_enables_auth_middleware_for_oidc(monkeypatch):
+    """OIDC-only deployments still need the auth middleware installed."""
+    monkeypatch.setenv("AGENT_BOM_OIDC_ISSUER", "https://corp.okta.com")
+    monkeypatch.setenv("AGENT_BOM_OIDC_AUDIENCE", "agent-bom")
+    configure_api(api_key=None)
+    try:
+        assert any(m.cls is APIKeyMiddleware for m in app.user_middleware)
+    finally:
+        monkeypatch.delenv("AGENT_BOM_OIDC_ISSUER", raising=False)
+        monkeypatch.delenv("AGENT_BOM_OIDC_AUDIENCE", raising=False)
+        configure_api(api_key=None)
+
+
+def test_configure_api_enables_auth_middleware_for_tenant_bound_oidc(monkeypatch):
+    """Tenant-bound OIDC issuer maps should also install auth middleware."""
+    monkeypatch.setenv(
+        "AGENT_BOM_OIDC_TENANT_PROVIDERS_JSON",
+        '{"tenant-alpha":{"issuer":"https://alpha.okta.example","audience":"agent-bom"}}',
+    )
+    configure_api(api_key=None)
+    try:
+        assert any(m.cls is APIKeyMiddleware for m in app.user_middleware)
+    finally:
+        monkeypatch.delenv("AGENT_BOM_OIDC_TENANT_PROVIDERS_JSON", raising=False)
+        configure_api(api_key=None)
+
+
+def test_configure_api_enables_auth_middleware_for_trusted_proxy(monkeypatch):
+    """Trusted-proxy browser auth must also install the auth middleware."""
+    monkeypatch.setenv("AGENT_BOM_TRUST_PROXY_AUTH", "1")
+    monkeypatch.setenv("AGENT_BOM_TRUST_PROXY_AUTH_SECRET", "test-proxy-secret-with-32-plus-bytes")
+    configure_api(api_key=None)
+    try:
+        assert any(m.cls is APIKeyMiddleware for m in app.user_middleware)
+    finally:
+        monkeypatch.delenv("AGENT_BOM_TRUST_PROXY_AUTH", raising=False)
+        monkeypatch.delenv("AGENT_BOM_TRUST_PROXY_AUTH_SECRET", raising=False)
+        configure_api(api_key=None)
+
+
+def test_api_key_middleware_oidc_requires_explicit_role_claim_when_enabled():
+    """Strict OIDC mode should reject tokens that lack a mapped role signal."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    test_app = Starlette(routes=[Route("/v1/test", dummy)])
+    test_app.add_middleware(APIKeyMiddleware, api_key="test-key-123")
+
+    cfg = OIDCConfig(
+        issuer="https://corp.okta.com",
+        audience="agent-bom",
+        require_role_claim=True,
+    )
+    with (
+        patch("agent_bom.api.oidc.OIDCConfig.from_env", return_value=cfg),
+        patch(
+            "agent_bom.api.oidc.verify_oidc_token",
+            return_value={"sub": "u1", "email": "alice@corp.com"},
+        ),
+    ):
+        client = TestClient(test_app)
+        resp = client.get("/v1/test", headers={"Authorization": "Bearer oidc.jwt"})
+
+    assert resp.status_code == 401
+    assert "invalid API key" in resp.json()["detail"]
+
+
+def test_rate_limit_middleware():
+    """Should return 429 when rate limit exceeded."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    test_app = Starlette(routes=[Route("/v1/scan", dummy, methods=["POST"])])
+    test_app.add_middleware(RateLimitMiddleware, scan_rpm=3, read_rpm=10)
+
+    client = TestClient(test_app)
+    # First 3 should succeed
+    for _ in range(3):
+        resp = client.post("/v1/scan")
+        assert resp.status_code == 200
+
+    # 4th should be rate limited
+    resp = client.post("/v1/scan")
+    assert resp.status_code == 429
+    assert "Retry-After" in resp.headers
+
+
+def test_runtime_evidence_ingest_uses_scan_rate_limit_bucket():
+    """CWPP ingest must not burn the generous read RPM budget."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    path = "/v1/cloud/runtime-evidence/ingest"
+    test_app = Starlette(
+        routes=[
+            Route(path, dummy, methods=["POST"]),
+            Route("/v1/findings", dummy, methods=["GET"]),
+        ]
+    )
+    test_app.add_middleware(RateLimitMiddleware, scan_rpm=3, read_rpm=10)
+
+    client = TestClient(test_app)
+    for _ in range(3):
+        resp = client.post(path)
+        assert resp.status_code == 200
+        assert resp.headers["X-RateLimit-Limit"] == "3"
+
+    resp = client.post(path)
+    assert resp.status_code == 429
+    assert resp.headers["X-RateLimit-Limit"] == "3"
+
+    # Read budget remains independent of the write ingest bucket.
+    read = client.get("/v1/findings")
+    assert read.status_code == 200
+    assert read.headers["X-RateLimit-Limit"] == "10"
+
+
+def test_write_rate_limit_classifier_covers_scan_and_runtime_ingest():
+    assert RateLimitMiddleware._is_write_rate_limited("/v1/scan", "POST") is True
+    assert RateLimitMiddleware._is_write_rate_limited("/v1/scan/dataset-cards", "POST") is True
+    assert RateLimitMiddleware._is_write_rate_limited("/v1/cloud/runtime-evidence/ingest", "POST") is True
+    assert RateLimitMiddleware._is_write_rate_limited("/v1/cloud/connections/events/ingest", "POST") is True
+    assert RateLimitMiddleware._is_write_rate_limited("/v1/cloud/runtime-evidence/ingest", "GET") is False
+    assert RateLimitMiddleware._is_write_rate_limited("/v1/findings", "GET") is False
+    assert RateLimitMiddleware._is_write_rate_limited("/v1/findings", "POST") is False
+
+
+def test_audit_and_gateway_limits_are_validated():
+    """High-volume audit surfaces must reject invalid limits instead of forwarding them."""
+    configure_api(api_key=None, rate_limit_rpm=1000)
+    client = TestClient(app)
+
+    assert client.get("/v1/audit?limit=0").status_code == 422
+    assert client.get("/v1/audit?limit=1001").status_code == 422
+    assert client.get("/v1/audit/integrity?limit=0").status_code == 422
+    assert client.get("/v1/audit/export?limit=10001").status_code == 422
+    assert client.get("/v1/gateway/audit?limit=1001").status_code == 422
+
+
+def test_rate_limit_middleware_uses_postgres_store_when_available(monkeypatch):
+    """Postgres-backed limiter should be selected when AGENT_BOM_POSTGRES_URL is set."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    fake_store = MagicMock()
+    fake_store.hit.return_value = (1, 1_700_000_060)
+
+    monkeypatch.setenv("AGENT_BOM_POSTGRES_URL", "postgresql://example/test")
+    with patch("agent_bom.api.middleware.PostgresRateLimitStore", return_value=fake_store):
+        test_app = Starlette(routes=[Route("/v1/test", dummy)])
+        test_app.add_middleware(RateLimitMiddleware, scan_rpm=3, read_rpm=10)
+        client = TestClient(test_app)
+        resp = client.get("/v1/test")
+
+    assert resp.status_code == 200
+    fake_store.hit.assert_called_once()
+
+
+def test_rate_limit_middleware_fails_closed_when_postgres_store_unavailable(monkeypatch):
+    """Configured shared Postgres state must not silently downgrade to local buckets."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    monkeypatch.setenv("AGENT_BOM_POSTGRES_URL", "postgresql://example/test")
+    with patch("agent_bom.api.middleware.PostgresRateLimitStore", side_effect=RuntimeError("boom")):
+        test_app = Starlette(routes=[Route("/v1/test", dummy)])
+        test_app.add_middleware(RateLimitMiddleware, scan_rpm=3, read_rpm=10)
+        client = TestClient(test_app)
+        with pytest.raises(RuntimeError, match="Configured Postgres rate limiter could not initialize"):
+            client.get("/v1/test")
+
+
+def test_rate_limit_middleware_can_fail_closed_when_shared_store_required(monkeypatch):
+    """Production-style deployments should be able to refuse startup without shared limiter state."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    monkeypatch.setenv("AGENT_BOM_CONTROL_PLANE_REPLICAS", "2")
+    test_app = Starlette(routes=[Route("/v1/test", dummy)])
+    test_app.add_middleware(RateLimitMiddleware, scan_rpm=3, read_rpm=10)
+    client = TestClient(test_app)
+    try:
+        client.get("/v1/test")
+        raise AssertionError("expected shared rate-limit initialization to fail")
+    except RuntimeError as exc:
+        assert "Shared rate limiting is required" in str(exc)
+
+
+def test_rate_limit_middleware_respects_explicit_shared_rate_limit_requirement(monkeypatch):
+    """The explicit fail-closed flag should reject startup without Postgres too."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    monkeypatch.setenv("AGENT_BOM_REQUIRE_SHARED_RATE_LIMIT", "1")
+    with patch("agent_bom.api.middleware.PostgresRateLimitStore", side_effect=RuntimeError("boom")):
+        test_app = Starlette(routes=[Route("/v1/test", dummy)])
+        test_app.add_middleware(RateLimitMiddleware, scan_rpm=3, read_rpm=10)
+        client = TestClient(test_app)
+        try:
+            client.get("/v1/test")
+            raise AssertionError("expected shared rate-limit initialization to fail")
+        except RuntimeError as exc:
+            assert "Shared rate limiting is required" in str(exc)
+
+
+def test_rate_limit_middleware_scopes_by_auth_credential():
+    """Different API credentials behind one shared IP should not starve each other."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    test_app = Starlette(routes=[Route("/v1/test", dummy)])
+    test_app.add_middleware(RateLimitMiddleware, scan_rpm=3, read_rpm=2)
+
+    client = TestClient(test_app)
+    assert client.get("/v1/test", headers={"X-API-Key": "alpha"}).status_code == 200
+    assert client.get("/v1/test", headers={"X-API-Key": "alpha"}).status_code == 200
+    assert client.get("/v1/test", headers={"X-API-Key": "beta"}).status_code == 200
+
+
+def test_rate_limit_middleware_ignores_untrusted_tenant_state():
+    """Forged tenant state must not move unauthenticated requests into fresh buckets."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        request.state.tenant_id = request.headers.get("X-Agent-Bom-Tenant-ID", "default")
+        return StarletteJSONResponse({"ok": True})
+
+    test_app = Starlette(routes=[Route("/v1/test", dummy)])
+    limiter = RateLimitMiddleware(test_app, scan_rpm=3, read_rpm=2)
+    client = TestClient(limiter)
+
+    assert client.get("/v1/test", headers={"X-Agent-Bom-Tenant-ID": "tenant-a"}).status_code == 200
+    assert client.get("/v1/test", headers={"X-Agent-Bom-Tenant-ID": "tenant-b"}).status_code == 200
+    assert client.get("/v1/test", headers={"X-Agent-Bom-Tenant-ID": "tenant-c"}).status_code == 429
+
+
+def test_rate_limit_middleware_scopes_api_keys_by_tenant():
+    """Different API keys for the same tenant should share one tenant-wide bucket."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    original_store = get_key_store()
+    store = KeyStore()
+    raw_alpha, alpha = create_api_key("alpha", Role.ADMIN, tenant_id="tenant-alpha")
+    raw_beta, beta = create_api_key("beta", Role.ANALYST, tenant_id="tenant-alpha")
+    store.add(alpha)
+    store.add(beta)
+    set_key_store(store)
+    try:
+        test_app = Starlette(routes=[Route("/v1/test", dummy)])
+        test_app.add_middleware(APIKeyMiddleware, api_key="unused-static-key")
+        # These reads resolve to a tenant bucket, so the authenticated budget is
+        # the one under test here; read_rpm covers anonymous callers only.
+        test_app.add_middleware(RateLimitMiddleware, scan_rpm=3, read_rpm=2, authenticated_read_rpm=2)
+
+        client = TestClient(test_app)
+        assert client.get("/v1/test", headers={"Authorization": f"Bearer {raw_alpha}"}).status_code == 200
+        assert client.get("/v1/test", headers={"Authorization": f"Bearer {raw_beta}"}).status_code == 200
+        assert client.get("/v1/test", headers={"Authorization": f"Bearer {raw_alpha}"}).status_code == 429
+    finally:
+        set_key_store(original_store)
+
+
+def test_in_memory_rate_limit_store_prunes_oldest_entries_instead_of_clearing_all():
+    """Overflow should evict oldest buckets, not reset every limiter bucket at once."""
+    store = InMemoryRateLimitStore(window_seconds=60)
+    now = time.time()
+    store._hits = {f"bucket-{idx}": [now - 1] for idx in range(store._MAX_ENTRIES)}
+    store._hits["important"] = [now - 1]
+    store._last_cleanup = 0
+
+    count, _ = store.hit("important", now)
+
+    assert count == 2
+    assert "important" in store._hits
+    assert len(store._hits) <= store._MAX_ENTRIES
+
+
+def test_in_memory_rate_limit_store_is_thread_safe_for_same_bucket():
+    """Concurrent hits on one bucket should not lose updates."""
+    store = InMemoryRateLimitStore(window_seconds=60)
+    now = time.time()
+
+    def _hit() -> int:
+        count, _ = store.hit("shared-bucket", now)
+        return count
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        counts = list(pool.map(lambda _: _hit(), range(64)))
+
+    assert len(store._hits["shared-bucket"]) == 64
+    assert max(counts) == 64
+
+
+def test_max_body_size_middleware():
+    """Should reject requests with Content-Length > max."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    test_app = Starlette(routes=[Route("/v1/scan", dummy, methods=["POST"])])
+    test_app.add_middleware(MaxBodySizeMiddleware, max_bytes=100)
+
+    client = TestClient(test_app)
+    resp = client.post("/v1/scan", headers={"Content-Length": "200"}, content=b"x" * 200)
+    assert resp.status_code == 413
+
+
+def test_max_concurrent_jobs():
+    """Should return 429 when the tenant's active scan quota is exceeded."""
+    from agent_bom.api.server import JobStatus, ScanJob, ScanRequest, _get_store, set_job_store
+    from agent_bom.api.store import InMemoryJobStore
+    from agent_bom.config import API_MAX_ACTIVE_SCAN_JOBS_PER_TENANT
+
+    # Use a fresh in-memory store filled with running jobs
+    original_store = _get_store()
+    fake_store = InMemoryJobStore()
+    dummy_request = ScanRequest()
+    for i in range(API_MAX_ACTIVE_SCAN_JOBS_PER_TENANT):
+        fake_store.put(
+            ScanJob(
+                job_id=f"fake-{i}",
+                status=JobStatus.RUNNING,
+                created_at="2026-01-01T00:00:00Z",
+                request=dummy_request,
+                progress=[],
+                tenant_id="default",
+            )
+        )
+
+    set_job_store(fake_store)
+    try:
+        client = TestClient(app)
+        resp = client.post("/v1/scan", json={"images": [], "k8s": False, "tf_dirs": [], "agent_projects": [], "enrich": False})
+        assert resp.status_code == 429
+        assert "concurrent" in resp.json()["detail"].lower()
+    finally:
+        set_job_store(original_store)
+
+
+def test_api_key_middleware_rejects_request_when_tenant_rls_bypass_is_active(monkeypatch):
+    """Defence-in-depth guard at middleware.py:805-810.
+
+    When `AGENT_BOM_POSTGRES_URL` is set and a request enters with the RLS
+    bypass context still active (a code path that should never reach the HTTP
+    boundary because `bypass_tenant_rls()` is `with`-scoped), the middleware
+    must reject the request with 500 rather than serve tenant data with the
+    bypass flag still true. Locks the guard so a future refactor can't quietly
+    drop it.
+    """
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    monkeypatch.setenv("AGENT_BOM_POSTGRES_URL", "postgresql://stub")
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    # Stub `is_tenant_rls_bypassed` so the test does not require a live
+    # Postgres connection — the bypass flag itself is a process-local
+    # contextvar, which makes it cheap and safe to monkeypatch.
+    import agent_bom.api.middleware as middleware_module
+    import agent_bom.api.postgres_store as postgres_store_module
+
+    monkeypatch.setattr(postgres_store_module, "is_tenant_rls_bypassed", lambda: True)
+
+    test_app = Starlette(routes=[Route("/v1/test", dummy)])
+    test_app.add_middleware(middleware_module.APIKeyMiddleware, api_key="test-key-123")
+
+    client = TestClient(test_app)
+    resp = client.get("/v1/test", headers={"Authorization": "Bearer test-key-123"})
+
+    assert resp.status_code == 500
+    assert "Tenant isolation guard" in resp.json()["detail"]
+
+
+def test_api_key_middleware_does_not_check_rls_bypass_when_postgres_disabled(monkeypatch):
+    """Reverse case: with no Postgres configured the guard short-circuits.
+
+    Without `AGENT_BOM_POSTGRES_URL` set, the request must not even import
+    the postgres_store helper — the `if os.environ.get(...)` gate keeps the
+    SQLite-only path off the postgres dependency.
+    """
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    monkeypatch.delenv("AGENT_BOM_POSTGRES_URL", raising=False)
+
+    async def dummy(request):
+        return StarletteJSONResponse({"ok": True})
+
+    import agent_bom.api.middleware as middleware_module
+
+    test_app = Starlette(routes=[Route("/v1/test", dummy)])
+    test_app.add_middleware(middleware_module.APIKeyMiddleware, api_key="test-key-123")
+
+    client = TestClient(test_app)
+    resp = client.get("/v1/test", headers={"Authorization": "Bearer test-key-123"})
+
+    assert resp.status_code == 200
+
+
+# ── Auth-session brute-force throttle identity (X-Forwarded-For spoofing) ─────
+
+
+def test_client_fingerprint_ignores_xff_without_trusted_proxy(monkeypatch):
+    """Default identity is the transport peer, not an attacker-supplied XFF."""
+    from agent_bom.api.routes import enterprise
+
+    monkeypatch.delenv("AGENT_BOM_TRUST_PROXY_AUTH", raising=False)
+    monkeypatch.delenv("AGENT_BOM_TRUSTED_PROXY_HOPS", raising=False)
+    request = SimpleNamespace(headers={"x-forwarded-for": "9.9.9.9"}, client=SimpleNamespace(host="10.0.0.5"))
+    assert enterprise._client_fingerprint(request) == "10.0.0.5"
+
+
+def test_client_fingerprint_honors_xff_with_trusted_hop_count(monkeypatch):
+    """A declared trusted-proxy hop count selects the proxy-appended address."""
+    from agent_bom.api.routes import enterprise
+
+    monkeypatch.delenv("AGENT_BOM_TRUST_PROXY_AUTH", raising=False)
+    monkeypatch.setenv("AGENT_BOM_TRUSTED_PROXY_HOPS", "1")
+    request = SimpleNamespace(
+        headers={"x-forwarded-for": "1.1.1.1, 2.2.2.2, 3.3.3.3"},
+        client=SimpleNamespace(host="10.0.0.5"),
+    )
+    assert enterprise._client_fingerprint(request) == "3.3.3.3"
+
+
+@pytest.mark.asyncio
+async def test_auth_session_xff_spoof_does_not_reset_bruteforce_window(monkeypatch):
+    """Rotating X-Forwarded-For must not let an attacker evade the limiter.
+
+    Fails before the fix: the throttle keyed on the leftmost XFF, so each forged
+    value minted a fresh bucket and the brute-force window never tripped.
+    """
+    from fastapi import HTTPException
+
+    from agent_bom.api.routes import enterprise
+    from agent_bom.api.shared_auth_state import reset_auth_state_for_tests
+
+    reset_auth_state_for_tests()
+    monkeypatch.delenv("AGENT_BOM_TRUST_PROXY_AUTH", raising=False)
+    monkeypatch.delenv("AGENT_BOM_TRUSTED_PROXY_HOPS", raising=False)
+    monkeypatch.setenv("AGENT_BOM_AUTH_SESSION_ATTEMPTS_PER_MINUTE", "1")
+    monkeypatch.setenv("AGENT_BOM_API_KEY", "valid-key")
+
+    def make_request(spoofed_xff: str):
+        return SimpleNamespace(
+            headers={"x-forwarded-for": spoofed_xff},
+            client=SimpleNamespace(host="203.0.113.10"),
+        )
+
+    with pytest.raises(HTTPException) as first:
+        await enterprise.create_browser_session(make_request("1.1.1.1"), Response(), enterprise.BrowserSessionRequest(api_key="bad-1"))
+    assert first.value.status_code == 401
+
+    with pytest.raises(HTTPException) as second:
+        await enterprise.create_browser_session(make_request("2.2.2.2"), Response(), enterprise.BrowserSessionRequest(api_key="bad-2"))
+    assert second.value.status_code == 429
+
+
+# ── Outermost coarse global rate limiter (pre-auth flood cap) ─────────────────
+
+
+def test_global_rate_limit_caps_flood_regardless_of_auth_outcome(monkeypatch):
+    """The global per-IP limiter caps traffic even when the handler rejects it.
+
+    Fails before the fix: there was no outermost limiter, so unauthenticated
+    floods reached (and were only rejected by) the auth layer without being
+    counted or capped.
+    """
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+    from starlette.routing import Route
+
+    from agent_bom.api.middleware import GlobalRateLimitMiddleware
+
+    monkeypatch.delenv("AGENT_BOM_POSTGRES_URL", raising=False)
+    monkeypatch.delenv("AGENT_BOM_REQUIRE_SHARED_RATE_LIMIT", raising=False)
+    monkeypatch.delenv("AGENT_BOM_CONTROL_PLANE_REPLICAS", raising=False)
+
+    async def unauthorized(request):
+        return StarletteJSONResponse({"detail": "unauthorized"}, status_code=401)
+
+    test_app = Starlette(routes=[Route("/v1/ping", unauthorized)])
+    test_app.add_middleware(GlobalRateLimitMiddleware, rpm=3)
+
+    client = TestClient(test_app)
+    codes = [client.get("/v1/ping").status_code for _ in range(6)]
+    # First 3 reach the (rejecting) handler; the 4th+ are capped pre-handler.
+    assert codes[0] == 401
+    assert codes[3] == 429
+    last = client.get("/v1/ping")
+    assert last.status_code == 429
+    assert last.json()["detail"] == "Global rate limit exceeded"
+
+
+def test_configure_api_mounts_global_limiter_outermost(monkeypatch):
+    """The global limiter must sit before auth and body-size middleware."""
+    from agent_bom.api.middleware import GlobalRateLimitMiddleware
+    from agent_bom.api.server import app as server_app
+    from agent_bom.api.server import configure_api as cfg
+
+    original = list(server_app.user_middleware)
+    try:
+        monkeypatch.delenv("AGENT_BOM_OIDC_ISSUER", raising=False)
+        cfg(api_key="test-key-123", rate_limit_rpm=10)
+        order = [m.cls for m in server_app.user_middleware]
+        assert order.index(GlobalRateLimitMiddleware) < order.index(APIKeyMiddleware)
+        assert order.index(GlobalRateLimitMiddleware) < order.index(MaxBodySizeMiddleware)
+    finally:
+        server_app.user_middleware = original
+        if server_app.middleware_stack is not None:
+            server_app.middleware_stack = server_app.build_middleware_stack()
+
+
+# ── Zero-config loopback dev key (feat/serve-zero-config-devkey) ─────────────
+
+
+def _clear_dev_key_auth_env(monkeypatch):
+    for name in (
+        "AGENT_BOM_API_KEY",
+        "AGENT_BOM_API_KEYS",
+        "AGENT_BOM_OIDC_ISSUER",
+        "AGENT_BOM_OIDC_TENANT_PROVIDERS_JSON",
+        "AGENT_BOM_TRUST_PROXY_AUTH",
+        "AGENT_BOM_SCIM_BEARER_TOKEN",
+        "AGENT_BOM_ALLOW_UNAUTHENTICATED_API",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_loopback_dev_key_request_succeeds(monkeypatch):
+    """A request bearing the seeded dev key succeeds (200) while unauthenticated fails closed (401)."""
+    from agent_bom.api.server import configure_api as cfg
+    from agent_bom.api.server import set_dev_api_key
+    from agent_bom.cli._server import _generate_dev_api_key
+
+    _clear_dev_key_auth_env(monkeypatch)
+    dev_key = _generate_dev_api_key()
+    cfg(api_key=dev_key)
+    set_dev_api_key(dev_key)
+
+    client = TestClient(app)
+    # Fail-closed without credentials.
+    assert client.get("/v1/overview").status_code == 401
+    # Authenticated with the dev key (Bearer and X-API-Key both accepted).
+    assert client.get("/v1/overview", headers={"Authorization": f"Bearer {dev_key}"}).status_code == 200
+    assert client.get("/v1/overview", headers={"X-API-Key": dev_key}).status_code == 200
+
+
+def test_dev_session_cookie_authenticates_dashboard(monkeypatch):
+    """With a dev key active, the auto-issued browser session cookie authenticates the overview."""
+    from agent_bom.api.server import _maybe_attach_dev_session_cookie, set_dev_api_key
+    from agent_bom.api.server import configure_api as cfg
+    from agent_bom.cli._server import _generate_dev_api_key
+
+    _clear_dev_key_auth_env(monkeypatch)
+    dev_key = _generate_dev_api_key()
+    cfg(api_key=dev_key)
+    set_dev_api_key(dev_key)
+
+    response = Response()
+    _maybe_attach_dev_session_cookie(response, SimpleNamespace(cookies={}))
+    set_cookies = [v.decode() for k, v in response.raw_headers if k == b"set-cookie"]
+    session_cookie = next((c for c in set_cookies if c.startswith(f"{SESSION_COOKIE_NAME}=")), None)
+    assert session_cookie is not None, "dev session cookie should be issued when a dev key is active"
+    token = session_cookie.split("=", 1)[1].split(";", 1)[0]
+
+    client = TestClient(app)
+    client.cookies.set(SESSION_COOKIE_NAME, token)
+    assert client.get("/v1/overview").status_code == 200
+
+
+def test_no_dev_session_cookie_without_active_dev_key(monkeypatch):
+    """No dev key set => the helper is a no-op (fail-closed for non-zero-config serves)."""
+    from agent_bom.api.server import _maybe_attach_dev_session_cookie, set_dev_api_key
+
+    _clear_dev_key_auth_env(monkeypatch)
+    set_dev_api_key(None)
+
+    response = Response()
+    _maybe_attach_dev_session_cookie(response, SimpleNamespace(cookies={}))
+    set_cookies = [v.decode() for k, v in response.raw_headers if k == b"set-cookie"]
+    assert set_cookies == []
+
+
+def test_dev_session_cookie_not_reissued_when_session_present(monkeypatch):
+    """An existing valid session cookie is reused, not churned into a fresh nonce."""
+    from agent_bom.api.server import _maybe_attach_dev_session_cookie, set_dev_api_key
+    from agent_bom.api.server import configure_api as cfg
+    from agent_bom.cli._server import _generate_dev_api_key
+
+    _clear_dev_key_auth_env(monkeypatch)
+    dev_key = _generate_dev_api_key()
+    cfg(api_key=dev_key)
+    set_dev_api_key(dev_key)
+
+    existing_token, _ = create_browser_session_token(
+        subject="loopback-dev-key",
+        role="admin",
+        tenant_id="default",
+        auth_method="browser_session_dev_key",
+        key_id=None,
+        scopes=[],
+        max_age_seconds=3600,
+    )
+    response = Response()
+    _maybe_attach_dev_session_cookie(response, SimpleNamespace(cookies={SESSION_COOKIE_NAME: existing_token}))
+    set_cookies = [v.decode() for k, v in response.raw_headers if k == b"set-cookie"]
+    assert set_cookies == []

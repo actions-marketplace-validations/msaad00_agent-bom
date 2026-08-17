@@ -8,8 +8,8 @@ import pytest
 
 from agent_bom.security import (
     SecurityError,
+    require_recognized_launcher,
     sanitize_error,
-    validate_command,
     validate_image_ref,
 )
 
@@ -82,6 +82,55 @@ class TestSnowflakeIdentifierValidation:
             _validate_sf_identifier("123start")
 
 
+class TestSnowflakeQuotedIdentifier:
+    """Quoted identifiers should be escaped safely for SQL interpolation."""
+
+    def test_quotes_plain_identifier(self):
+        from agent_bom.cloud.snowflake import _quote_sf_identifier
+
+        assert _quote_sf_identifier("NOTEBOOK_ONE") == '"NOTEBOOK_ONE"'
+
+    def test_escapes_embedded_quotes(self):
+        from agent_bom.cloud.snowflake import _quote_sf_identifier
+
+        assert _quote_sf_identifier('weird"name') == '"weird""name"'
+
+    def test_rejects_control_characters(self):
+        from agent_bom.cloud.snowflake import _quote_sf_identifier
+
+        with pytest.raises(ValueError):
+            _quote_sf_identifier("bad\nname")
+
+
+class TestSnowflakeDaysValidation:
+    """Snowflake day windows should be normalized before SQL interpolation."""
+
+    def test_accepts_positive_int_like_values(self):
+        from agent_bom.cloud.snowflake import _coerce_snowflake_days
+
+        assert _coerce_snowflake_days("7") == 7
+        assert _coerce_snowflake_days(30, max_days=365) == 30
+
+    def test_rejects_non_integer_values(self):
+        from agent_bom.cloud.snowflake import _coerce_snowflake_days
+
+        with pytest.raises(ValueError, match="days must be an integer"):
+            _coerce_snowflake_days("7; DROP TABLE")
+
+    def test_rejects_zero_or_negative_values(self):
+        from agent_bom.cloud.snowflake import _coerce_snowflake_days
+
+        with pytest.raises(ValueError, match="days must be >= 1"):
+            _coerce_snowflake_days(0)
+        with pytest.raises(ValueError, match="days must be >= 1"):
+            _coerce_snowflake_days(-5)
+
+    def test_caps_values_when_max_days_is_provided(self):
+        from agent_bom.cloud.snowflake import _coerce_snowflake_days
+
+        assert _coerce_snowflake_days(999, max_days=365) == 365
+
+
 # ─── Error Sanitization ──────────────────────────────────────────────────────
 
 
@@ -114,22 +163,27 @@ class TestErrorSanitization:
 # ─── Proxy Command Validation ────────────────────────────────────────────────
 
 
-class TestProxyCommandValidation:
-    """Proxy should validate commands before spawning."""
+class TestProxyLaunchHygiene:
+    """Proxy rejects unrecognized launcher binaries before spawning.
 
-    def test_allowed_commands_accepted(self):
-        """npx, uvx, python, etc. should be allowed."""
+    This is a misconfiguration/typo guard, NOT isolation: a recognized
+    launcher (python, node, docker) can still run arbitrary code. Actual
+    isolation is the container sandbox (agent_bom.proxy_sandbox, --isolate).
+    """
+
+    def test_known_launchers_accepted(self):
+        """npx, uvx, python, etc. are recognized MCP launchers."""
         for cmd in ["npx", "uvx", "python", "python3", "node", "deno", "bun"]:
-            validate_command(cmd)  # Should not raise
+            require_recognized_launcher(cmd)  # Should not raise
 
-    def test_arbitrary_commands_rejected(self):
-        """Random executables should be rejected."""
+    def test_unrecognized_binaries_rejected(self):
+        """Binaries outside the recognized launcher set are refused."""
         with pytest.raises(SecurityError):
-            validate_command("bash")
+            require_recognized_launcher("bash")
         with pytest.raises(SecurityError):
-            validate_command("/usr/bin/evil")
+            require_recognized_launcher("/usr/bin/evil")
         with pytest.raises(SecurityError):
-            validate_command("curl")
+            require_recognized_launcher("curl")
 
 
 # ─── Safe Path Validation ────────────────────────────────────────────────────

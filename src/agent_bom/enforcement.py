@@ -16,21 +16,17 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-import unicodedata
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
+from agent_bom.graph.severity import severity_at_or_above
 from agent_bom.models import MCPServer, Severity
+from agent_bom.runtime.text_normalize import normalize_text as _normalize_text
 
 if TYPE_CHECKING:
     from agent_bom.mcp_introspect import IntrospectionReport, ServerIntrospection
 
 logger = logging.getLogger(__name__)
-
-_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "none": 4, "unknown": -1}
-
-# Zero-width and invisible Unicode characters commonly used for evasion
-_INVISIBLE_RE = re.compile(r"[\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\u2064\ufeff\u00ad\u034f\u115f\u1160\u17b4\u17b5]")
 
 
 @dataclass
@@ -83,15 +79,6 @@ class EnforcementReport:
                 for f in self.findings
             ],
         }
-
-
-def _normalize_text(text: str) -> str:
-    """Normalize text for pattern matching: strip invisible chars, normalize Unicode."""
-    # Strip zero-width and invisible characters
-    text = _INVISIBLE_RE.sub("", text)
-    # NFKD normalization: decomposes ligatures, converts fullwidth chars, etc.
-    text = unicodedata.normalize("NFKD", text)
-    return text
 
 
 def _extract_schema_descriptions(input_schema: dict | None) -> list[str]:
@@ -630,7 +617,7 @@ def check_over_permission(server: MCPServer, agent_type: str | None = None) -> l
     - chat agents (claude-desktop): READ only
     - automation agents (goose, crewai): READ + WRITE + NETWORK
     """
-    from agent_bom.risk_analyzer import ToolCapability, classify_tool
+    from agent_bom.risk_analyzer import ToolCapability, classify_mcp_tool
 
     findings: list[EnforcementFinding] = []
     if not server.tools:
@@ -650,7 +637,7 @@ def check_over_permission(server: MCPServer, agent_type: str | None = None) -> l
         "amazon-q",
     }
     chat_agents = {"claude-desktop", "custom"}
-    automation_agents = {"goose", "openclaw", "toolhive", "docker-mcp"}
+    automation_agents = {"goose", "openclaw", "docker-mcp"}
 
     if agent_type in code_agents:
         expected = {ToolCapability.READ, ToolCapability.WRITE, ToolCapability.EXECUTE}
@@ -665,7 +652,7 @@ def check_over_permission(server: MCPServer, agent_type: str | None = None) -> l
     # Classify actual capabilities
     actual: set[ToolCapability] = set()
     for tool in server.tools:
-        actual.update(classify_tool(tool.name, tool.description))
+        actual.update(classify_mcp_tool(tool))
 
     excess = actual - expected
     if excess:
@@ -757,9 +744,8 @@ def run_enforcement(
     report.findings.extend(check_tool_name_collisions(servers))
 
     # Determine pass/fail based on threshold
-    threshold = _SEVERITY_ORDER.get(fail_on_severity, 1)
     for finding in report.findings:
-        if _SEVERITY_ORDER.get(finding.severity, 3) <= threshold:
+        if severity_at_or_above(finding.severity, fail_on_severity):
             report.passed = False
             break
 

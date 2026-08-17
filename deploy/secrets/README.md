@@ -1,0 +1,59 @@
+# Compose secrets directory
+
+Used by `deploy/docker-compose.platform.yml`, `docker-compose.fullstack.yml`,
+and `docker-compose.yml` to mount credentials as files instead of env vars.
+Secrets must never live in `.env`, compose interpolation, or git.
+
+Populate before `docker compose up` (or run
+`python scripts/deploy/hosted_poc_preflight.py --write-secret --skip-compose`):
+
+```bash
+mkdir -p deploy/secrets
+
+# Postgres: bootstrap/admin (init+migrations), app (tenant-bound runtime), and
+# trusted maintenance (scoped cross-tenant work) use independent credentials.
+printf %s "$(openssl rand -hex 32)" > deploy/secrets/postgres_password
+printf %s "$(openssl rand -hex 32)" > deploy/secrets/postgres_app_password
+printf %s "$(openssl rand -hex 32)" > deploy/secrets/postgres_maintenance_password
+
+# Control-plane crypto / auth material
+printf %s "$(openssl rand -hex 32)" > deploy/secrets/api_key
+printf %s "$(openssl rand -hex 32)" > deploy/secrets/audit_hmac_key
+printf %s "$(openssl rand -hex 32)" > deploy/secrets/browser_session_signing_key
+printf %s "$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')" \
+  > deploy/secrets/connections_key
+
+# Optional (mount manually or via preflight --write-secret)
+# printf %s "$(openssl rand -hex 32)" > deploy/secrets/rate_limit_key
+# printf %s "$(openssl rand -hex 32)" > deploy/secrets/trust_proxy_auth_secret
+# printf %s "$(openssl rand -hex 32)" > deploy/secrets/scim_bearer_token
+
+# 0644 (world-readable), NOT 0400: compose bind-mounts these host files into
+# /run/secrets/* preserving host perms (the mode/uid/gid long-syntax fields are
+# swarm-only, ignored by compose), and the non-root container users — postgres
+# UID 70 running initdb, the API app user — must read them. On a single-tenant
+# self-host VM the host filesystem is the trust boundary; swarm/k8s use
+# per-container secret perms instead.
+chmod 0644 deploy/secrets/postgres_password deploy/secrets/postgres_app_password \
+  deploy/secrets/postgres_maintenance_password \
+  deploy/secrets/api_key deploy/secrets/audit_hmac_key \
+  deploy/secrets/browser_session_signing_key deploy/secrets/connections_key
+```
+
+`*.example` files are non-secret documentation placeholders only.
+Compose defaults to the real `deploy/secrets/*` paths so a shared stack fails
+closed if a real secret file is missing.
+
+The API reads `AGENT_BOM_*_FILE` mounts (file wins over plain env). Helm may
+still inject via Secret→env; compose/local is file-only. This file-first
+resolution also covers the signing PEMs, so a mounted file works everywhere the
+inline env var did:
+
+- `AGENT_BOM_OAUTH_AS_PRIVATE_KEY_PEM_FILE` — RSA PEM for the OAuth AS token
+  signing key (unset → ephemeral per-restart key).
+- `AGENT_BOM_COMPLIANCE_ED25519_PRIVATE_KEY_PEM_FILE` — Ed25519 PEM for
+  compliance-bundle signing (unset → HMAC-SHA256 fallback).
+
+The API's tenant-bound traffic uses `agent_bom_app`; scoped cross-tenant jobs
+use `agent_bom_maintenance` through a separately validated pool. The API never
+uses the Postgres bootstrap/admin role, which is reserved for init/migrations.

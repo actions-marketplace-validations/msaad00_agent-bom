@@ -1,0 +1,237 @@
+name: release-snowflake
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Optional semantic version, for example 0.96.3. Defaults to pyproject.toml.
+        required: false
+        default: ""
+        type: string
+      release_channel:
+        description: Snowflake Native App release channel
+        required: true
+        default: QA
+        type: choice
+        options:
+          - QA
+          - ALPHA
+          - DEFAULT
+      dry_run:
+        description: Build, validate, and package only; do not access Snowflake
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-snowflake-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Validate Native App package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      package_version: ${{ steps.release.outputs.package_version }}
+      semantic_version: ${{ steps.release.outputs.semantic_version }}
+      image_matrix: ${{ steps.release.outputs.image_matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Install validation dependencies
+        run: python -m pip install pyyaml==6.0.2 snowflake-cli==3.23.0
+
+      - name: Resolve and validate release contract
+        id: release
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          semantic_version="$INPUT_VERSION"
+          if [ -z "$semantic_version" ]; then
+            semantic_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          fi
+          package_version="v${semantic_version//./_}"
+          python scripts/release/snowflake_native_app.py validate --version "$semantic_version"
+          snow app bundle --project deploy/snowflake/native-app
+          {
+            echo "semantic_version=$semantic_version"
+            echo "package_version=$package_version"
+            echo "image_matrix=$(python scripts/release/snowflake_native_app.py matrix --version "$semantic_version")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build reproducible Native App artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          python scripts/release/snowflake_native_app.py package \
+            --version "${{ steps.release.outputs.semantic_version }}" \
+            --output "dist/agent-bom-snowflake-${{ steps.release.outputs.package_version }}.tgz" \
+            | tee "dist/agent-bom-snowflake-${{ steps.release.outputs.package_version }}.sha256"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agent-bom-snowflake-${{ steps.release.outputs.package_version }}
+          path: dist/
+          if-no-files-found: error
+
+  images:
+    name: Build ${{ matrix.image.name }} for SPCS
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.package.outputs.image_matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build immutable linux/amd64 image
+        env:
+          LOCAL_IMAGE: agent-bom-spcs/${{ matrix.image.name }}:${{ matrix.image.tag }}
+        run: |
+          docker buildx build \
+            --platform "${{ matrix.image.platform }}" \
+            --load \
+            --file "${{ matrix.image.dockerfile }}" \
+            --build-arg "VERSION=${{ matrix.image.version }}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=${{ matrix.image.version }}" \
+            --tag "$LOCAL_IMAGE" \
+            "${{ matrix.image.context }}"
+          docker image inspect "$LOCAL_IMAGE" --format '{{.Id}}'
+
+      - name: Export image for the protected publish job
+        shell: bash
+        env:
+          LOCAL_IMAGE: agent-bom-spcs/${{ matrix.image.name }}:${{ matrix.image.tag }}
+        run: |
+          mkdir -p dist
+          docker save "$LOCAL_IMAGE" | gzip -n > \
+            "dist/${{ matrix.image.name }}-${{ matrix.image.tag }}.tar.gz"
+          sha256sum "dist/${{ matrix.image.name }}-${{ matrix.image.tag }}.tar.gz" > \
+            "dist/${{ matrix.image.name }}-${{ matrix.image.tag }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agent-bom-spcs-image-${{ matrix.image.name }}-${{ matrix.image.tag }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Push images and publish release directive
+    needs: [package, images]
+    if: ${{ inputs.dry_run == false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: snowflake-marketplace
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v6.2.0
+        with:
+          python-version: "3.11"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          pattern: agent-bom-spcs-image-*
+          path: dist/images
+          merge-multiple: true
+
+      - name: Install pinned Snowflake CLI
+        run: python -m pip install snowflake-cli==3.23.0 pyyaml==6.0.2
+
+      - name: Require protected publisher configuration
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+          SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_IMAGE_REPOSITORY_URL: ${{ vars.SNOWFLAKE_IMAGE_REPOSITORY_URL }}
+        run: |
+          test -n "$SNOWFLAKE_ACCOUNT"
+          test -n "$SNOWFLAKE_USER"
+          test -n "$SNOWFLAKE_PRIVATE_KEY"
+          test -n "$SNOWFLAKE_ROLE"
+          test -n "$SNOWFLAKE_WAREHOUSE"
+          case "$SNOWFLAKE_IMAGE_REPOSITORY_URL" in
+            *.registry.snowflakecomputing.com/agent_bom_provider/spcs/agent_bom_repo) ;;
+            *) echo "SNOWFLAKE_IMAGE_REPOSITORY_URL must target the canonical provider repository" >&2; exit 1 ;;
+          esac
+
+      - name: Write ephemeral private key
+        env:
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["RUNNER_TEMP"]) / "snowflake-release-key.p8"
+          path.write_text(os.environ["SNOWFLAKE_PRIVATE_KEY"], encoding="utf-8")
+          path.chmod(0o600)
+          PY
+
+      - name: Bootstrap provider repository and authenticate Docker
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE }}
+        run: |
+          key="$RUNNER_TEMP/snowflake-release-key.p8"
+          snow sql --temporary-connection \
+            --account "$SNOWFLAKE_ACCOUNT" --user "$SNOWFLAKE_USER" \
+            --private-key-file "$key" --role "$SNOWFLAKE_ROLE" \
+            --warehouse "$SNOWFLAKE_WAREHOUSE" \
+            -f scripts/release/snowflake_provider_bootstrap.sql
+          snow spcs image-registry login --temporary-connection \
+            --account "$SNOWFLAKE_ACCOUNT" --user "$SNOWFLAKE_USER" \
+            --private-key-file "$key" --role "$SNOWFLAKE_ROLE"
+
+      - name: Push all version-pinned SPCS images
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ needs.package.outputs.package_version }}
+          SNOWFLAKE_IMAGE_REPOSITORY_URL: ${{ vars.SNOWFLAKE_IMAGE_REPOSITORY_URL }}
+        run: |
+          for name in agent-bom agent-bom-ui agent-bom-scanner agent-bom-mcp-runtime; do
+            archive="dist/images/${name}-${PACKAGE_VERSION}.tar.gz"
+            test -s "$archive"
+            gzip -dc "$archive" | docker load
+            local_image="agent-bom-spcs/${name}:${PACKAGE_VERSION}"
+            target="${SNOWFLAKE_IMAGE_REPOSITORY_URL}/${name}:${PACKAGE_VERSION}"
+            docker tag "$local_image" "$target"
+            docker push "$target"
+          done
+
+      - name: Deploy package and publish approved release channel
+        env:
+          PACKAGE_VERSION: ${{ needs.package.outputs.package_version }}
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE }}
+        run: |
+          key="$RUNNER_TEMP/snowflake-release-key.p8"
+          common=(--temporary-connection --account "$SNOWFLAKE_ACCOUNT" --user "$SNOWFLAKE_USER" --private-key-file "$key" --role "$SNOWFLAKE_ROLE" --warehouse "$SNOWFLAKE_WAREHOUSE")
+          snow app deploy --project deploy/snowflake/native-app \
+            --prune --recursive --validate "${common[@]}"
+          snow app publish --project deploy/snowflake/native-app \
+            --version "$PACKAGE_VERSION" --create-version \
+            --channel "${{ inputs.release_channel }}" "${common[@]}"
+
+      - name: Remove publisher credential
+        if: always()
+        run: rm -f "$RUNNER_TEMP/snowflake-release-key.p8"

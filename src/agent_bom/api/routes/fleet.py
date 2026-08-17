@@ -2,6 +2,7 @@
 
 Endpoints:
     GET   /v1/fleet                   list fleet agents (filterable)
+    GET   /v1/fleet/agents            alias for list fleet agents
     GET   /v1/fleet/stats             fleet-wide statistics
     GET   /v1/fleet/{agent_id}        single agent with trust breakdown
     POST  /v1/fleet/sync              discovery + sync to fleet registry
@@ -11,61 +12,178 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
+from typing import Any, TypeVar, cast
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
-from agent_bom.api.models import FleetAgentUpdate, StateUpdate
-from agent_bom.api.stores import _get_fleet_store
+from agent_bom.api.idempotency_store import IdempotencyConflictError, idempotency_request_fingerprint
+from agent_bom.api.mcp_observation_store import MCPObservation, merge_observations
+from agent_bom.api.models import FleetAgentUpdate, PushPayload, StateUpdate
+from agent_bom.api.stores import _get_fleet_store, _get_idempotency_store, _get_mcp_observation_store, _get_policy_store
+from agent_bom.api.tenancy import require_request_tenant_id
+from agent_bom.api.tenant_quota import enforce_fleet_agents_quota, tenant_quota_guard
+from agent_bom.backpressure import BackpressureRejectedError, adaptive_backpressure
+from agent_bom.mcp_blocklist import sanitize_security_intelligence_entry
+from agent_bom.rbac import require_authenticated_permission
+from agent_bom.security import sanitize_command_args, sanitize_error, sanitize_security_warnings, sanitize_text, sanitize_url
 
 router = APIRouter()
 
+_T = TypeVar("_T")
 
-@router.get("/v1/fleet", tags=["fleet"])
+
+def _dep(permission: str) -> Any:
+    return cast(Any, require_authenticated_permission(permission))
+
+
+async def _store_call(fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
+    """Run a sync fleet-store method off the event loop under graph backpressure."""
+    try:
+        async with adaptive_backpressure("graph"):
+            return await asyncio.to_thread(fn, *args, **kwargs)
+    except BackpressureRejectedError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=exc.to_dict(),
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
+
+
+def _quarantine_policy_name(agent_name: str) -> str:
+    """Deterministic gateway-policy name for an agent's quarantine deny rule."""
+    return f"Quarantine deny — {agent_name}"
+
+
+def _state_value(agent: Any) -> str:
+    state = getattr(agent, "lifecycle_state", "")
+    return str(getattr(state, "value", state) or "")
+
+
+def _agent_text(value: Any) -> str:
+    return str(value or "").lower()
+
+
+def _query_fleet_fallback(
+    agents: list,
+    *,
+    state: str | None,
+    environment: str | None,
+    min_trust: float | None,
+    search: str | None,
+    include_quarantined: bool,
+    limit: int,
+    offset: int,
+) -> tuple[list, int]:
+    filtered = list(agents)
+    if not include_quarantined and state is None:
+        filtered = [a for a in filtered if _state_value(a) not in ("quarantined", "decommissioned")]
+    if state:
+        filtered = [a for a in filtered if _state_value(a) == state]
+    if environment:
+        filtered = [a for a in filtered if getattr(a, "environment", None) == environment]
+    if min_trust is not None:
+        filtered = [a for a in filtered if float(getattr(a, "trust_score", 0.0) or 0.0) >= min_trust]
+    if search:
+        needle = search.lower()
+        filtered = [
+            a
+            for a in filtered
+            if needle in _agent_text(getattr(a, "name", ""))
+            or needle in _agent_text(getattr(a, "owner", ""))
+            or needle in _agent_text(getattr(a, "environment", ""))
+            or any(needle in _agent_text(tag) for tag in getattr(a, "tags", []) or [])
+        ]
+    filtered = sorted(filtered, key=lambda a: (_agent_text(getattr(a, "name", "")), str(getattr(a, "agent_id", ""))))
+    total = len(filtered)
+    return filtered[offset : offset + limit], total
+
+
+def _request_header(request: Request, key: str) -> str:
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return ""
+    return str(headers.get(key, "") or "")
+
+
+@router.get("/fleet", tags=["fleet"])
+@router.get("/fleet/agents", tags=["fleet"], include_in_schema=False)
 async def list_fleet(
+    request: Request,
     state: str | None = None,
     environment: str | None = None,
     min_trust: float | None = None,
+    search: str | None = None,
+    include_quarantined: bool = False,
     limit: int = 50,
     offset: int = 0,
-):
+) -> dict[str, Any]:
     """List all agents in the fleet registry.
 
     Supports pagination via ``limit`` (default 50, max 200) and ``offset``.
+    Quarantined and decommissioned agents are excluded by default —
+    pass ``include_quarantined=true`` to include them.
     """
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
-    agents = _get_fleet_store().list_all()
-    if state:
-        agents = [a for a in agents if a.lifecycle_state.value == state]
-    if environment:
-        agents = [a for a in agents if a.environment == environment]
-    if min_trust is not None:
-        agents = [a for a in agents if a.trust_score >= min_trust]
-    total = len(agents)
-    page = agents[offset : offset + limit]
+    tenant_id = require_request_tenant_id(request)
+    min_trust_value = float(min_trust) if min_trust is not None else None
+    search_value = (search or "").strip() or None
+    store = _get_fleet_store()
+    result = None
+    query_by_tenant = getattr(store, "query_by_tenant", None)
+    if callable(query_by_tenant):
+        result = await _store_call(
+            query_by_tenant,
+            tenant_id,
+            state=state,
+            environment=environment,
+            min_trust=min_trust_value,
+            search=search_value,
+            include_quarantined=include_quarantined,
+            limit=limit,
+            offset=offset,
+        )
+    if isinstance(result, tuple) and len(result) == 2:
+        page, total = result
+    else:
+        page, total = _query_fleet_fallback(
+            await _store_call(store.list_by_tenant, tenant_id),
+            state=state,
+            environment=environment,
+            min_trust=min_trust_value,
+            search=search_value,
+            include_quarantined=include_quarantined,
+            limit=limit,
+            offset=offset,
+        )
     return {
         "agents": [a.model_dump() for a in page],
         "count": len(page),
         "total": total,
         "limit": limit,
         "offset": offset,
+        "has_more": offset + len(page) < total,
     }
 
 
-@router.get("/v1/fleet/stats", tags=["fleet"])
-async def fleet_stats():
+@router.get("/fleet/stats", tags=["fleet"])
+async def fleet_stats(request: Request) -> dict[str, Any]:
     """Fleet-wide statistics."""
-    agents = _get_fleet_store().list_all()
+    tenant_id = require_request_tenant_id(request)
+    agents = await _store_call(_get_fleet_store().list_by_tenant, tenant_id)
     by_state: dict[str, int] = {}
     by_env: dict[str, int] = {}
     trust_scores: list[float] = []
     for a in agents:
-        by_state[a.lifecycle_state.value] = by_state.get(a.lifecycle_state.value, 0) + 1
+        state_value = getattr(a.lifecycle_state, "value", str(a.lifecycle_state))
+        by_state[state_value] = by_state.get(state_value, 0) + 1
         env = a.environment or "unset"
         by_env[env] = by_env.get(env, 0) + 1
-        trust_scores.append(a.trust_score)
+        trust_scores.append(float(getattr(a, "trust_score", 0.0) or 0.0))
     return {
         "total": len(agents),
         "by_state": by_state,
@@ -75,83 +193,384 @@ async def fleet_stats():
     }
 
 
-@router.get("/v1/fleet/{agent_id}", tags=["fleet"])
-async def get_fleet_agent(agent_id: str):
+@router.get("/fleet/endpoints", tags=["fleet"])
+async def list_fleet_endpoints(
+    request: Request,
+    search: str | None = None,
+    completeness: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """List latest privacy-safe workstation evidence, one row per endpoint."""
+
+    if completeness not in (None, "complete", "partial"):
+        raise HTTPException(status_code=422, detail="completeness must be complete or partial")
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    tenant_id = require_request_tenant_id(request)
+    store = _get_fleet_store()
+    query = getattr(store, "query_endpoints", None)
+    if not callable(query):
+        return {"endpoints": [], "count": 0, "total": 0, "limit": limit, "offset": offset, "has_more": False}
+    endpoints, total = await _store_call(
+        query,
+        tenant_id,
+        search=(search or "").strip() or None,
+        completeness=completeness,
+        limit=limit,
+        offset=offset,
+    )
+    return {
+        "endpoints": [endpoint.model_dump() for endpoint in endpoints],
+        "count": len(endpoints),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": offset + len(endpoints) < total,
+    }
+
+
+@router.get("/fleet/endpoints/{endpoint_id}", tags=["fleet"])
+async def get_fleet_endpoint(request: Request, endpoint_id: str) -> dict[str, Any]:
+    """Return one tenant-scoped endpoint inventory summary."""
+
+    tenant_id = require_request_tenant_id(request)
+    getter = getattr(_get_fleet_store(), "get_endpoint", None)
+    endpoint = await _store_call(getter, endpoint_id, tenant_id=tenant_id) if callable(getter) else None
+    if endpoint is None:
+        raise HTTPException(status_code=404, detail="Fleet endpoint not found")
+    return cast(dict[str, Any], endpoint.model_dump())
+
+
+@router.get("/fleet/{agent_id}", tags=["fleet"])
+async def get_fleet_agent(request: Request, agent_id: str) -> dict[str, Any]:
     """Get a single fleet agent with trust score breakdown."""
-    agent = _get_fleet_store().get(agent_id)
+    tenant_id = require_request_tenant_id(request)
+    agent = await _store_call(_get_fleet_store().get, agent_id, tenant_id=tenant_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Fleet agent not found")
-    return agent.model_dump()
+    return cast(dict[str, Any], agent.model_dump())
 
 
-@router.post("/v1/fleet/sync", tags=["fleet"])
-async def sync_fleet():
+def _server_counts(agent: Any) -> tuple[int, int, int, int]:
+    server_count = len(agent.mcp_servers)
+    pkg_count = sum(len(s.packages) for s in agent.mcp_servers)
+    cred_count = sum(len(s.credential_names) for s in agent.mcp_servers)
+    vuln_count = sum(s.total_vulnerabilities for s in agent.mcp_servers)
+    return server_count, pkg_count, cred_count, vuln_count
+
+
+def _payload_counts(agent: dict) -> tuple[int, int, int, int]:
+    servers = agent.get("mcp_servers", []) or []
+    server_count = len(servers)
+    pkg_count = 0
+    cred_count = 0
+    vuln_count = 0
+    for server in servers:
+        pkg_count += len(server.get("packages", []) or [])
+        cred_count += len(server.get("credential_names", []) or [])
+        vuln_count += int(server.get("total_vulnerabilities", 0) or 0)
+    return server_count, pkg_count, cred_count, vuln_count
+
+
+def _payload_tags(agent: dict) -> list[str]:
+    return sorted({str(tag).strip() for tag in list(agent.get("tags", []) or []) if str(tag).strip()})
+
+
+def _persist_payload_observations(tenant_id: str, agent: dict, *, last_discovery: str, last_synced: str) -> None:
+    store = _get_mcp_observation_store()
+    agent_name = str(agent.get("name", "unknown-agent"))
+    for idx, server in enumerate(agent.get("mcp_servers", []) or []):
+        server_name = str(server.get("name") or f"server-{idx}")
+        server_url = str(server.get("url") or "") or None
+        credential_names = list(server.get("credential_names", []) or [])
+        auth_mode = str(server.get("auth_mode") or "")
+        if not auth_mode:
+            if credential_names:
+                auth_mode = "env-credentials"
+            elif server_url and "@" in server_url:
+                auth_mode = "url-embedded-credentials"
+            elif server_url:
+                auth_mode = "network-no-auth-observed"
+            else:
+                auth_mode = "local-stdio"
+        transport = str(server.get("transport") or "")
+        stable_id = str(server.get("stable_id") or f"{server_name}:{server.get('command', '')}")
+        observation_id = f"{agent_name}:{stable_id}"
+        candidate = MCPObservation(
+            tenant_id=tenant_id,
+            observation_id=observation_id,
+            server_stable_id=stable_id,
+            server_fingerprint=str(server.get("fingerprint") or stable_id),
+            server_name=server_name,
+            agent_name=agent_name,
+            transport=transport,
+            url=sanitize_url(server_url),
+            auth_mode=auth_mode,
+            command=sanitize_text(server.get("command", ""), max_len=200),
+            args=sanitize_command_args(list(server.get("args", []) or [])),
+            config_path=server.get("config_path"),
+            credential_env_vars=credential_names,
+            security_blocked=bool(server.get("security_blocked", False)),
+            security_warnings=sanitize_security_warnings(list(server.get("security_warnings", []) or [])),
+            security_intelligence=[
+                sanitize_security_intelligence_entry(item)
+                for item in (server.get("security_intelligence", []) or [])
+                if isinstance(item, dict)
+            ],
+            observed_via=["fleet_sync"],
+            observed_scopes=["endpoint"],
+            scan_sources=[],
+            source_agents=[agent_name] if server_url and transport.lower() in {"http", "https", "sse"} else [],
+            configured_locally=False,
+            fleet_present=True,
+            gateway_registered=bool(server_url and transport.lower() in {"http", "https", "sse"}),
+            runtime_observed=False,
+            first_seen=last_discovery,
+            last_seen=last_discovery,
+            last_synced=last_synced,
+        )
+        store.put(merge_observations(store.get(tenant_id, observation_id), candidate))
+
+
+@router.post("/fleet/sync", tags=["fleet"])
+async def sync_fleet(request: Request, body: PushPayload | None = None) -> dict[str, Any]:
     """Run discovery and sync results into the fleet registry.
 
     New agents -> state=DISCOVERED. Existing agents -> counts updated.
     Trust scores are recomputed for all synced agents.
     """
-    from agent_bom.api.fleet_store import FleetAgent, FleetLifecycleState
+    from agent_bom.api.audit_log import log_action
+    from agent_bom.api.fleet_store import FleetAgent, FleetLifecycleState, match_discovered_fleet_agent
+    from agent_bom.canonical_ids import canonical_agent_id
     from agent_bom.discovery import discover_all
     from agent_bom.fleet.trust_scoring import compute_trust_score
 
-    discovered = discover_all()
     store = _get_fleet_store()
+    tenant_id = require_request_tenant_id(request)
+    actor = getattr(request.state, "api_key_name", "") or "system"
     now = datetime.now(timezone.utc).isoformat()
+    source_id = (body.source_id if body else "") or _request_header(request, "X-Agent-Bom-Source-Id") or "server-discovery"
+    idem_key = (body.idempotency_key if body else "") or _request_header(request, "Idempotency-Key")
+    request_hash = idempotency_request_fingerprint(body)
+    if idem_key:
+        try:
+            cached = _get_idempotency_store().get(
+                "/v1/fleet/sync",
+                tenant_id,
+                source_id,
+                idem_key,
+                request_hash=request_hash,
+            )
+        except IdempotencyConflictError as exc:
+            raise HTTPException(status_code=409, detail=sanitize_error(exc)) from exc
+        if cached is not None:
+            cached["idempotent_replay"] = True
+            return cast(dict[str, Any], cached)
     new_count = 0
     updated_count = 0
 
-    for agent in discovered:
-        existing = store.get_by_name(agent.name)
-        server_count = len(agent.mcp_servers)
-        pkg_count = sum(len(s.packages) for s in agent.mcp_servers)
-        cred_count = sum(len(s.credential_names) for s in agent.mcp_servers)
-        vuln_count = sum(s.total_vulnerabilities for s in agent.mcp_servers)
-
-        score, factors = compute_trust_score(agent)
-
-        if existing:
-            existing.server_count = server_count
-            existing.package_count = pkg_count
-            existing.credential_count = cred_count
-            existing.vuln_count = vuln_count
-            existing.trust_score = score
-            existing.trust_factors = factors
-            existing.last_discovery = now
-            existing.updated_at = now
-            existing.config_path = agent.config_path or ""
-            store.put(existing)
-            updated_count += 1
-        else:
-            fleet_agent = FleetAgent(
-                agent_id=str(uuid.uuid4()),
-                name=agent.name,
-                agent_type=agent.agent_type.value if hasattr(agent.agent_type, "value") else str(agent.agent_type),
-                config_path=agent.config_path or "",
-                lifecycle_state=FleetLifecycleState.DISCOVERED,
-                trust_score=score,
-                trust_factors=factors,
-                server_count=server_count,
-                package_count=pkg_count,
-                credential_count=cred_count,
-                vuln_count=vuln_count,
-                last_discovery=now,
-                created_at=now,
-                updated_at=now,
+    if body and body.agents:
+        payload_agents = body.agents
+        existing_agents = store.list_by_tenant(tenant_id)
+        existing_by_identity = {(agent.source_id or source_id or "server-discovery", agent.name): agent for agent in existing_agents}
+        existing_by_legacy_name = {agent.name: agent for agent in existing_agents if not agent.source_id}
+        incoming_keys = {
+            (
+                str(agent.get("source_id") or source_id or "server-discovery"),
+                str(agent.get("name", "unknown-agent")),
             )
-            store.put(fleet_agent)
-            new_count += 1
+            for agent in payload_agents
+        }
+        new_identities = incoming_keys - set(existing_by_identity)
 
-    return {
+        # Hold the per-tenant quota guard across the (check + insert
+        # loop) pair so concurrent fleet-sync POSTs serialise per
+        # tenant — without this, two replicas can both pass the
+        # enforce_fleet_agents_quota check and overshoot the quota by
+        # `num_replicas` (audit-5 P1 fleet race fix).
+        with tenant_quota_guard(
+            tenant_id,
+            lambda: enforce_fleet_agents_quota(tenant_id, attempted=len(new_identities)),
+        ):
+            for payload_agent in payload_agents:
+                name = payload_agent.get("name", "unknown-agent")
+                payload_source_id = str(payload_agent.get("source_id") or source_id or "server-discovery")
+                payload_agent_type = str(payload_agent.get("agent_type", "unknown"))
+                payload_canonical_id = str(payload_agent.get("canonical_id") or "") or canonical_agent_id(
+                    payload_agent_type,
+                    str(name),
+                    source_id=payload_source_id,
+                )
+                identity_key = (payload_source_id, str(name))
+                existing = existing_by_identity.get(identity_key) or existing_by_legacy_name.get(str(name))
+                server_count, pkg_count, cred_count, vuln_count = _payload_counts(payload_agent)
+                score = float(payload_agent.get("trust_score", 0.0) or 0.0)
+                factors = dict(payload_agent.get("trust_factors", {}) or {})
+                payload_enrollment_name = str(payload_agent.get("enrollment_name") or "")
+                payload_mdm_provider = str(payload_agent.get("mdm_provider") or "")
+                payload_owner = payload_agent.get("owner")
+                payload_environment = payload_agent.get("environment")
+                payload_tags = _payload_tags(payload_agent)
+                if existing:
+                    existing.canonical_id = payload_canonical_id
+                    existing.server_count = server_count
+                    existing.package_count = pkg_count
+                    existing.credential_count = cred_count
+                    existing.vuln_count = vuln_count
+                    existing.trust_score = score
+                    existing.trust_factors = factors
+                    existing.last_discovery = now
+                    existing.updated_at = now
+                    existing.config_path = ""
+                    existing.agent_type = payload_agent_type or existing.agent_type
+                    existing.source_id = payload_source_id or existing.source_id
+                    existing.enrollment_name = payload_enrollment_name or existing.enrollment_name
+                    existing.mdm_provider = payload_mdm_provider or existing.mdm_provider
+                    if payload_owner is not None:
+                        existing.owner = str(payload_owner or "")
+                    if payload_environment is not None:
+                        existing.environment = str(payload_environment or "")
+                    if payload_tags:
+                        existing.tags = payload_tags
+                    store.put(existing)
+                    updated_count += 1
+                else:
+                    fleet_agent = FleetAgent(
+                        agent_id=str(uuid.uuid4()),
+                        canonical_id=payload_canonical_id,
+                        name=name,
+                        agent_type=payload_agent_type,
+                        config_path="",
+                        source_id=payload_source_id,
+                        enrollment_name=payload_enrollment_name,
+                        mdm_provider=payload_mdm_provider,
+                        lifecycle_state=FleetLifecycleState.DISCOVERED,
+                        owner=str(payload_owner or "") or None,
+                        environment=str(payload_environment or "") or None,
+                        tags=payload_tags,
+                        trust_score=score,
+                        trust_factors=factors,
+                        server_count=server_count,
+                        package_count=pkg_count,
+                        credential_count=cred_count,
+                        vuln_count=vuln_count,
+                        tenant_id=tenant_id,
+                        last_discovery=now,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    store.put(fleet_agent)
+                    new_count += 1
+                _persist_payload_observations(tenant_id, payload_agent, last_discovery=now, last_synced=now)
+    else:
+        discovered = discover_all()
+        existing_agents = store.list_by_tenant(tenant_id)
+        claimed_agent_ids: set[str] = set()
+        matched_discovery: list[tuple[Any, FleetAgent | None]] = []
+        for discovered_agent in discovered:
+            discovered_type = (
+                discovered_agent.agent_type.value if hasattr(discovered_agent.agent_type, "value") else str(discovered_agent.agent_type)
+            )
+            match = match_discovered_fleet_agent(
+                existing_agents,
+                canonical_id=str(getattr(discovered_agent, "canonical_id", "") or ""),
+                agent_type=discovered_type,
+                name=discovered_agent.name,
+                config_path=discovered_agent.config_path or "",
+                previous_canonical_ids=list(getattr(discovered_agent, "previous_canonical_ids", []) or []),
+                claimed_agent_ids=claimed_agent_ids,
+            )
+            if match is not None:
+                claimed_agent_ids.add(match.agent_id)
+            matched_discovery.append((discovered_agent, match))
+        new_identity_count = sum(1 for _agent, match in matched_discovery if match is None)
+        # Same per-tenant quota guard as the payload-agents branch.
+        with tenant_quota_guard(
+            tenant_id,
+            lambda: enforce_fleet_agents_quota(tenant_id, attempted=new_identity_count),
+        ):
+            for discovered_agent, existing in matched_discovery:
+                discovered_type = (
+                    discovered_agent.agent_type.value if hasattr(discovered_agent.agent_type, "value") else str(discovered_agent.agent_type)
+                )
+                discovered_canonical_id = str(getattr(discovered_agent, "canonical_id", "") or "")
+                server_count, pkg_count, cred_count, vuln_count = _server_counts(discovered_agent)
+                score, factors = compute_trust_score(discovered_agent)
+
+                if existing:
+                    existing.canonical_id = discovered_canonical_id
+                    existing.name = discovered_agent.name
+                    existing.agent_type = discovered_type
+                    existing.server_count = server_count
+                    existing.package_count = pkg_count
+                    existing.credential_count = cred_count
+                    existing.vuln_count = vuln_count
+                    existing.trust_score = score
+                    existing.trust_factors = factors
+                    existing.last_discovery = now
+                    existing.updated_at = now
+                    existing.config_path = discovered_agent.config_path or ""
+                    existing.source_id = str(getattr(discovered_agent, "source_id", "") or existing.source_id)
+                    existing.device_fingerprint = str(getattr(discovered_agent, "device_fingerprint", "") or existing.device_fingerprint)
+                    store.put(existing)
+                    updated_count += 1
+                else:
+                    fleet_agent = FleetAgent(
+                        agent_id=str(uuid.uuid4()),
+                        canonical_id=discovered_canonical_id,
+                        name=discovered_agent.name,
+                        agent_type=discovered_type,
+                        config_path=discovered_agent.config_path or "",
+                        source_id=str(getattr(discovered_agent, "source_id", "") or ""),
+                        device_fingerprint=str(getattr(discovered_agent, "device_fingerprint", "") or ""),
+                        lifecycle_state=FleetLifecycleState.DISCOVERED,
+                        trust_score=score,
+                        trust_factors=factors,
+                        server_count=server_count,
+                        package_count=pkg_count,
+                        credential_count=cred_count,
+                        vuln_count=vuln_count,
+                        tenant_id=tenant_id,
+                        last_discovery=now,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    store.put(fleet_agent)
+                    new_count += 1
+
+    response = {
         "synced": new_count + updated_count,
         "new": new_count,
         "updated": updated_count,
+        "source_id": source_id,
     }
+    log_action(
+        "fleet.sync",
+        actor=actor,
+        resource="fleet/sync",
+        tenant_id=tenant_id,
+        synced=response["synced"],
+        new=response["new"],
+        updated=response["updated"],
+        source_id=source_id,
+    )
+    if idem_key:
+        _get_idempotency_store().put(
+            "/v1/fleet/sync",
+            tenant_id,
+            source_id,
+            idem_key,
+            response,
+            request_hash=request_hash,
+        )
+    return response
 
 
-@router.put("/v1/fleet/{agent_id}/state", tags=["fleet"])
-async def update_fleet_state(agent_id: str, body: StateUpdate):
+@router.put("/fleet/{agent_id}/state", tags=["fleet"])
+async def update_fleet_state(request: Request, agent_id: str, body: StateUpdate) -> dict[str, Any]:
     """Update agent lifecycle state."""
+    from agent_bom.api.audit_log import log_action
     from agent_bom.api.fleet_store import FleetLifecycleState
 
     try:
@@ -162,16 +581,175 @@ async def update_fleet_state(agent_id: str, body: StateUpdate):
             detail=f"Invalid state: {body.state}. Valid: {[s.value for s in FleetLifecycleState]}",
         )
     store = _get_fleet_store()
-    if not store.update_state(agent_id, new_state):
+    tenant_id = require_request_tenant_id(request)
+    actor = getattr(request.state, "api_key_name", "") or "system"
+    agent = store.get(agent_id, tenant_id=tenant_id)
+    if agent is None:
         raise HTTPException(status_code=404, detail="Fleet agent not found")
-    return {"agent_id": agent_id, "lifecycle_state": new_state.value}
+    was_quarantined = agent.lifecycle_state == FleetLifecycleState.QUARANTINED
+    store.update_state(agent_id, new_state, tenant_id=tenant_id)
+    log_action(
+        "fleet.state_update",
+        actor=actor,
+        resource=f"fleet/{agent_id}",
+        tenant_id=tenant_id,
+        lifecycle_state=new_state.value,
+    )
+    result: dict[str, Any] = {"agent_id": agent_id, "lifecycle_state": new_state.value}
+
+    # Releasing an agent has to reverse containment, not just relabel it.
+    # Quarantine mints an enforce-mode deny-all policy; leaving the state
+    # without disabling it left the agent blocked forever on the control-plane
+    # policy path. Reuses _quarantine_policy_name so the two sides cannot drift.
+    if was_quarantined and new_state != FleetLifecycleState.QUARANTINED:
+        disabled = _disable_quarantine_policy(agent.name, tenant_id=tenant_id, actor=actor)
+        if disabled is not None:
+            result["gateway_policy"] = {"policy_id": disabled, "disabled": True}
+    return result
 
 
-@router.put("/v1/fleet/{agent_id}", tags=["fleet"])
-async def update_fleet_agent(agent_id: str, body: FleetAgentUpdate):
+def _disable_quarantine_policy(agent_name: str, *, tenant_id: str, actor: str) -> str | None:
+    """Disable the agent's quarantine deny policy; return its id when one was found."""
+    from agent_bom.api.audit_log import log_action
+
+    policy_store = _get_policy_store()
+    policy_name = _quarantine_policy_name(agent_name)
+    policy = next(
+        (p for p in policy_store.list_policies(tenant_id=tenant_id) if p.name == policy_name),
+        None,
+    )
+    if policy is None or not policy.enabled:
+        return None
+    policy.enabled = False
+    policy.updated_at = datetime.now(timezone.utc).isoformat()
+    policy_store.put_policy(policy)
+    log_action(
+        "gateway.policy_updated",
+        actor=actor,
+        resource=f"gateway-policy/{policy.policy_id}",
+        tenant_id=tenant_id,
+        origin="fleet_unquarantine",
+        enabled=False,
+    )
+    return str(policy.policy_id)
+
+
+@router.post("/fleet/{agent_id}/quarantine", tags=["fleet"], dependencies=[_dep("policy_write")])
+async def quarantine_fleet_agent(request: Request, agent_id: str) -> dict[str, Any]:
+    """Quarantine an agent and fail closed with a gateway DENY policy for its identity.
+
+    One click performs two containment actions:
+
+    1. Moves the fleet agent to the ``QUARANTINED`` lifecycle state.
+    2. Creates (or re-enables) an ``enforce``-mode gateway policy bound to the
+       agent's identity whose single rule denies every tool call
+       (``block_tools=["*"]``).
+
+    The deny policy is scoped via ``bound_agents`` so only the quarantined
+    agent's traffic is blocked at the proxy / gateway relay — other agents are
+    unaffected. The operation is idempotent (a second call re-enables the same
+    policy rather than stacking duplicates) and both actions are audit-logged.
+    Requires the ``policy_write`` permission because it mints a gateway
+    enforcement policy.
+    """
+    from agent_bom.api.audit_log import log_action
+    from agent_bom.api.fleet_store import FleetLifecycleState
+    from agent_bom.api.policy_store import GatewayPolicy, GatewayRule, PolicyMode
+
+    tenant_id = require_request_tenant_id(request)
+    actor = getattr(request.state, "api_key_name", "") or "system"
+    fleet_store = _get_fleet_store()
+    agent = fleet_store.get(agent_id, tenant_id=tenant_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Fleet agent not found")
+
+    # 1) Quarantine the fleet agent (fail-closed lifecycle state).
+    fleet_store.update_state(agent_id, FleetLifecycleState.QUARANTINED, tenant_id=tenant_id)
+    log_action(
+        "fleet.quarantine",
+        actor=actor,
+        resource=f"fleet/{agent_id}",
+        tenant_id=tenant_id,
+        agent_name=agent.name,
+        lifecycle_state=FleetLifecycleState.QUARANTINED.value,
+    )
+
+    # 2) Create or re-enable a gateway DENY policy bound to this agent's identity.
+    policy_store = _get_policy_store()
+    now = datetime.now(timezone.utc).isoformat()
+    policy_name = _quarantine_policy_name(agent.name)
+    deny_rule = GatewayRule(
+        id="quarantine-deny-all",
+        action="block",
+        block_tools=["*"],
+        description=f"Quarantine: deny all tool calls for {agent.name}",
+    )
+    existing = next(
+        (p for p in policy_store.list_policies(tenant_id=tenant_id) if p.name == policy_name),
+        None,
+    )
+    if existing is not None:
+        existing.mode = PolicyMode.ENFORCE
+        existing.rules = [deny_rule]
+        if agent.name not in (existing.bound_agents or []):
+            existing.bound_agents = [*(existing.bound_agents or []), agent.name]
+        existing.enabled = True
+        existing.updated_at = now
+        policy_store.put_policy(existing)
+        policy = existing
+        policy_action = "gateway.policy_updated"
+    else:
+        policy = GatewayPolicy(
+            policy_id=str(uuid.uuid4()),
+            name=policy_name,
+            description=f"Auto-generated on fleet quarantine of {agent.name}. Denies all tool calls for this agent's identity.",
+            mode=PolicyMode.ENFORCE,
+            rules=[deny_rule],
+            bound_agents=[agent.name],
+            enabled=True,
+            created_at=now,
+            updated_at=now,
+            tenant_id=tenant_id,
+        )
+        policy_store.put_policy(policy)
+        policy_action = "gateway.policy_created"
+
+    log_action(
+        policy_action,
+        actor=actor,
+        resource=f"gateway-policy/{policy.policy_id}",
+        tenant_id=tenant_id,
+        name=policy.name,
+        mode=policy.mode.value,
+        enabled=policy.enabled,
+        rule_count=len(policy.rules),
+        bound_agents=policy.bound_agents,
+        origin="fleet_quarantine",
+    )
+
+    return {
+        "agent_id": agent_id,
+        "lifecycle_state": FleetLifecycleState.QUARANTINED.value,
+        "gateway_policy": {
+            "policy_id": policy.policy_id,
+            "name": policy.name,
+            "mode": policy.mode.value,
+            "enabled": policy.enabled,
+            "bound_agents": policy.bound_agents,
+            "created": policy_action == "gateway.policy_created",
+        },
+    }
+
+
+@router.put("/fleet/{agent_id}", tags=["fleet"])
+async def update_fleet_agent(request: Request, agent_id: str, body: FleetAgentUpdate) -> dict[str, Any]:
     """Update agent metadata (owner, environment, tags, notes)."""
+    from agent_bom.api.audit_log import log_action
+
     store = _get_fleet_store()
-    agent = store.get(agent_id)
+    tenant_id = require_request_tenant_id(request)
+    actor = getattr(request.state, "api_key_name", "") or "system"
+    agent = store.get(agent_id, tenant_id=tenant_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Fleet agent not found")
     if body.owner is not None:
@@ -184,4 +762,13 @@ async def update_fleet_agent(agent_id: str, body: FleetAgentUpdate):
         agent.notes = body.notes
     agent.updated_at = datetime.now(timezone.utc).isoformat()
     store.put(agent)
-    return agent.model_dump()
+    log_action(
+        "fleet.agent_update",
+        actor=actor,
+        resource=f"fleet/{agent_id}",
+        tenant_id=tenant_id,
+        owner=agent.owner,
+        environment=agent.environment,
+        tags=agent.tags,
+    )
+    return cast(dict[str, Any], agent.model_dump())

@@ -1,0 +1,46 @@
+{
+  "additionalProperties": false,
+  "description": "Body for PUT /v1/overview/score-config (issue #3940).\n\nLenient about *values*: they are canonicalized / clamped server-side (see\n``agent_bom.exec_score.canonicalize_config``) so an out-of-range weight or\nan invalid display format never raises.\n\nStrict about *keys*, like every other write body. A misspelled top-level\nfield used to be dropped silently and the response still reported the\noverride as active \u2014 a config write that says it applied while having\nchanged nothing.",
+  "properties": {
+    "display_format": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Display Format"
+    },
+    "grade_thresholds": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Grade Thresholds"
+    },
+    "weights": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Weights"
+    }
+  },
+  "title": "ExecScoreConfigUpdateRequest",
+  "type": "object"
+}

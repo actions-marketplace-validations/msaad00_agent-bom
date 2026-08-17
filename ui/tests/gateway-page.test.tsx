@@ -1,0 +1,136 @@
+import { render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import GatewayPage from "@/app/gateway/GatewayDashboard";
+
+const { apiMock } = vi.hoisted(() => ({
+  apiMock: {
+    listGatewayPolicies: vi.fn(),
+    getGatewayStats: vi.fn(),
+    listGatewayAudit: vi.fn(),
+    createGatewayPolicy: vi.fn(),
+    deleteGatewayPolicy: vi.fn(),
+    updateGatewayPolicy: vi.fn(),
+    evaluateGateway: vi.fn(),
+    getGatewayFeed: vi.fn(),
+    getGatewayFeedKpis: vi.fn(),
+    getPostureCounts: vi.fn(),
+  },
+}));
+
+vi.mock("@/lib/api", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
+  return {
+    ...actual,
+    api: apiMock,
+  };
+});
+
+describe("GatewayPage", () => {
+  beforeEach(() => {
+    Object.values(apiMock).forEach((mockFn) => mockFn.mockReset());
+    apiMock.getPostureCounts.mockResolvedValue({
+      has_gateway: true,
+      has_proxy: false,
+      has_traces: false,
+      scan_count: 1,
+      deployment_mode: "local",
+    });
+    apiMock.listGatewayPolicies.mockResolvedValue({ policies: [], count: 0 });
+    apiMock.listGatewayAudit.mockResolvedValue({ entries: [], count: 0 });
+    apiMock.getGatewayFeed.mockResolvedValue({
+      events: [],
+      count: 0,
+      health: {
+        state: "unavailable",
+        live: false,
+        heartbeat_at: null,
+        age_seconds: null,
+        stale_after_seconds: 120,
+        reason: "transport_or_heartbeat_unavailable",
+      },
+    });
+    apiMock.getGatewayFeedKpis.mockResolvedValue({
+      calls_today: 0,
+      blocked_today: 0,
+      shadow_ai_blocked: 0,
+      data_filters_applied: 0,
+      uptime_seconds: 0,
+      health: {
+        state: "unavailable",
+        live: false,
+        heartbeat_at: null,
+        age_seconds: null,
+        stale_after_seconds: 120,
+        reason: "transport_or_heartbeat_unavailable",
+      },
+      by_action_type: {},
+      by_source: {},
+    });
+    apiMock.getGatewayStats.mockResolvedValue({
+      total_policies: 2,
+      enforce_count: 1,
+      audit_count: 1,
+      enabled_count: 2,
+      total_rules: 3,
+      audit_entries: 4,
+      blocked_count: 2,
+      alerted_count: 1,
+      policy_runtime: {
+        source: "control_plane",
+        source_kind: "policy_store",
+        enabled_policies: 2,
+        rollout_mode: "mixed",
+        summary: "Mixed rollout: some rules block while others remain advisory.",
+        total_rules: 3,
+        blocking_rules: 1,
+        advisory_rules: 2,
+        allowlist_rules: 0,
+        default_deny_rules: 0,
+        read_only_rules: 0,
+        secret_path_rules: 1,
+        unknown_egress_rules: 1,
+        denied_tool_classes: ["network"],
+        blocks_requests: true,
+        advisory_only: false,
+        default_deny: false,
+        protects_secret_paths: true,
+        restricts_unknown_egress: true,
+      },
+    });
+  });
+
+  it("surfaces runtime rollout posture and protective controls", async () => {
+    render(<GatewayPage />);
+
+    await waitFor(() => expect(screen.getByText("Runtime posture")).toBeInTheDocument());
+    expect(screen.getByText("mixed")).toBeInTheDocument();
+    expect(screen.getByText("Mixed rollout: some rules block while others remain advisory.")).toBeInTheDocument();
+    expect(screen.getByText("Enabled policies")).toBeInTheDocument();
+    expect(screen.getByText("Secret path guard")).toBeInTheDocument();
+    expect(screen.getByText("Unknown egress guard")).toBeInTheDocument();
+    expect(screen.getByText("Denied tool classes: network")).toBeInTheDocument();
+    const postureCard = screen.getByText("Runtime posture").closest("div.rounded-2xl");
+    expect(postureCard).toHaveClass("bg-[var(--surface)]");
+    expect(postureCard?.className).not.toContain("rgba(24,24,27");
+  });
+
+  it("degrades a malformed feed response without crashing the runtime page", async () => {
+    apiMock.getGatewayFeed.mockResolvedValue({
+      events: undefined,
+      count: 0,
+      health: undefined,
+    });
+
+    render(<GatewayPage />);
+
+    await waitFor(() => expect(apiMock.getGatewayFeed).toHaveBeenCalled());
+    await waitFor(() => {
+      expect(
+        screen.getByText("No gateway activity yet. Events appear as agents call tools through the gateway/proxy."),
+      ).toBeInTheDocument();
+    });
+    expect(screen.getByText("Unavailable")).toBeInTheDocument();
+    expect(screen.getByText("Calls today")).toBeInTheDocument();
+  });
+});

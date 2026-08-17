@@ -75,6 +75,34 @@ def test_parse_mcp_json_block(tmp_path):
     assert result.servers[0].name == "filesystem"
 
 
+def test_parse_mcp_jsonc_remote_server_block(tmp_path):
+    """JSONC MCP blocks should parse comments, trailing commas, and remote URLs."""
+    md = tmp_path / "config.md"
+    md.write_text(
+        "# MCP Config\n\n"
+        "```jsonc\n"
+        "{\n"
+        '  "mcpServers": {\n'
+        '    "remote": {\n'
+        '      "transport": "sse", // remote stream\n'
+        '      "url": "https://mcp.example.com/sse",\n'
+        '      "env": {"REMOTE_API_TOKEN": "secret"},\n'
+        "    },\n"
+        "  },\n"
+        "}\n"
+        "```\n"
+    )
+
+    result = parse_skill_file(md)
+
+    assert len(result.servers) == 1
+    assert result.servers[0].name == "remote"
+    assert result.servers[0].url == "https://mcp.example.com/sse"
+    assert result.servers[0].transport.value == "sse"
+    assert result.servers[0].config_path == str(md)
+    assert "REMOTE_API_TOKEN" in result.credential_env_vars
+
+
 def test_parse_credential_env_vars(tmp_path):
     """Detects credential env var references, excludes false positives."""
     md = tmp_path / "config.md"
@@ -117,11 +145,92 @@ def test_discover_skills_directory(tmp_path):
     assert any(p.name == "my-skill.md" for p in found)
 
 
+def test_discover_nested_skill_md_and_cursor_mdc(tmp_path):
+    """Discovers common nested skill layouts and Cursor .mdc rule files."""
+    nested_skill = tmp_path / "skills" / "review" / "SKILL.md"
+    cursor_rule = tmp_path / ".cursor" / "rules" / "secure-coding.mdc"
+    nested_skill.parent.mkdir(parents=True)
+    cursor_rule.parent.mkdir(parents=True)
+    nested_skill.write_text("# Review skill")
+    cursor_rule.write_text("# Cursor rule")
+
+    found = discover_skill_files(tmp_path)
+    assert nested_skill in found
+    assert cursor_rule in found
+
+
+def test_discover_ide_agent_and_skill_trees(tmp_path):
+    """Discovers Cursor/Claude/Codex agent + skill trees without bare agents/ FPs."""
+    surfaces = [
+        tmp_path / ".cursor" / "agents" / "reviewer.md",
+        tmp_path / ".cursor" / "skills" / "ship" / "SKILL.md",
+        tmp_path / ".claude" / "agents" / "planner.md",
+        tmp_path / ".claude" / "skills" / "triage" / "SKILL.md",
+        tmp_path / ".claude" / "commands" / "audit.md",
+        tmp_path / ".claude" / "rules" / "security.md",
+        tmp_path / ".codex" / "skills" / "pentest" / "SKILL.md",
+        tmp_path / ".agents" / "skills" / "local" / "SKILL.md",
+    ]
+    app_agent = tmp_path / "src" / "agents" / "worker.md"
+    for path in (*surfaces, app_agent):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Instruction surface")
+
+    found = discover_skill_files(tmp_path)
+    for path in surfaces:
+        assert path in found, path
+    assert app_agent not in found
+
+
 def test_discover_cursorrules(tmp_path):
     """Discovers .cursorrules file."""
     (tmp_path / ".cursorrules").write_text("# Cursor rules")
     found = discover_skill_files(tmp_path)
     assert any(p.name == ".cursorrules" for p in found)
+
+
+def test_discover_deeply_nested_skills_and_prompts(tmp_path):
+    """Auto-discovery finds nested skills/ and prompts/ layouts, not only top-level."""
+    nested_skill = tmp_path / "packages" / "svc" / "skills" / "deploy.md"
+    prompt_file = tmp_path / "prompts" / "triage.md"
+    gemini = tmp_path / "GEMINI.md"
+    copilot = tmp_path / ".github" / "instructions" / "python.md"
+    for path in (nested_skill, prompt_file, copilot):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Instruction surface")
+    gemini.write_text("# Gemini")
+
+    found = discover_skill_files(tmp_path)
+    names = {p.name for p in found}
+    assert {"deploy.md", "triage.md", "GEMINI.md", "python.md"} <= names
+
+
+def test_discover_skips_generic_markdown_and_vendored_dirs(tmp_path):
+    """Auto-discovery ignores generic docs and vendored trees."""
+    (tmp_path / "README.md").write_text("# Readme")
+    (tmp_path / "CLAUDE.md").write_text("# Claude")
+    vendored = tmp_path / "node_modules" / "pkg" / "skills" / "evil.md"
+    venv_skill = tmp_path / ".venv" / "lib" / "skills" / "tool.md"
+    docs_skill = tmp_path / "docs" / "skills" / "example.md"
+    site_docs_skill = tmp_path / "site-docs" / "skills" / "index.md"
+    agents_readme = tmp_path / ".agents" / "skills" / "README.md"
+    agents_skill = tmp_path / ".agents" / "skills" / "review" / "SKILL.md"
+    for path in (vendored, venv_skill, docs_skill, site_docs_skill, agents_readme, agents_skill):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Third-party or docs skill")
+
+    found = discover_skill_files(tmp_path)
+    names = {p.name for p in found}
+    rel = {str(p.relative_to(tmp_path)) for p in found}
+    assert "CLAUDE.md" in names
+    assert "README.md" not in names
+    assert "evil.md" not in names
+    assert "tool.md" not in names
+    assert "example.md" not in names
+    assert "index.md" not in names
+    assert ".agents/skills/README.md" not in rel
+    assert "site-docs/skills/index.md" not in rel
+    assert ".agents/skills/review/SKILL.md" in rel
 
 
 # ── scan_skill_files tests ──────────────────────────────────────────────────
@@ -137,6 +246,60 @@ def test_scan_deduplicates(tmp_path):
     result = scan_skill_files([f1, f2])
     names = [p.name for p in result.packages]
     assert names.count("@modelcontextprotocol/server-filesystem") == 1
+
+
+def test_explicit_directory_discovery_ignores_generic_markdown(tmp_path):
+    """Explicit directory scans should not treat arbitrary repo docs as skill files."""
+    (tmp_path / "README.md").write_text("# Generic doc\n")
+    github_dir = tmp_path / ".github"
+    github_dir.mkdir()
+    (github_dir / "PULL_REQUEST_TEMPLATE.md").write_text("# PR template\n")
+
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir(parents=True)
+    (skills_dir / "review.md").write_text("# Skill review\n")
+    (tmp_path / "CLAUDE.md").write_text("# Project instructions\n")
+
+    from agent_bom.skills_service import resolve_skill_targets
+
+    resolved = resolve_skill_targets([tmp_path], cwd=tmp_path)
+    names = sorted(path.name for path in resolved)
+
+    assert "CLAUDE.md" in names
+    assert "review.md" in names
+    assert "README.md" not in names
+    assert "PULL_REQUEST_TEMPLATE.md" not in names
+
+
+def test_explicit_directory_discovery_skips_docs_skills_examples(tmp_path):
+    docs_skill = tmp_path / "docs" / "skills" / "review.md"
+    docs_skill.parent.mkdir(parents=True)
+    docs_skill.write_text("# Example skill doc\n")
+
+    from agent_bom.skills_service import resolve_skill_targets
+
+    resolved = resolve_skill_targets([tmp_path], cwd=tmp_path)
+
+    assert docs_skill.resolve() not in resolved
+
+
+def test_explicit_directory_discovery_skips_virtualenv_and_node_modules(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text("# Project instructions\n")
+    venv_skill = tmp_path / ".venv" / "lib" / "python3.13" / "site-packages" / "pkg" / "skills" / "tool.md"
+    node_skill = tmp_path / "ui" / "node_modules" / "pkg" / "AGENTS.md"
+    venv_skill.parent.mkdir(parents=True)
+    node_skill.parent.mkdir(parents=True)
+    venv_skill.write_text("# Third-party skill\n")
+    node_skill.write_text("# Third-party agent\n")
+
+    from agent_bom.skills_service import resolve_skill_targets
+
+    resolved = resolve_skill_targets([tmp_path], cwd=tmp_path)
+    names = sorted(path.name for path in resolved)
+
+    assert "CLAUDE.md" in names
+    assert "tool.md" not in names
+    assert "AGENTS.md" not in names
 
 
 def test_parse_preserves_raw_content(tmp_path):
@@ -164,14 +327,14 @@ def test_scan_merges_raw_content(tmp_path):
     assert str(f2) in result.raw_content
 
 
-def test_raw_content_truncated(tmp_path):
-    """Very large files are truncated to 8000 chars in raw_content."""
+def test_raw_content_preserves_large_files_for_audit(tmp_path):
+    """Very large files remain available to the skills audit layer."""
     md = tmp_path / "huge.md"
     md.write_text("x" * 20000)
     from agent_bom.parsers.skills import parse_skill_file
 
     result = parse_skill_file(md)
-    assert len(result.raw_content[str(md)]) == 8000
+    assert len(result.raw_content[str(md)]) == 20000
 
 
 # ── Comment-stripping tests ──────────────────────────────────────────────

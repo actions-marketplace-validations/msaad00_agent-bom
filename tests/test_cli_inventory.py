@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from importlib import resources
+from unittest.mock import patch
 
-import pytest
 from click.testing import CliRunner
 
-from agent_bom.cli._inventory import completions_cmd, inventory, validate, where
+from agent_bom.cli import main
+from agent_bom.cli._inventory import _inventory_schema_path, completions_cmd, inventory, validate, where
 
 # ---------------------------------------------------------------------------
 # inventory
@@ -22,6 +22,27 @@ def test_inventory_no_agents():
         result = runner.invoke(inventory, [])
         assert result.exit_code == 0
         assert "No MCP configurations" in result.output
+
+
+def test_inventory_json_no_agents_includes_completeness():
+    runner = CliRunner()
+    with patch("agent_bom.cli._inventory.discover_all", return_value=[]):
+        result = runner.invoke(inventory, ["--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["agents"] == []
+        assert data["discovery_completeness"]["path_count"] >= 1
+        assert "actual_server_count" in data["discovery_completeness"]
+
+
+def test_mcp_validate_invalid_json_exits_nonzero(tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text("{bad", encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["mcp", "validate", str(bad)])
+
+    assert result.exit_code != 0
+    assert "Error:" in result.output
 
 
 def test_inventory_with_agents():
@@ -50,6 +71,69 @@ def test_inventory_with_config_file(tmp_path):
         assert result.exit_code == 0
 
 
+def test_inventory_json_with_config_reports_completeness(tmp_path):
+    runner = CliRunner()
+    config = {"mcpServers": {"test": {"command": "npx", "args": ["-y", "@example/server"]}}}
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps(config))
+
+    with patch("agent_bom.cli._inventory.extract_packages", return_value=[]):
+        result = runner.invoke(inventory, ["--config", str(config_file), "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        completeness = data["discovery_completeness"]
+        assert completeness["expected_server_count"] == 1
+        assert completeness["actual_server_count"] == 1
+        assert completeness["sources"][0]["status"] == "present"
+
+
+def test_inventory_prefers_project_inventory_json(tmp_path):
+    runner = CliRunner()
+    project_inventory = {
+        "schema_version": "1",
+        "generated_at": "2026-05-09T00:00:00Z",
+        "agents": [
+            {
+                "name": "operator-agent",
+                "agent_type": "custom",
+                "mcp_servers": [
+                    {
+                        "name": "declared-server",
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+                        "packages": [{"name": "left-pad", "version": "1.3.0", "ecosystem": "npm"}],
+                    }
+                ],
+            }
+        ],
+    }
+    (tmp_path / "inventory.json").write_text(json.dumps(project_inventory), encoding="utf-8")
+    (tmp_path / ".cursor").mkdir()
+    (tmp_path / ".cursor" / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"runtime-only": {"command": "node", "args": ["server.js"]}}}),
+        encoding="utf-8",
+    )
+
+    with (
+        patch("agent_bom.cli._inventory.discover_all") as mock_discover,
+        patch("agent_bom.cli._inventory.extract_packages") as mock_extract,
+    ):
+        result = runner.invoke(inventory, ["-p", str(tmp_path), "--json"])
+
+    assert result.exit_code == 0
+    mock_discover.assert_not_called()
+    mock_extract.assert_not_called()
+    data = json.loads(result.output)
+    assert data["summary"]["total_agents"] == 1
+    assert data["summary"]["total_mcp_servers"] == 1
+    assert data["summary"]["total_packages"] == 1
+    assert data["agents"][0]["name"] == "operator-agent"
+    server = data["agents"][0]["mcp_servers"][0]
+    assert server["name"] == "declared-server"
+    assert server["packages"][0]["name"] == "left-pad"
+    assert data["discovery_completeness"]["sources"][0]["expanded"].endswith("inventory.json")
+
+
 def test_inventory_with_bad_config(tmp_path):
     runner = CliRunner()
     config_file = tmp_path / "bad.json"
@@ -57,7 +141,8 @@ def test_inventory_with_bad_config(tmp_path):
 
     result = runner.invoke(inventory, ["--config", str(config_file)])
     assert result.exit_code == 1
-    assert "Error parsing" in result.output
+    assert "MCP config JSON error" in result.output
+    assert "JSONDecodeError" not in result.output
 
 
 def test_inventory_transitive():
@@ -83,6 +168,24 @@ def test_inventory_security_blocked():
         mock_extract.assert_not_called()
 
 
+def test_inventory_blocklist_match_skips_package_extraction():
+    """Known malicious MCP identities are blocked before extraction."""
+    runner = CliRunner()
+    from agent_bom.models import Agent, AgentType, MCPServer, TransportType
+
+    mock_server = MCPServer(name="mail", command="npx", args=["-y", "postmark-mcp"], transport=TransportType.STDIO)
+    mock_agent = Agent(name="a", agent_type=AgentType.CUSTOM, config_path="/t", mcp_servers=[mock_server])
+
+    with (
+        patch("agent_bom.cli._inventory.discover_all", return_value=[mock_agent]),
+        patch("agent_bom.cli._inventory.extract_packages") as mock_extract,
+    ):
+        result = runner.invoke(inventory, [])
+        assert result.exit_code == 0
+        mock_extract.assert_not_called()
+        assert mock_server.security_blocked is True
+
+
 # ---------------------------------------------------------------------------
 # validate
 # ---------------------------------------------------------------------------
@@ -90,19 +193,32 @@ def test_inventory_security_blocked():
 
 def test_validate_valid_file(tmp_path):
     runner = CliRunner()
-    # Create a minimal valid inventory
-    data = {"agents": [], "generated_at": "2025-01-01T00:00:00Z", "version": "0.1"}
+    data = {
+        "schema_version": "1",
+        "generated_at": "2025-01-01T00:00:00Z",
+        "agents": [{"name": "demo-agent", "agent_type": "custom", "mcp_servers": []}],
+    }
     inv_file = tmp_path / "inv.json"
     inv_file.write_text(json.dumps(data))
 
-    # Need the schema file to exist
-    schema_path = Path(__file__).parent.parent / "schemas" / "inventory.schema.json"
-    if not schema_path.exists():
-        pytest.skip("Schema file not found")
+    schema_path = _inventory_schema_path()
+    assert schema_path is not None
+    assert schema_path.exists()
 
     result = runner.invoke(validate, [str(inv_file)])
-    # Will succeed if schema allows empty agents, fail otherwise — just test it runs
-    assert result.exit_code in (0, 1)
+    assert result.exit_code == 0
+    assert "Valid" in result.output
+
+
+def test_validate_unknown_inventory_schema_version(tmp_path):
+    runner = CliRunner()
+    inv_file = tmp_path / "inv.json"
+    inv_file.write_text(json.dumps({"schema_version": "2", "agents": [{"name": "demo-agent"}]}))
+
+    result = runner.invoke(validate, [str(inv_file)])
+
+    assert result.exit_code == 1
+    assert "Unsupported inventory schema_version '2'" in result.output
 
 
 def test_validate_invalid_json(tmp_path):
@@ -110,13 +226,28 @@ def test_validate_invalid_json(tmp_path):
     inv_file = tmp_path / "bad.json"
     inv_file.write_text("not json {{{")
 
-    # Need the schema file to exist
-    schema_path = Path(__file__).parent.parent / "schemas" / "inventory.schema.json"
-    if not schema_path.exists():
-        pytest.skip("Schema file not found")
+    schema_path = _inventory_schema_path()
+    assert schema_path is not None
+    assert schema_path.exists()
 
     result = runner.invoke(validate, [str(inv_file)])
     assert result.exit_code == 1
+    assert "inventory file JSON error" in result.output
+    assert "JSONDecodeError" not in result.output
+
+
+def test_inventory_schema_path_points_to_repo_schema():
+    schema_path = _inventory_schema_path()
+    assert schema_path is not None
+    assert schema_path.name == "inventory.schema.json"
+    assert "config/schemas" in schema_path.as_posix()
+
+
+def test_inventory_schema_is_packaged_with_agent_bom_data():
+    schema = resources.files("agent_bom").joinpath("data", "inventory.schema.json")
+    assert schema.is_file()
+    payload = json.loads(schema.read_text(encoding="utf-8"))
+    assert payload["$id"].endswith("/schemas/inventory/v1")
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +269,19 @@ def test_where_json():
     data = json.loads(result.output)
     assert "platform" in data
     assert "paths" in data
+    assert "completeness" in data
+    assert data["completeness"]["path_count"] == data["path_count"]
+
+
+def test_discovery_completeness_counts_parse_errors(tmp_path):
+    from agent_bom.discovery.coverage import discovery_completeness_summary
+
+    bad_config = tmp_path / "bad.json"
+    bad_config.write_text("{not-json")
+    data = discovery_completeness_summary([("custom", str(bad_config))])
+    assert data["found_source_count"] == 1
+    assert data["parse_error_count"] == 1
+    assert data["confidence"] == "low"
 
 
 # ---------------------------------------------------------------------------
@@ -147,17 +291,17 @@ def test_where_json():
 
 def test_completions_bash():
     runner = CliRunner()
-    with patch("subprocess.run") as mock_run:
-        mock_result = MagicMock()
-        mock_result.stdout = "# bash completion"
-        mock_run.return_value = mock_result
-        result = runner.invoke(completions_cmd, ["bash"])
-        assert result.exit_code == 0
+    result = runner.invoke(completions_cmd, ["bash"])
+    assert result.exit_code == 0
+    # In-process generation must emit a real bash completion script, not zero bytes.
+    assert len(result.output) > 0
+    assert "_AGENT_BOM_COMPLETE=bash_complete" in result.output
 
 
 def test_completions_zsh_fallback():
     runner = CliRunner()
-    with patch("subprocess.run", side_effect=Exception("fail")):
+    # If Click's completion API errors, the fallback prints activation instructions.
+    with patch("click.shell_completion.get_completion_class", side_effect=Exception("fail")):
         result = runner.invoke(completions_cmd, ["zsh"])
         assert result.exit_code == 0
         assert "zsh_source" in result.output
@@ -165,7 +309,7 @@ def test_completions_zsh_fallback():
 
 def test_completions_fish_fallback():
     runner = CliRunner()
-    with patch("subprocess.run", side_effect=Exception("fail")):
+    with patch("click.shell_completion.get_completion_class", side_effect=Exception("fail")):
         result = runner.invoke(completions_cmd, ["fish"])
         assert result.exit_code == 0
         assert "fish_source" in result.output

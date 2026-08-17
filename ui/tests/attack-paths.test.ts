@@ -1,0 +1,859 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  attackPathKey,
+  attackPathSequenceLabels,
+  buildGraphInvestigationHref,
+  buildSecurityGraphHref,
+  decodeGraphInvestigationParams,
+  descriptiveAttackPathTitle,
+  investigationRootForAttackPath,
+  labelsForAttackPathType,
+  mapAttackPathChainType,
+  mapAttackPathNodeType,
+  matchesAttackPathFocus,
+  mergeAttackPathGraphPages,
+  moveAttackPathSelection,
+  rankedAttackPathRows,
+  recommendedInteractionRiskActions,
+  recommendedAttackPathActions,
+  summarizeInteractionRisks,
+  toAttackCardNodes,
+  toExposurePathFromAttackPath,
+} from "@/lib/attack-paths";
+import { EntityType, type AttackPath, type UnifiedNode } from "@/lib/graph-schema";
+
+describe("attack path helpers", () => {
+  function graphNode(id: string, entityType: EntityType, label: string): UnifiedNode {
+    return {
+      id,
+      entity_type: entityType,
+      label,
+      category_uid: 5,
+      class_uid: 4001,
+      type_uid: 0,
+      status: "active",
+      risk_score: 6,
+      severity: "high",
+      severity_id: 4,
+      first_seen: "2026-04-14T00:00:00Z",
+      last_seen: "2026-04-14T00:00:00Z",
+      attributes: {},
+      compliance_tags: [],
+      data_sources: [],
+      dimensions: {},
+    };
+  }
+
+  it("builds a stable key from source, target, and hops", () => {
+    const path: AttackPath = {
+      source: "pkg",
+      target: "agent",
+      hops: ["cve", "pkg", "server", "agent"],
+      edges: [],
+      composite_risk: 9.2,
+      summary: "critical path",
+      credential_exposure: [],
+      tool_exposure: [],
+      vuln_ids: ["CVE-2026-0001"],
+    };
+
+    expect(attackPathKey(path)).toBe("pkg::agent::cve->pkg->server->agent");
+  });
+
+  it("moves attack-path selection left and right with wraparound", () => {
+    const paths: AttackPath[] = [
+      {
+        source: "a",
+        target: "b",
+        hops: ["a", "b"],
+        edges: [],
+        composite_risk: 9.1,
+        summary: "path one",
+        credential_exposure: [],
+        tool_exposure: [],
+        vuln_ids: [],
+      },
+      {
+        source: "b",
+        target: "c",
+        hops: ["b", "c"],
+        edges: [],
+        composite_risk: 8.4,
+        summary: "path two",
+        credential_exposure: [],
+        tool_exposure: [],
+        vuln_ids: [],
+      },
+    ];
+
+    const firstKey = attackPathKey(paths[0]!);
+    const secondKey = attackPathKey(paths[1]!);
+
+    expect(moveAttackPathSelection(paths, firstKey, 1)).toBe(secondKey);
+    expect(moveAttackPathSelection(paths, secondKey, 1)).toBe(firstKey);
+    expect(moveAttackPathSelection(paths, firstKey, -1)).toBe(secondKey);
+  });
+
+  it("maps supported entity types into attack card node types", () => {
+    expect(mapAttackPathNodeType(EntityType.VULNERABILITY)).toBe("cve");
+    expect(mapAttackPathNodeType(EntityType.PACKAGE)).toBe("package");
+    expect(mapAttackPathNodeType(EntityType.SERVER)).toBe("server");
+    expect(mapAttackPathNodeType(EntityType.AGENT)).toBe("agent");
+    expect(mapAttackPathNodeType(EntityType.CREDENTIAL)).toBe("credential");
+    expect(mapAttackPathNodeType(EntityType.TOOL)).toBeNull();
+  });
+
+  it("maps every entity type into a chain node type without dropping hops", () => {
+    expect(mapAttackPathChainType(EntityType.VULNERABILITY)).toBe("cve");
+    expect(mapAttackPathChainType(EntityType.PACKAGE)).toBe("package");
+    expect(mapAttackPathChainType(EntityType.CLOUD_RESOURCE)).toBe("server");
+    expect(mapAttackPathChainType(EntityType.AGENT)).toBe("agent");
+    expect(mapAttackPathChainType(EntityType.SERVICE_ACCOUNT)).toBe("identity");
+    expect(mapAttackPathChainType(EntityType.CREDENTIAL)).toBe("credential");
+    expect(mapAttackPathChainType(EntityType.TOOL)).toBe("tool");
+    expect(mapAttackPathChainType(EntityType.DATA_STORE)).toBe("data");
+    expect(mapAttackPathChainType(EntityType.ENVIRONMENT)).toBe("entity");
+  });
+
+  it("renders the full correlated chain — including tool and data-store hops the old mapping dropped", () => {
+    const path: AttackPath = {
+      source: "cve-1",
+      target: "data-1",
+      hops: ["cve-1", "tool-1", "agent-1", "data-1"],
+      edges: [],
+      composite_risk: 7.8,
+      summary: "mixed path",
+      credential_exposure: [],
+      tool_exposure: [],
+      vuln_ids: ["CVE-2026-0002"],
+    };
+
+    const nodes = new Map<string, UnifiedNode>([
+      [
+        "cve-1",
+        {
+          id: "cve-1",
+          entity_type: EntityType.VULNERABILITY,
+          label: "CVE-2026-0002",
+          category_uid: 2,
+          class_uid: 2001,
+          type_uid: 0,
+          status: "active",
+          risk_score: 9,
+          severity: "critical",
+          severity_id: 5,
+          first_seen: "2026-04-14T00:00:00Z",
+          last_seen: "2026-04-14T00:00:00Z",
+          attributes: {},
+          compliance_tags: [],
+          data_sources: [],
+          dimensions: {},
+        },
+      ],
+      [
+        "tool-1",
+        {
+          id: "tool-1",
+          entity_type: EntityType.TOOL,
+          label: "run_shell",
+          category_uid: 5,
+          class_uid: 4001,
+          type_uid: 0,
+          status: "active",
+          risk_score: 4,
+          severity: "high",
+          severity_id: 4,
+          first_seen: "2026-04-14T00:00:00Z",
+          last_seen: "2026-04-14T00:00:00Z",
+          attributes: {},
+          compliance_tags: [],
+          data_sources: [],
+          dimensions: {},
+        },
+      ],
+      [
+        "agent-1",
+        {
+          id: "agent-1",
+          entity_type: EntityType.AGENT,
+          label: "Claude Desktop",
+          category_uid: 5,
+          class_uid: 4001,
+          type_uid: 0,
+          status: "active",
+          risk_score: 6,
+          severity: "high",
+          severity_id: 4,
+          first_seen: "2026-04-14T00:00:00Z",
+          last_seen: "2026-04-14T00:00:00Z",
+          attributes: {},
+          compliance_tags: [],
+          data_sources: [],
+          dimensions: {},
+        },
+      ],
+      [
+        "data-1",
+        {
+          id: "data-1",
+          entity_type: EntityType.DATA_STORE,
+          label: "customers-pii",
+          category_uid: 5,
+          class_uid: 4001,
+          type_uid: 0,
+          status: "active",
+          risk_score: 8,
+          severity: "critical",
+          severity_id: 5,
+          first_seen: "2026-04-14T00:00:00Z",
+          last_seen: "2026-04-14T00:00:00Z",
+          attributes: {},
+          compliance_tags: [],
+          data_sources: [],
+          dimensions: {},
+        },
+      ],
+    ]);
+
+    expect(toAttackCardNodes(path, nodes)).toEqual([
+      { type: "cve", label: "CVE-2026-0002", severity: "critical" },
+      { type: "tool", label: "Run Shell", severity: "high" },
+      { type: "agent", label: "Claude Desktop", severity: "high" },
+      { type: "data", label: "Customers Pii", severity: "critical" },
+    ]);
+  });
+
+  it("keeps a descriptive backend title but replaces the generic 'Exposure path' with chain endpoints", () => {
+    const nodes = [
+      { type: "identity" as const, label: "billing-service-account" },
+      { type: "server" as const, label: "Postgres connector" },
+      { type: "data" as const, label: "customers-pii" },
+    ];
+    expect(descriptiveAttackPathTitle("CVE-2026-0002 via analyst-agent", nodes)).toBe(
+      "CVE-2026-0002 via analyst-agent",
+    );
+    expect(descriptiveAttackPathTitle("Exposure path", nodes)).toBe("billing-service-account → customers-pii");
+    expect(descriptiveAttackPathTitle("Exposure path via analyst-agent", nodes)).toBe(
+      "billing-service-account → customers-pii",
+    );
+    expect(descriptiveAttackPathTitle(undefined, [{ type: "data" as const, label: "customers-pii" }])).toBe(
+      "customers-pii",
+    );
+    expect(descriptiveAttackPathTitle(undefined, [])).toBe("Exposure path");
+  });
+
+  it("stamps unique 1..N ranks by sorted position even when path keys collide", () => {
+    const collidingPath = (composite: number): AttackPath => ({
+      source: "s",
+      target: "t",
+      hops: ["s", "t"],
+      edges: [],
+      composite_risk: composite,
+      summary: "same key different path",
+      credential_exposure: [],
+      tool_exposure: [],
+      vuln_ids: [],
+    });
+    const paths = [collidingPath(9.9), collidingPath(9.9), collidingPath(9.9)];
+
+    const rows = rankedAttackPathRows(paths);
+
+    expect(rows.map((row) => row.rank)).toEqual([1, 2, 3]);
+    expect(new Set(rows.map((row) => row.key)).size).toBe(3);
+  });
+
+  it("matches fix-first cards to their attack paths after filtering or reordering", () => {
+    const pathA: AttackPath = {
+      source: "finding-a",
+      target: "agent-a",
+      hops: ["finding-a", "tool-a", "agent-a"],
+      edges: [],
+      composite_risk: 9.8,
+      summary: "path A",
+      credential_exposure: [],
+      tool_exposure: ["tool-a"],
+      vuln_ids: ["CVE-A"],
+    };
+    const pathB: AttackPath = {
+      source: "finding-b",
+      target: "agent-b",
+      hops: ["finding-b", "agent-b"],
+      edges: [],
+      composite_risk: 8.7,
+      summary: "path B",
+      credential_exposure: [],
+      tool_exposure: [],
+      vuln_ids: ["CVE-B"],
+    };
+    const cards = [
+      { title: "Finding B via agent-b", attack_path: pathB },
+      { title: "Finding A via agent-a", attack_path: pathA },
+    ];
+
+    expect(rankedAttackPathRows([pathA, pathB], cards).map((row) => row.card?.title)).toEqual([
+      "Finding A via agent-a",
+      "Finding B via agent-b",
+    ]);
+    expect(rankedAttackPathRows([pathB], cards)[0]?.card?.title).toBe("Finding B via agent-b");
+  });
+
+  it("builds a focused security-graph href from canonical context", () => {
+    expect(
+      buildSecurityGraphHref({
+        scanId: "scan-123",
+        cve: "CVE-2026-0002",
+        packageName: "flask",
+        agentName: "Claude Desktop",
+      }),
+    ).toBe("/security-graph?scan=scan-123&cve=CVE-2026-0002&package=flask&agent=Claude+Desktop");
+  });
+
+  it("builds a shareable graph investigation href", () => {
+    expect(
+      buildGraphInvestigationHref({
+        scanId: "scan-123",
+        agentName: "Claude Desktop",
+        rootId: "pkg-1",
+        rootLabel: "flask",
+      }),
+    ).toBe("/graph?scan=scan-123&agent=Claude+Desktop&investigate=1&root=pkg-1&q=flask");
+  });
+
+  it("decodes graph investigation roots from URL params", () => {
+    expect(decodeGraphInvestigationParams(new URLSearchParams("investigate=1&root=pkg-1&q=flask"))).toEqual({
+      rootId: "pkg-1",
+      rootLabel: "flask",
+    });
+    expect(decodeGraphInvestigationParams(new URLSearchParams("investigate=0&root=pkg-1"))).toBeNull();
+  });
+
+  it("chooses a concrete investigation root from the selected attack path", () => {
+    const path: AttackPath = {
+      source: "cve-1",
+      target: "agent-1",
+      hops: ["cve-1", "pkg-1", "server-1", "agent-1"],
+      edges: [],
+      composite_risk: 9.4,
+      summary: "focused path",
+      credential_exposure: [],
+      tool_exposure: [],
+      vuln_ids: ["CVE-2026-0002"],
+    };
+    const nodes = new Map<string, UnifiedNode>([
+      ["cve-1", graphNode("cve-1", EntityType.VULNERABILITY, "CVE-2026-0002")],
+      ["pkg-1", graphNode("pkg-1", EntityType.PACKAGE, "flask")],
+      ["server-1", graphNode("server-1", EntityType.SERVER, "mcp-server")],
+      ["agent-1", graphNode("agent-1", EntityType.AGENT, "Claude Desktop")],
+    ]);
+
+    expect(investigationRootForAttackPath(path, nodes, { packageName: "flask" })?.id).toBe("pkg-1");
+    expect(investigationRootForAttackPath(path, nodes, { agentName: "Claude Desktop" })?.id).toBe("agent-1");
+    expect(investigationRootForAttackPath(path, nodes, {})?.id).toBe("cve-1");
+  });
+
+  it("adapts persisted attack paths into the shared exposure path contract", () => {
+    const path: AttackPath = {
+      source: "cve-1",
+      target: "agent-1",
+      hops: ["cve-1", "pkg-1", "server-1", "agent-1"],
+      edges: ["edge:cve-pkg", "edge:pkg-server", "edge:server-agent"],
+      composite_risk: 9.4,
+      summary: "CVE reaches an agent through a shared server",
+      credential_exposure: ["DATABASE_URL"],
+      tool_exposure: ["execute_sql"],
+      vuln_ids: ["CVE-2026-0002"],
+    };
+    const nodes = new Map<string, UnifiedNode>([
+      ["cve-1", graphNode("cve-1", EntityType.VULNERABILITY, "CVE-2026-0002")],
+      ["pkg-1", graphNode("pkg-1", EntityType.PACKAGE, "werkzeug")],
+      ["server-1", graphNode("server-1", EntityType.SERVER, "database")],
+      ["agent-1", graphNode("agent-1", EntityType.AGENT, "analyst-agent")],
+    ]);
+
+    const exposure = toExposurePathFromAttackPath(path, nodes, { rank: 1, scanId: "scan-1" });
+
+    expect(exposure.rank).toBe(1);
+    expect(exposure.riskScore).toBe(9.4);
+    expect(exposure.findings).toEqual(["CVE-2026-0002"]);
+    expect(exposure.dependencyContext).toMatchObject({ packageName: "werkzeug", serverName: "database" });
+    expect(exposure.affectedAgents).toEqual(["Analyst Agent"]);
+    expect(exposure.reachableTools).toEqual(["execute_sql"]);
+    expect(exposure.exposedCredentials).toEqual(["DATABASE_URL"]);
+    expect(exposure.provenance).toEqual({ source: "graph_attack_path", scanId: "scan-1" });
+  });
+
+  it("matches a focused attack path by cve, package, and agent labels", () => {
+    const path: AttackPath = {
+      source: "cve-1",
+      target: "agent-1",
+      hops: ["cve-1", "pkg-1", "server-1", "agent-1"],
+      edges: [],
+      composite_risk: 8.4,
+      summary: "focused path",
+      credential_exposure: [],
+      tool_exposure: [],
+      vuln_ids: ["CVE-2026-7777"],
+    };
+
+    const nodes = new Map<string, UnifiedNode>([
+      [
+        "cve-1",
+        {
+          id: "cve-1",
+          entity_type: EntityType.VULNERABILITY,
+          label: "CVE-2026-7777",
+          category_uid: 2,
+          class_uid: 2001,
+          type_uid: 0,
+          status: "active",
+          risk_score: 9,
+          severity: "critical",
+          severity_id: 5,
+          first_seen: "2026-04-14T00:00:00Z",
+          last_seen: "2026-04-14T00:00:00Z",
+          attributes: {},
+          compliance_tags: [],
+          data_sources: [],
+          dimensions: {},
+        },
+      ],
+      [
+        "pkg-1",
+        {
+          id: "pkg-1",
+          entity_type: EntityType.PACKAGE,
+          label: "flask",
+          category_uid: 5,
+          class_uid: 4001,
+          type_uid: 0,
+          status: "active",
+          risk_score: 6,
+          severity: "high",
+          severity_id: 4,
+          first_seen: "2026-04-14T00:00:00Z",
+          last_seen: "2026-04-14T00:00:00Z",
+          attributes: {},
+          compliance_tags: [],
+          data_sources: [],
+          dimensions: {},
+        },
+      ],
+      [
+        "server-1",
+        {
+          id: "server-1",
+          entity_type: EntityType.SERVER,
+          label: "sqlite-mcp",
+          category_uid: 5,
+          class_uid: 4001,
+          type_uid: 0,
+          status: "active",
+          risk_score: 6,
+          severity: "high",
+          severity_id: 4,
+          first_seen: "2026-04-14T00:00:00Z",
+          last_seen: "2026-04-14T00:00:00Z",
+          attributes: {},
+          compliance_tags: [],
+          data_sources: [],
+          dimensions: {},
+        },
+      ],
+      [
+        "agent-1",
+        {
+          id: "agent-1",
+          entity_type: EntityType.AGENT,
+          label: "Claude Desktop",
+          category_uid: 5,
+          class_uid: 4001,
+          type_uid: 0,
+          status: "active",
+          risk_score: 6,
+          severity: "high",
+          severity_id: 4,
+          first_seen: "2026-04-14T00:00:00Z",
+          last_seen: "2026-04-14T00:00:00Z",
+          attributes: {},
+          compliance_tags: [],
+          data_sources: [],
+          dimensions: {},
+        },
+      ],
+    ]);
+
+    expect(
+      matchesAttackPathFocus(path, nodes, {
+        cve: "CVE-2026-7777",
+        packageName: "flask",
+        agentName: "Claude Desktop",
+      }),
+    ).toBe(true);
+
+    expect(
+      matchesAttackPathFocus(path, nodes, {
+        cve: "CVE-2026-7777",
+        packageName: "requests",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns unique labels for a requested attack-path node type", () => {
+    const path: AttackPath = {
+      source: "cve-1",
+      target: "agent-1",
+      hops: ["agent-1", "agent-2", "agent-1", "cred-1"],
+      edges: [],
+      composite_risk: 5.3,
+      summary: "duplicate agent labels",
+      credential_exposure: [],
+      tool_exposure: [],
+      vuln_ids: [],
+    };
+
+    const nodes = new Map<string, UnifiedNode>([
+      [
+        "agent-1",
+        {
+          id: "agent-1",
+          entity_type: EntityType.AGENT,
+          label: "Claude Desktop",
+          category_uid: 5,
+          class_uid: 4001,
+          type_uid: 0,
+          status: "active",
+          risk_score: 5,
+          severity: "medium",
+          severity_id: 3,
+          first_seen: "2026-04-14T00:00:00Z",
+          last_seen: "2026-04-14T00:00:00Z",
+          attributes: {},
+          compliance_tags: [],
+          data_sources: [],
+          dimensions: {},
+        },
+      ],
+      [
+        "agent-2",
+        {
+          id: "agent-2",
+          entity_type: EntityType.AGENT,
+          label: "Cursor",
+          category_uid: 5,
+          class_uid: 4001,
+          type_uid: 0,
+          status: "active",
+          risk_score: 5,
+          severity: "medium",
+          severity_id: 3,
+          first_seen: "2026-04-14T00:00:00Z",
+          last_seen: "2026-04-14T00:00:00Z",
+          attributes: {},
+          compliance_tags: [],
+          data_sources: [],
+          dimensions: {},
+        },
+      ],
+      [
+        "cred-1",
+        {
+          id: "cred-1",
+          entity_type: EntityType.CREDENTIAL,
+          label: "ANTHROPIC_API_KEY",
+          category_uid: 5,
+          class_uid: 4001,
+          type_uid: 0,
+          status: "active",
+          risk_score: 6,
+          severity: "high",
+          severity_id: 4,
+          first_seen: "2026-04-14T00:00:00Z",
+          last_seen: "2026-04-14T00:00:00Z",
+          attributes: {},
+          compliance_tags: [],
+          data_sources: [],
+          dimensions: {},
+        },
+      ],
+    ]);
+
+    expect(labelsForAttackPathType(path, nodes, "agent")).toEqual(["Claude Desktop", "Cursor"]);
+  });
+
+  it("returns ordered labels for the selected path sequence", () => {
+    const path: AttackPath = {
+      source: "cve-1",
+      target: "agent-1",
+      hops: ["cve-1", "pkg-1", "agent-1"],
+      edges: [],
+      composite_risk: 7.1,
+      summary: "ordered labels",
+      credential_exposure: [],
+      tool_exposure: [],
+      vuln_ids: ["CVE-2026-1212"],
+    };
+
+    const nodes = new Map<string, UnifiedNode>([
+      [
+        "cve-1",
+        {
+          id: "cve-1",
+          entity_type: EntityType.VULNERABILITY,
+          label: "CVE-2026-1212",
+          category_uid: 2,
+          class_uid: 2001,
+          type_uid: 0,
+          status: "active",
+          risk_score: 9,
+          severity: "critical",
+          severity_id: 5,
+          first_seen: "2026-04-14T00:00:00Z",
+          last_seen: "2026-04-14T00:00:00Z",
+          attributes: {},
+          compliance_tags: [],
+          data_sources: [],
+          dimensions: {},
+        },
+      ],
+      [
+        "pkg-1",
+        {
+          id: "pkg-1",
+          entity_type: EntityType.PACKAGE,
+          label: "flask",
+          category_uid: 5,
+          class_uid: 4001,
+          type_uid: 0,
+          status: "active",
+          risk_score: 5,
+          severity: "medium",
+          severity_id: 3,
+          first_seen: "2026-04-14T00:00:00Z",
+          last_seen: "2026-04-14T00:00:00Z",
+          attributes: {},
+          compliance_tags: [],
+          data_sources: [],
+          dimensions: {},
+        },
+      ],
+      [
+        "agent-1",
+        {
+          id: "agent-1",
+          entity_type: EntityType.AGENT,
+          label: "Claude Desktop",
+          category_uid: 5,
+          class_uid: 4001,
+          type_uid: 0,
+          status: "active",
+          risk_score: 6,
+          severity: "high",
+          severity_id: 4,
+          first_seen: "2026-04-14T00:00:00Z",
+          last_seen: "2026-04-14T00:00:00Z",
+          attributes: {},
+          compliance_tags: [],
+          data_sources: [],
+          dimensions: {},
+        },
+      ],
+    ]);
+
+    expect(attackPathSequenceLabels(path, nodes)).toEqual([
+      "CVE-2026-1212",
+      "flask",
+      "Claude Desktop",
+    ]);
+  });
+
+  it("recommends deterministic next actions for a selected path", () => {
+    const path: AttackPath = {
+      source: "cve-1",
+      target: "agent-1",
+      hops: ["cve-1", "agent-1"],
+      edges: [],
+      composite_risk: 9.2,
+      summary: "actionable path",
+      credential_exposure: ["ANTHROPIC_API_KEY"],
+      tool_exposure: ["run_shell"],
+      vuln_ids: ["CVE-2026-3434"],
+    };
+
+    const nodes = new Map<string, UnifiedNode>([
+      [
+        "cve-1",
+        {
+          id: "cve-1",
+          entity_type: EntityType.VULNERABILITY,
+          label: "CVE-2026-3434",
+          category_uid: 2,
+          class_uid: 2001,
+          type_uid: 0,
+          status: "active",
+          risk_score: 9,
+          severity: "critical",
+          severity_id: 5,
+          first_seen: "2026-04-14T00:00:00Z",
+          last_seen: "2026-04-14T00:00:00Z",
+          attributes: {},
+          compliance_tags: [],
+          data_sources: [],
+          dimensions: {},
+        },
+      ],
+      [
+        "agent-1",
+        {
+          id: "agent-1",
+          entity_type: EntityType.AGENT,
+          label: "Claude Desktop",
+          category_uid: 5,
+          class_uid: 4001,
+          type_uid: 0,
+          status: "active",
+          risk_score: 6,
+          severity: "high",
+          severity_id: 4,
+          first_seen: "2026-04-14T00:00:00Z",
+          last_seen: "2026-04-14T00:00:00Z",
+          attributes: {},
+          compliance_tags: [],
+          data_sources: [],
+          dimensions: {},
+        },
+      ],
+    ]);
+
+    expect(recommendedAttackPathActions(path, nodes)).toEqual([
+      {
+        title: "Validate the lead finding",
+        detail: "Open the primary CVE evidence first so the exploit chain has a confirmed root cause.",
+        href: "/findings?cve=CVE-2026-3434",
+      },
+      {
+        title: "Inspect the exposed agent",
+        detail: "Review the first affected agent and confirm its connected servers, tools, and configuration trust boundary.",
+        href: "/agents?name=Claude%20Desktop",
+      },
+      {
+        title: "Contain credential exposure",
+        detail: "Rotate or scope exposed secrets before you widen blast radius by exploring deeper topology.",
+        href: "/mesh",
+      },
+    ]);
+  });
+
+  it("summarizes interaction risks for panel-level metrics", () => {
+    expect(
+      summarizeInteractionRisks([
+        {
+          pattern: "credential + tool",
+          agents: ["Claude Desktop", "Cursor"],
+          risk_score: 8.8,
+          description: "shared exposure",
+        },
+        {
+          pattern: "runtime drift",
+          agents: ["Cursor"],
+          risk_score: 6.4,
+          description: "policy drift",
+        },
+      ]),
+    ).toEqual({
+      total: 2,
+      uniqueAgents: 2,
+      highestRisk: 8.8,
+    });
+  });
+
+  it("recommends deterministic follow-up actions for an interaction risk", () => {
+    expect(
+      recommendedInteractionRiskActions({
+        pattern: "credential + tool",
+        agents: ["Claude Desktop"],
+        risk_score: 8.2,
+        description: "shared exposure",
+        owasp_agentic_tag: "AGENT-001",
+      }),
+    ).toEqual([
+      {
+        label: "Open lead agent",
+        href: "/agents?name=Claude%20Desktop",
+      },
+      {
+        label: "Review tag evidence",
+        href: "/compliance?q=AGENT-001",
+      },
+    ]);
+  });
+});
+
+describe("mergeAttackPathGraphPages", () => {
+  const path = (source: string, target: string, risk: number): AttackPath =>
+    ({
+      source,
+      target,
+      hops: [source, target],
+      edges: [],
+      composite_risk: risk,
+      summary: `${source}->${target}`,
+      credential_exposure: [],
+      tool_exposure: [],
+      vuln_ids: [],
+    });
+
+  const emptyStats = {
+    total_nodes: 0,
+    total_edges: 0,
+    node_types: {},
+    severity_counts: {},
+    relationship_types: {},
+    attack_path_count: 0,
+    interaction_risk_count: 0,
+    max_attack_path_risk: 0,
+    highest_interaction_risk: 0,
+  };
+
+  const page = (
+    paths: AttackPath[],
+    nodeIds: string[],
+    edgeIds: string[],
+    pagination: { total: number; offset: number; limit: number; has_more: boolean },
+  ): import("@/lib/api-types").UnifiedGraphResponse =>
+    ({
+      scan_id: "scan-1",
+      tenant_id: "default",
+      created_at: "2026-07-22T00:00:00Z",
+      nodes: nodeIds.map((id) => ({ id })) as import("@/lib/api-types").UnifiedGraphResponse["nodes"],
+      edges: edgeIds.map((id) => ({ id })) as import("@/lib/api-types").UnifiedGraphResponse["edges"],
+      attack_paths: paths,
+      interaction_risks: [],
+      stats: { ...emptyStats, attack_path_count: pagination.total },
+      pagination,
+    });
+
+  it("appends unique paths/nodes/edges and keeps latest pagination", () => {
+    const first = page([path("a", "b", 9)], ["a", "b"], ["e1"], {
+      total: 3,
+      offset: 0,
+      limit: 1,
+      has_more: true,
+    });
+    const second = page([path("b", "c", 8)], ["b", "c"], ["e1", "e2"], {
+      total: 3,
+      offset: 1,
+      limit: 1,
+      has_more: true,
+    });
+    const merged = mergeAttackPathGraphPages(first, second);
+    expect(merged.nodes.map((n) => n.id)).toEqual(["a", "b", "c"]);
+    expect(merged.edges.map((e) => e.id)).toEqual(["e1", "e2"]);
+    expect(merged.attack_paths.map((p) => attackPathKey(p))).toEqual([
+      attackPathKey(path("a", "b", 9)),
+      attackPathKey(path("b", "c", 8)),
+    ]);
+    expect(merged.pagination).toEqual(second.pagination);
+    expect(merged.stats.attack_path_count).toBe(3);
+  });
+});

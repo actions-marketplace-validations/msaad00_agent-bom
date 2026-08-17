@@ -7,7 +7,7 @@
 
 import { useEffect, useState, useMemo } from "react";
 import { api } from "@/lib/api";
-import type { ScanJob } from "@/lib/api";
+import type { JobListItem } from "@/lib/api";
 import {
   Search,
   CheckCircle,
@@ -52,7 +52,7 @@ function timeAgo(iso: string): string {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
-function jobsToEvents(jobs: ScanJob[]): ActivityEvent[] {
+function jobsToEvents(jobs: JobListItem[]): ActivityEvent[] {
   const events: ActivityEvent[] = [];
   for (const job of jobs) {
     events.push({
@@ -63,18 +63,21 @@ function jobsToEvents(jobs: ScanJob[]): ActivityEvent[] {
       meta: { job_id: job.job_id },
     });
     if (job.status === "done" && job.completed_at) {
-      const result = job.result as Record<string, unknown> | undefined;
-      const blast = (result?.blast_radius as Array<Record<string, unknown>>) ?? [];
-      const critCount = blast.filter((b) => b.severity === "critical").length;
+      const findingCount = job.summary?.total_vulnerabilities;
+      const critCount = job.summary?.critical_findings;
+      const message =
+        findingCount == null
+          ? "Scan completed · finding metrics unavailable"
+          : `Scan completed: ${findingCount} findings${critCount != null && critCount > 0 ? `, ${critCount} critical` : ""}`;
       events.push({
         id: `${job.job_id}-done`,
         type: "scan_completed",
-        message: `Scan completed: ${blast.length} findings${critCount > 0 ? `, ${critCount} critical` : ""}`,
+        message,
         timestamp: job.completed_at,
         meta: {
           job_id: job.job_id,
-          cve_count: blast.length,
-          critical_count: critCount,
+          ...(findingCount == null ? {} : { cve_count: findingCount }),
+          ...(critCount == null ? {} : { critical_count: critCount }),
         },
       });
     } else if (job.status === "failed" && job.completed_at) {
@@ -95,31 +98,47 @@ function jobsToEvents(jobs: ScanJob[]): ActivityEvent[] {
 interface ActivityFeedProps {
   maxItems?: number;
   className?: string;
+  initialJobs?: JobListItem[];
+  refresh?: boolean;
 }
 
-export function ActivityFeed({ maxItems = 20, className }: ActivityFeedProps) {
-  const [jobs, setJobs] = useState<ScanJob[]>([]);
+export function ActivityFeed({
+  maxItems = 20,
+  className,
+  initialJobs = [],
+  refresh = true,
+}: ActivityFeedProps) {
+  const [jobs, setJobs] = useState<JobListItem[]>(initialJobs);
   const [filter, setFilter] = useState<ActivityType | "all">("all");
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(refresh && initialJobs.length === 0);
 
   useEffect(() => {
+    if (initialJobs.length > 0) {
+      setJobs(initialJobs);
+      setLoading(false);
+    }
+  }, [initialJobs]);
+
+  useEffect(() => {
+    if (!refresh) {
+      setLoading(false);
+      return;
+    }
+
     async function load() {
       try {
         const jobsRes = await api.listJobs();
-        const full = await Promise.all(
-          jobsRes.jobs.slice(0, 20).map((j) => api.getScan(j.job_id))
-        );
-        setJobs(full);
+        setJobs(jobsRes.jobs.slice(0, 20));
       } catch {
         /* ignore */
       } finally {
         setLoading(false);
       }
     }
-    load();
+    void load();
     const interval = setInterval(load, 15000);
     return () => clearInterval(interval);
-  }, []);
+  }, [refresh]);
 
   const events = useMemo(() => jobsToEvents(jobs), [jobs]);
   const filtered = useMemo(
@@ -133,15 +152,15 @@ export function ActivityFeed({ maxItems = 20, className }: ActivityFeedProps) {
 
   return (
     <div
-      className={`bg-zinc-900 border border-zinc-800 rounded-xl ${className ?? ""}`}
+      className={`bg-[var(--surface)] border border-[var(--border-subtle)] rounded-xl ${className ?? ""}`}
     >
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800">
-        <h3 className="text-sm font-semibold text-zinc-300">Activity</h3>
+      <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border-subtle)]">
+        <h3 className="text-sm font-semibold text-[var(--text-secondary)]">Activity</h3>
         <select
           value={filter}
           onChange={(e) => setFilter(e.target.value as ActivityType | "all")}
-          className="text-xs bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-zinc-400"
+          className="text-xs bg-[var(--surface-elevated)] border border-[var(--border-subtle)] rounded px-2 py-1 text-[var(--text-secondary)]"
         >
           <option value="all">All</option>
           <option value="scan_started">Scans</option>
@@ -151,32 +170,32 @@ export function ActivityFeed({ maxItems = 20, className }: ActivityFeedProps) {
       </div>
 
       {/* Event list */}
-      <div className="divide-y divide-zinc-800 max-h-[400px] overflow-y-auto">
+      <div className="divide-y divide-[var(--border-subtle)] max-h-[400px] overflow-y-auto">
         {loading ? (
-          <div className="p-4 text-center text-zinc-600 text-xs">
+          <div className="p-4 text-center text-[var(--text-tertiary)] text-xs">
             Loading...
           </div>
         ) : filtered.length === 0 ? (
-          <div className="p-4 text-center text-zinc-600 text-xs">
+          <div className="p-4 text-center text-[var(--text-tertiary)] text-xs">
             No activity yet
           </div>
         ) : (
-          filtered.map((event) => {
+          filtered?.map((event) => {
             const Icon = TYPE_ICONS[event.type];
             const color = TYPE_COLORS[event.type];
             return (
               <div
                 key={event.id}
-                className="flex items-start gap-3 px-4 py-3 hover:bg-zinc-800/50 transition-colors"
+                className="flex items-start gap-3 px-4 py-3 hover:bg-[var(--surface-elevated)]/50 transition-colors"
               >
                 <Icon
                   className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${color}`}
                 />
                 <div className="flex-1 min-w-0">
-                  <p className="text-xs text-zinc-300 leading-tight truncate">
+                  <p className="text-xs text-[var(--text-secondary)] leading-tight truncate">
                     {event.message}
                   </p>
-                  <p className="text-[10px] text-zinc-600 mt-0.5">
+                  <p className="text-[10px] text-[var(--text-tertiary)] mt-0.5">
                     {timeAgo(event.timestamp)}
                   </p>
                 </div>

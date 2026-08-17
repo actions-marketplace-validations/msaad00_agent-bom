@@ -1,7 +1,10 @@
 # Permissions & Trust Contract
 
-agent-bom is a **read-only security scanner**. This document is an explicit,
-auditable contract of what the tool accesses — and what it never touches.
+agent-bom's scanner lane is **read-only by default**. This document is an
+explicit, auditable contract of what the local scan path accesses — and what it
+never touches. Control-plane, connector, export, proxy/gateway, and Shield
+surfaces have separate operator-approved destinations or write actions called
+out below.
 
 ---
 
@@ -14,18 +17,26 @@ agent-bom reads only what you explicitly ask it to scan:
 | Agent configs | auto-discovery or `--project` | Config JSON/YAML files (e.g. `claude_desktop_config.json`) |
 | Inventory | `--inventory` | Your inventory JSON file |
 | Lock files | inferred from project | `package-lock.json`, `requirements.txt`, `Cargo.lock`, etc. |
-| Docker images | `--image` | Image filesystem layers (via Grype/Syft subprocess) |
+| Docker images | `--image` | Image filesystem layers (via container inspection subprocess) |
 | Kubernetes | `--k8s` | Pod specs via `kubectl get pods -o json` (read-only) |
 | Terraform | `--tf-dir` | `.tf` source files (no state files, no `.tfvars`) |
-| GitHub Actions | `--gha` | `.github/workflows/*.yml` files |
+| GitHub Actions | `--gha` | `.github/workflows/*.yml` files; reports AI/credential use plus unpinned remote actions, `pull_request_target`, and missing top-level `permissions:` policies |
 | SBOM files | `--sbom` | CycloneDX/SPDX JSON you provide |
+
+Run `agent-bom agents --gha . --offline` to inspect workflow files without
+network access. Pipeline-hardening gaps appear as scan warnings; pin remote
+actions and reusable workflows to full commit SHAs, avoid executing untrusted
+pull-request code under `pull_request_target`, and declare least-privilege
+top-level `permissions:` before rerunning the same command.
 
 ---
 
-## Auto-Discovery Config Paths (exhaustive list)
+## Auto-Discovery Config Paths
 
-**Auto-discovery** reads these specific config paths only. No directory traversal,
-no glob patterns, no recursive walks. If a file does not exist, it is silently skipped.
+**Auto-discovery** reads known client and project paths for supported agent
+surfaces. Most entries are fixed file paths; some supported clients use bounded
+project or profile globs so teams can find the same configs their tools load.
+If a file does not exist, it is silently skipped.
 
 ### Global config files
 
@@ -58,9 +69,13 @@ no glob patterns, no recursive walks. If a file does not exist, it is silently s
 - `compose.yml`
 - `compose.yaml`
 
-**Total**: 27 specific file paths. No other files are ever read during auto-discovery.
+The exact path set changes as supported clients are added. Use
+`agent-bom where --json` or `agent-bom where --dry-run` to preview the paths
+that would be read on a given machine before any scan runs.
 
-Use `--dry-run` to preview exactly which paths would be read before any scan runs.
+Default discovery stays scoped to known agent, MCP, Docker Compose, JetBrains,
+and project config surfaces; arbitrary filesystem crawling is not part of
+auto-discovery.
 
 ---
 
@@ -98,19 +113,21 @@ Credential values are **never** read, stored, logged, or transmitted. Only names
 - **Never write** to any config file, lock file, or project file
 - **Never execute** MCP servers or agent processes
 - **Never store** credential values — only env var _names_ appear in reports
-- **Never transmit** your file contents, project structure, or inventory to external services
+- **Never transmit** your file contents, project structure, or inventory to external services unless you explicitly enable a push, export, or integration destination; pushed payloads are sanitized before transmission
 - **Never cache** any personal data to disk (scan history is opt-in via `--save`)
 - **Never require** authentication tokens or API keys (NVD key is optional for rate limits only)
-- **Never access** arbitrary files — only the 27 enumerated paths above
-- **Never traverse** directories or use glob patterns during auto-discovery
+- **Never access** arbitrary files outside the supported discovery surfaces you choose to scan
+- **Never perform** broad recursive filesystem crawls during auto-discovery
 - **Never run** background processes, daemons, cron jobs, or system services
 
 ---
 
-## External API Calls (exhaustive list)
+## Scanner and Enrichment API Calls
 
-All network calls are read-only GET/POST to public vulnerability databases.
-Only package names and versions are sent. No user data is included in requests.
+Scanner and enrichment network calls are read-only GET/POST requests to public
+vulnerability and package metadata databases. Only package names, versions,
+CVE IDs, or repository coordinates needed for that lookup are sent. No config
+contents or credential values are included in those requests.
 
 | Service | URL | What we send | What we receive | Auth |
 |---------|-----|-------------|----------------|------|
@@ -121,10 +138,24 @@ Only package names and versions are sent. No user data is included in requests.
 | npm registry | `https://registry.npmjs.org/{pkg}/{version}` | Package name + version | Package metadata | None |
 | PyPI | `https://pypi.org/pypi/{pkg}/{version}/json` | Package name + version | Package metadata | None |
 | OpenSSF Scorecard | `https://api.securityscorecards.dev/projects/github.com/{owner}/{repo}` | GitHub owner/repo | Scorecard scores | None |
-| Jira (optional) | `https://{instance}.atlassian.net/rest/api/3/issue` | Finding summaries | Ticket confirmation | API token (`--jira-token`) |
-| Slack (optional) | User-provided webhook URL | Finding summaries | Delivery status | Webhook URL (`--slack-webhook`) |
-| Vanta (optional) | `https://api.vanta.com/v1/` | Compliance evidence | Upload confirmation | API token (`--vanta-token`) |
-| Drata (optional) | `https://public-api.drata.com/` | Compliance evidence | Upload confirmation | API token (`--drata-token`) |
+## Explicit Push, Export, and Integration Destinations
+
+The destinations below are not hidden telemetry. They are only used when an
+operator configures the corresponding flag, URL, token, connector, or control
+plane setting.
+
+| Destination | Example URL | What we send | Auth |
+|-------------|-------------|--------------|------|
+| Push API / control plane | User-provided `--push-url` or API base URL | Sanitized findings, inventory, graph, or audit payloads | API key or bearer token |
+| Webhook outbox | User-provided webhook URL | Signed posture events and delivery metadata | Operator-provided secret/token |
+| SIEM / audit export | User-provided export destination or `/v1/audit/export` consumer | OCSF-shaped audit events | Deployment-specific |
+| OTLP / Prometheus Pushgateway | User-provided collector endpoint | Metrics/traces, no credential values | Deployment-specific |
+| Jira (optional) | `https://{instance}.atlassian.net/rest/api/3/issue` | Finding summaries | API token (`--jira-token`) |
+| Slack (optional) | User-provided webhook URL | Finding summaries | Webhook URL (`--slack-webhook`) |
+| Vanta (optional) | `https://api.vanta.com/v1/` | Compliance evidence | API token (`--vanta-token`) |
+| Drata (optional) | `https://public-api.drata.com/` | Compliance evidence | API token (`--drata-token`) |
+| SaaS connectors | Connector-specific API URL | Connector evidence requested by the operator | Connector-specific token |
+| AI enrichment | Operator-provided LLM endpoint | Redacted finding context for enrichment | Operator-provided key |
 
 ### Data flow
 
@@ -133,18 +164,21 @@ Only package names and versions are sent. No user data is included in requests.
                           ↓
 [Package names+versions]  →  sent to OSV.dev, NVD, EPSS, KEV, npm, PyPI, OpenSSF Scorecard
                           ↓
-[Findings (optional)]     →  sent to Jira, Slack, Vanta, Drata (only if flags provided)
+[Findings (optional)]     →  sent to configured push/export/integration destinations
                           ↓
 [CVE results]  →  returned to local process, written to stdout or --output file
 ```
 
-- **Sent to APIs**: package name + version only (e.g., `express@4.17.1`)
+- **Sent to scanner/enrichment APIs**: package name + version, CVE ID, or repository coordinate only
 - **Returned from APIs**: CVE IDs, severity scores, advisory URLs
-- **Never sent**: file paths, config contents, env var values, scan results, hostnames, IP addresses
+- **Never sent to public scanner/enrichment APIs**: file paths, config contents, env var values, scan results, hostnames, IP addresses
+- **Sent to configured destinations**: only the sanitized payload for the explicit push, export, connector, or webhook action the operator enabled
 
 All external calls can be completely disabled with `--no-scan` (inventory-only mode).
 
-**No telemetry, analytics, or tracking.** Zero network calls unless scanning for vulnerabilities.
+**No hidden telemetry, analytics, or tracking.** Network calls occur only for
+requested scanner/enrichment lookups or explicitly configured push, export,
+connector, webhook, metrics, trace, or AI-enrichment destinations.
 
 ---
 
@@ -153,6 +187,21 @@ All external calls can be completely disabled with `--no-scan` (inventory-only m
 Environment variables in MCP server configs are **never read for their values**.
 Only the _key names_ (e.g. `OPENAI_API_KEY`, `DATABASE_URL`) are inspected to
 determine whether credentials are present. Values are always shown as `***REDACTED***`.
+
+When you explicitly scan project files for hardcoded secrets or PII, agent-bom
+must read the files inside the requested scan scope to classify the risk. The
+report still does not store the matched value or a prefix of it. Secret-scan
+findings retain only:
+
+- relative file path
+- line number
+- finding type and severity
+- redacted evidence label such as `[CREDENTIAL_REDACTED]`
+- relevant actor, tenant, device, agent, resource, and attack-path metadata
+
+agent-bom does not validate leaked credentials, call provider APIs with them,
+or transmit the matched value. Validation of whether a secret is live belongs
+in a separate, explicit, operator-approved workflow.
 
 agent-bom itself optionally uses one env var:
 - `NVD_API_KEY` — increases NVD rate limit from 5 to 50 requests per 30 seconds. This key is sent only to `services.nvd.nist.gov` and is never logged, cached, or transmitted elsewhere.
@@ -166,14 +215,15 @@ Users can restrict or bypass auto-discovery entirely:
 | Flag | Effect |
 |------|--------|
 | `--dry-run` | Shows exactly which files, APIs, and data would be accessed, then exits without reading anything |
-| `--inventory <file>` | Scans only the agents/packages defined in a JSON inventory file — skips all config discovery |
-| `--project <dir>` | Scans only MCP configs in a specific project directory |
+| `--inventory <file>` | Reads agents/packages from a JSON inventory file |
+| `--inventory-only` / `--no-discover` | Uses only explicit input artifacts and suppresses ambient project, cwd, skill, model, dataset, and secret discovery |
+| `--project <dir>` | Restricts discovery to MCP configs in a specific project directory (does not include machine-wide configs) |
 | `--config-dir <dir>` | Reads MCP configs from a single custom directory only |
 | `--no-skill` | Disables skill/instruction file scanning |
 | `--skill-only` | Runs only skill scanning, skips all agent/package/CVE analysis |
 | `--no-scan` | Inventory-only mode — discovers configs but makes no network calls |
 
-**Recommended first run**: `agent-bom scan --dry-run` to preview the complete access plan before any actual scanning.
+**Recommended first run**: `agent-bom agents --dry-run` to preview the complete access plan before any actual scanning.
 
 ---
 
@@ -184,11 +234,13 @@ This is an open-source tool — you can verify every claim above:
 | Verification | How |
 |---|---|
 | Read source code | `src/agent_bom/` — all scanning logic is in plain Python |
-| Audit network calls | `grep -rn "osv.dev\|nvd.nist\|first.org\|cisa.gov\|npmjs.org\|pypi.org" src/agent_bom/` — exhaustive list of all outbound URLs |
+| Audit scanner/enrichment calls | `grep -rn "osv.dev\|nvd.nist\|first.org\|cisa.gov\|npmjs.org\|pypi.org" src/agent_bom/` — public vulnerability and package metadata lookups used by scanner/enrichment paths |
 | Audit file access | `grep -rn "open(\|Path(" src/agent_bom/discovery/` — all file reads in the discovery module |
-| Audit credential handling | `src/agent_bom/models.py` — `MCPServer.credential_names` property + `SENSITIVE_PATTERNS` in `security.py` |
+| Audit credential handling | `src/agent_bom/constants.py` — canonical `is_credential_key` predicate; `src/agent_bom/models.py` — `MCPServer.credential_names`; `src/agent_bom/security.py` — conservative value redaction |
+| Inspect boundary contract | `agent-bom trust --format json` — code-generated data, network, storage, auth, and SCIM boundaries surfaced through CLI/API/UI |
+| Verify SCIM tenant boundary | `docs/SCIM_SECURITY_MODEL.md` and `/v1/auth/policy` — tenant comes from `AGENT_BOM_SCIM_TENANT_ID`, not IdP payload fields |
 | Run in isolation | `--no-scan` skips all network calls; `--dry-run` reads nothing |
-| Verify signed releases | `cosign verify-blob dist/agent_bom-*.whl --bundle dist/agent_bom-*.whl.bundle --certificate-oidc-issuer https://token.actions.githubusercontent.com` |
+| Verify signed releases | `cosign verify-blob dist/agent_bom-*.whl --bundle dist/agent_bom-*.whl.sigstore.json --certificate-oidc-issuer https://token.actions.githubusercontent.com` |
 | OpenSSF Scorecard | [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/msaad00/agent-bom/badge)](https://securityscorecards.dev/viewer/?uri=github.com/msaad00/agent-bom) |
 
 ---
@@ -202,8 +254,10 @@ X-Agent-Bom-Read-Only: true
 X-Agent-Bom-No-Credential-Storage: true
 ```
 
-The API server itself runs entirely in-process. No outbound connections are made
-unless a scan job explicitly requests enrichment (`"enrich": true` in the request body).
+The API server itself runs entirely in-process. It does not make third-party outbound
+connections unless a scan job explicitly requests enrichment (`"enrich": true` in the
+request body). Browser clients and local dashboards may still connect to the local
+agent-bom API over HTTP/WebSocket for normal UI operation.
 
 ---
 
@@ -228,22 +282,22 @@ follows the principle of least privilege with read-only scopes.
 
 ```bash
 # Preferred: SSO (default — opens browser for Okta/Azure AD/Google)
-agent-bom scan --snowflake
+agent-bom agents --snowflake
 
 # Key-pair auth (recommended for CI/CD — no browser needed)
 SNOWFLAKE_PRIVATE_KEY_PATH=~/.ssh/snowflake_key.p8 \
-agent-bom scan --snowflake
+agent-bom agents --snowflake
 
 # Explicit SSO
-agent-bom scan --snowflake --snowflake-authenticator externalbrowser
+agent-bom agents --snowflake --snowflake-authenticator externalbrowser
 
 # OAuth access token
 SNOWFLAKE_AUTHENTICATOR=oauth SNOWFLAKE_TOKEN=<token> \
-agent-bom scan --snowflake
+agent-bom agents --snowflake
 
 # OAuth token
 SNOWFLAKE_TOKEN=<token> \
-agent-bom scan --snowflake --snowflake-authenticator oauth
+agent-bom agents --snowflake --snowflake-authenticator oauth
 ```
 
 ### CIA Triad compliance
@@ -251,7 +305,7 @@ agent-bom scan --snowflake --snowflake-authenticator oauth
 | Principle | How agent-bom upholds it |
 |-----------|--------------------------|
 | **Confidentiality** | Credentials pass env → SDK, never logged. `sanitize_error()` strips secrets from all error messages. Audit logs stored at `0600` permissions. |
-| **Integrity** | SHA-256 payload hashing on every proxied MCP call. Audit logs HMAC-signed (SHA-256) for tamper detection. Set `AGENT_BOM_AUDIT_HMAC_KEY` in production to persist verifiability across restarts. Model weight hash verification (`--verify-model-hashes`). SBOM + VEX support for supply chain integrity. |
+| **Integrity** | SHA-256 payload hashing on every proxied MCP call. Audit logs HMAC-signed (SHA-256) for tamper detection. Set `AGENT_BOM_AUDIT_HMAC_KEY` in production to persist verifiability across restarts; production or multi-replica control planes fail closed without it unless `AGENT_BOM_ALLOW_EPHEMERAL_AUDIT_HMAC=1` is explicitly set. Model weight hash verification (`agent-bom verify --model-dir ...` or `--verify-model-hashes` in scan workflows). SBOM + VEX support for supply chain integrity. |
 | **Availability** | Graceful degradation on auth failure (warning, not crash). Offline mode (`--no-scan`). Rate limiting respected — we never exhaust API quotas. |
 
 ### What we never do
@@ -260,10 +314,11 @@ agent-bom scan --snowflake --snowflake-authenticator oauth
 - Never cache credentials to disk
 - Never log credential values (sanitize_error removes them)
 - Never require admin/write permissions
-- Never make network calls beyond the explicitly listed data sources
+- Never make third-party network calls beyond the explicitly listed data sources.
+  Local UI-to-API traffic is expected when using the dashboard or browser client.
 
 ---
 
 ## Reporting a Security Issue
 
-See [SECURITY.md](SECURITY.md) for responsible disclosure via GitHub Security Advisories.
+See [SECURITY.md](../SECURITY.md) for responsible disclosure via GitHub Security Advisories.

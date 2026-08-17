@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -15,9 +16,30 @@ from agent_bom.registry import (
     compare_versions,
     detect_version_drift,
     list_registry,
+    registry_freshness_status,
+    registry_server_count,
     search_registry,
     update_registry_versions,
 )
+
+# ── Registry size ───────────────────────────────────────────────────────────
+
+
+def test_registry_server_count_matches_bundled_servers_map():
+    """The advertised size is derived from the bundled map, never hardcoded."""
+    from agent_bom.registry import _REGISTRY_PATH
+
+    bundled = json.loads(_REGISTRY_PATH.read_text())["servers"]
+    assert registry_server_count() == len(bundled)
+
+
+def test_registry_server_count_is_zero_when_registry_unreadable(tmp_path):
+    """A broken registry reports 0 rather than raising into the MCP server."""
+    broken = tmp_path / "mcp_registry.json"
+    broken.write_text("{ not json")
+    with patch("agent_bom.registry._REGISTRY_PATH", broken):
+        assert registry_server_count() == 0
+
 
 # ── Version comparison ──────────────────────────────────────────────────────
 
@@ -248,6 +270,61 @@ def test_list_real_registry_filter_npm():
     assert all(e["ecosystem"] == "npm" for e in entries)
 
 
+# ── Registry freshness ─────────────────────────────────────────────────────
+
+
+def test_registry_freshness_status_fresh():
+    status = registry_freshness_status(
+        stale_after_days=14,
+        now=datetime(2026, 4, 10, tzinfo=timezone.utc),
+        data={"_updated": "2026-04-06", "_sources": ["mcp-official"], "servers": {"a": {}}},
+    )
+
+    assert status.status == "fresh"
+    assert status.is_fresh is True
+    assert status.age_days == 4
+    assert status.server_count == 1
+    assert status.sources == ["mcp-official"]
+
+
+def test_registry_freshness_status_stale():
+    status = registry_freshness_status(
+        stale_after_days=14,
+        now=datetime(2026, 4, 25, tzinfo=timezone.utc),
+        data={"_updated": "2026-04-06", "_sources": ["mcp-official"], "servers": {}},
+    )
+
+    assert status.status == "stale"
+    assert status.is_fresh is False
+    assert status.needs_refresh is True
+    assert status.recommended_action == "run agent-bom registry sync-all"
+    assert status.age_days == 19
+
+
+def test_registry_freshness_status_never_synced():
+    status = registry_freshness_status(now=datetime(2026, 4, 25, tzinfo=timezone.utc), data={"servers": {}})
+
+    assert status.status == "never_synced"
+    assert status.needs_refresh is True
+    assert status.age_days is None
+    assert status.error == "missing_or_invalid_last_synced_at"
+
+
+def test_registry_freshness_status_airgapped_stale(monkeypatch):
+    monkeypatch.setenv("AGENT_BOM_REGISTRY_AIRGAPPED", "1")
+
+    status = registry_freshness_status(
+        stale_after_days=1,
+        now=datetime(2026, 4, 25, tzinfo=timezone.utc),
+        data={"_last_synced_at": "2026-04-01T00:00:00Z", "servers": {}},
+    )
+
+    assert status.status == "airgapped_stale"
+    assert status.airgapped is True
+    assert status.needs_refresh is False
+    assert "offline promotion process" in status.recommended_action
+
+
 # ── Update (mocked) ────────────────────────────────────────────────────────
 
 
@@ -322,6 +399,7 @@ def test_cli_registry_help():
     assert "update" in result.output
     assert "list" in result.output
     assert "search" in result.output
+    assert "status" in result.output
 
 
 def test_cli_registry_list():
@@ -369,6 +447,40 @@ def test_cli_registry_search_no_match():
     result = runner.invoke(main, ["registry", "search", "zzzzz-nonexistent-pkg"])
     assert result.exit_code == 0
     assert "No results" in result.output or "0" in result.output
+
+
+def test_cli_registry_status_json():
+    from click.testing import CliRunner
+
+    from agent_bom.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["registry", "status", "-f", "json"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["status"] in {"fresh", "stale", "airgapped_stale", "never_synced"}
+    assert data["server_count"] >= 100
+    assert "stale_after_days" in data
+    assert "needs_refresh" in data
+    assert "recommended_action" in data
+
+
+def test_cli_registry_status_fail_on_stale_exits_nonzero():
+    from click.testing import CliRunner
+
+    from agent_bom.cli import main
+
+    runner = CliRunner()
+    stale_registry = {
+        "_updated": "2000-01-01",
+        "_sources": ["mcp-official"],
+        "servers": {"example/server": {"package": "example/server"}},
+    }
+    with patch("agent_bom.registry._load_registry_full", return_value=stale_registry):
+        result = runner.invoke(main, ["registry", "status", "--stale-after-days", "0", "--fail-on-stale", "-f", "json"])
+    assert result.exit_code == 1
+    data = json.loads(result.output)
+    assert data["needs_refresh"] is True
 
 
 # ── Dataclass construction ──────────────────────────────────────────────────
@@ -470,6 +582,8 @@ def test_cve_enrich_result_dataclass():
     assert r.total == 10
     assert r.scannable == 5
     assert r.enriched == 2
+    assert r.updated == 0
+    assert r.cleared == 0
     assert r.total_cves == 3
     assert r.total_critical == 0
     assert r.total_kev == 0
@@ -557,9 +671,56 @@ async def test_enrich_registry_with_cves_with_vulns():
         result = await enrich_registry_with_cves(dry_run=True)
 
     assert result.enriched == 1
+    assert result.updated == 1
     assert result.total_cves == 1
     assert result.total_critical == 1  # EPSS >= 0.7
     assert result.details[0]["cves"] == ["CVE-2024-12345"]
+    assert result.details[0]["changed"] is True
+
+
+@pytest.mark.asyncio
+async def test_enrich_registry_with_cves_unchanged_metadata_not_counted_as_update():
+    """Existing matching CVE metadata is reported without inflating update counts."""
+    from agent_bom.registry import enrich_registry_with_cves
+
+    summary = {
+        "total": 1,
+        "ghsa_count": 0,
+        "critical": 0,
+        "kev": 0,
+        "severity_breakdown": {"critical": 0, "high": 0, "medium": 0, "low": 0},
+        "fix_available": False,
+        "fix_versions": [],
+    }
+    registry = {
+        "servers": {
+            "stable-vuln-server": {
+                "package": "stable-vuln-pkg",
+                "ecosystem": "npm",
+                "latest_version": "1.0.0",
+                "known_cves": ["CVE-2024-12345"],
+                "cve_summary": summary,
+            }
+        }
+    }
+    osv_vulns = {
+        "npm:stable-vuln-pkg@1.0.0": [
+            {"id": "CVE-2024-12345", "aliases": [], "severity": [], "affected": []},
+        ],
+    }
+
+    with (
+        patch("agent_bom.registry._load_registry_full", return_value=registry),
+        patch("agent_bom.scanners.query_osv_batch", new_callable=AsyncMock, return_value=osv_vulns),
+        patch("agent_bom.enrichment.fetch_epss_scores", new_callable=AsyncMock, return_value={}),
+        patch("agent_bom.enrichment.fetch_cisa_kev_catalog", new_callable=AsyncMock, return_value={}),
+    ):
+        result = await enrich_registry_with_cves(dry_run=True)
+
+    assert result.enriched == 1
+    assert result.updated == 0
+    assert result.details[0]["changed"] is False
+    assert result.details[0]["change_type"] == "unchanged"
 
 
 @pytest.mark.asyncio
@@ -597,6 +758,7 @@ async def test_enrich_registry_with_cves_kev_detection():
         result = await enrich_registry_with_cves(dry_run=True)
 
     assert result.enriched == 1
+    assert result.updated == 1
     assert result.total_kev == 1
     assert result.total_critical == 1  # KEV = critical
 
@@ -624,4 +786,40 @@ async def test_enrich_registry_with_cves_no_vulns():
 
     assert result.scannable == 1
     assert result.enriched == 0
+    assert result.updated == 0
     assert result.total_cves == 0
+
+
+@pytest.mark.asyncio
+async def test_enrich_registry_with_cves_clears_stale_metadata(tmp_path):
+    """A clean OSV response removes stale CVE metadata and writes the registry."""
+    from agent_bom.registry import enrich_registry_with_cves
+
+    registry_path = tmp_path / "mcp_registry.json"
+    registry = {
+        "servers": {
+            "formerly-vuln-server": {
+                "package": "formerly-vuln-pkg",
+                "ecosystem": "npm",
+                "latest_version": "3.0.0",
+                "known_cves": ["CVE-2024-99999"],
+                "cve_summary": {"total": 1},
+            }
+        }
+    }
+
+    with (
+        patch("agent_bom.registry._REGISTRY_PATH", registry_path),
+        patch("agent_bom.registry._load_registry_full", return_value=registry),
+        patch("agent_bom.scanners.query_osv_batch", new_callable=AsyncMock, return_value={}),
+    ):
+        result = await enrich_registry_with_cves(dry_run=False)
+
+    assert result.enriched == 0
+    assert result.updated == 1
+    assert result.cleared == 1
+    assert result.details[0]["change_type"] == "cleared"
+    written = json.loads(registry_path.read_text(encoding="utf-8"))
+    server = written["servers"]["formerly-vuln-server"]
+    assert server["known_cves"] == []
+    assert server["cve_summary"] == {}

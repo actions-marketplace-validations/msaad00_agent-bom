@@ -108,13 +108,24 @@ def _make_report(agents=None, blast_radii=None):
 
 class TestPostureScorecard:
     def test_clean_report_good_grade(self):
-        """Clean report (no vulns) should get a good grade (A or B)."""
+        """A report that actually scanned a clean package gets a good grade (A/B)."""
         from agent_bom.posture import compute_posture_scorecard
 
-        report = _make_report()
+        server = _make_server(packages=[_make_package()], registry_verified=True)
+        agent = _make_agent(servers=[server])
+        report = _make_report(agents=[agent])
         sc = compute_posture_scorecard(report)
         assert sc.grade in ("A", "B")
         assert sc.score >= 75
+        assert sc.no_data is False
+
+    def test_empty_scan_is_no_data_not_passing(self):
+        """A scan that examined zero artifacts is N/A, never a passing grade."""
+        from agent_bom.posture import compute_posture_scorecard
+
+        sc = compute_posture_scorecard(_make_report())
+        assert sc.grade == "N/A"
+        assert sc.no_data is True
 
     def test_critical_vulns_lower_score(self):
         """Critical vulnerabilities should significantly reduce score."""
@@ -216,6 +227,52 @@ class TestPostureScorecard:
         sc_fix = compute_posture_scorecard(fixable_report)
         sc_nofix = compute_posture_scorecard(unfixable_report)
         assert sc_fix.dimensions["vulnerability_posture"].score >= sc_nofix.dimensions["vulnerability_posture"].score
+
+    def test_filesystem_only_scans_do_not_fail_configuration_quality(self):
+        """Filesystem-only scans should treat MCP config quality as not applicable."""
+        from agent_bom.models import Agent, AgentType, MCPServer, Package, ServerSurface, Severity, Vulnerability
+        from agent_bom.posture import compute_posture_scorecard
+        from agent_bom.vuln_compliance import tag_vulnerability
+
+        pkg = Package(name="langchain", version="0.1.0", ecosystem="pypi")
+        vuln = Vulnerability(id="CVE-2026-1000", summary="demo", severity=Severity.HIGH)
+        vuln.compliance_tags = tag_vulnerability(vuln, pkg)
+        br = _make_blast_radius(pkg=pkg, vuln=vuln)
+
+        fs_server = MCPServer(name="filesystem:repo", command="", packages=[pkg], surface=ServerSurface.FILESYSTEM)
+        fs_agent = Agent(name="filesystem:repo", agent_type=AgentType.CUSTOM, config_path=".", mcp_servers=[fs_server])
+        report = _make_report(agents=[fs_agent], blast_radii=[br])
+
+        sc = compute_posture_scorecard(report)
+        assert sc.dimensions["configuration_quality"].score == 100.0
+        assert "N/A" in sc.dimensions["configuration_quality"].details
+        assert sc.dimensions["compliance_coverage"].score > 0
+
+    def test_weak_grade_summary_explains_real_credential_exposure(self):
+        """Weak grades should explain when credential/config risk is the real cause."""
+        from agent_bom.posture import compute_posture_scorecard
+
+        server = _make_server(
+            registry_verified=False,
+            tools=[],
+            env={"API_KEY": "secret", "DB_PASSWORD": "pass", "SLACK_TOKEN": "token"},
+        )
+        agent = _make_agent(servers=[server])
+        brs = [
+            _make_blast_radius(
+                vuln=_make_vuln(vuln_id=f"CVE-2026-{i:04d}", severity="CRITICAL"),
+                agents=[agent],
+                servers=[server],
+                creds=["API_KEY"],
+            )
+            for i in range(3)
+        ]
+        report = _make_report(agents=[agent], blast_radii=brs)
+
+        sc = compute_posture_scorecard(report)
+        assert sc.grade in ("D", "F")
+        assert "credential exposure" in sc.summary
+        assert "MCP configuration" in sc.summary
 
 
 # ── Credential Risk Ranking ──────────────────────────────────────────────────
@@ -676,6 +733,73 @@ class TestJSONOutputIntegration:
         sc = result["posture_scorecard"]
         assert sc["score"] < 100
 
+    def test_to_json_includes_scorecard_summary(self):
+        """to_json should include explicit Scorecard enrichment coverage."""
+        from agent_bom.output import to_json
+
+        pkg = _make_package()
+        pkg.repository_url = "https://github.com/example/repo"
+        server = _make_server(packages=[pkg])
+        agent = _make_agent(servers=[server])
+        agent.mcp_servers[0].packages[0].scorecard_lookup_state = "failed"
+        report = _make_report(agents=[agent])
+        result = to_json(report)
+        summary = result["scorecard_summary"]
+        assert summary["eligible_packages"] == 1
+        assert summary["failed_packages"] == 1
+        assert summary["persistent_failed_packages"] == 1
+        assert summary["transient_failed_packages"] == 0
+        assert summary["failed_reasons"]["scorecard_lookup_failed"] == 1
+
+    def test_posture_supply_chain_detail_explains_scorecard_coverage_state(self):
+        """Posture details should explain when Scorecard coverage is pending, not hide behind a neutral default."""
+        from agent_bom.posture import compute_posture_scorecard
+
+        pkg = _make_package()
+        pkg.homepage = "https://github.com/example/repo"
+        server = _make_server(packages=[pkg])
+        agent = _make_agent(servers=[server])
+        agent.mcp_servers[0].packages[0].scorecard_lookup_state = "failed"
+        report = _make_report(agents=[agent])
+        sc = compute_posture_scorecard(report)
+        assert "coverage pending" in sc.dimensions["supply_chain_quality"].details.lower()
+
+    def test_posture_supply_chain_does_not_penalize_transient_scorecard_outage(self):
+        """Temporary upstream Scorecard failures should not drag posture down as if package quality were bad."""
+        from agent_bom.posture import compute_posture_scorecard
+
+        pkg = _make_package()
+        pkg.homepage = "https://github.com/example/repo"
+        pkg.scorecard_lookup_state = "failed"
+        pkg.scorecard_lookup_reason = "scorecard_service_unavailable"
+        server = _make_server(packages=[pkg])
+        agent = _make_agent(servers=[server])
+        report = _make_report(agents=[agent])
+        sc = compute_posture_scorecard(report)
+        dim = sc.dimensions["supply_chain_quality"]
+        assert dim.score == 100.0
+        assert "temporarily unavailable upstream" in dim.details.lower()
+
+    def test_to_json_includes_transient_scorecard_failure_breakdown(self):
+        """Structured output should distinguish transient Scorecard failures."""
+        from agent_bom.output import to_json
+
+        pkg = _make_package()
+        pkg.homepage = "https://github.com/example/repo"
+        pkg.scorecard_lookup_state = "failed"
+        pkg.scorecard_lookup_reason = "scorecard_rate_limited"
+        server = _make_server(packages=[pkg])
+        agent = _make_agent(servers=[server])
+        report = _make_report(agents=[agent])
+
+        result = to_json(report)
+        summary = result["scorecard_summary"]
+
+        assert summary["failed_packages"] == 1
+        assert summary["transient_failed_packages"] == 1
+        assert summary["persistent_failed_packages"] == 0
+        assert summary["failed_reasons"]["scorecard_rate_limited"] == 1
+
     def test_to_json_incident_with_agents(self):
         """to_json incidents should list agents with vulns."""
         from agent_bom.output import to_json
@@ -711,3 +835,29 @@ class TestDimensionScore:
         assert d["score"] == 50.0
         assert d["weight"] == 0.1
         assert d["details"] == "test detail"
+
+
+class TestCredentialRiskDiscoveryOnly:
+    def test_discovery_only_credential_ranked_without_cve(self):
+        """A credential on an MCP server with no CVE is still ranked (not dropped)."""
+        from agent_bom.posture import compute_credential_risk_ranking
+
+        srv = _make_server(name="db", env={"AWS_SECRET_ACCESS_KEY": "x", "PATH": "y"})
+        agent = _make_agent(name="prod-agent", servers=[srv])
+        report = _make_report(agents=[agent])
+        ranking = compute_credential_risk_ranking(report)
+        creds = {r["credential"]: r for r in ranking}
+        assert "AWS_SECRET_ACCESS_KEY" in creds
+        assert creds["AWS_SECRET_ACCESS_KEY"]["basis"] == "discovery"
+        assert creds["AWS_SECRET_ACCESS_KEY"]["risk_tier"] in {"low", "medium"}
+        assert "prod-agent" in creds["AWS_SECRET_ACCESS_KEY"]["agents"]
+        assert "PATH" not in creds  # non-sensitive env var excluded
+
+    def test_cve_backed_credential_keeps_vulnerability_basis(self):
+        from agent_bom.posture import compute_credential_risk_ranking
+
+        br = _make_blast_radius(vuln=_make_vuln(severity="CRITICAL"), creds=["API_KEY"])
+        report = _make_report(blast_radii=[br])
+        ranking = compute_credential_risk_ranking(report)
+        assert ranking[0]["basis"] == "vulnerability"
+        assert ranking[0]["risk_tier"] == "critical"

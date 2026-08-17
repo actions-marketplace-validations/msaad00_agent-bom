@@ -1,28 +1,24 @@
-"""Fetch and cache MITRE ATT&CK Enterprise technique data from official sources.
+"""Load and refresh MITRE ATT&CK Enterprise + CAPEC catalogs.
 
-Data sources (all public, no auth required):
+Default behavior is deterministic and offline-friendly:
 
-- **ATT&CK STIX data** — https://github.com/mitre/cti (official MITRE GitHub)
-  Published as STIX 2.0 bundles.  We fetch enterprise-attack.json and
-  extract only the techniques that belong to the top-10 relevant tactics.
+- agent-bom ships a normalized MITRE ATT&CK Enterprise + CAPEC catalog in-repo
+- scans read that bundled catalog by default
+- operators can explicitly sync a fresher upstream catalog out of band
+- long-lived connected deployments can opt into runtime refresh mode
 
-- **CAPEC STIX data** — same GitHub repo (capec/2.1)
-  Provides the official CWE → CAPEC → ATT&CK technique bridge.  We parse
-  the STIX relationship objects to derive an evidence-based CWE mapping.
-
-Cache TTL: 30 days (``AGENT_BOM_MITRE_CACHE_TTL`` env var, in seconds).
-Cache path: ``~/.cache/agent-bom/mitre-attack-catalog.json``.
-
-No technique IDs, names, or mappings are hardcoded in agent-bom source
-code.  Everything comes from MITRE's published data.
+The scan hot path never requires a live network fetch unless the operator
+explicitly enables refresh mode.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -30,96 +26,141 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# ─── Official MITRE data URLs (STIX 2.0, public, no auth) ────────────────────
+# Pinned official first-party STIX releases (supply-chain hygiene: an immutable
+# git tag + versioned filename, never a mutable ``master`` branch). Refreshing to
+# a newer release means bumping these three constants and re-running the refresh
+# path (``refresh_bundled_catalog``); the recorded digest then pins the exact
+# bytes so the artifact is reproducible.
+_ATTACK_RELEASE = "18.1"
+_CAPEC_RELEASE = "3.5"
+_ENTERPRISE_STIX_URL = (
+    "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/"
+    f"v{_ATTACK_RELEASE}/enterprise-attack/enterprise-attack-{_ATTACK_RELEASE}.json"
+)
+_CAPEC_STIX_URL = f"https://raw.githubusercontent.com/mitre/cti/CAPEC-v{_CAPEC_RELEASE}/capec/2.1/stix-capec.json"
 
-_ENTERPRISE_STIX_URL = "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json"
-
-_CAPEC_STIX_URL = "https://raw.githubusercontent.com/mitre/cti/master/capec/2.1/stix-capec.json"
-
-# ─── Top-10 enterprise tactics most relevant to AI agent infrastructure ───────
-#
-# These are the *tactic* short-names as used in MITRE ATT&CK STIX objects
-# (``kill_chain_phases[].phase_name``).  The full set of Enterprise tactics is
-# 14; we scope to the 10 most directly applicable to AI/MCP infrastructure.
-# All *techniques* under these tactics are covered — nothing is cherry-picked.
-
+# The 14 MITRE ATT&CK Enterprise tactics (v18.1). Techniques are kept when they
+# belong to at least one of these kill-chain phases; Reconnaissance (TA0043) and
+# Resource Development (TA0042) are first-class members of this set.
 TOP_TACTIC_PHASE_NAMES = frozenset(
     [
-        "initial-access",  # TA0001 — how an attacker enters via vulnerable pkg
-        "execution",  # TA0002 — code execution through a CVE
-        "privilege-escalation",  # TA0004 — elevation via misconfiguration / auth flaw
-        "defense-evasion",  # TA0005 — disabling logging / audit (observed in AI infra)
-        "credential-access",  # TA0006 — credential theft, the #1 AI agent risk
-        "discovery",  # TA0007 — information disclosure / path traversal
-        "collection",  # TA0009 — data gathering via compromised MCP tools
-        "exfiltration",  # TA0010 — data leaving via agent tool invocation
-        "command-and-control",  # TA0011 — attacker C2 via compromised server
-        "impact",  # TA0040 — DoS, data destruction
+        "reconnaissance",
+        "resource-development",
+        "initial-access",
+        "execution",
+        "persistence",
+        "privilege-escalation",
+        "defense-evasion",
+        "credential-access",
+        "discovery",
+        "lateral-movement",
+        "collection",
+        "command-and-control",
+        "exfiltration",
+        "impact",
     ]
 )
 
-_DEFAULT_TTL = 30 * 24 * 3600  # 30 days
-_CACHE_PATH = Path.home() / ".cache" / "agent-bom" / "mitre-attack-catalog.json"
-_FETCH_TIMEOUT = 60  # seconds per HTTP request
-
-# ─── Cache schema ─────────────────────────────────────────────────────────────
-#
-# {
-#   "fetched_at": <unix timestamp>,
-#   "attack_version": "ATT&CK v16.1",    # x_mitre_version from STIX bundle
-#   "techniques": {
-#     "T1059": {
-#       "name": "Command and Scripting Interpreter",
-#       "tactics": ["execution"],
-#       "description": "...",             # first 200 chars
-#       "platforms": ["Linux", "macOS"],
-#       "sub_techniques": ["T1059.001", ...]
-#     },
-#     ...
-#   },
-#   "cwe_to_attack": {
-#     "CWE-78": ["T1059", "T1059.004"],   # derived from CAPEC STIX relationships
-#     ...
-#   }
-# }
+_CATALOG_SCHEMA_VERSION = 1
+_FETCH_TIMEOUT = 60
+_BUNDLED_CATALOG_PATH = Path(__file__).with_name("data") / "mitre_attack_catalog.json"
+_DEFAULT_SYNC_PATH = Path.home() / ".agent-bom" / "catalogs" / "mitre_attack_catalog.json"
+_ALLOWED_CATALOG_MODES = {"auto", "bundled", "synced", "refresh"}
 
 
-def _cache_ttl() -> int:
-    try:
-        return int(os.environ.get("AGENT_BOM_MITRE_CACHE_TTL", _DEFAULT_TTL))
-    except ValueError:
-        return _DEFAULT_TTL
+def _sync_catalog_path() -> Path:
+    override = os.environ.get("AGENT_BOM_MITRE_CATALOG_PATH", "").strip()
+    return Path(override).expanduser() if override else _DEFAULT_SYNC_PATH
 
 
-def _load_cache(ignore_ttl: bool = False) -> Optional[dict]:
-    """Return cached catalog if valid, else None.
+def _catalog_mode() -> str:
+    raw = os.environ.get("AGENT_BOM_MITRE_CATALOG_MODE", "auto").strip().lower()
+    return raw if raw in _ALLOWED_CATALOG_MODES else "auto"
 
-    Args:
-        ignore_ttl: If True, return stale cache regardless of age (used as
-                    offline fallback when network fetch fails).
-    """
-    if not _CACHE_PATH.exists():
+
+def _empty_catalog(source: str = "unavailable") -> dict:
+    return {
+        "schema_version": _CATALOG_SCHEMA_VERSION,
+        "catalog_id": "mitre_attack_enterprise_capec",
+        "catalog_type": "mitre_attack",
+        "source": source,
+        "attack_version": "unavailable",
+        "attack_release": "unavailable",
+        "updated_at": "",
+        "fetched_at": 0,
+        "normalized_sha256": "",
+        "sources": {},
+        "technique_count": 0,
+        "tactic_count": 0,
+        "tactics": {},
+        "techniques": {},
+        "cwe_to_attack": {},
+    }
+
+
+def _catalog_metadata(catalog: dict) -> dict:
+    return {
+        "schema_version": catalog.get("schema_version", _CATALOG_SCHEMA_VERSION),
+        "catalog_id": catalog.get("catalog_id", "mitre_attack_enterprise_capec"),
+        "catalog_type": catalog.get("catalog_type", "mitre_attack"),
+        "source": catalog.get("source", "unknown"),
+        "attack_version": catalog.get("attack_version", "unknown"),
+        "attack_release": catalog.get("attack_release", "unknown"),
+        "updated_at": catalog.get("updated_at", ""),
+        "fetched_at": catalog.get("fetched_at", 0),
+        "normalized_sha256": catalog.get("normalized_sha256", ""),
+        "sources": catalog.get("sources", {}),
+        "technique_count": len(catalog.get("techniques", {})),
+        "tactic_count": len(catalog.get("tactics", {})),
+        "cwe_mapping_count": len(catalog.get("cwe_to_attack", {})),
+        "path": catalog.get("_path", ""),
+    }
+
+
+def get_catalog_metadata() -> dict:
+    """Return metadata for the active MITRE catalog."""
+    return _catalog_metadata(build_catalog())
+
+
+def _load_catalog_file(path: Path) -> Optional[dict]:
+    if not path.exists():
         return None
     try:
-        data = json.loads(_CACHE_PATH.read_text())
-        age = time.time() - data.get("fetched_at", 0)
-        if ignore_ttl or age < _cache_ttl():
-            return data
-    except (OSError, json.JSONDecodeError, KeyError):
-        pass
-    return None
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to read MITRE catalog %s: %s", path, exc)
+        return None
+
+    if not isinstance(data.get("techniques"), dict) or not isinstance(data.get("cwe_to_attack"), dict):
+        logger.warning("Ignoring invalid MITRE catalog at %s: missing techniques or cwe_to_attack", path)
+        return None
+
+    data.setdefault("schema_version", _CATALOG_SCHEMA_VERSION)
+    data.setdefault("catalog_id", "mitre_attack_enterprise_capec")
+    data.setdefault("catalog_type", "mitre_attack")
+    data.setdefault("source", "synced" if path == _sync_catalog_path() else "bundled")
+    data.setdefault("attack_release", data.get("attack_version", "unknown"))
+    data.setdefault("updated_at", "")
+    data.setdefault("fetched_at", 0)
+    data.setdefault("normalized_sha256", "")
+    data.setdefault("sources", {})
+    data.setdefault("tactics", {})
+    data.setdefault("tactic_count", len(data.get("tactics", {})))
+    data.setdefault("technique_count", len(data.get("techniques", {})))
+    data["_path"] = str(path)
+    return data
 
 
-def _save_cache(catalog: dict) -> None:
-    try:
-        _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _CACHE_PATH.write_text(json.dumps(catalog, separators=(",", ":")))
-    except OSError as exc:
-        logger.debug("MITRE cache write failed: %s", exc)
+def _load_bundled_catalog() -> dict:
+    catalog = _load_catalog_file(_BUNDLED_CATALOG_PATH)
+    return catalog or _empty_catalog("bundled")
+
+
+def _load_synced_catalog() -> Optional[dict]:
+    return _load_catalog_file(_sync_catalog_path())
 
 
 def _fetch_json(url: str) -> Optional[dict]:
-    """Fetch a JSON URL with a reasonable timeout.  Returns None on failure."""
     try:
         with httpx.Client(timeout=_FETCH_TIMEOUT, follow_redirects=True) as client:
             resp = client.get(url)
@@ -130,44 +171,50 @@ def _fetch_json(url: str) -> Optional[dict]:
         return None
 
 
-def _parse_attack_stix(stix_bundle: dict) -> tuple[str, dict[str, dict]]:
-    """Extract technique catalog from enterprise-attack STIX 2.0 bundle.
+def _fetch_text(url: str) -> Optional[str]:
+    try:
+        with httpx.Client(timeout=_FETCH_TIMEOUT, follow_redirects=True) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            return resp.text
+    except Exception as exc:
+        logger.warning("MITRE fetch failed (%s): %s", url, exc)
+        return None
 
-    Returns:
-        ``(version_string, techniques_dict)`` where ``techniques_dict`` maps
-        technique ID → metadata dict.  Only techniques in the top-10 tactics
-        scope are included.
-    """
+
+def _parse_attack_stix(stix_bundle: dict) -> tuple[str, dict[str, dict]]:
     version = "unknown"
+    fallback_version = "unknown"
     techniques: dict[str, dict] = {}
 
     for obj in stix_bundle.get("objects", []):
         obj_type = obj.get("type", "")
-
-        # Extract ATT&CK version from the identity or x-mitre-collection object
         if obj_type == "x-mitre-collection":
             version = obj.get("x_mitre_version") or obj.get("name", "unknown")
+        elif obj_type == "x-mitre-matrix" and fallback_version == "unknown":
+            modified = (obj.get("modified") or "").split("T", 1)[0]
+            spec_version = obj.get("x_mitre_attack_spec_version")
+            if modified and spec_version:
+                fallback_version = f"snapshot {modified} (spec {spec_version})"
+            elif modified:
+                fallback_version = f"snapshot {modified}"
+            elif spec_version:
+                fallback_version = f"spec {spec_version}"
 
         if obj_type != "attack-pattern":
             continue
-
-        # Skip deprecated / revoked techniques
         if obj.get("x_mitre_deprecated") or obj.get("revoked"):
             continue
 
-        # Technique ID (external_references[0].external_id, e.g. "T1059")
         ext_refs = obj.get("external_references", [])
-        tech_id = next(
-            (r.get("external_id", "") for r in ext_refs if r.get("source_name") == "mitre-attack"),
-            "",
+        capec_refs = sorted(
+            {ref.get("external_id", "").upper() for ref in ext_refs if ref.get("source_name") == "capec" and ref.get("external_id")}
         )
+        tech_id = next((r.get("external_id", "") for r in ext_refs if r.get("source_name") == "mitre-attack"), "")
         if not tech_id or not tech_id.startswith("T"):
             continue
 
-        # Tactics via kill_chain_phases
         tactics = [phase["phase_name"] for phase in obj.get("kill_chain_phases", []) if phase.get("kill_chain_name") == "mitre-attack"]
-
-        # Scope to top-10 tactics
         if not any(t in TOP_TACTIC_PHASE_NAMES for t in tactics):
             continue
 
@@ -176,186 +223,289 @@ def _parse_attack_stix(stix_bundle: dict) -> tuple[str, dict[str, dict]]:
             "tactics": tactics,
             "description": (obj.get("description") or "")[:200],
             "platforms": obj.get("x_mitre_platforms", []),
+            "capec_refs": capec_refs,
         }
 
+    if version == "unknown":
+        version = fallback_version
     return version, techniques
 
 
-def _parse_capec_stix(capec_bundle: dict, attack_techniques: dict[str, dict]) -> dict[str, list[str]]:
-    """Derive CWE → ATT&CK technique mapping from CAPEC STIX 2.0 bundle.
+def _parse_attack_tactics(stix_bundle: dict) -> dict[str, dict]:
+    """Extract the Enterprise tactics keyed by ATT&CK tactic ID (``TAxxxx``).
 
-    CAPEC bridge chain:
-      CWE  ←(Related_Weakness)─  CAPEC  ─(uses/maps-to)→  ATT&CK technique
-
-    We parse STIX relationship objects:
-    - ``exploits`` / ``related-to`` (CAPEC → CWE)
-    - ``uses`` (CAPEC → ATT&CK)
-
-    Only produces mappings for ATT&CK techniques already in our top-10 scope.
+    Only non-deprecated ``x-mitre-tactic`` objects whose short name is one of the
+    in-scope :data:`TOP_TACTIC_PHASE_NAMES` are returned, so a future upstream
+    tactic the rest of the pipeline does not yet handle is not silently adopted.
     """
+    tactics: dict[str, dict] = {}
+    for obj in stix_bundle.get("objects", []):
+        if obj.get("type") != "x-mitre-tactic":
+            continue
+        if obj.get("x_mitre_deprecated") or obj.get("revoked"):
+            continue
+        shortname = obj.get("x_mitre_shortname", "")
+        if shortname not in TOP_TACTIC_PHASE_NAMES:
+            continue
+        tactic_id = next(
+            (r.get("external_id", "") for r in obj.get("external_references", []) if r.get("source_name") == "mitre-attack"),
+            "",
+        )
+        if not tactic_id.startswith("TA"):
+            continue
+        tactics[tactic_id] = {"shortname": shortname, "name": obj.get("name", shortname)}
+    return tactics
+
+
+def _parse_capec_stix(capec_bundle: dict, attack_techniques: dict[str, dict]) -> dict[str, list[str]]:
     objects = capec_bundle.get("objects", [])
+    capec_stix_to_external: dict[str, str] = {}
+    capec_to_cwes: dict[str, set[str]] = {}
+    capec_to_attack: dict[str, set[str]] = {}
+    weakness_map: dict[str, str] = {}
+    embedded_attack_refs: dict[str, set[str]] = {}
 
-    # Build maps from CAPEC STIX IDs
-    # capec_to_cwes: capec_stix_id → [CWE-NNN, ...]
-    # capec_to_attack: capec_stix_id → [T-code, ...]
-    capec_to_cwes: dict[str, list[str]] = {}
-    capec_to_attack: dict[str, list[str]] = {}
+    def _normalize_cwe(raw_id: str) -> str:
+        value = (raw_id or "").strip().upper()
+        if not value:
+            return ""
+        return value if value.startswith("CWE-") else f"CWE-{value}"
 
-    # Index attack-pattern objects by STIX id for later lookup
-    capec_external: dict[str, str] = {}  # stix_id → CAPEC-NNN
     for obj in objects:
-        if obj.get("type") != "attack-pattern":
-            continue
-        stix_id = obj.get("id", "")
-        for ref in obj.get("external_references", []):
-            if ref.get("source_name") == "capec":
-                capec_external[stix_id] = ref["external_id"]
-
-    # Parse relationships
-    for obj in objects:
-        if obj.get("type") != "relationship":
-            continue
-        rel_type = obj.get("relationship_type", "")
-        source_id = obj.get("source_ref", "")
-        target_id = obj.get("target_ref", "")
-
-        # CAPEC → CWE (the CAPEC "exploits" or targets a CWE weakness)
-        if rel_type in ("exploits", "related-to") and target_id.startswith("weakness--"):
-            # CWE external_id lives on weakness objects
-            pass  # handled via weakness lookup below
-
-        # CAPEC attack-pattern → ATT&CK attack-pattern
-        if rel_type in ("uses", "maps-to") and source_id.startswith("attack-pattern--"):
-            # Determine if target is an ATT&CK technique (external_id starts with T)
-            pass  # handled via dedicated index below
-
-    # Rebuild with weakness objects included
-    weakness_map: dict[str, str] = {}  # stix_id → CWE-NNN
-    for obj in objects:
-        if obj.get("type") == "weakness":
+        obj_type = obj.get("type")
+        if obj_type == "weakness":
             stix_id = obj.get("id", "")
             for ref in obj.get("external_references", []):
                 if ref.get("source_name") == "cwe":
-                    cwe_id = ref["external_id"]
-                    if not cwe_id.upper().startswith("CWE-"):
-                        cwe_id = f"CWE-{cwe_id}"
-                    weakness_map[stix_id] = cwe_id.upper()
+                    cwe_id = _normalize_cwe(ref.get("external_id", ""))
+                    if cwe_id:
+                        weakness_map[stix_id] = cwe_id
+        elif obj_type == "attack-pattern":
+            stix_id = obj.get("id", "")
+            ext_refs = obj.get("external_references", [])
+            capec_ids = {
+                ref.get("external_id", "").upper() for ref in ext_refs if ref.get("source_name") == "capec" and ref.get("external_id")
+            }
+            cwe_ids = {_normalize_cwe(ref.get("external_id", "")) for ref in ext_refs if ref.get("source_name") == "cwe"}
+            cwe_ids.discard("")
+            attack_ids = {
+                ref.get("external_id", "").upper()
+                for ref in ext_refs
+                if ref.get("source_name") in {"ATTACK", "mitre-attack"} and ref.get("external_id", "").startswith("T")
+            }
+            attack_ids = {tech for tech in attack_ids if tech in attack_techniques}
 
-    # Index attack-pattern external IDs (ATT&CK techniques)
-    attack_external: dict[str, str] = {}  # stix_id → T-code
-    for obj in objects:
-        if obj.get("type") != "attack-pattern":
-            continue
-        stix_id = obj.get("id", "")
-        for ref in obj.get("external_references", []):
-            if ref.get("source_name") == "mitre-attack":
-                tech_id = ref.get("external_id", "")
-                if tech_id.startswith("T"):
-                    attack_external[stix_id] = tech_id
+            if capec_ids:
+                capec_id = sorted(capec_ids)[0]
+                capec_stix_to_external[stix_id] = capec_id
+                if cwe_ids:
+                    capec_to_cwes.setdefault(capec_id, set()).update(cwe_ids)
+                if attack_ids:
+                    capec_to_attack.setdefault(capec_id, set()).update(attack_ids)
+            elif attack_ids:
+                embedded_attack_refs[stix_id] = attack_ids
 
-    # Rebuild relationship maps with full index
+    for tech_id, metadata in attack_techniques.items():
+        for capec_id in metadata.get("capec_refs", []) or []:
+            capec_to_attack.setdefault(capec_id.upper(), set()).add(tech_id)
+
     for obj in objects:
         if obj.get("type") != "relationship":
             continue
-        rel_type = obj.get("relationship_type", "")
-        source_id = obj.get("source_ref", "")
-        target_id = obj.get("target_ref", "")
+        source_ref = obj.get("source_ref", "")
+        target_ref = obj.get("target_ref", "")
+        capec_id = capec_stix_to_external.get(source_ref)
+        if not capec_id:
+            continue
+        if target_ref in weakness_map:
+            capec_to_cwes.setdefault(capec_id, set()).add(weakness_map[target_ref])
+        if target_ref in embedded_attack_refs:
+            capec_to_attack.setdefault(capec_id, set()).update(embedded_attack_refs[target_ref])
 
-        # CAPEC → CWE weakness
-        if target_id in weakness_map and source_id in capec_external:
-            cwe = weakness_map[target_id]
-            capec_to_cwes.setdefault(source_id, [])
-            if cwe not in capec_to_cwes[source_id]:
-                capec_to_cwes[source_id].append(cwe)
-
-        # CAPEC → ATT&CK technique
-        if target_id in attack_external and source_id in capec_external:
-            tech = attack_external[target_id]
-            if tech in attack_techniques:  # only our scoped techniques
-                capec_to_attack.setdefault(source_id, [])
-                if tech not in capec_to_attack[source_id]:
-                    capec_to_attack[source_id].append(tech)
-
-    # Chain: CWE → CAPEC → ATT&CK
     cwe_to_attack: dict[str, list[str]] = {}
-    for capec_stix_id, techs in capec_to_attack.items():
-        for cwe in capec_to_cwes.get(capec_stix_id, []):
-            existing = set(cwe_to_attack.get(cwe, []))
-            existing.update(techs)
-            cwe_to_attack[cwe] = sorted(existing)
-
+    for capec_id, cwe_ids in capec_to_cwes.items():
+        techniques = sorted(capec_to_attack.get(capec_id, set()))
+        if not techniques:
+            continue
+        for cwe_id in cwe_ids:
+            existing = set(cwe_to_attack.get(cwe_id, []))
+            existing.update(techniques)
+            cwe_to_attack[cwe_id] = sorted(existing)
     return cwe_to_attack
 
 
-def build_catalog(force_refresh: bool = False) -> dict:
-    """Return the full MITRE ATT&CK + CAPEC catalog as a dict.
-
-    Loads from cache when valid.  Fetches from MITRE GitHub on first call or
-    when the cache has expired.  Falls back to an empty catalog on network
-    failure so that scans are never blocked.
-
-    Returns:
-        Dict with keys:
-
-        - ``"techniques"`` — ``{T-code: {name, tactics, description, platforms}}``
-        - ``"cwe_to_attack"`` — ``{CWE-NNN: [T-code, ...]}`` (CAPEC-derived)
-        - ``"attack_version"`` — e.g. ``"ATT&CK v16.1"``
-        - ``"fetched_at"`` — unix timestamp
-    """
-    if not force_refresh:
-        cached = _load_cache()
-        if cached:
-            return cached
-
-    logger.debug("Fetching MITRE ATT&CK Enterprise STIX from %s", _ENTERPRISE_STIX_URL)
-    attack_bundle = _fetch_json(_ENTERPRISE_STIX_URL)
-
-    if not attack_bundle:
-        # Network failed — serve stale cache rather than silently dropping all ATT&CK tags
-        stale = _load_cache(ignore_ttl=True)
-        if stale and stale.get("techniques"):
-            stale_age_days = int((time.time() - stale.get("fetched_at", 0)) / 86400)
-            logger.warning(
-                "MITRE ATT&CK fetch failed; using stale cache (%d days old). ATT&CK tags will reflect the cached version.",
-                stale_age_days,
-            )
-            return stale
-        logger.warning("MITRE ATT&CK fetch failed and no cache exists; returning empty catalog")
-        return {"techniques": {}, "cwe_to_attack": {}, "attack_version": "unavailable", "fetched_at": 0}
-
-    version, techniques = _parse_attack_stix(attack_bundle)
-    logger.debug("Parsed %d ATT&CK techniques across top-10 tactics (version: %s)", len(techniques), version)
-
-    # CAPEC for CWE → ATT&CK bridge
-    logger.debug("Fetching CAPEC STIX for CWE→ATT&CK bridge from %s", _CAPEC_STIX_URL)
-    capec_bundle = _fetch_json(_CAPEC_STIX_URL)
-    cwe_to_attack: dict[str, list[str]] = {}
-    if capec_bundle:
-        cwe_to_attack = _parse_capec_stix(capec_bundle, techniques)
-        logger.debug("Derived %d CWE→ATT&CK mappings from CAPEC", len(cwe_to_attack))
-    else:
-        logger.warning("CAPEC fetch failed; CWE→ATT&CK mapping unavailable")
-
-    catalog = {
+def _normalize_catalog(
+    *,
+    version: str,
+    release: str,
+    techniques: dict[str, dict],
+    tactics: dict[str, dict],
+    cwe_to_attack: dict[str, list[str]],
+    source: str,
+    fetched_at: float,
+    source_hashes: dict[str, dict[str, str]],
+) -> dict:
+    core = {
         "techniques": techniques,
+        "tactics": tactics,
         "cwe_to_attack": cwe_to_attack,
         "attack_version": version,
-        "fetched_at": time.time(),
+        "attack_release": release,
     }
-    _save_cache(catalog)
+    normalized_sha256 = hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {
+        "schema_version": _CATALOG_SCHEMA_VERSION,
+        "catalog_id": "mitre_attack_enterprise_capec",
+        "catalog_type": "mitre_attack",
+        "source": source,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": fetched_at,
+        "normalized_sha256": normalized_sha256,
+        "sources": source_hashes,
+        "technique_count": len(techniques),
+        "tactic_count": len(tactics),
+        **core,
+    }
+
+
+def _write_catalog(catalog: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(catalog, separators=(",", ":")))
+
+
+def _refresh_from_upstream(source: str) -> Optional[dict]:
+    """Fetch the pinned STIX releases and normalize them into a catalog.
+
+    Returns ``None`` when either pinned bundle cannot be fetched so callers can
+    fall back to the last-known-good catalog. Records unambiguous provenance:
+    the pinned release, source URL, source digest, fetch time, and the technique
+    and tactic counts.
+    """
+    attack_text = _fetch_text(_ENTERPRISE_STIX_URL)
+    capec_text = _fetch_text(_CAPEC_STIX_URL)
+    if not attack_text or not capec_text:
+        return None
+
+    attack_bundle = json.loads(attack_text)
+    capec_bundle = json.loads(capec_text)
+    version, techniques = _parse_attack_stix(attack_bundle)
+    tactics = _parse_attack_tactics(attack_bundle)
+    cwe_to_attack = _parse_capec_stix(capec_bundle, techniques)
+
+    source_hashes = {
+        "enterprise_attack": {
+            "url": _ENTERPRISE_STIX_URL,
+            "release": _ATTACK_RELEASE,
+            "sha256": hashlib.sha256(attack_text.encode()).hexdigest(),
+        },
+        "capec": {
+            "url": _CAPEC_STIX_URL,
+            "release": _CAPEC_RELEASE,
+            "sha256": hashlib.sha256(capec_text.encode()).hexdigest(),
+        },
+    }
+    return _normalize_catalog(
+        version=version,
+        release=_ATTACK_RELEASE,
+        techniques=techniques,
+        tactics=tactics,
+        cwe_to_attack=cwe_to_attack,
+        source=source,
+        fetched_at=time.time(),
+        source_hashes=source_hashes,
+    )
+
+
+def sync_catalog(output_path: Path | None = None) -> dict:
+    """Fetch and normalize the pinned MITRE ATT&CK + CAPEC releases.
+
+    Writes the last-known-good synced catalog to ``~/.agent-bom/catalogs`` by
+    default and returns the normalized catalog. If refresh fails, falls back to
+    the existing synced catalog, then the bundled catalog.
+    """
+    catalog = _refresh_from_upstream(source="synced")
+    if catalog is None:
+        fallback = _load_synced_catalog() or _load_bundled_catalog()
+        logger.warning("MITRE sync failed; using last-known-good catalog from %s", fallback.get("source", "unknown"))
+        return fallback
+
+    target = output_path or _sync_catalog_path()
+    _write_catalog(catalog, target)
+    catalog["_path"] = str(target)
     return catalog
 
 
+def refresh_bundled_catalog(output_path: Path | None = None) -> dict:
+    """Regenerate the in-repo *bundled* ATT&CK/CAPEC catalog from pinned releases.
+
+    This is the maintainer refresh path for the shipped artifact
+    (:data:`_BUNDLED_CATALOG_PATH`). It reuses the same fetch/parse/normalize
+    pipeline as :func:`sync_catalog` but stamps ``source="bundled"`` and requires
+    the network fetch to succeed (a fabricated or partial security reference is
+    worse than a stale one, so it raises rather than silently falling back).
+    """
+    catalog = _refresh_from_upstream(source="bundled")
+    if catalog is None:
+        raise RuntimeError("Unable to fetch pinned MITRE ATT&CK/CAPEC STIX releases; refusing to write a partial catalog.")
+    target = output_path or _BUNDLED_CATALOG_PATH
+    _write_catalog(catalog, target)
+    catalog["_path"] = str(target)
+    return catalog
+
+
+def build_catalog(force_refresh: bool = False) -> dict:
+    """Return the active MITRE catalog without forcing network fetches by default."""
+    mode = _catalog_mode()
+
+    if force_refresh or mode == "refresh":
+        refreshed = sync_catalog()
+        if refreshed.get("techniques"):
+            return refreshed
+
+    bundled = _load_bundled_catalog()
+    synced = _load_synced_catalog()
+
+    if mode == "bundled":
+        return bundled or synced or _empty_catalog("bundled")
+    if mode == "synced":
+        return synced or bundled or _empty_catalog("synced")
+
+    # auto: explicit sync opt-in via local synced catalog, otherwise bundled
+    return synced or bundled or _empty_catalog("bundled")
+
+
 def get_techniques() -> dict[str, dict]:
-    """Return technique catalog dict ``{T-code: {name, tactics, ...}}``."""
     return build_catalog().get("techniques", {})
 
 
+def get_bundled_techniques() -> dict[str, dict]:
+    """Return techniques from the bundled catalog only.
+
+    Deterministic and offline: ignores any locally synced catalog so callers
+    that disclose the *bundled* technique count (docs, compliance coverage
+    metadata) get the same figure in every environment.
+    """
+    return _load_bundled_catalog().get("techniques", {})
+
+
 def get_cwe_to_attack() -> dict[str, list[str]]:
-    """Return CWE → ATT&CK technique list derived from official CAPEC data."""
     return build_catalog().get("cwe_to_attack", {})
 
 
+def get_tactics() -> dict[str, dict]:
+    """Return ``{tactic_id: {shortname, name}}`` from the active ATT&CK catalog."""
+    return build_catalog().get("tactics", {})
+
+
+def get_bundled_tactics() -> dict[str, dict]:
+    """Return the Enterprise tactics from the bundled catalog only (offline)."""
+    return _load_bundled_catalog().get("tactics", {})
+
+
 def get_attack_version() -> str:
-    """Return the ATT&CK version string of the cached catalog."""
     return build_catalog().get("attack_version", "unknown")
+
+
+def get_attack_release() -> str:
+    """Return the pinned ATT&CK release identifier for the active catalog."""
+    return build_catalog().get("attack_release", "unknown")

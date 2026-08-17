@@ -2,14 +2,27 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from unittest.mock import patch
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
 
 from agent_bom.mcp_server import (
+    _caller_rate_windows,
+    _check_caller_rate_limit,
+    _current_tool_request,
+    _execute_tool_async,
+    _execute_tool_sync_async,
     _get_registry_data,
     _get_registry_data_raw,
+    _recent_tool_requests,
+    _record_tool_metric,
+    _record_tool_request,
+    _tool_metrics,
+    _tool_metrics_snapshot,
     _truncate_response,
     _validate_cve_id,
     _validate_ecosystem,
@@ -75,7 +88,7 @@ class TestTruncateResponse:
 
 class TestRegistryCache:
     def test_get_registry_data_returns_dict(self):
-        import agent_bom.mcp_server as mod
+        import agent_bom.mcp_server_helpers as mod
 
         old = mod._registry_cache
         try:
@@ -86,7 +99,7 @@ class TestRegistryCache:
             mod._registry_cache = old
 
     def test_get_registry_data_raw_returns_str(self):
-        import agent_bom.mcp_server as mod
+        import agent_bom.mcp_server_helpers as mod
 
         old = mod._registry_raw_cache
         try:
@@ -99,7 +112,7 @@ class TestRegistryCache:
             mod._registry_raw_cache = old
 
     def test_cache_reuse(self):
-        import agent_bom.mcp_server as mod
+        import agent_bom.mcp_server_helpers as mod
 
         old = mod._registry_cache
         try:
@@ -149,3 +162,194 @@ class TestCheckMcpSdk:
         with patch.dict("sys.modules", {"mcp": None}):
             with pytest.raises(ImportError, match="mcp SDK is required"):
                 _check_mcp_sdk()
+
+
+class TestToolMetrics:
+    def test_metrics_snapshot_summarizes_calls(self):
+        _tool_metrics.clear()
+        _record_tool_metric("scan", elapsed_ms=12, success=True)
+        _record_tool_metric("scan", elapsed_ms=20, success=False, error="boom")
+        snap = _tool_metrics_snapshot()
+        assert snap["summary"]["tool_count"] == 1
+        assert snap["summary"]["total_calls"] == 2
+        assert snap["summary"]["total_failures"] == 1
+        assert snap["tools"][0]["tool"] == "scan"
+        assert snap["tools"][0]["avg_elapsed_ms"] == 16.0
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_async_returns_timeout_payload(self):
+        async def _slow():
+            await asyncio.sleep(0.05)
+            return "ok"
+
+        result = await _execute_tool_async("slow_tool", _slow, timeout=0.001)
+        payload = json.loads(result)
+        assert payload["tool"] == "slow_tool"
+        assert payload["timed_out"] is True
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_sync_async_returns_timeout_payload(self):
+        def _slow_sync():
+            import time
+
+            time.sleep(0.05)
+            return "ok"
+
+        result = await _execute_tool_sync_async("slow_sync_tool", _slow_sync, tool_timeout=0.001)
+        payload = json.loads(result)
+        assert payload["tool"] == "slow_sync_tool"
+        assert payload["timed_out"] is True
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_async_returns_sanitized_error_payload(self):
+        async def _boom():
+            raise RuntimeError("failed token=abc123 at /tmp/private/path")
+
+        result = await _execute_tool_async("failing_tool", _boom)
+
+        payload = json.loads(result)
+        assert payload["tool"] == "failing_tool"
+        assert payload["status"] == "error"
+        assert "token=<redacted>" in payload["error"]
+        assert "/tmp/private/path" not in payload["error"]
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_async_preserves_tool_error(self):
+        async def _tool_error():
+            raise ToolError("Invalid severity: bad")
+
+        with pytest.raises(ToolError, match="Invalid severity"):
+            await _execute_tool_async("failing_tool", _tool_error)
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_sync_async_returns_sanitized_error_payload(self):
+        def _boom_sync():
+            raise RuntimeError("failed password=swordfish at /tmp/private/path")
+
+        result = await _execute_tool_sync_async("failing_sync_tool", _boom_sync)
+
+        payload = json.loads(result)
+        assert payload["tool"] == "failing_sync_tool"
+        assert payload["status"] == "error"
+        assert "password=<redacted>" in payload["error"]
+        assert "/tmp/private/path" not in payload["error"]
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_sync_async_preserves_tool_error(self):
+        def _tool_error_sync():
+            raise ToolError("Invalid severity: bad")
+
+        with pytest.raises(ToolError, match="Invalid severity"):
+            await _execute_tool_sync_async("failing_sync_tool", _tool_error_sync)
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_logs_single_line_caller(self, caplog, monkeypatch):
+        import agent_bom.mcp_server as mod
+
+        _caller_rate_windows.clear()
+        monkeypatch.setattr(
+            mod,
+            "_current_tool_request",
+            lambda: {
+                "caller": "client-1\nforged=true",
+                "client_id": "client-1\nforged=true",
+                "request_id": "req-1\r\nforged=true",
+            },
+        )
+
+        async def _ok():
+            return "ok"
+
+        caplog.set_level(logging.INFO, logger="agent_bom.mcp_server")
+        assert await _execute_tool_async("safe_tool", _ok) == "ok"
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("client-1 forged=true" in message for message in messages)
+        assert all("client-1\nforged=true" not in message for message in messages)
+        assert all("req-1\r\nforged=true" not in message for message in messages)
+
+    def test_current_tool_request_defaults_to_local_without_context(self):
+        assert _current_tool_request() == {"caller": "local", "client_id": None, "request_id": None, "auth_scopes": ""}
+
+    def test_caller_keyed_on_verified_token_not_session(self):
+        """Reconnecting must not reset the rate-limit window.
+
+        Fails before the fix: caller fell back to a per-connection session-object
+        id, so a fresh connection minted a new caller key and a new window.
+        """
+        from types import SimpleNamespace
+
+        from agent_bom import mcp_server_runtime as runtime
+
+        token_a = SimpleNamespace(client_id="oauth-client-9", scopes=["read"])
+        token_b = SimpleNamespace(client_id="oauth-client-9", scopes=["read"])
+        # Two distinct connections (distinct session objects), same verified token.
+        req1 = SimpleNamespace(access_token=token_a, session=object(), meta=None, request_id="r1")
+        req2 = SimpleNamespace(access_token=token_b, session=object(), meta=None, request_id="r2")
+
+        caller1 = runtime.current_tool_request(lambda: req1)["caller"]
+        caller2 = runtime.current_tool_request(lambda: req2)["caller"]
+        assert caller1 == caller2 == "token-client:oauth-client-9"
+
+    def test_caller_falls_back_to_token_hash_without_client_id(self):
+        from types import SimpleNamespace
+
+        from agent_bom import mcp_server_runtime as runtime
+
+        req1 = SimpleNamespace(access_token=SimpleNamespace(token="bearer-secret-xyz"), session=object(), meta=None)
+        req2 = SimpleNamespace(access_token=SimpleNamespace(token="bearer-secret-xyz"), session=object(), meta=None)
+        caller1 = runtime.current_tool_request(lambda: req1)["caller"]
+        caller2 = runtime.current_tool_request(lambda: req2)["caller"]
+        assert caller1 == caller2
+        assert caller1.startswith("token-hash:")
+
+    def test_global_rate_limit_backstop_caps_distinct_callers(self):
+        """A flood spread across distinct caller identities is still capped."""
+        from collections import OrderedDict
+
+        from agent_bom import mcp_server_runtime as runtime
+
+        windows: OrderedDict = OrderedDict()
+        kwargs = dict(
+            caller_rate_limit=100,  # high so per-caller never trips
+            caller_window_seconds=60.0,
+            max_caller_states=256,
+            monotonic_now=200.0,
+            global_rate_limit=2,
+            global_window_seconds=60.0,
+        )
+        assert runtime.check_caller_rate_limit(windows, "caller-0", **kwargs) is None
+        assert runtime.check_caller_rate_limit(windows, "caller-1", **kwargs) is None
+        # Third distinct caller trips the process-wide ceiling despite a fresh key.
+        assert runtime.check_caller_rate_limit(windows, "caller-2", **kwargs) is not None
+
+    def test_check_caller_rate_limit_enforces_window(self, monkeypatch):
+        import agent_bom.mcp_server as mod
+
+        _caller_rate_windows.clear()
+        monkeypatch.setattr(mod, "_MCP_CALLER_RATE_LIMIT", 2)
+        monkeypatch.setattr(mod, "_MCP_CALLER_WINDOW_SECONDS", 60.0)
+        times = iter([100.0, 100.5, 101.0])
+        monkeypatch.setattr(mod.time, "monotonic", lambda: next(times))
+
+        assert _check_caller_rate_limit("caller-a") is None
+        assert _check_caller_rate_limit("caller-a") is None
+        assert _check_caller_rate_limit("caller-a") == 59.0
+
+    def test_tool_metrics_snapshot_includes_recent_requests(self):
+        _tool_metrics.clear()
+        _recent_tool_requests.clear()
+        _record_tool_metric("scan", elapsed_ms=10, success=True)
+        _record_tool_request(
+            "scan",
+            caller="client-1",
+            client_id="client-1",
+            request_id="req-1",
+            status="ok",
+            elapsed_ms=10,
+        )
+
+        snap = _tool_metrics_snapshot()
+        assert snap["summary"]["recent_request_count"] == 1
+        assert snap["recent_requests"][0]["caller"] == "client-1"
+        assert snap["recent_requests"][0]["request_id"] == "req-1"

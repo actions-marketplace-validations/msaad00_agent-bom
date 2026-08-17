@@ -1,0 +1,206 @@
+# Supply Chain and Dependency Controls
+
+`agent-bom` keeps its dependency and release trust posture explicit:
+
+- small required runtime footprint
+- optional extras for heavier surfaces
+- locked dependency resolution
+- per-PR dependency review
+- signed and attested release artifacts
+- published self-SBOMs
+- self-scan and fuzz coverage in CI
+
+This page is the operator-facing map of those controls.
+
+## Dependency model
+
+There are three layers to understand:
+
+1. Core runtime dependencies in [pyproject.toml](../pyproject.toml)
+2. Fully resolved Python dependencies in [uv.lock](../uv.lock)
+3. Fully resolved UI dependencies in [ui/package-lock.json](../ui/package-lock.json)
+
+The core runtime stays intentionally small. Heavier surfaces are behind extras
+such as:
+
+- `api`
+- `mcp-server`
+- `graph`
+- `cloud`
+- `dashboard`
+- `postgres`
+- `oidc`
+
+That keeps the default install lean while still allowing fuller deployments to
+turn on additional capability explicitly.
+
+Some extras also carry platform markers where an upstream provider package is
+not yet compatible with the full supported Python/platform matrix. Those
+constraints are intentional and documented rather than hidden.
+
+## Version control and drift boundaries
+
+`agent-bom` uses bounded runtime version ranges in `pyproject.toml` and locked
+resolution in `uv.lock`.
+
+That gives two protections:
+
+- maintainers and CI get exact, reproducible transitive resolution
+- users installing without the lockfile still stay inside known-compatible major
+  ranges instead of drifting arbitrarily
+
+Transitive security pins that close specific advisories are annotated inline
+with GHSA/CVE context in `pyproject.toml`.
+
+## Extras audit coverage
+
+The root dependency graph is not the only surface that matters. Optional extras
+pull in additional transitive dependencies, so they need independent visibility.
+
+The extras audit workflow is:
+
+- workflow: [extras-audit.yml](../.github/workflows/extras-audit.yml)
+- trigger: pull requests touching dependency surfaces, weekly schedule, or
+  manual dispatch
+- output: per-surface dependency trees and `pip-audit` JSON artifacts
+
+Current audit groups:
+
+- `api-runtime`
+- `mcp-surface`
+- `analytics-ui`
+- `cloud-surface`
+
+Those groups are intentionally broader than a single extra so the artifacts map
+to real deployment surfaces rather than individual package toggles.
+
+## CI and scanning controls
+
+Dependency and supply-chain controls are enforced through multiple workflows:
+
+- `dependency-review.yml` for per-PR dependency diffs
+- `dependency-submission.yml` for GitHub dependency graph visibility
+- `cve-freshness.yml` for daily dependency vulnerability checks
+- `container-rescan.yml` for image rescans
+- `cflite-pr.yml` for parser and ingestion fuzzing
+- `post-merge-self-scan.yml` for dogfooding scans against `agent-bom` itself
+- `release.yml` and `publish-mcp.yml` for signed, attested release output
+
+This is additive by design. No single workflow is treated as the entire trust
+story.
+
+## Parser and fuzz coverage
+
+High-risk ingestion surfaces are fuzzed because they process untrusted external
+data:
+
+- `fuzz/fuzz_policy.py`
+- `fuzz/fuzz_sbom.py`
+- `fuzz/fuzz_skill_parser.py`
+- `fuzz/fuzz_external_scanners.py`
+
+The external scanner fuzz target covers:
+
+- CVE-scanner JSON ingestion (common industry formats)
+- container-SBOM JSON ingestion (common industry formats)
+- format auto-detection via `detect_and_parse()`
+
+That keeps the import path for third-party scanner results under the same
+hardening discipline as SBOM and policy ingest.
+
+## Release verification and SBOMs
+
+Tagged releases publish:
+
+- Python distributions
+- Sigstore bundles (`*.sigstore.json`)
+- SLSA provenance bundles (`*.intoto.jsonl`)
+- CycloneDX self-SBOM (`agent-bom-sbom.cdx.json`)
+
+Use the release verification guide:
+
+- [Release Verification](RELEASE_VERIFICATION.md)
+
+That document includes:
+
+- `cosign verify-blob` examples
+- provenance inspection
+- self-SBOM inspection and rescanning
+
+This is the public verification path. Release trust is not hidden inside CI.
+
+## Scanned-package integrity and provenance verdict
+
+`agent-bom scan --verify-integrity` checks each resolved package's artifact
+digest against its registry (`Package.integrity_verified`) and looks for a SLSA
+/ PEP 740 / `sum.golang.org` attestation (`Package.provenance_attested`, with
+`provenance_source` naming which one). The verdict is machine-readable in every
+serializing format, so a gate never has to scrape console text:
+
+| Surface | Where the verdict lands |
+| --- | --- |
+| JSON | `agents[].mcp_servers[].packages[].integrity_verified` / `.provenance_attested` / `.provenance_source` / `.provenance_status` |
+| CycloneDX 1.7 | `component.evidence.identity[]` — `methods[].technique` is `hash-comparison` (integrity) and `attestation` (provenance), `confidence` 1.0 pass / 0.0 fail; plus `component.properties` `agent-bom:integrity-verified`, `agent-bom:provenance-attested`, `agent-bom:provenance-source`, `agent-bom:provenance-status` |
+| SPDX 3.0.1 | `software_Package.annotation[]` with `annotationType: other` — `agent-bom:integrity-verified=<bool>`, `agent-bom:provenance-attested=<bool> source=<src>`, `agent-bom:provenance-status=<status>` |
+| SPDX 2.2 / 2.3 | `packages[].annotations[]` with `annotationType: OTHER` and the same `comment` statements |
+| SARIF 2.1.0 | `runs[].results[].properties.package_integrity_verified` / `.package_provenance_attested` / `.package_provenance_source` / `.package_provenance_status` |
+| CSV | appended `integrity_verified`, `provenance_attested`, `provenance_source`, `provenance_status` columns |
+| `GET /v1/findings` | `package_integrity_verified`, `package_provenance_attested`, `package_provenance_source`, `package_provenance_status` on each finding |
+| MCP `scan` tool | the JSON payload above, from the same verification helper the CLI uses |
+
+Neither CycloneDX nor SPDX models a verification *verdict* as a first-class
+field, so each format uses the extension point its own spec designates for a
+tool-asserted statement: CycloneDX identity evidence plus namespaced
+`properties`, and SPDX annotations (`AnnotationType.other` — "extra information
+about an Element which is not part of a review").
+
+The provenance verdict has three states, not two, and every format above carries
+all three:
+
+| State | `provenance_attested` | `provenance_status` | Meaning |
+| --- | --- | --- | --- |
+| not checked | absent / `null` | absent / `null` | `--verify-integrity` did not run, or the package version was unresolved so the registry was never asked |
+| checked | `true` / `false` | `verified` · `not_published` · `not_provenance` · `partial` | the registry answered |
+| could not check | absent / `null` | `unavailable` | the registry was asked and did not answer — a timeout, a 5xx, or an unparseable body |
+
+The third row is why `provenance_status` exists. Coercing an unreachable
+registry to `false` publishes "we asked and there is no attestation" — the
+verdict a release gate blocks on — out of an outage, so
+`integrity.PROVENANCE_UNKNOWN_STATUSES` leaves the boolean absent and records
+the reason instead. In CycloneDX that means no `attestation` identity evidence
+is emitted either: a `confidence: 0.0` method asserts a documented failure the
+lookup never established.
+
+`integrity_verified` needs no equivalent: its helpers return `None` rather than
+a dict when the registry is unreachable, so an outage already leaves the field
+absent.
+
+Absent therefore means the check produced no verdict; a failed verification is
+emitted explicitly as `false` / `confidence: 0.0`, so "not checked", "could not
+check" and "checked and failed" are never conflated.
+
+## Where to inspect the current posture
+
+- [Security Policy](../SECURITY.md)
+- [Security Architecture](SECURITY_ARCHITECTURE.md)
+- [Image Security](IMAGE_SECURITY.md)
+- [Threat Model](THREAT_MODEL.md)
+- [Release Verification](RELEASE_VERIFICATION.md)
+- [Permissions and Trust](PERMISSIONS.md)
+- [Air-Gapped Image Bundle](../site-docs/deployment/airgapped-image-bundle.md)
+
+## Operational guidance
+
+For maintainers:
+
+- keep runtime dependency ranges bounded
+- refresh `uv.lock` whenever dependency policy changes
+- review extras audit artifacts, not just the default environment
+- treat parser fuzz coverage as part of release trust, not optional polish
+
+For operators:
+
+- verify release assets before internal distribution
+- archive the published self-SBOM with the release artifact set
+- use the same release verification process for both PyPI and GitHub release
+  consumption

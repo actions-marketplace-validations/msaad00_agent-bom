@@ -9,35 +9,186 @@ Endpoints:
     POST   /v1/gateway/evaluate              dry-run policy evaluation
     GET    /v1/gateway/audit                 policy audit log
     GET    /v1/gateway/stats                 gateway statistics
+    GET    /v1/gateway/upstreams/discovered  MCP upstreams discovered across the fleet
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import threading
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
-from fastapi import APIRouter, HTTPException
+import anyio.to_thread
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, Response
 
-from agent_bom.api.models import EvaluateRequest, PolicyCreate, PolicyUpdate
-from agent_bom.api.stores import _get_policy_store
+from agent_bom.api.demo_refresh import demo_daily_evidence_dependency
+from agent_bom.api.models import EvaluateRequest, JobStatus, PolicyCreate, PolicyUpdate
+from agent_bom.api.stores import _get_firewall_decision_store, _get_policy_store, _get_store
+from agent_bom.api.tenancy import require_request_tenant_id
+from agent_bom.gateway_upstreams import is_gateway_compatible_upstream_transport
+from agent_bom.rbac import require_authenticated_permission
+from agent_bom.security import sanitize_error
 
-router = APIRouter()
+if TYPE_CHECKING:
+    from agent_bom.api.policy_store import GatewayPolicy
+
+router = APIRouter(dependencies=[Depends(demo_daily_evidence_dependency)])
+_REPLAY_ONLY_ARGUMENT_VALUE = "[replay-only]"
+_FIREWALL_POLICY_CACHE_LOCK = threading.RLock()
+_FIREWALL_POLICY_CACHE: dict[str, Any] = {
+    "path": None,
+    "mtime_ns": None,
+    "policy": None,
+    "loaded_at": None,
+}
 
 
-@router.get("/v1/gateway/policies", tags=["gateway"])
-async def list_gateway_policies(enabled: bool | None = None, mode: str | None = None):
+def _dep(permission: str) -> Any:
+    return cast(Any, require_authenticated_permission(permission))
+
+
+def _policy_collection_etag(policies: list["GatewayPolicy"]) -> str:
+    payload = json.dumps([p.model_dump() for p in policies], sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload.encode()).hexdigest()
+    return f'"{digest}"'
+
+
+def _build_arguments_preview(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Build a bounded tier-A preview of gateway arguments."""
+    from agent_bom.evidence import EvidenceTier, classify_field, redact_for_persistence
+    from agent_bom.security import sanitize_sensitive_payload
+
+    sanitized = sanitize_sensitive_payload(arguments)
+    if not isinstance(sanitized, dict):
+        return {}
+
+    preview: dict[str, Any] = {}
+    for key, value in list(sanitized.items())[:32]:
+        key_text = str(key)
+        if classify_field(key_text) is not EvidenceTier.SAFE_TO_STORE:
+            preview[key_text] = _REPLAY_ONLY_ARGUMENT_VALUE
+            continue
+        safe_value = redact_for_persistence({key_text: value}, EvidenceTier.SAFE_TO_STORE).get(key_text)
+        if isinstance(safe_value, str) and len(safe_value) > 256:
+            safe_value = safe_value[:256] + "…"
+        preview[key_text] = safe_value
+    return preview
+
+
+def _firewall_policy_path() -> Path | None:
+    """Return the configured control-plane firewall policy path, if any."""
+    raw = (os.environ.get("AGENT_BOM_API_FIREWALL_POLICY") or os.environ.get("AGENT_BOM_GATEWAY_FIREWALL_POLICY") or "").strip()
+    if not raw:
+        return None
+    return Path(raw).expanduser()
+
+
+def _load_control_plane_firewall_policy() -> tuple[Any, dict[str, Any]]:
+    """Load the central inter-agent firewall policy for the API decision route.
+
+    No configured policy intentionally means a default-allow policy so pilots
+    can turn on the endpoint without blocking traffic. A configured but missing
+    or malformed policy fails closed at the HTTP layer, leaving the proxy's
+    fail-open/fail-closed mode to make the runtime availability choice.
+    """
+    from agent_bom.firewall import AgentFirewallPolicy, FirewallPolicyError, load_firewall_policy_file
+
+    policy_path = _firewall_policy_path()
+    if policy_path is None:
+        return AgentFirewallPolicy(), {
+            "source": "default-allow",
+            "path": None,
+            "loaded_at": None,
+            "default_decision": "allow",
+            "enforcement_mode": "enforce",
+            "tenant_id": None,
+        }
+
+    try:
+        stat = policy_path.stat()
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail=f"Firewall policy unavailable: {policy_path}") from exc
+
+    path_text = str(policy_path)
+    with _FIREWALL_POLICY_CACHE_LOCK:
+        if (
+            _FIREWALL_POLICY_CACHE["path"] == path_text
+            and _FIREWALL_POLICY_CACHE["mtime_ns"] == stat.st_mtime_ns
+            and _FIREWALL_POLICY_CACHE["policy"] is not None
+        ):
+            policy = _FIREWALL_POLICY_CACHE["policy"]
+            loaded_at = _FIREWALL_POLICY_CACHE["loaded_at"]
+        else:
+            try:
+                policy = load_firewall_policy_file(policy_path)
+            except FirewallPolicyError as exc:
+                raise HTTPException(status_code=503, detail=f"Firewall policy invalid: {sanitize_error(exc)}") from exc
+            loaded_at = datetime.now(timezone.utc).isoformat()
+            _FIREWALL_POLICY_CACHE.update(
+                {
+                    "path": path_text,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "policy": policy,
+                    "loaded_at": loaded_at,
+                }
+            )
+    return policy, {
+        "source": "file",
+        "path": path_text,
+        "loaded_at": loaded_at,
+        "default_decision": policy.default_decision.value,
+        "enforcement_mode": policy.enforcement_mode.value,
+        "tenant_id": policy.tenant_id,
+    }
+
+
+def _firewall_rule_payload(rule: Any) -> dict[str, Any] | None:
+    if rule is None:
+        return None
+    return {
+        "source": rule.source,
+        "target": rule.target,
+        "decision": rule.decision.value,
+        "description": rule.description,
+    }
+
+
+def _firewall_string_list(value: Any, field_name: str) -> set[str]:
+    if value is None:
+        return set()
+    if not isinstance(value, list) or any(not isinstance(role, str) for role in value):
+        raise HTTPException(status_code=400, detail=f"{field_name} must be a list of strings")
+    return {role for role in value if role}
+
+
+@router.get("/gateway/policies", tags=["gateway"], dependencies=[_dep("policy_read")])
+async def list_gateway_policies(request: Request, enabled: bool | None = None, mode: str | None = None) -> Response:
     """List all gateway policies."""
-    policies = _get_policy_store().list_policies()
+    tenant_id = require_request_tenant_id(request)
+    policies = _get_policy_store().list_policies(tenant_id=tenant_id)
     if enabled is not None:
         policies = [p for p in policies if p.enabled == enabled]
     if mode:
         policies = [p for p in policies if p.mode.value == mode]
-    return {"policies": [p.model_dump() for p in policies], "count": len(policies)}
+    etag = _policy_collection_etag(policies)
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-store"})
+    return JSONResponse(
+        {"policies": [p.model_dump() for p in policies], "count": len(policies)},
+        headers={"ETag": etag, "Cache-Control": "no-store"},
+    )
 
 
-@router.post("/v1/gateway/policies", tags=["gateway"], status_code=201)
-async def create_gateway_policy(body: PolicyCreate):
+@router.post("/gateway/policies", tags=["gateway"], status_code=201, dependencies=[_dep("policy_write")])
+async def create_gateway_policy(body: PolicyCreate, request: Request) -> dict[str, Any]:
     """Create a new gateway policy."""
+    from agent_bom.api.audit_log import log_action
     from agent_bom.api.policy_store import GatewayPolicy, GatewayRule, PolicyMode
 
     try:
@@ -49,6 +200,7 @@ async def create_gateway_policy(body: PolicyCreate):
         )
     now = datetime.now(timezone.utc).isoformat()
     rules = [GatewayRule(**r) for r in body.rules]
+    tenant_id = require_request_tenant_id(request)
     policy = GatewayPolicy(
         policy_id=str(uuid.uuid4()),
         name=body.name,
@@ -61,29 +213,45 @@ async def create_gateway_policy(body: PolicyCreate):
         enabled=body.enabled,
         created_at=now,
         updated_at=now,
+        tenant_id=tenant_id,
     )
     _get_policy_store().put_policy(policy)
+    actor = getattr(request.state, "api_key_name", "unknown")
+    log_action(
+        "gateway.policy_created",
+        actor=actor,
+        resource=f"gateway-policy/{policy.policy_id}",
+        tenant_id=tenant_id,
+        name=policy.name,
+        mode=policy.mode.value,
+        enabled=policy.enabled,
+        rule_count=len(policy.rules),
+    )
     return policy.model_dump()
 
 
-@router.get("/v1/gateway/policies/{policy_id}", tags=["gateway"])
-async def get_gateway_policy(policy_id: str):
+@router.get("/gateway/policies/{policy_id}", tags=["gateway"], dependencies=[_dep("policy_read")])
+async def get_gateway_policy(policy_id: str, request: Request) -> dict[str, Any]:
     """Get a gateway policy by ID."""
-    policy = _get_policy_store().get_policy(policy_id)
+    tenant_id = require_request_tenant_id(request)
+    policy = _get_policy_store().get_policy(policy_id, tenant_id=tenant_id)
     if policy is None:
         raise HTTPException(status_code=404, detail="Policy not found")
-    return policy.model_dump()
+    return cast(dict[str, Any], policy.model_dump())
 
 
-@router.put("/v1/gateway/policies/{policy_id}", tags=["gateway"])
-async def update_gateway_policy(policy_id: str, body: PolicyUpdate):
+@router.put("/gateway/policies/{policy_id}", tags=["gateway"], dependencies=[_dep("policy_write")])
+async def update_gateway_policy(policy_id: str, body: PolicyUpdate, request: Request) -> dict[str, Any]:
     """Update an existing gateway policy."""
+    from agent_bom.api.audit_log import log_action
     from agent_bom.api.policy_store import GatewayRule, PolicyMode
 
     store = _get_policy_store()
-    policy = store.get_policy(policy_id)
+    tenant_id = require_request_tenant_id(request)
+    policy = store.get_policy(policy_id, tenant_id=tenant_id)
     if policy is None:
         raise HTTPException(status_code=404, detail="Policy not found")
+    original = policy.model_dump()
     if body.name is not None:
         policy.name = body.name
     if body.description is not None:
@@ -105,61 +273,301 @@ async def update_gateway_policy(policy_id: str, body: PolicyUpdate):
         policy.enabled = body.enabled
     policy.updated_at = datetime.now(timezone.utc).isoformat()
     store.put_policy(policy)
-    return policy.model_dump()
+    actor = getattr(request.state, "api_key_name", "unknown")
+    updated = policy.model_dump()
+    changed_fields = sorted(key for key, value in updated.items() if original.get(key) != value)
+    log_action(
+        "gateway.policy_updated",
+        actor=actor,
+        resource=f"gateway-policy/{policy.policy_id}",
+        tenant_id=tenant_id,
+        name=policy.name,
+        changed_fields=changed_fields,
+        enabled=policy.enabled,
+        rule_count=len(policy.rules),
+    )
+    return cast(dict[str, Any], policy.model_dump())
 
 
-@router.delete("/v1/gateway/policies/{policy_id}", tags=["gateway"])
-async def delete_gateway_policy(policy_id: str):
+@router.delete("/gateway/policies/{policy_id}", tags=["gateway"], dependencies=[_dep("policy_write")])
+async def delete_gateway_policy(policy_id: str, request: Request) -> dict[str, Any]:
     """Delete a gateway policy."""
-    if not _get_policy_store().delete_policy(policy_id):
+    tenant_id = require_request_tenant_id(request)
+    store = _get_policy_store()
+    policy = store.get_policy(policy_id, tenant_id=tenant_id)
+    if policy is None:
         raise HTTPException(status_code=404, detail="Policy not found")
+    if not store.delete_policy(policy_id, tenant_id=tenant_id):
+        raise HTTPException(status_code=404, detail="Policy not found")
+    from agent_bom.api.audit_log import log_action
+
+    actor = getattr(request.state, "api_key_name", "unknown")
+    log_action(
+        "gateway.policy_deleted",
+        actor=actor,
+        resource=f"gateway-policy/{policy_id}",
+        tenant_id=tenant_id,
+        name=policy.name,
+        mode=policy.mode.value,
+        rule_count=len(policy.rules),
+    )
     return {"deleted": True, "policy_id": policy_id}
 
 
-@router.post("/v1/gateway/evaluate", tags=["gateway"])
-async def evaluate_gateway(body: EvaluateRequest):
-    """Dry-run evaluation of gateway policies against a tool call."""
-    from agent_bom.gateway import evaluate_gateway_policies
+@router.post("/gateway/evaluate", tags=["gateway"], dependencies=[_dep("policy_read")])
+async def evaluate_gateway(body: EvaluateRequest, request: Request) -> dict[str, Any]:
+    """Evaluate gateway policies against a tool call and audit-log every decision.
 
-    policies = _get_policy_store().list_policies()
+    The audit row is written for both ``allow`` and ``deny`` outcomes so that
+    compliance/forensics tooling can replay every gateway decision back to a
+    specific policy *and* rule. Audit-mode matches (where the call is allowed
+    but a rule would have denied it in enforce mode) are recorded with
+    ``action_taken="alerted"`` so dashboards can distinguish them from clean
+    allows.
+    """
+    import logging
+    import uuid as _uuid
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    from agent_bom.api.policy_store import PolicyAuditEntry
+    from agent_bom.gateway import evaluate_gateway_policies_detail
+
+    tenant_id = require_request_tenant_id(request)
+    store = _get_policy_store()
+    policies = store.list_policies(tenant_id=tenant_id)
     active = [p for p in policies if p.enabled]
-    allowed, reason, policy_id = evaluate_gateway_policies(
-        active,
-        body.tool_name,
-        body.arguments,
-    )
+    policy_status = "configured" if active else "not_configured"
+    warnings: list[str] = []
+    if not active:
+        warnings.append("No enabled gateway policies are configured; evaluation is observing and allowing by default.")
+    (
+        allowed,
+        reason,
+        policy_id,
+        rule_id,
+        policy_name,
+        policy_mode,
+    ) = evaluate_gateway_policies_detail(active, body.tool_name, body.arguments)
+
+    # ── Audit-log every decision ────────────────────────────────────────────
+    # Compliance/forensics requirement: every block (and every audit-mode
+    # alert and every allow) must be replayable from the audit store.
+    if allowed and reason == "":
+        action_taken = "allowed"
+        log_reason = "no enabled gateway policies configured" if not active else "no matching deny rule"
+    elif allowed:
+        # audit-mode match — call went through but a rule would have blocked
+        action_taken = "alerted"
+        log_reason = reason
+    else:
+        action_taken = "blocked"
+        log_reason = reason
+
+    # Keep argument names for incident reconstruction, but only persist values
+    # that the two-bucket evidence policy marks safe to store indefinitely.
+    args_preview = _build_arguments_preview(body.arguments)
+
+    request_id = getattr(request.state, "request_id", "") or ""
+    trace_id = getattr(request.state, "trace_id", "") or ""
+    actor = getattr(request.state, "api_key_name", "") or "unknown"
+    agent_name = body.agent_name or actor or "unknown"
+
+    try:
+        store.put_audit_entry(
+            PolicyAuditEntry(
+                entry_id=str(_uuid.uuid4()),
+                policy_id=policy_id or "",
+                policy_name=policy_name or "",
+                rule_id=rule_id or "",
+                agent_name=agent_name,
+                tool_name=body.tool_name,
+                arguments_preview=args_preview,
+                action_taken=action_taken,
+                reason=log_reason,
+                timestamp=_dt.now(_tz.utc).isoformat(),
+                tenant_id=tenant_id,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Audit write failures must not break the evaluation response — they
+        # surface in server logs instead.
+        logging.getLogger(__name__).warning("gateway audit write failed: %s", exc)
+
     return {
         "allowed": allowed,
         "reason": reason,
         "policy_id": policy_id,
+        "rule_id": rule_id,
+        "policy_name": policy_name,
+        "policy_mode": policy_mode,
+        "action_taken": action_taken,
         "policies_evaluated": len(active),
+        "policy_status": policy_status,
+        "warnings": warnings,
+        "request_id": request_id,
+        "trace_id": trace_id,
     }
 
 
-@router.get("/v1/gateway/audit", tags=["gateway"])
+@router.get("/gateway/audit", tags=["gateway"], dependencies=[_dep("audit_read")])
 async def list_gateway_audit(
+    request: Request,
     policy_id: str | None = None,
     agent_name: str | None = None,
-    limit: int = 100,
-):
+    limit: int = Query(100, ge=1, le=1000),
+) -> dict[str, Any]:
     """Query the gateway policy audit log."""
+    tenant_id = require_request_tenant_id(request)
     entries = _get_policy_store().list_audit_entries(
         policy_id=policy_id,
         agent_name=agent_name,
         limit=limit,
+        tenant_id=tenant_id,
     )
     return {"entries": [e.model_dump() for e in entries], "count": len(entries)}
 
 
-@router.get("/v1/gateway/stats", tags=["gateway"])
-async def gateway_stats():
+@router.get(
+    "/gateway/upstreams/discovered",
+    tags=["gateway"],
+    dependencies=[cast(Any, require_authenticated_permission("read"))],
+)
+async def discovered_upstreams(request: Request) -> dict:
+    """Return the remote MCP servers discovered across the tenant's fleet.
+
+    Aggregates every MCP server surfaced by the fleet-scan path (pushed
+    via ``/v1/fleet/sync`` or returned from in-cluster scans) that has a
+    streamable HTTP URL — i.e. something this multi-MCP gateway can
+    relay with JSON-RPC-over-HTTP POST. stdio servers are excluded because
+    they only make sense as a per-workload sidecar / wrapper
+    (``agent-bom proxy -- <cmd>``); legacy SSE endpoints are excluded
+    because the gateway does not maintain persistent upstream SSE clients.
+
+    Response shape matches the ``upstreams.yaml`` the gateway consumes,
+    so a gateway pod can pull this endpoint at startup and every N
+    seconds to auto-populate its registry without the operator hand-
+    editing YAML. Auth / bearer-token wiring is still operator-supplied
+    via `gateway.envFrom` because tokens live in Secrets, not scan data.
+
+    Shape::
+
+        {
+          "generated_at": "2026-04-20T00:00:00Z",
+          "tenant_id": "...",
+          "source": "fleet_scan_aggregate",
+          "upstreams": [
+            {"name": "jira", "url": "https://...", "transport": "streamable-http",
+             "auth": "none", "source_agents": ["agent-a", ...]},
+            ...
+          ]
+        }
+
+    The ``auth`` field is always ``"none"`` from discovery — discovery can
+    see the URL but not the credential. The gateway operator decides per
+    upstream whether to switch it to ``bearer`` + ``token_env`` when
+    merging with their authored overrides.
+    """
+    tenant_id = require_request_tenant_id(request)
+    return await anyio.to_thread.run_sync(_build_discovered_upstreams, tenant_id)
+
+
+def _build_discovered_upstreams(tenant_id: str) -> dict:
+    jobs = _get_store().list_all(tenant_id=tenant_id)
+
+    # Key by (name, url) so two laptops reporting the same MCP name pointed
+    # at different URLs don't silently collapse into one record. This is the
+    # real-world case where one team's "jira" MCP is a SaaS endpoint and
+    # another team's "jira" is an in-cluster one — each must route to its
+    # own URL, and operators must see both in the discovered list so they
+    # can rename or consolidate explicitly.
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    conflicts: dict[str, set[str]] = {}
+    for job in jobs:
+        if job.status != JobStatus.DONE or not job.result:
+            continue
+        agents = job.result.get("agents") or []
+        for agent in agents:
+            agent_name = agent.get("name") or agent.get("agent_name") or ""
+            for server in agent.get("servers") or []:
+                url = server.get("url") or ""
+                name = server.get("name") or ""
+                if not name:
+                    continue
+                transport = server.get("transport") or "http"
+                if not is_gateway_compatible_upstream_transport(transport, url):
+                    # Skip stdio and SSE MCPs. The gateway upstream relay is
+                    # streamable-http only; SSE requires a persistent upstream
+                    # event client that this relay intentionally does not run.
+                    continue
+                key = (name, url)
+                record = by_key.setdefault(
+                    key,
+                    {
+                        "name": name,
+                        "url": url,
+                        "transport": "streamable-http",
+                        "auth": "none",
+                        "source_agents": [],
+                    },
+                )
+                # Track conflicts for operator visibility (same name, different URLs).
+                conflicts.setdefault(name, set()).add(url)
+                if agent_name and agent_name not in record["source_agents"]:
+                    record["source_agents"].append(agent_name)
+
+    # Suffix the routing name on conflicts so each gets a unique /mcp/{name}.
+    # The first URL keeps the bare name (stable for existing clients); every
+    # other URL with the same base name gets an index suffix. Operators see
+    # the collision in the `conflicts` array and can consolidate in their
+    # overlay upstreams.yaml.
+    conflict_report: list[dict[str, Any]] = []
+    renamed_by_key: dict[tuple[str, str], str] = {}
+    for name, urls in conflicts.items():
+        if len(urls) <= 1:
+            continue
+        sorted_urls = sorted(urls)
+        conflict_report.append({"name": name, "urls": sorted_urls})
+        # First URL wins the bare name; subsequent URLs get -1, -2, ...
+        for idx, url in enumerate(sorted_urls[1:], start=1):
+            renamed_by_key[(name, url)] = f"{name}-{idx}"
+
+    upstreams: list[dict[str, Any]] = []
+    for key, record in by_key.items():
+        rename = renamed_by_key.get(key)
+        if rename is not None:
+            record = {**record, "name": rename, "original_name": record["name"]}
+        upstreams.append(record)
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "tenant_id": tenant_id,
+        "source": "fleet_scan_aggregate",
+        "upstreams": sorted(upstreams, key=lambda r: r["name"]),
+        "conflicts": conflict_report,
+    }
+
+
+@router.get("/gateway/stats", tags=["gateway"], dependencies=[_dep("audit_read")])
+async def gateway_stats(request: Request) -> dict[str, Any]:
     """Gateway-wide statistics."""
-    policies = _get_policy_store().list_policies()
-    audit = _get_policy_store().list_audit_entries(limit=10000)
-    enforce_count = sum(1 for p in policies if p.mode.value == "enforce" and p.enabled)
-    audit_count = sum(1 for p in policies if p.mode.value == "audit" and p.enabled)
+    from agent_bom.gateway import summarize_gateway_policies
+
+    tenant_id = require_request_tenant_id(request)
+    policies = _get_policy_store().list_policies(tenant_id=tenant_id)
+    audit = _get_policy_store().list_audit_entries(limit=10000, tenant_id=tenant_id)
+    active_policies = [p for p in policies if p.enabled]
+    enforce_count = sum(1 for p in active_policies if p.mode.value == "enforce")
+    audit_count = sum(1 for p in active_policies if p.mode.value == "audit")
     blocked = sum(1 for e in audit if e.action_taken == "blocked")
     alerted = sum(1 for e in audit if e.action_taken == "alerted")
+    policy_runtime = {
+        "source": "control_plane",
+        "source_kind": "policy_store",
+        "enabled_policies": len(active_policies),
+        **summarize_gateway_policies(active_policies),
+    }
+    firewall_runtime = _get_firewall_decision_store().stats(tenant_id=tenant_id, recent_limit=10, top_pairs=10)
     return {
         "total_policies": len(policies),
         "enforce_count": enforce_count,
@@ -169,4 +577,93 @@ async def gateway_stats():
         "audit_entries": len(audit),
         "blocked_count": blocked,
         "alerted_count": alerted,
+        "policy_runtime": policy_runtime,
+        "firewall_runtime": firewall_runtime,
     }
+
+
+@router.post("/firewall/check", tags=["gateway"], dependencies=[_dep("scan")])
+async def firewall_check(request: Request) -> dict[str, Any]:
+    """Evaluate a source -> target agent decision through the control plane.
+
+    This is the centralized policy endpoint used by `agent-bom proxy
+    --firewall-gateway-url`. It mirrors the standalone gateway route but stores
+    every decision in the control-plane firewall tally so operators can see
+    allow/warn/deny trends and recent denials from the dashboard.
+    """
+    from agent_bom.firewall import evaluate
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON body") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="firewall check body must be a JSON object")
+
+    source_agent = payload.get("source_agent")
+    target_agent = payload.get("target_agent")
+    if not isinstance(source_agent, str) or not source_agent.strip():
+        raise HTTPException(status_code=400, detail="source_agent is required")
+    if not isinstance(target_agent, str) or not target_agent.strip():
+        raise HTTPException(status_code=400, detail="target_agent is required")
+
+    source_agent = source_agent.strip()
+    target_agent = target_agent.strip()
+    source_roles = _firewall_string_list(payload.get("source_roles"), "source_roles")
+    target_roles = _firewall_string_list(payload.get("target_roles"), "target_roles")
+    policy, policy_meta = _load_control_plane_firewall_policy()
+    result = evaluate(
+        policy,
+        source_agent=source_agent,
+        target_agent=target_agent,
+        source_roles=source_roles,
+        target_roles=target_roles,
+    )
+    tenant_id = require_request_tenant_id(request)
+    now = datetime.now(timezone.utc).timestamp()
+    matched_rule = _firewall_rule_payload(result.matched_rule)
+    event = {
+        "action": "gateway.firewall_decision",
+        "source_agent": source_agent,
+        "target_agent": target_agent,
+        "source_roles": sorted(source_roles),
+        "target_roles": sorted(target_roles),
+        "decision": result.decision.value,
+        "effective_decision": result.effective_decision.value,
+        "matched_rule": matched_rule,
+        "tenant_id": tenant_id,
+        "enforcement_mode": policy.enforcement_mode.value,
+        "timestamp": now,
+        "policy": policy_meta,
+    }
+    _get_firewall_decision_store().record(tenant_id=tenant_id, event=event)
+    return {
+        "source_agent": source_agent,
+        "target_agent": target_agent,
+        "source_roles": sorted(source_roles),
+        "target_roles": sorted(target_roles),
+        "decision": result.decision.value,
+        "effective_decision": result.effective_decision.value,
+        "matched_rule": matched_rule,
+        "policy": policy_meta,
+    }
+
+
+@router.get("/firewall/stats", tags=["gateway"], dependencies=[_dep("audit_read")])
+async def firewall_stats(request: Request) -> dict[str, Any]:
+    """Aggregated inter-agent firewall decisions for the runtime-tab overlay.
+
+    Returns counters (total / allow / warn / deny), the top decision pairs by
+    deny count, and the most recent decisions for the dashboard's
+    "recent denials" list. Backed by an in-memory tally that is populated
+    when /v1/proxy/audit ingests `gateway.firewall_decision` events; the
+    canonical record stays in the audit pipeline.
+    """
+    from agent_bom.api.stores import _get_firewall_decision_store
+
+    tenant_id = require_request_tenant_id(request)
+    return cast(
+        dict[str, Any],
+        _get_firewall_decision_store().stats(tenant_id=tenant_id, recent_limit=200, top_pairs=25),
+    )

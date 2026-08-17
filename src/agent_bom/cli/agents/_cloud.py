@@ -1,0 +1,734 @@
+"""Steps 1h, 1x–1z: cloud providers, benchmarks, SaaS connectors."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from agent_bom.cli._terminal_sections import (
+    ctx_quiet,
+    ctx_verbose,
+    print_benchmark_line,
+    print_lane_header,
+    print_provider_discovery_result,
+    stage_status,
+)
+from agent_bom.cli.agents._context import ScanContext
+
+# Shared CIS status badges across every provider table. ``not_applicable`` is
+# rendered as a short ``N/A`` badge so it is never truncated to ``not_a…`` in
+# the width-constrained Status column, and unknown statuses fall back to their
+# raw value instead of a missing cell.
+_CIS_STATUS_STYLE = {
+    "pass": "[green]PASS[/]",
+    "fail": "[red]FAIL[/]",
+    "error": "[yellow]ERR[/]",
+    "not_applicable": "[dim]N/A[/]",
+}
+
+# Width that fits the longest rendered status label (``FAIL``/``PASS``/``ERR``/
+# ``N/A``) without clipping.
+_CIS_STATUS_WIDTH = 6
+
+
+def _cis_status_badge(status_value: str) -> str:
+    """Render a CIS check status as a compact, never-truncated badge."""
+    return _CIS_STATUS_STYLE.get(status_value, status_value)
+
+
+def _safe_error(exc: object) -> str:
+    """Escape an error message for Rich so bracketed install hints survive.
+
+    Provider errors carry hints like ``pip install 'agent-bom[aws]'``; without
+    escaping, Rich parses ``[aws]`` as a markup tag and drops it, mangling the
+    one piece of guidance the operator needs.
+    """
+    from rich.markup import escape
+
+    return escape(str(exc))
+
+
+def run_cloud_discovery(
+    ctx: ScanContext,
+    *,
+    skill_only: bool,
+    aws: bool,
+    aws_region: Any,
+    aws_profile: Any,
+    aws_include_lambda: bool,
+    aws_include_eks: bool,
+    aws_include_step_functions: bool,
+    aws_include_ec2: bool,
+    aws_include_iam: bool,
+    aws_ec2_tag: Any,
+    azure_flag: bool,
+    azure_subscription: Any,
+    gcp_flag: bool,
+    gcp_project: Any,
+    coreweave_flag: bool,
+    coreweave_context: Any,
+    coreweave_namespace: Any,
+    databricks_flag: bool,
+    snowflake_flag: bool,
+    snowflake_authenticator: Any,
+    nebius_flag: bool,
+    nebius_api_key: Any,
+    nebius_project_id: Any,
+    hf_flag: bool,
+    hf_token: Any,
+    hf_username: Any,
+    hf_organization: Any,
+    wandb_flag: bool,
+    wandb_api_key: Any,
+    wandb_entity: Any,
+    wandb_project: Any,
+    mlflow_flag: bool,
+    mlflow_tracking_uri: Any,
+    openai_flag: bool,
+    openai_api_key: Any,
+    openai_org_id: Any,
+    ollama_flag: bool,
+    ollama_host: Any,
+    jira_discover: bool = False,
+    jira_url: Any = None,
+    jira_user: Any = None,
+    jira_token: Any = None,
+    servicenow_flag: bool = False,
+    servicenow_instance: Any = None,
+    servicenow_token: Any = None,
+    slack_discover: bool = False,
+    slack_bot_token: Any = None,
+    **kwargs: Any,
+) -> None:
+    """Step 1h: cloud provider discovery + Step 1y: SaaS connector discovery + Step 1z: multi-source correlation."""
+    con = ctx.con
+
+    # Step 1h: Cloud provider discovery
+    cloud_providers: list[tuple[str, dict]] = []
+    if not skill_only and aws:
+        aws_kwargs: dict = {"region": aws_region, "profile": aws_profile}
+        # Lambda is on by default; only pass False when the operator opts out.
+        if aws_include_lambda is False:
+            aws_kwargs["include_lambda"] = False
+        if aws_include_eks:
+            aws_kwargs["include_eks"] = True
+        if aws_include_step_functions:
+            aws_kwargs["include_step_functions"] = True
+        if aws_include_ec2:
+            aws_kwargs["include_ec2"] = True
+            if aws_ec2_tag and "=" in aws_ec2_tag:
+                k, v = aws_ec2_tag.split("=", 1)
+                aws_kwargs["ec2_tag_filter"] = {k: v}
+        if aws_include_iam:
+            aws_kwargs["include_iam"] = True
+        cloud_providers.append(("aws", aws_kwargs))
+    if not skill_only and azure_flag:
+        cloud_providers.append(("azure", {"subscription_id": azure_subscription}))
+    if not skill_only and gcp_flag:
+        cloud_providers.append(("gcp", {"project_id": gcp_project}))
+    if not skill_only and coreweave_flag:
+        cloud_providers.append(("coreweave", {"context": coreweave_context, "namespace": coreweave_namespace}))
+    if not skill_only and databricks_flag:
+        cloud_providers.append(("databricks", {}))
+    if not skill_only and snowflake_flag:
+        cloud_providers.append(("snowflake", {"authenticator": snowflake_authenticator} if snowflake_authenticator else {}))
+    if not skill_only and nebius_flag:
+        cloud_providers.append(("nebius", {"api_key": nebius_api_key, "project_id": nebius_project_id}))
+    if not skill_only and hf_flag:
+        cloud_providers.append(("huggingface", {"token": hf_token, "username": hf_username, "organization": hf_organization}))
+    if not skill_only and wandb_flag:
+        cloud_providers.append(("wandb", {"api_key": wandb_api_key, "entity": wandb_entity, "project": wandb_project}))
+    if not skill_only and mlflow_flag:
+        cloud_providers.append(("mlflow", {"tracking_uri": mlflow_tracking_uri}))
+    if not skill_only and openai_flag:
+        cloud_providers.append(("openai", {"api_key": openai_api_key, "organization": openai_org_id}))
+    if not skill_only and ollama_flag:
+        cloud_providers.append(("ollama", {"host": ollama_host}))
+
+    _pre_cloud_idx = len(ctx.agents)
+    quiet = ctx_quiet(ctx)
+    verbose = ctx_verbose(ctx)
+    for provider_name, provider_kwargs in cloud_providers:
+        from agent_bom.cloud import discover_from_provider
+
+        if verbose and not quiet:
+            print_lane_header(con, "discover", f"{provider_name.upper()} agents")
+        try:
+            with stage_status(con, f"[bold]Discovering {provider_name.upper()}…[/bold]", enabled=not quiet and not verbose):
+                cloud_agents, cloud_warnings = discover_from_provider(provider_name, **provider_kwargs)
+            if not quiet:
+                pkg_count = sum(a.total_packages for a in cloud_agents) if cloud_agents else 0
+                print_provider_discovery_result(
+                    con,
+                    provider_name,
+                    agent_count=len(cloud_agents),
+                    package_count=pkg_count,
+                    warnings=cloud_warnings,
+                    verbose=verbose,
+                )
+            if cloud_agents:
+                ctx.agents.extend(cloud_agents)
+            ctx.cloud_provider_successes.append({"provider": provider_name, "stage": "discovery"})
+            for warning in cloud_warnings:
+                ctx.cloud_provider_warnings.append({"provider": provider_name, "stage": "discovery", "warning": str(warning)})
+        except Exception as exc:  # noqa: BLE001 - isolate requested collectors so later providers still run
+            if not quiet:
+                con.print(f"\n  [red]{provider_name.upper()} discovery error: {_safe_error(exc)}[/red]")
+            # A requested provider whose SDK or credentials are missing/invalid is a
+            # hard failure, not a clean empty result. Record it so the final exit code
+            # is non-zero (silent CI passes are the bug). The loop continues, so the
+            # other requested providers are still scanned.
+            ctx.cloud_provider_failures.append({"provider": provider_name, "stage": "discovery", "error": _safe_error(exc)})
+
+    # Step 1h2: Auto-scan container images discovered from cloud providers (Azure, GCP, etc.)
+    # Cloud providers discover container refs but cannot scan them — bridge that gap here.
+    _cloud_image_targets: list[tuple[str, Any]] = []  # (image_ref, MCPServer to populate)
+    for agent in ctx.agents[_pre_cloud_idx:]:
+        for server in agent.mcp_servers:
+            # A ``container-image`` package is just the image name:tag placeholder
+            # that ECS/EKS/SageMaker/Cloud Run pre-fill — not real dependency
+            # extraction. Treat it as empty so those images still get deep-scanned
+            # (Azure already works because it leaves packages empty).
+            _real_pkgs = [p for p in server.packages if p.ecosystem != "container-image"]
+            if server.command == "docker" and len(server.args) >= 2 and server.args[0] == "run" and not _real_pkgs:
+                _cloud_image_targets.append((server.args[1], server))
+
+    if _cloud_image_targets:
+        from agent_bom.image import ImageScanError, scan_image
+        from agent_bom.models import ServerSurface
+
+        # Deduplicate: if multiple agents share the same image, scan once and share packages
+        _seen: dict[str, list] = {}
+        for img_ref, srv in _cloud_image_targets:
+            srv.surface = ServerSurface.CONTAINER_IMAGE
+            _seen.setdefault(img_ref, []).append(srv)
+
+        if verbose and not quiet:
+            print_lane_header(con, "scan", f"{len(_seen)} cloud container image(s)")
+        with stage_status(con, f"[bold]Scanning {len(_seen)} cloud image(s)…[/bold]", enabled=not quiet and not verbose):
+            for img_ref, servers in _seen.items():
+                try:
+                    img_packages, strategy = scan_image(img_ref)
+                    for srv in servers:
+                        srv.packages = img_packages
+                    if not quiet:
+                        con.print(f"  [green]✓[/green] {img_ref}: {len(img_packages)} package(s) [dim](via {strategy})[/dim]")
+                except ImageScanError as exc:
+                    if not quiet:
+                        con.print(f"  [yellow]![/yellow] cloud image {img_ref}: {exc}")
+                except Exception as exc:
+                    if not quiet:
+                        con.print(f"  [yellow]![/yellow] cloud image {img_ref}: could not scan — {exc}")
+
+    # Step 1y: SaaS connector discovery
+    saas_connectors: list[tuple[str, dict]] = []
+    if not skill_only and jira_discover:
+        saas_connectors.append(("jira", {"jira_url": jira_url, "email": jira_user, "api_token": jira_token}))
+    if not skill_only and servicenow_flag:
+        saas_connectors.append(("servicenow", {"instance_url": servicenow_instance, "token": servicenow_token}))
+    if not skill_only and slack_discover:
+        saas_connectors.append(("slack", {"bot_token": slack_bot_token}))
+
+    for connector_name, connector_kwargs in saas_connectors:
+        from agent_bom.connectors import ConnectorError, discover_from_connector
+
+        if verbose and not quiet:
+            print_lane_header(con, "discover", f"{connector_name.upper()} connector")
+        try:
+            with stage_status(con, f"[bold]Discovering {connector_name.upper()}…[/bold]", enabled=not quiet and not verbose):
+                con_agents, con_warnings = discover_from_connector(connector_name, **connector_kwargs)
+            if not quiet:
+                print_provider_discovery_result(
+                    con,
+                    connector_name,
+                    agent_count=len(con_agents),
+                    package_count=0,
+                    warnings=con_warnings,
+                    verbose=verbose,
+                )
+            if con_agents:
+                ctx.agents.extend(con_agents)
+        except ConnectorError as exc:
+            if not quiet:
+                con.print(f"\n  [red]{connector_name.upper()} connector error: {exc}[/red]")
+
+    # Step 1z: Multi-source correlation (dedup + merge across sources)
+    if not skill_only and ctx.agents:
+        sources = {a.source or "local" for a in ctx.agents}
+        if len(sources) > 1:
+            from agent_bom.correlate import correlate_agents
+
+            ctx.agents, corr_result = correlate_agents(ctx.agents)
+            if corr_result.cross_source_matches and not quiet:
+                con.print(
+                    f"\n  [bold]Correlated:[/bold] {corr_result.cross_source_matches} package(s) "
+                    f"merged across {len(corr_result.source_summary)} source(s)"
+                )
+
+
+def run_benchmarks(
+    ctx: ScanContext,
+    *,
+    skill_only: bool,
+    verify_model_hashes: bool,
+    project: Any,
+    hf_token: Any,
+    aws_cis_benchmark: bool,
+    aws_region: Any,
+    aws_profile: Any,
+    snowflake_cis_benchmark: bool,
+    snowflake_authenticator: Any,
+    azure_cis_benchmark: bool,
+    azure_subscription: Any,
+    gcp_cis_benchmark: bool,
+    gcp_project: Any,
+    databricks_security: bool,
+    aisvs_flag: bool,
+    vector_db_scan: bool,
+    gpu_scan_flag: bool,
+    gpu_k8s_context: Any,
+    no_dcgm_probe: bool,
+    smithery_flag: bool,
+    smithery_token: Any,
+    mcp_registry_flag: bool,
+    snyk_flag: bool,
+    snyk_token: Any,
+    snyk_org: Any,
+    cortex_observability: bool,
+    snowflake_flag: bool = False,
+    **kwargs: Any,
+) -> None:
+    """Steps 1x–1z: model hash, CIS benchmarks, AISVS, vector DB, GPU, SaaS connectors."""
+    con = ctx.con
+    quiet = ctx_quiet(ctx)
+    verbose = ctx_verbose(ctx)
+
+    # Step 1x: Model hash verification (supply chain integrity)
+    if verify_model_hashes:
+        from pathlib import Path
+
+        from agent_bom.model_hash import verify_model_hashes as _verify_hashes
+
+        _scan_roots = [Path(project)] if project else [Path.home()]
+        _combined_hash_report: dict[str, Any] = {
+            "scanned": 0,
+            "verified": 0,
+            "tampered": 0,
+            "unverified": 0,
+            "offline": 0,
+            "has_tampering": False,
+            "results": [],
+            "roots": [],
+        }
+        for _root in _scan_roots:
+            with con.status(f"[bold]Verifying model weight hashes under {_root.name}...[/bold]", spinner="dots"):
+                _hash_report = _verify_hashes(str(_root), token=hf_token)
+            _hash_data = _hash_report.to_dict()
+            _combined_hash_report["scanned"] += _hash_data["scanned"]
+            _combined_hash_report["verified"] += _hash_data["verified"]
+            _combined_hash_report["tampered"] += _hash_data["tampered"]
+            _combined_hash_report["unverified"] += _hash_data["unverified"]
+            _combined_hash_report["offline"] += _hash_data["offline"]
+            _combined_hash_report["has_tampering"] = _combined_hash_report["has_tampering"] or _hash_data["has_tampering"]
+            _combined_hash_report["results"].extend(_hash_data["results"])
+            _combined_hash_report["roots"].append(str(_root))
+            if _hash_report.scanned == 0:
+                con.print(f"  [dim]No model weight files found under {_root}[/dim]")
+            elif _hash_report.has_tampering:
+                con.print(
+                    f"  [red]⚠ SUPPLY_CHAIN_TAMPERING[/red] {_hash_report.tampered} tampered file(s) out of {_hash_report.scanned} scanned"
+                )
+                for r in _hash_report.results:
+                    if r.is_tampered:
+                        con.print(
+                            f"    [red]✗[/red] {r.filename}"
+                            f"  expected={(r.expected_sha256 or '?')[:16]}…"
+                            f"  got={r.actual_sha256[:16] if r.actual_sha256 else '?'}…"
+                        )
+            elif _hash_report.offline > 0:
+                con.print(f"  [yellow]~[/yellow] {_hash_report.scanned} file(s) found — HuggingFace Hub unreachable, hashes unverified")
+            else:
+                con.print(
+                    f"  [green]✓[/green] {_hash_report.verified} model file(s) verified, {_hash_report.unverified} unverified (not in Hub)"
+                )
+        ctx.model_hash_verification_data = _combined_hash_report
+
+    # Step 1y: CIS AWS Foundations Benchmark
+    if aws_cis_benchmark:
+        from agent_bom.cloud import CloudDiscoveryError
+
+        if verbose and not quiet:
+            print_lane_header(con, "govern", "CIS AWS Foundations Benchmark v3.0")
+        try:
+            from agent_bom.cloud import aws_organizations
+
+            with stage_status(con, "[bold]CIS AWS Foundations Benchmark v3.0[/bold]", enabled=not quiet and not verbose):
+                # When the org fan-out flag is on, fan the benchmark across every
+                # member account of the organization (same boundary set the inventory
+                # fan-out uses) and aggregate with per-account attribution. Each
+                # account is reached via a read-only AssumeRole; an account that denies
+                # the role is skipped. Off = unchanged single-account/region run.
+                if aws_organizations.org_fanout_enabled():
+                    from agent_bom.cloud.aws_cis_benchmark import run_all_account_benchmarks
+
+                    ctx.cis_benchmark_report = run_all_account_benchmarks(profile=aws_profile)
+                else:
+                    from agent_bom.cloud import aws_inventory
+                    from agent_bom.cloud.aws_cis_benchmark import run_benchmark as run_cis
+                    from agent_bom.cloud.aws_cis_benchmark import run_benchmark_all_regions
+
+                    if aws_inventory.all_regions_enabled():
+                        ctx.cis_benchmark_report = run_benchmark_all_regions(profile=aws_profile, region=aws_region)
+                    else:
+                        ctx.cis_benchmark_report = run_cis(region=aws_region, profile=aws_profile)
+            passed = ctx.cis_benchmark_report.passed
+            failed = ctx.cis_benchmark_report.failed
+            total = ctx.cis_benchmark_report.total
+            rate = ctx.cis_benchmark_report.pass_rate
+            errored = getattr(ctx.cis_benchmark_report, "errored", 0)
+            scanned = getattr(ctx.cis_benchmark_report, "accounts_scanned", []) or []
+            regions_scanned = getattr(ctx.cis_benchmark_report, "regions_scanned", []) or []
+            scope = f"{len(scanned)} account(s)" if len(scanned) > 1 else ""
+            if len(regions_scanned) > 1:
+                scope = f"{len(regions_scanned)} region(s)" if not scope else f"{scope}, {len(regions_scanned)} region(s)"
+            if not quiet:
+                print_benchmark_line(
+                    con,
+                    "CIS AWS",
+                    total=total,
+                    passed=passed,
+                    failed=failed,
+                    pass_rate=rate,
+                    scope=scope,
+                    errored=errored,
+                )
+        except CloudDiscoveryError as exc:
+            if not quiet:
+                con.print(f"  [red]CIS Benchmark error: {_safe_error(exc)}[/red]")
+            ctx.cloud_provider_failures.append({"provider": "aws", "stage": "cis_benchmark", "error": str(exc)})
+
+    # Step 1x-sf: CIS Snowflake Benchmark
+    if snowflake_cis_benchmark:
+        from agent_bom.cloud import CloudDiscoveryError as _SFCISError
+
+        if verbose and not quiet:
+            print_lane_header(con, "govern", "CIS Snowflake Benchmark v1.0")
+        try:
+            from agent_bom.cloud.snowflake_cis_benchmark import run_benchmark as run_sf_cis
+
+            with stage_status(con, "[bold]CIS Snowflake Benchmark v1.0[/bold]", enabled=not quiet and not verbose):
+                # Forward the chosen authenticator; account/user resolve from env.
+                ctx.sf_cis_benchmark_report = run_sf_cis(authenticator=snowflake_authenticator or None)
+            passed = ctx.sf_cis_benchmark_report.passed
+            failed = ctx.sf_cis_benchmark_report.failed
+            total = ctx.sf_cis_benchmark_report.total
+            rate = ctx.sf_cis_benchmark_report.pass_rate
+            if not quiet:
+                print_benchmark_line(con, "CIS Snowflake", total=total, passed=passed, failed=failed, pass_rate=rate)
+        except _SFCISError as exc:
+            if not quiet:
+                con.print(f"  [red]CIS Snowflake Benchmark error: {_safe_error(exc)}[/red]")
+            ctx.cloud_provider_failures.append({"provider": "snowflake", "stage": "cis_benchmark", "error": str(exc)})
+
+    # Step 1x-az: CIS Azure Benchmark
+    if azure_cis_benchmark:
+        from agent_bom.cloud import CloudDiscoveryError as _AZCISError
+
+        if verbose and not quiet:
+            print_lane_header(con, "govern", "CIS Azure Security Benchmark v3.0")
+        try:
+            from agent_bom.cloud import azure_inventory
+
+            with stage_status(con, "[bold]CIS Azure Security Benchmark v3.0[/bold]", enabled=not quiet and not verbose):
+                # When the multi-subscription flag is on, fan the benchmark across
+                # every subscription in the tenant (same boundary set the inventory
+                # fan-out uses) and aggregate with per-subscription attribution.
+                # Off = unchanged single-subscription run.
+                if azure_inventory.all_subscriptions_enabled():
+                    from agent_bom.cloud.azure_cis_benchmark import run_all_subscription_benchmarks
+
+                    ctx.azure_cis_benchmark_report = run_all_subscription_benchmarks()
+                else:
+                    from agent_bom.cloud.azure_cis_benchmark import run_benchmark as run_az_cis
+
+                    # Forward the --subscription value; run_benchmark falls back to
+                    # AZURE_SUBSCRIPTION_ID only when this is None.
+                    ctx.azure_cis_benchmark_report = run_az_cis(subscription_id=azure_subscription or None)
+            passed = ctx.azure_cis_benchmark_report.passed
+            failed = ctx.azure_cis_benchmark_report.failed
+            total = ctx.azure_cis_benchmark_report.total
+            rate = ctx.azure_cis_benchmark_report.pass_rate
+            errored = getattr(ctx.azure_cis_benchmark_report, "errored", 0)
+            scanned = getattr(ctx.azure_cis_benchmark_report, "subscriptions_scanned", []) or []
+            scope = f"{len(scanned)} subscription(s)" if len(scanned) > 1 else ""
+            if not quiet:
+                print_benchmark_line(
+                    con,
+                    "CIS Azure",
+                    total=total,
+                    passed=passed,
+                    failed=failed,
+                    pass_rate=rate,
+                    scope=scope,
+                    errored=errored,
+                )
+        except _AZCISError as exc:
+            if not quiet:
+                con.print(f"  [red]CIS Azure Benchmark error: {_safe_error(exc)}[/red]")
+            ctx.cloud_provider_failures.append({"provider": "azure", "stage": "cis_benchmark", "error": str(exc)})
+
+    # Step 1x-gcp: CIS GCP Benchmark
+    if gcp_cis_benchmark:
+        from agent_bom.cloud import CloudDiscoveryError as _GCPCISError
+
+        if verbose and not quiet:
+            print_lane_header(con, "govern", "CIS GCP Foundation Benchmark v3.0")
+        try:
+            from agent_bom.cloud import gcp_inventory
+
+            with stage_status(con, "[bold]CIS GCP Foundation Benchmark v3.0[/bold]", enabled=not quiet and not verbose):
+                # When the multi-project flag is on, fan the benchmark across every
+                # project in the org/folder tree (same boundary set the inventory
+                # fan-out uses) and aggregate with per-project attribution.
+                # Off = unchanged single-project run.
+                if gcp_inventory.all_projects_enabled():
+                    from agent_bom.cloud.gcp_cis_benchmark import run_all_project_benchmarks
+
+                    ctx.gcp_cis_benchmark_report = run_all_project_benchmarks()
+                else:
+                    from agent_bom.cloud.gcp_cis_benchmark import run_benchmark as run_gcp_cis
+
+                    ctx.gcp_cis_benchmark_report = run_gcp_cis()
+            passed = ctx.gcp_cis_benchmark_report.passed
+            failed = ctx.gcp_cis_benchmark_report.failed
+            total = ctx.gcp_cis_benchmark_report.total
+            rate = ctx.gcp_cis_benchmark_report.pass_rate
+            errored = getattr(ctx.gcp_cis_benchmark_report, "errored", 0)
+            scanned = getattr(ctx.gcp_cis_benchmark_report, "projects_scanned", []) or []
+            scope = f"{len(scanned)} project(s)" if len(scanned) > 1 else ""
+            if not quiet:
+                print_benchmark_line(
+                    con,
+                    "CIS GCP",
+                    total=total,
+                    passed=passed,
+                    failed=failed,
+                    pass_rate=rate,
+                    scope=scope,
+                    errored=errored,
+                )
+        except _GCPCISError as exc:
+            if not quiet:
+                con.print(f"  [red]CIS GCP Benchmark error: {_safe_error(exc)}[/red]")
+            ctx.cloud_provider_failures.append({"provider": "gcp", "stage": "cis_benchmark", "error": str(exc)})
+
+    # Step 1x-db: Databricks Security Best Practices
+    if databricks_security:
+        from agent_bom.cloud import CloudDiscoveryError as _DBSecError
+
+        if verbose and not quiet:
+            print_lane_header(con, "govern", "Databricks Security Best Practices")
+        try:
+            import os
+
+            from agent_bom.cloud.databricks_security import run_security_checks as run_db_sec
+
+            with stage_status(con, "[bold]Databricks security checks[/bold]", enabled=not quiet and not verbose):
+                _db_host = os.environ.get("DATABRICKS_HOST")
+                _db_token = os.environ.get("DATABRICKS_TOKEN")
+                ctx.databricks_security_report = run_db_sec(host=_db_host, token=_db_token)
+            passed = ctx.databricks_security_report.passed
+            failed = ctx.databricks_security_report.failed
+            total = ctx.databricks_security_report.total
+            rate = ctx.databricks_security_report.pass_rate
+            if not quiet:
+                print_benchmark_line(con, "Databricks", total=total, passed=passed, failed=failed, pass_rate=rate)
+        except _DBSecError as exc:
+            if not quiet:
+                con.print(f"  [red]Databricks security check error: {_safe_error(exc)}[/red]")
+            ctx.cloud_provider_failures.append({"provider": "databricks", "stage": "security_checks", "error": str(exc)})
+
+    # Step 1x-b: Vector DB scan
+    if vector_db_scan:
+        from rich.table import Table as _RTable
+
+        con.print("\n[bold blue]Scanning for vector databases...[/bold blue]\n")
+        try:
+            from agent_bom.cloud.vector_db import discover_pinecone, discover_vector_dbs
+
+            vector_db_results = discover_vector_dbs()
+            pinecone_results = discover_pinecone()
+            ctx.vector_db_results = [*vector_db_results, *pinecone_results]
+            if not vector_db_results and not pinecone_results:
+                con.print("  [dim]No running vector databases found. Set PINECONE_API_KEY to scan Pinecone.[/dim]")
+            else:
+                total = len(vector_db_results) + len(pinecone_results)
+                con.print(f"  Found [bold]{total}[/bold] vector database(s)")
+                tbl = _RTable(title="Vector DB Security", show_lines=True)
+                tbl.add_column("DB", width=10)
+                tbl.add_column("Instance", width=20)
+                tbl.add_column("Auth", width=8)
+                tbl.add_column("Risk", width=10)
+                tbl.add_column("Flags")
+                _vdb_risk = {
+                    "critical": "[red]critical[/]",
+                    "high": "[bright_red]high[/]",
+                    "medium": "[yellow]medium[/]",
+                    "safe": "[green]safe[/]",
+                }
+                for vdb_r in vector_db_results:
+                    tbl.add_row(
+                        vdb_r.db_type,
+                        f"{vdb_r.host}:{vdb_r.port}",
+                        "[green]yes[/]" if vdb_r.requires_auth else "[red]NO[/]",
+                        _vdb_risk.get(vdb_r.risk_level, vdb_r.risk_level),
+                        ", ".join(vdb_r.risk_flags) or "-",
+                    )
+                for pine_r in pinecone_results:
+                    tbl.add_row(
+                        "pinecone",
+                        pine_r.index_name,
+                        "[green]API key[/]",
+                        _vdb_risk.get(pine_r.risk_level, pine_r.risk_level),
+                        ", ".join(pine_r.risk_flags) or "-",
+                    )
+                con.print()
+                con.print(tbl)
+        except Exception as exc:
+            con.print(f"  [red]Vector DB scan error: {exc}[/red]")
+
+    # Step 1x-b2: GPU infra scan
+    if gpu_scan_flag:
+        import asyncio as _asyncio
+
+        from rich.table import Table as _RTable
+
+        con.print("\n[bold blue]Scanning GPU/AI compute infrastructure...[/bold blue]\n")
+        try:
+            from agent_bom.cloud.gpu_infra import gpu_infra_to_agents, scan_gpu_infra
+
+            with con.status("[bold]Probing Docker, K8s, and DCGM endpoints...[/bold]", spinner="dots"):
+                ctx.gpu_infra_report = _asyncio.run(scan_gpu_infra(k8s_context=gpu_k8s_context, probe_dcgm=not no_dcgm_probe))
+            for w in ctx.gpu_infra_report.warnings:
+                con.print(f"  [yellow]⚠[/yellow] {w}")
+            gpu_agents = gpu_infra_to_agents(ctx.gpu_infra_report)
+            if gpu_agents:
+                ctx.agents.extend(gpu_agents)
+                con.print(
+                    f"  [green]✓[/green] {ctx.gpu_infra_report.total_gpu_containers} GPU container(s), "
+                    f"{len(ctx.gpu_infra_report.gpu_nodes)} K8s GPU node(s)"
+                )
+                if ctx.gpu_infra_report.unique_cuda_versions:
+                    con.print(f"  CUDA versions: {', '.join(ctx.gpu_infra_report.unique_cuda_versions)}")
+                if ctx.gpu_infra_report.unauthenticated_dcgm_count:
+                    con.print(
+                        f"  [red]⚠ {ctx.gpu_infra_report.unauthenticated_dcgm_count} unauthenticated DCGM exporter(s) — metrics leak[/red]"
+                    )
+                if ctx.gpu_infra_report.dcgm_endpoints:
+                    tbl = _RTable(title="DCGM Endpoints", show_lines=False)
+                    tbl.add_column("Host", width=20)
+                    tbl.add_column("Port", width=8)
+                    tbl.add_column("Auth", width=8)
+                    tbl.add_column("GPUs", width=6)
+                    for ep in ctx.gpu_infra_report.dcgm_endpoints:
+                        tbl.add_row(
+                            ep.host,
+                            str(ep.port),
+                            "[green]yes[/]" if ep.authenticated else "[red]NO[/]",
+                            str(ep.gpu_count) if ep.gpu_count is not None else "?",
+                        )
+                    con.print()
+                    con.print(tbl)
+            else:
+                con.print("  [dim]No GPU containers or K8s GPU nodes found[/dim]")
+        except Exception as exc:
+            con.print(f"  [red]GPU scan error: {exc}[/red]")
+
+    # Step 1x-c: AISVS compliance benchmark
+    if aisvs_flag:
+        from rich.table import Table as _RTable
+
+        if verbose and not quiet:
+            print_lane_header(con, "govern", "AISVS v1.0 compliance")
+        try:
+            from agent_bom.cloud.aisvs_benchmark import run_benchmark as _run_aisvs
+
+            with stage_status(con, "[bold]AISVS v1.0 compliance[/bold]", enabled=not quiet and not verbose):
+                ctx.aisvs_report = _run_aisvs()
+            passed = ctx.aisvs_report.passed
+            failed = ctx.aisvs_report.failed
+            total = ctx.aisvs_report.total
+            rate = ctx.aisvs_report.pass_rate
+            if not quiet:
+                print_benchmark_line(con, "AISVS", total=total, passed=passed, failed=failed, pass_rate=rate)
+            if verbose and not quiet:
+                tbl = _RTable(title="AISVS Compliance", show_lines=True)
+                tbl.add_column("Check", width=8)
+                tbl.add_column("Title", max_width=45)
+                tbl.add_column("Status", width=8)
+                tbl.add_column("Sev", width=8)
+                tbl.add_column("MAESTRO", width=22)
+                tbl.add_column("Evidence", max_width=40)
+                _aiv_status = {
+                    "pass": "[green]PASS[/]",
+                    "fail": "[red]FAIL[/]",
+                    "error": "[yellow]ERR[/]",
+                    "not_applicable": "[dim]N/A[/]",
+                }
+                from agent_bom.maestro import tag_aisvs_check as _maestro_tag
+
+                for c in ctx.aisvs_report.checks:
+                    maestro = _maestro_tag(c.check_id).value
+                    tbl.add_row(
+                        c.check_id,
+                        c.title,
+                        _aiv_status.get(c.status.value, c.status.value),
+                        c.severity,
+                        maestro,
+                        c.evidence,
+                    )
+                con.print()
+                con.print(tbl)
+        except Exception as exc:
+            if not quiet:
+                con.print(f"  [red]AISVS benchmark error: {exc}[/red]")
+
+
+# click.Context.meta key the cloud command writes when --show-passed is set;
+# meta is shared across the whole context stack, so it survives the
+# ``cloud scan`` → ``scan`` invoke without a new flag on the scan command.
+CIS_SHOW_PASSED_META = "cis_show_passed"
+
+
+def render_cis_findings_from_context(ctx: ScanContext) -> None:
+    """Render grouped CIS posture once at report time (not during discovery).
+
+    Builds a lightweight report-shaped view exposing each provider's
+    serialized bundle under the attribute name the renderer reads
+    (``*_cis_benchmark_data``), then defers to ``print_cis_findings``.
+    Honors the cloud command's ``--show-passed`` flag (carried on the click
+    context ``meta``) to list passed checks instead of collapsing them.
+    Emits nothing when no CIS data is present.
+    """
+    from types import SimpleNamespace
+    from typing import cast
+
+    import click
+
+    from agent_bom.models import AIBOMReport
+    from agent_bom.output.console_render import print_cis_findings
+
+    bundle_attrs = (
+        ("cis_benchmark_data", ctx.cis_benchmark_report),
+        ("azure_cis_benchmark_data", ctx.azure_cis_benchmark_report),
+        ("gcp_cis_benchmark_data", ctx.gcp_cis_benchmark_report),
+        ("snowflake_cis_benchmark_data", ctx.sf_cis_benchmark_report),
+        ("databricks_security_data", ctx.databricks_security_report),
+    )
+    # print_cis_findings reads each provider's bundle off the report via
+    # getattr(report, "<provider>_cis_benchmark_data"); a namespace carrying
+    # exactly those attributes is all it touches, so no full report is needed.
+    view = SimpleNamespace(**{attr: (rep.to_dict() if rep is not None else None) for attr, rep in bundle_attrs})
+
+    click_ctx = click.get_current_context(silent=True)
+    show_passed = bool(click_ctx.meta.get(CIS_SHOW_PASSED_META)) if click_ctx is not None else False
+    print_cis_findings(cast("AIBOMReport", view), show_passed=show_passed)

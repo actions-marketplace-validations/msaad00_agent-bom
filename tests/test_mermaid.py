@@ -8,12 +8,13 @@ from agent_bom.models import (
     AIBOMReport,
     BlastRadius,
     MCPServer,
+    MCPTool,
     Package,
     Severity,
     TransportType,
     Vulnerability,
 )
-from agent_bom.output.mermaid import to_mermaid, to_mermaid_lifecycle
+from agent_bom.output.mermaid import to_mermaid, to_mermaid_lifecycle, to_mermaid_supply_chain
 
 
 def _make_report_and_blast_radii():
@@ -72,11 +73,99 @@ def test_mermaid_edges():
     assert "-->|exposes|" in result
 
 
+def test_mermaid_uses_short_ids_with_descriptive_labels():
+    """Flowchart IDs stay readable while labels keep entity names."""
+    report, brs = _make_report_and_blast_radii()
+    result = to_mermaid(report, brs)
+    assert "n1" in result
+    assert "CVE_2024_1234" not in result
+    assert "srv_test_server" not in result
+    assert "CVE-2024-1234" in result
+    assert "test-server" in result
+    assert "claude-desktop" in result
+
+
+def test_mermaid_supply_chain_uses_short_ids_with_descriptive_labels():
+    """Supply-chain Mermaid output avoids long agent/server IDs."""
+    report, _brs = _make_report_and_blast_radii()
+    result = to_mermaid_supply_chain(report)
+    assert "n1" in result
+    assert "agt_claude_desktop" not in result
+    assert "srv_claude_desktop_test_server" not in result
+    assert "claude-desktop" in result
+    assert "test-server" in result
+    assert "express@4.17.1" in result
+
+
+def test_mermaid_supply_chain_uses_canonical_severity_rank() -> None:
+    """Supply-chain package styling picks the worst vuln via severity_rank()."""
+    crit = Vulnerability(id="CVE-CRIT", severity=Severity.CRITICAL, summary="critical pkg vuln")
+    low = Vulnerability(id="CVE-LOW", severity=Severity.LOW, summary="low pkg vuln")
+    pkg = Package(
+        name="lodash",
+        version="4.17.20",
+        ecosystem="npm",
+        vulnerabilities=[low, crit],
+    )
+    server = MCPServer(
+        name="pkg-server",
+        command="npx",
+        args=["-y", "@test/server"],
+        transport=TransportType.STDIO,
+        packages=[pkg],
+    )
+    agent = Agent(
+        name="desktop",
+        agent_type=AgentType.CLAUDE_DESKTOP,
+        config_path="/tmp/config.json",
+        mcp_servers=[server],
+    )
+    result = to_mermaid_supply_chain(AIBOMReport(agents=[agent]))
+    assert "fill:#d32f2f" in result
+
+
 def test_mermaid_credential_exposure():
     """Mermaid output shows exposed credentials."""
     report, brs = _make_report_and_blast_radii()
     result = to_mermaid(report, brs)
     assert "API_KEY" in result
+
+
+def test_mermaid_attack_flow_shows_credential_to_tool_reachability():
+    """Attack-flow Mermaid output carries conservative credential -> tool evidence."""
+    report, brs = _make_report_and_blast_radii()
+    brs[0].exposed_tools = [MCPTool(name="delete_repo", description="Delete repository")]
+    result = to_mermaid(report, brs)
+    assert "delete_repo" in result
+    assert "|reaches_tool|" in result
+
+
+def test_mermaid_supply_chain_shows_credential_to_tool_reachability():
+    """Supply-chain Mermaid output carries conservative credential -> tool evidence."""
+    server = MCPServer(
+        name="github",
+        command="npx",
+        args=["-y", "@modelcontextprotocol/server-github"],
+        env={"GITHUB_TOKEN": "***"},
+        transport=TransportType.STDIO,
+        tools=[
+            MCPTool(name="create_issue", description="Create issue"),
+            MCPTool(name="delete_repo", description="Delete repository"),
+        ],
+    )
+    agent = Agent(
+        name="claude-desktop",
+        agent_type=AgentType.CLAUDE_DESKTOP,
+        config_path="/tmp/config.json",
+        mcp_servers=[server],
+    )
+    result = to_mermaid_supply_chain(AIBOMReport(agents=[agent]))
+
+    assert "GITHUB_TOKEN" in result
+    assert "delete_repo" in result
+    assert "|provides_tool|" in result
+    assert "|exposes_cred|" in result
+    assert "|reaches_tool|" in result
 
 
 def test_mermaid_severity_styling():

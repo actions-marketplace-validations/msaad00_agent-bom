@@ -1,0 +1,876 @@
+"""Compliance narrative generator — review-ready stories from scan data.
+
+Produces human-readable compliance narratives from AIBOMReport data without
+requiring an LLM.  Uses template strings and structured data from blast_radius
+entries to generate executive summaries, per-framework stories, and
+remediation-compliance bridges.
+
+Supported frameworks (slug → display name):
+    owasp-llm         OWASP Top 10 for LLM
+    owasp-mcp         OWASP MCP Top 10
+    owasp-agentic     OWASP Agentic Top 10
+    nist-800-53       NIST SP 800-53
+    fedramp           FedRAMP Moderate
+    atlas             MITRE ATLAS
+    attack            MITRE ATT&CK Enterprise
+    nist              NIST AI RMF
+    eu-ai-act         EU AI Act
+    nist-csf          NIST CSF 2.0
+    iso-27001         ISO 27001:2022
+    soc2              SOC 2 TSC
+    cis               CIS Controls v8
+    cmmc              CMMC 2.0
+    pci-dss           PCI DSS v4.0
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agent_bom.models import AIBOMReport
+
+from agent_bom import config
+from agent_bom.compliance_coverage import (
+    COMPLIANCE_TAG_FIELDS,
+    FRAMEWORK_SLUG_ALIASES,
+    control_key_for_tag,
+    normalize_framework_slug,
+)
+from agent_bom.evidence.control_modes import DETECTIVE_CONTROLS, detective_control_status
+
+COMPLIANCE_CLAIM_BOUNDARY = (
+    "Vulnerability-to-control mappings are review evidence, not a determination of compliance, "
+    "certification, audit result, or regulatory breach."
+)
+
+# ─── Catalogue lookups ────────────────────────────────────────────────────────
+# Imported lazily where needed to keep top-level import cost low.
+
+_DISPLAY_NAME_OVERRIDES: dict[str, str] = {
+    "owasp-llm": "OWASP Top 10 for LLM",
+    "owasp-mcp": "OWASP MCP Top 10",
+    "owasp-agentic": "OWASP Agentic Top 10",
+    "nist": "NIST AI RMF",
+    "nist-csf": "NIST CSF 2.0",
+    "nist-800-53": "NIST 800-53",
+    "fedramp": "FedRAMP",
+    "atlas": "MITRE ATLAS",
+    "attack": "MITRE ATT&CK",
+    "iso-27001": "ISO 27001:2022",
+    "soc2": "SOC 2 TSC",
+    "cis": "CIS Controls v8",
+    "cmmc": "CMMC 2.0",
+}
+
+
+def _get_catalog(slug: str) -> tuple[dict[str, str], str, str]:
+    """Return (catalog_dict, tag_field_on_blast_radius, display_name) for a framework slug."""
+    from agent_bom.compliance_coverage import TAG_MAPPED_FRAMEWORKS
+
+    framework_map: dict[str, tuple[dict[str, str], str, str]] = {}
+    for metadata in TAG_MAPPED_FRAMEWORKS:
+        catalog = dict(metadata.catalog)
+        if metadata.slug == "attack":
+            from agent_bom.mitre_attack import get_attack_techniques
+
+            catalog = get_attack_techniques()
+        framework_map[metadata.slug] = (catalog, metadata.tag_field, _DISPLAY_NAME_OVERRIDES.get(metadata.slug, metadata.report_label))
+    entry = framework_map.get(slug)
+    if entry is None:
+        raise ValueError(f"Unknown framework '{slug}'. Supported: {', '.join(framework_map.keys())}")
+    return entry
+
+
+def _all_framework_slugs() -> list[str]:
+    from agent_bom.compliance_coverage import TAG_MAPPED_FRAMEWORKS
+
+    return [metadata.slug for metadata in TAG_MAPPED_FRAMEWORKS]
+
+
+ALL_FRAMEWORK_SLUGS: list[str] = _all_framework_slugs()
+ACCEPTED_FRAMEWORK_SLUGS: list[str] = [*ALL_FRAMEWORK_SLUGS, *FRAMEWORK_SLUG_ALIASES]
+
+
+# ─── Dataclasses ─────────────────────────────────────────────────────────────
+
+
+@dataclass
+class ControlNarrative:
+    """Auditor-facing explanation of a single failing control."""
+
+    control_id: str
+    title: str
+    status: str  # "pass" | "warning" | "fail"
+    narrative: str
+    affected_packages: list[str] = field(default_factory=list)
+    affected_agents: list[str] = field(default_factory=list)
+    # The vulnerability ids that mapped onto this control. Without them an
+    # auditor can only walk control -> package and can never tie the control
+    # assertion back to the finding that produced it.
+    affected_findings: list[str] = field(default_factory=list)
+    remediation_steps: list[str] = field(default_factory=list)
+
+
+@dataclass
+class FrameworkNarrative:
+    """Per-framework compliance story."""
+
+    framework: str  # display name, e.g. "OWASP Top 10 for LLM"
+    slug: str  # e.g. "owasp-llm"
+    status: str  # "evidence_current" | "review" | "action_required" | "not_evaluated"
+    score: int  # 0-100, over evaluated controls only (0 when nothing evaluated)
+    narrative: str  # 2-3 sentences
+    failing_controls: list[ControlNarrative] = field(default_factory=list)
+    recommendations: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RemediationImpact:
+    """How a single package upgrade maps to compliance controls."""
+
+    package: str
+    current_version: str
+    fix_version: str  # empty string when no fix is available
+    controls_fixed: list[str]  # control codes, e.g. ["LLM05", "MCP04"]
+    frameworks_impacted: list[str]  # framework display names
+    narrative: str  # "Upgrading X from Y to Z fixes controls A, B, C"
+
+
+@dataclass
+class ComplianceNarrative:
+    """Full review-ready compliance story from a scan."""
+
+    executive_summary: str
+    framework_narratives: list[FrameworkNarrative]
+    remediation_impact: list[RemediationImpact]
+    risk_narrative: str
+    generated_at: str  # ISO 8601
+    claim_boundary: str = COMPLIANCE_CLAIM_BOUNDARY
+    # Catalog-backed NIST SP 800-53 Rev 5 line (vendor-asserted), scored over
+    # EVALUATED controls only, with ISO-by-id attribution — the same
+    # representation the /v1/compliance API line reports (one source of truth).
+    # Empty dict when a single-framework narrative is scoped to a non-NIST slug.
+    nist_800_53_catalog: dict = field(default_factory=dict)
+
+
+# ─── Internal helpers ─────────────────────────────────────────────────────────
+
+
+def _severity_order(sev: str) -> int:
+    from agent_bom.graph.severity import severity_worst_first_rank
+
+    return severity_worst_first_rank(sev)
+
+
+def _control_status(sev_breakdown: dict[str, int]) -> str:
+    """Status of a control that HAS mapped findings, by worst severity.
+
+    Mirror of ``routes/compliance._evaluated_control_status``. Callers only reach
+    this with findings > 0, so an all-zero breakdown means every mapped finding
+    is unrated-severity — evidence exists but severity is ungraded, which is
+    ``not_evaluated``, never a silent pass. Keep in sync with that function.
+    """
+    if sev_breakdown.get("critical", 0) > 0 or sev_breakdown.get("high", 0) > 0:
+        return "fail"
+    if sev_breakdown.get("medium", 0) > 0 or sev_breakdown.get("low", 0) > 0:
+        return "warning"
+    return "not_evaluated"
+
+
+def _control_narrative(
+    control_id: str,
+    control_name: str,
+    findings: int,
+    affected_pkgs: list[str],
+    affected_agents: list[str],
+    sev_breakdown: dict[str, int],
+) -> str:
+    """Generate a plain-English explanation for a control's status."""
+    if findings == 0:
+        return (
+            f"Control {control_id} ({control_name}) shows no findings in this scan. "
+            "This is an absence of mapped findings, not a determination that the control is satisfied."
+        )
+
+    pkg_str = ", ".join(affected_pkgs[:3])
+    if len(affected_pkgs) > 3:
+        pkg_str += f" and {len(affected_pkgs) - 3} more"
+
+    agent_str = ""
+    if affected_agents:
+        a_list = ", ".join(affected_agents[:3])
+        agent_str = f" reaching agent{'s' if len(affected_agents) > 1 else ''} {a_list}"
+
+    crit = sev_breakdown.get("critical", 0)
+    high = sev_breakdown.get("high", 0)
+    med = sev_breakdown.get("medium", 0)
+
+    severity_desc = ""
+    if crit:
+        severity_desc = f"{crit} critical"
+        if high:
+            severity_desc += f" and {high} high"
+    elif high:
+        severity_desc = f"{high} high"
+    elif med:
+        severity_desc = f"{med} medium"
+    else:
+        severity_desc = "low"
+
+    return (
+        f"Control {control_id} ({control_name}) has {findings} finding"
+        f"{'s' if findings > 1 else ''} ({severity_desc} severity) "
+        f"in packages: {pkg_str}{agent_str}. "
+        "The mapped finding requires review and remediation; this mapping does not determine control compliance."
+    )
+
+
+def _detective_control_narrative(control_id: str, control_name: str, status: str) -> str:
+    """Explain a detective control's status in scan-evidence terms.
+
+    A detective control is *implemented by* the scan (see
+    :mod:`agent_bom.evidence.control_modes`), so its story is about evidence
+    freshness, never about which findings mapped to it.
+    """
+    if status == "pass":
+        return (
+            f"Control {control_id} ({control_name}) is evidenced by this scan itself: "
+            "the run completed inside the evidence-freshness window, which is what "
+            "this control requires. Findings surfaced by the scan are proof the "
+            "control operates, not proof it failed."
+        )
+    return (
+        f"Control {control_id} ({control_name}) has no scan evidence inside the "
+        f"freshness window ({config.COMPLIANCE_DETECTIVE_EVIDENCE_MAX_AGE_DAYS} days) — "
+        "the evidence backing it is stale, so continuous monitoring has lapsed. "
+        "Its evidence status requires action independently of any vulnerability finding."
+    )
+
+
+def _detective_remediation_steps(control_id: str, control_name: str) -> list[str]:
+    """Remediation for a detective control is to resume scanning, not to patch."""
+    return [
+        f"Re-run agent-bom so {control_id} is backed by evidence inside the "
+        f"{config.COMPLIANCE_DETECTIVE_EVIDENCE_MAX_AGE_DAYS}-day freshness window.",
+        "Schedule the scan continuously (CI or a recurring job) — this evidence documents "
+        "ongoing monitoring, so a one-off run is current only until the window lapses.",
+        f"Record the scan cadence for {control_name} in your compliance evidence package.",
+    ]
+
+
+def _control_remediation_steps(
+    control_id: str,
+    control_name: str,
+    affected_pkgs: list[str],
+    sev_breakdown: dict[str, int],
+) -> list[str]:
+    """Generate actionable remediation steps for mapped control evidence."""
+    steps: list[str] = []
+    if affected_pkgs:
+        steps.append(f"Upgrade vulnerable packages: {', '.join(affected_pkgs[:5])}" + (" (and others)" if len(affected_pkgs) > 5 else ""))
+    if sev_breakdown.get("critical", 0) or sev_breakdown.get("high", 0):
+        steps.append("Prioritise critical and high severity findings for immediate patching, then validate the control independently.")
+    steps.append(f"Re-run agent-bom after upgrades to verify findings mapped to {control_id} are no longer detected.")
+    steps.append(f"Document the remediation timeline for {control_name} in your compliance evidence package.")
+    return steps
+
+
+def _framework_overall_narrative(
+    display_name: str,
+    total_controls: int,
+    evaluated_count: int,
+    pass_count: int,
+    fail_count: int,
+    warn_count: int,
+    critical_failing: list[str],
+    score: int,
+) -> str:
+    """2-3 sentence framework-level posture narrative."""
+    if evaluated_count == 0:
+        return (
+            f"No {display_name} controls could be evaluated in this scan: "
+            f"0 of {total_controls} controls have vulnerability-derived evidence. "
+            "This is a coverage gap, not a pass — controls without mapped findings are "
+            f"reported as not-evaluated. Run scans that map findings to {display_name} "
+            "before relying on this posture."
+        )
+
+    plural = "s" if evaluated_count != 1 else ""
+    if fail_count == 0 and warn_count == 0:
+        return (
+            f"Evidence is current for all {evaluated_count} evaluated {display_name} control{plural} "
+            f"({evaluated_count} of {total_controls} controls evaluated; score {score}/100 "
+            "over evaluated controls). Controls with no mapped findings are reported as "
+            "not-evaluated rather than compliant. This evidence status is not an audit conclusion."
+        )
+
+    if fail_count == 0:
+        return (
+            f"{display_name} evidence requires review: {warn_count} control"
+            f"{'s have' if warn_count > 1 else ' has'} mapped medium or low severity findings "
+            f"(score {score}/100 over {evaluated_count} evaluated control{plural}). "
+            "Schedule remediation within the next maintenance cycle. The mapping is not a compliance determination."
+        )
+
+    ctrl_str = ", ".join(critical_failing[:3])
+    if len(critical_failing) > 3:
+        ctrl_str += f" and {len(critical_failing) - 3} others"
+
+    return (
+        f"{display_name} evidence requires action: {fail_count} control"
+        f"{'s have' if fail_count > 1 else ' has'} mapped critical or high severity findings "
+        f"(score {score}/100 over {evaluated_count} evaluated control{plural}). "
+        f"Controls requiring review include {ctrl_str}. "
+        "Remediate the underlying findings and obtain independent control evidence before drawing a compliance conclusion."
+    )
+
+
+def _signing_caveat() -> str:
+    """Qualify "export a signed bundle" when this deployment's signer is ephemeral.
+
+    Recommending auditor submission is only honest when the signature can be
+    checked. A default deployment signs with a per-process HMAC key, so the
+    recommendation has to carry that fact rather than imply verifiable evidence.
+    """
+    from agent_bom.api.compliance_signing import describe_signer_disclosure
+
+    disclosure = describe_signer_disclosure()
+    if disclosure.signature_verifiable:
+        return ""
+    return (
+        " Note: this deployment currently signs with a per-process key, so the bundle's signature cannot be verified "
+        "by an auditor — or by this deployment after a restart. Set AGENT_BOM_AUDIT_HMAC_KEY, or "
+        "AGENT_BOM_COMPLIANCE_ED25519_PRIVATE_KEY_PEM for auditor-distributable signing, and re-export before "
+        "submitting."
+    )
+
+
+def _framework_recommendations(
+    display_name: str,
+    slug: str,
+    fail_count: int,
+    warn_count: int,
+    failing_controls: list[ControlNarrative],
+) -> list[str]:
+    """Generate 2-4 actionable framework-level recommendations."""
+    recs: list[str] = []
+    if fail_count:
+        recs.append(
+            f"Review and remediate all critical/high findings mapped to {display_name} before the next audit window; "
+            "validate control operation with independent evidence."
+        )
+    if warn_count:
+        recs.append(f"Schedule remediation for {display_name} warning-state controls within the next sprint or maintenance cycle.")
+    if failing_controls:
+        top_pkgs: list[str] = []
+        for ctrl in failing_controls[:3]:
+            top_pkgs.extend(ctrl.affected_packages[:2])
+        if top_pkgs:
+            recs.append(f"Prioritise upgrades to: {', '.join(dict.fromkeys(top_pkgs))}")
+    recs.append(
+        f"Export a signed {display_name} evidence bundle from the compliance API "
+        f"(`GET /v1/compliance/{slug}/report`, or the all-framework pack at "
+        "`GET /v1/compliance/report/pack`) for auditor submission." + _signing_caveat()
+    )
+    return recs
+
+
+# ─── Per-framework builder ────────────────────────────────────────────────────
+
+
+def _build_framework_narrative(
+    slug: str,
+    blast_radii_dicts: list[dict],
+    *,
+    scan_count: int = 0,
+    latest_scan: str | None = None,
+) -> FrameworkNarrative:
+    """Build a FrameworkNarrative for a single framework from pre-serialised blast radius data.
+
+    ``scan_count``/``latest_scan`` carry the scan-evidence freshness that
+    detective controls are scored from — see :func:`_build_framework_narrative`'s
+    detective branch and :mod:`agent_bom.evidence.control_modes`.
+    """
+    catalog, tag_field, display_name = _get_catalog(slug)
+    detective_ids = DETECTIVE_CONTROLS.get(tag_field, frozenset())
+
+    control_data: dict[str, dict] = {}
+    for code, name in catalog.items():
+        control_data[code] = {
+            "name": name,
+            "findings": 0,
+            "severity_breakdown": {"critical": 0, "high": 0, "medium": 0, "low": 0},
+            "affected_pkgs": set(),
+            "affected_agents": set(),
+            "affected_findings": set(),
+        }
+
+    for br in blast_radii_dicts:
+        tags = br.get(tag_field, [])
+        sev = (br.get("severity") or "").lower()
+        pkg = br.get("package", "")
+        agents = br.get("affected_agents", [])
+        vuln_id = br.get("vulnerability_id") or ""
+        for tag in tags:
+            control_id = control_key_for_tag(tag, catalog)
+            if control_id is None:
+                continue
+            entry = control_data[control_id]
+            entry["findings"] += 1
+            if sev in entry["severity_breakdown"]:
+                entry["severity_breakdown"][sev] += 1
+            if pkg:
+                entry["affected_pkgs"].add(pkg)
+            if vuln_id:
+                entry["affected_findings"].add(vuln_id)
+            for agent in agents:
+                entry["affected_agents"].add(agent)
+
+    total_controls = len(control_data)
+    evaluated_count = 0
+    pass_count = 0
+    warn_count = 0
+    fail_count = 0
+    failing_controls: list[ControlNarrative] = []
+    critical_failing_ids: list[str] = []
+
+    for code, data in sorted(control_data.items()):
+        if code in detective_ids:
+            # The scan IS this control operating ("monitor and scan for
+            # vulnerabilities", "maintain a component inventory"). Findings are
+            # never tagged onto it, so the zero-mapped-findings skip below
+            # dropped it from the narrative entirely instead of reporting the
+            # pass it earned. Score it from evidence freshness, like the API.
+            status, _reason = detective_control_status(scan_count=scan_count, latest_scan=latest_scan)
+            if status == "not_assessed":
+                # No completed scan: nothing was measured, so the control is not
+                # asserted in either direction.
+                continue
+            evaluated_count += 1
+            if status == "pass":
+                pass_count += 1
+                continue
+            fail_count += 1
+            critical_failing_ids.append(code)
+            failing_controls.append(
+                ControlNarrative(
+                    control_id=code,
+                    title=data["name"],
+                    status=status,
+                    narrative=_detective_control_narrative(code, data["name"], status),
+                    remediation_steps=_detective_remediation_steps(code, data["name"]),
+                )
+            )
+            continue
+
+        # A control is only "evaluated" when at least one finding maps to it.
+        # Controls with zero mapped findings carry no vulnerability-derived
+        # evidence, so they are not-evaluated — never counted as a silent pass.
+        if data["findings"] == 0:
+            continue
+        status = _control_status(data["severity_breakdown"])
+        if status == "not_evaluated":
+            # Findings map here but all are unrated-severity: evidence exists but
+            # severity is ungraded, so it is not an evaluated pass/warn/fail — it
+            # must not inflate the denominator or read as a silent pass. Mirrors
+            # the API excluding not_evaluated controls from evaluated_controls.
+            continue
+        evaluated_count += 1
+        pkgs = sorted(data["affected_pkgs"])
+        agents = sorted(data["affected_agents"])
+
+        if status == "pass":
+            pass_count += 1
+        elif status == "warning":
+            warn_count += 1
+        else:
+            fail_count += 1
+            critical_failing_ids.append(code)
+
+        if status in ("warning", "fail"):
+            failing_controls.append(
+                ControlNarrative(
+                    control_id=code,
+                    title=data["name"],
+                    status=status,
+                    narrative=_control_narrative(code, data["name"], data["findings"], pkgs, agents, data["severity_breakdown"]),
+                    affected_packages=pkgs,
+                    affected_agents=agents,
+                    affected_findings=sorted(data["affected_findings"]),
+                    remediation_steps=_control_remediation_steps(code, data["name"], pkgs, data["severity_breakdown"]),
+                )
+            )
+
+    # Score over EVALUATED controls only. With nothing evaluated there is no
+    # evidence, so the score is 0 (not 100) and the status is not_evaluated —
+    # an empty scan must never read as "fully compliant".
+    score = round((pass_count / evaluated_count) * 100) if evaluated_count > 0 else 0
+
+    if evaluated_count == 0:
+        fw_status = "not_evaluated"
+    elif fail_count > 0:
+        fw_status = "action_required"
+    elif warn_count > 0:
+        fw_status = "review"
+    else:
+        fw_status = "evidence_current"
+
+    narrative = _framework_overall_narrative(
+        display_name, total_controls, evaluated_count, pass_count, fail_count, warn_count, critical_failing_ids, score
+    )
+    recommendations = _framework_recommendations(display_name, slug, fail_count, warn_count, failing_controls)
+
+    return FrameworkNarrative(
+        framework=display_name,
+        slug=slug,
+        status=fw_status,
+        score=score,
+        narrative=narrative,
+        failing_controls=failing_controls,
+        recommendations=recommendations,
+    )
+
+
+# ─── Remediation-compliance bridge ───────────────────────────────────────────
+
+
+def _build_remediation_impact(
+    blast_radii_dicts: list[dict],
+    framework_slug: str | None = None,
+) -> list[RemediationImpact]:
+    """Cross-reference fix versions with control tags to build RemediationImpact entries.
+
+    Groups blast radius entries by (package, current_version, fix_version),
+    collects framework control codes triggered, and generates a narrative.
+
+    When ``framework_slug`` is set, only that framework's controls are listed —
+    so a single-framework report (e.g. ``--framework soc2``) doesn't bleed ISO /
+    NIST / EU-AI-Act control IDs into its remediation section.
+    """
+    from agent_bom.compliance_coverage import TAG_MAPPED_FRAMEWORKS
+
+    field_to_framework = {
+        metadata.tag_field: _DISPLAY_NAME_OVERRIDES.get(metadata.slug, metadata.report_label) for metadata in TAG_MAPPED_FRAMEWORKS
+    }
+    if framework_slug:
+        try:
+            _catalog, tag_field, display_name = _get_catalog(framework_slug)
+            field_to_framework = {tag_field: display_name}
+        except ValueError:
+            pass  # unknown slug — fall back to all frameworks
+
+    # Group: key = (pkg_name_version, fix_version)
+    # value = {controls: set, frameworks: set}
+    groups: dict[tuple[str, str], dict] = {}
+
+    for br in blast_radii_dicts:
+        raw_pkg = br.get("package", "")  # "name@version" format from json_fmt
+        fix_ver = br.get("fixed_version") or ""
+
+        # Extract current version from "name@version" string
+        if "@" in raw_pkg:
+            pkg_name, current_ver = raw_pkg.rsplit("@", 1)
+        else:
+            pkg_name = raw_pkg
+            current_ver = ""
+
+        key = (f"{pkg_name}@{current_ver}", fix_ver)
+        if key not in groups:
+            groups[key] = {
+                "pkg_name": pkg_name,
+                "current_ver": current_ver,
+                "fix_ver": fix_ver,
+                "controls": set(),
+                "frameworks": set(),
+            }
+
+        for tag_field, framework_label in field_to_framework.items():
+            for tag in br.get(tag_field, []):
+                groups[key]["controls"].add(tag)
+                groups[key]["frameworks"].add(framework_label)
+
+    impacts: list[RemediationImpact] = []
+    for _key, data in groups.items():
+        controls = sorted(data["controls"])
+        frameworks = sorted(data["frameworks"])
+        if not controls:
+            continue  # skip entries with no compliance tags
+
+        pkg_name = data["pkg_name"]
+        current_ver = data["current_ver"]
+        fix_ver = data["fix_ver"]
+
+        if fix_ver:
+            ctrl_str = ", ".join(controls[:5])
+            if len(controls) > 5:
+                ctrl_str += f" and {len(controls) - 5} more"
+            narrative = f"Upgrading {pkg_name} from {current_ver} to {fix_ver} resolves compliance findings for controls: {ctrl_str}."
+        else:
+            ctrl_str = ", ".join(controls[:5])
+            narrative = (
+                f"{pkg_name} {current_ver} has no fix available. "
+                f"Controls affected: {ctrl_str}. "
+                "Consider a mitigating control or package replacement."
+            )
+
+        impacts.append(
+            RemediationImpact(
+                package=pkg_name,
+                current_version=current_ver,
+                fix_version=fix_ver,
+                controls_fixed=controls,
+                frameworks_impacted=frameworks,
+                narrative=narrative,
+            )
+        )
+
+    # Sort by number of controls fixed (most impactful first)
+    impacts.sort(key=lambda x: len(x.controls_fixed), reverse=True)
+    return impacts
+
+
+# ─── Top-level risk narrative ─────────────────────────────────────────────────
+
+
+def _build_risk_narrative(
+    blast_radii_dicts: list[dict],
+    total_agents: int,
+    total_vulns: int,
+    critical_count: int,
+) -> str:
+    """Plain-English top-risk explanation from scan data."""
+    if not blast_radii_dicts:
+        return (
+            "No vulnerabilities were detected in this scan. "
+            "The AI agent environment appears clean based on the packages assessed. "
+            "Continue regular scanning to detect newly published vulnerabilities."
+        )
+
+    kev_entries = [br for br in blast_radii_dicts if br.get("is_kev")]
+    # Find the highest-risk entry
+    sorted_by_risk = sorted(
+        blast_radii_dicts,
+        key=lambda b: (
+            -(b.get("risk_score") or 0),
+            _severity_order(b.get("severity") or "low"),
+        ),
+    )
+    top = sorted_by_risk[0] if sorted_by_risk else None
+
+    parts: list[str] = []
+
+    # Lead sentence
+    agent_str = f"{total_agents} agent{'s' if total_agents != 1 else ''}"
+    parts.append(f"This scan identified {total_vulns} vulnerabilit{'ies' if total_vulns != 1 else 'y'} across {agent_str}.")
+
+    # KEV callout
+    if kev_entries:
+        kev_pkgs = list({(br.get("package") or "") for br in kev_entries})[:3]
+        parts.append(
+            f"{len(kev_entries)} finding{'s are' if len(kev_entries) > 1 else ' is'} "
+            f"listed in the CISA Known Exploited Vulnerabilities (KEV) catalog "
+            f"(packages: {', '.join(kev_pkgs)}), indicating active exploitation in the wild."
+        )
+
+    # Critical callout
+    if critical_count and not kev_entries:
+        parts.append(
+            f"{critical_count} critical severity finding{'s require' if critical_count > 1 else ' requires'} "
+            "immediate attention as they represent the highest exploitability risk."
+        )
+
+    # Top finding
+    if top:
+        top_pkg = top.get("package", "an affected package")
+        top_vuln = top.get("vulnerability_id", "an unknown CVE")
+        top_agents = top.get("affected_agents", [])
+        top_creds = top.get("exposed_credentials", [])
+        top_score = top.get("risk_score") or 0
+
+        agent_exposure = ""
+        if top_agents:
+            agent_exposure = f", affecting agent{'s' if len(top_agents) > 1 else ''} {', '.join(top_agents[:2])}"
+
+        cred_exposure = ""
+        if top_creds:
+            cred_exposure = f" with {len(top_creds)} exposed credential{'s' if len(top_creds) > 1 else ''}"
+
+        parts.append(f"The highest-risk finding is {top_vuln} in {top_pkg} (risk score {top_score:.1f}/10{agent_exposure}{cred_exposure}).")
+
+    return " ".join(parts)
+
+
+# ─── Executive summary ────────────────────────────────────────────────────────
+
+
+def _build_executive_summary(
+    framework_narratives: list[FrameworkNarrative],
+    total_agents: int,
+    total_packages: int,
+    total_vulns: int,
+    critical_count: int,
+    generated_at: str,
+) -> str:
+    """3-5 sentence executive summary for compliance stakeholders."""
+    action_fws = [fn for fn in framework_narratives if fn.status == "action_required"]
+    review_fws = [fn for fn in framework_narratives if fn.status == "review"]
+    evaluated_fws = [fn for fn in framework_narratives if fn.status in ("evidence_current", "review", "action_required")]
+    # Lead: what was scanned
+    sentences: list[str] = [
+        f"This AI-BOM compliance report covers {total_agents} AI agent"
+        f"{'s' if total_agents != 1 else ''} "
+        f"and {total_packages} package{'s' if total_packages != 1 else ''} "
+        f"scanned on {generated_at[:10]}."
+    ]
+
+    # Vulnerability posture
+    if total_vulns == 0:
+        sentences.append("No vulnerabilities were detected; all assessed dependencies are clean.")
+    elif critical_count > 0:
+        sentences.append(
+            f"{total_vulns} vulnerabilit{'ies were' if total_vulns > 1 else 'y was'} identified "
+            f"including {critical_count} critical finding"
+            f"{'s' if critical_count > 1 else ''} that require immediate remediation."
+        )
+    else:
+        sentences.append(f"{total_vulns} vulnerabilit{'ies were' if total_vulns > 1 else 'y was'} identified across the assessed packages.")
+
+    # Framework posture
+    total_fws = len(framework_narratives)
+    if action_fws:
+        fw_names = ", ".join(fn.framework for fn in action_fws[:3])
+        sentences.append(f"{len(action_fws)} of {total_fws} framework mappings have evidence requiring action: {fw_names}.")
+    elif review_fws:
+        fw_names = ", ".join(fn.framework for fn in review_fws[:3])
+        sentences.append(
+            f"No framework mapping has critical/high findings; {len(review_fws)} "
+            f"{'require' if len(review_fws) > 1 else 'requires'} review: {fw_names}."
+        )
+    elif evaluated_fws:
+        sentences.append(f"All {len(evaluated_fws)} evaluated framework evidence sets are current with no mapped critical findings.")
+    else:
+        sentences.append(
+            f"None of the {total_fws} frameworks could be evaluated — no findings mapped to their "
+            "controls, so compliance posture is unknown rather than compliant."
+        )
+
+    # Closing action
+    if action_fws or review_fws:
+        sentences.append(
+            "Remediation of identified vulnerabilities is the highest-priority action; control owners must validate compliance separately."
+        )
+    else:
+        sentences.append("Continue regular scanning and independent control validation to maintain current evidence coverage.")
+
+    return " ".join(sentences)
+
+
+# ─── Public API ───────────────────────────────────────────────────────────────
+
+
+def generate_compliance_narrative(
+    report: "AIBOMReport",
+    framework: str | None = None,
+) -> ComplianceNarrative:
+    """Generate review-ready compliance narrative from scan results.
+
+    Args:
+        report: The AIBOMReport to analyse.
+        framework: Optional framework slug to generate a single-framework
+            narrative.  When None (default), all frameworks are included.
+            Supported slugs are the tag-mapped slugs in
+            agent_bom.compliance_coverage.TAG_MAPPED_FRAMEWORKS.
+
+    Returns:
+        A ComplianceNarrative dataclass suitable for JSON serialisation.
+
+    Raises:
+        ValueError: If an unknown framework slug is provided.
+    """
+    # Validate slug early so we fail fast before any computation
+    if framework is not None:
+        framework = normalize_framework_slug(framework)
+        _get_catalog(framework)  # raises ValueError for unknown slugs
+
+    # Build a lightweight list-of-dicts from blast_radii (avoids re-importing models)
+    blast_dicts: list[dict] = []
+    for br in report.blast_radii:
+        blast_dicts.append(
+            {
+                "vulnerability_id": br.vulnerability.id,
+                "severity": br.vulnerability.severity.value,
+                "package": f"{br.package.name}@{br.package.version}",
+                "fixed_version": br.vulnerability.fixed_version,
+                "risk_score": br.risk_score,
+                "is_kev": br.vulnerability.is_kev,
+                "affected_agents": [a.name for a in br.affected_agents],
+                "affected_servers": [s.name for s in br.affected_servers],
+                "exposed_credentials": br.exposed_credentials,
+                **{field: list(getattr(br, field, []) or []) for field in COMPLIANCE_TAG_FIELDS},
+            }
+        )
+
+    slugs = [framework] if framework is not None else ALL_FRAMEWORK_SLUGS
+
+    # Scan-evidence freshness for detective controls. ``scan_count`` uses the
+    # same conservative derivation as the nist_800_53_catalog line below — a
+    # report carrying no findings is treated as no evidence, so an unmapped or
+    # unscanned estate reads not_evaluated rather than a fabricated pass, and
+    # the two representations in one narrative cannot contradict each other.
+    # ``generated_at`` may be absent on the lightweight shim the CLI rebuilds
+    # from a saved artifact; an unknown age is reported as unknown, never
+    # silently assumed fresh (see ``detective_control_status``).
+    _scan_count = 1 if blast_dicts else 0
+    _report_generated_at = getattr(report, "generated_at", None)
+    _latest_scan = _report_generated_at.isoformat() if isinstance(_report_generated_at, datetime) else None
+
+    framework_narratives: list[FrameworkNarrative] = [
+        _build_framework_narrative(slug, blast_dicts, scan_count=_scan_count, latest_scan=_latest_scan) for slug in slugs
+    ]
+
+    remediation_impact = _build_remediation_impact(blast_dicts, framework)
+
+    total_vulns = len(blast_dicts)
+    critical_count = sum(1 for b in blast_dicts if (b.get("severity") or "") == "critical")
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+
+    risk_narrative = _build_risk_narrative(
+        blast_dicts,
+        total_agents=report.total_agents,
+        total_vulns=total_vulns,
+        critical_count=critical_count,
+    )
+
+    executive_summary = _build_executive_summary(
+        framework_narratives=framework_narratives,
+        total_agents=report.total_agents,
+        total_packages=report.total_packages,
+        total_vulns=total_vulns,
+        critical_count=critical_count,
+        generated_at=generated_at,
+    )
+
+    # Catalog-backed NIST 800-53 line (vendor-asserted, scored over evaluated
+    # controls only). The narrative path has no CIS Foundations checks, so CIS
+    # statuses are empty; scan_count is 1 when the report carries findings (a
+    # scan ran) so an unmapped estate reads no_data, never a false pass. Included
+    # for the full narrative and the nist-800-53 single-framework narrative only.
+    nist_800_53_catalog: dict = {}
+    if framework is None or framework == "nist-800-53":
+        from agent_bom.compliance_nist_catalog import build_nist_800_53_catalog_line
+
+        nist_800_53_catalog = build_nist_800_53_catalog_line(blast_dicts, {}, 1 if blast_dicts else 0)
+
+    return ComplianceNarrative(
+        executive_summary=executive_summary,
+        framework_narratives=framework_narratives,
+        remediation_impact=remediation_impact,
+        risk_narrative=risk_narrative,
+        generated_at=generated_at,
+        claim_boundary=COMPLIANCE_CLAIM_BOUNDARY,
+        nist_800_53_catalog=nist_800_53_catalog,
+    )

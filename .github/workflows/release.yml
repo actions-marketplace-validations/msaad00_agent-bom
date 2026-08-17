@@ -5,48 +5,301 @@ on:
     tags:
       - "v*.*.*"  # semver only — excludes floating tags like v0
 
-permissions:
-  contents: read
+permissions: {}  # all permissions denied by default; jobs declare only what they need
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build distribution
+  version-guard:
+    name: Verify tag/version alignment
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify tag commit is exact green main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/check_release_main_ci.py
+          --repo "${{ github.repository }}"
+          --sha "${{ github.sha }}"
+          --branch main
+          --workflow ci.yml
+
+      - name: Extract version from tag
+        id: meta
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify pyproject version matches tag
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          tag = "${{ steps.meta.outputs.version }}"
+          text = Path("pyproject.toml").read_text()
+          m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+          if not m:
+              raise SystemExit("pyproject.toml version not found")
+          pkg = m.group(1)
+          if pkg != tag:
+              raise SystemExit(f"Tag version {tag} does not match pyproject version {pkg}")
+          print(f"Version aligned: {pkg}")
+          PY
+
+      - name: Verify CHANGELOG contains release entry
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          tag = "${{ steps.meta.outputs.version }}"
+          changelog = Path("CHANGELOG.md")
+          if not changelog.is_file():
+              raise SystemExit("CHANGELOG.md not found")
+          text = changelog.read_text(encoding="utf-8")
+          if not re.search(rf"^## \[{re.escape(tag)}\](?:\s|$)", text, re.M):
+              raise SystemExit(f"CHANGELOG.md is missing release entry: ## [{tag}]")
+          print(f"CHANGELOG entry present: {tag}")
+          PY
+
+      - name: Verify auxiliary versions track the release tag
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          tag = "${{ steps.meta.outputs.version }}"
+          errors: list[str] = []
+
+          # Helm chart `version:` (chart SemVer) and `appVersion:` both track the platform tag.
+          chart_text = Path("deploy/helm/agent-bom/Chart.yaml").read_text(encoding="utf-8")
+          chart_version = re.search(r"^version:\s*(\S+)", chart_text, re.M)
+          chart_app_version = re.search(r'^appVersion:\s*"([^"]+)"', chart_text, re.M)
+          if not chart_version:
+              errors.append("Chart.yaml: version: not found")
+          elif chart_version.group(1) != tag:
+              errors.append(f"Chart.yaml version {chart_version.group(1)} does not match tag {tag}")
+          if not chart_app_version:
+              errors.append("Chart.yaml: appVersion: not found")
+          elif chart_app_version.group(1) != tag:
+              errors.append(f"Chart.yaml appVersion {chart_app_version.group(1)} does not match tag {tag}")
+
+          # ui/package.json `version` tracks the platform tag so the published image and
+          # the bundle manifest agree on what version is shipping.
+          ui_pkg = json.loads(Path("ui/package.json").read_text(encoding="utf-8"))
+          ui_version = ui_pkg.get("version")
+          if ui_version != tag:
+              errors.append(f"ui/package.json version {ui_version!r} does not match tag {tag}")
+
+          # The chart's pinned image tags must track the release tag so a `helm install`
+          # of the published chart pulls the images built by this same release.
+          values_text = Path("deploy/helm/agent-bom/values.yaml").read_text(encoding="utf-8")
+          for block in ("image", "uiImage", "runtimeImage"):
+              m = re.search(
+                  rf'^{block}:\n(?:[ \t]+.*\n)*?[ \t]+tag:\s*"?([^"\n]+)"?',
+                  values_text,
+                  re.M,
+              )
+              if not m:
+                  errors.append(f"values.yaml: {block}.tag not found")
+              elif m.group(1).strip() != tag:
+                  errors.append(
+                      f"values.yaml {block}.tag {m.group(1).strip()!r} does not match tag {tag}"
+                  )
+
+          if errors:
+              raise SystemExit("\n".join(errors))
+          print(
+              f"Auxiliary versions aligned with {tag}: chart, appVersion, "
+              "ui/package.json, values.yaml image/uiImage/runtimeImage tags"
+          )
+          PY
+
+      - name: Verify version alignment across all deploy/docs surfaces
+        run: python3 scripts/check_version_alignment.py
+
+      - name: Block Finder duplicate artifacts
+        run: python3 scripts/check_duplicate_artifacts.py
+
+  docs-site:
+    name: Rebuild and deploy docs
+    needs: version-guard
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/docs.yml
+    with:
+      deploy: false
+
+  mcp-registry-freshness-gate:
+    name: MCP registry freshness gate
+    needs: version-guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-python
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Verify bundled MCP registry freshness
+        run: |
+          set -euo pipefail
+          if ! uv run agent-bom registry status --stale-after-days 14 --fail-on-stale --format json; then
+            echo "::error::Bundled MCP registry freshness is stale or invalid. Refresh the committed registry in a pre-release PR, review src/agent_bom/mcp_registry.json, then retag the release."
+            exit 1
+          fi
+
+      - name: Verify MCP registry serialization is stable
+        run: |
+          set -euo pipefail
+          uv run python - <<'PY'
+          import json
+          from pathlib import Path
+
+          from agent_bom.mcp_registry_text import dumps_registry_json
+
+          path = Path("src/agent_bom/mcp_registry.json")
+          current = path.read_text(encoding="utf-8")
+          normalized = dumps_registry_json(json.loads(current))
+          if normalized != current:
+              path.write_text(normalized, encoding="utf-8")
+          PY
+          if ! git diff --quiet -- src/agent_bom/mcp_registry.json; then
+            echo "::error::Bundled MCP registry serialization is not stable. Run the registry formatter locally, review and commit src/agent_bom/mcp_registry.json, then retag the release."
+            git diff --stat -- src/agent_bom/mcp_registry.json
+            git diff -- src/agent_bom/mcp_registry.json | head -200 || true
+            exit 1
+          fi
+
+  atlas-catalog-freshness-gate:
+    name: MITRE ATLAS catalog freshness gate
+    needs: version-guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-python
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Verify bundled MITRE ATLAS catalog freshness
+        run: |
+          set -euo pipefail
+          if ! uv run agent-bom db framework-status --framework atlas --stale-after-days 180 --fail-on-stale --format json; then
+            echo "::error::Bundled MITRE ATLAS catalog is stale, empty, or missing. Refresh in a pre-release PR via 'uv run agent-bom db update-frameworks --framework atlas', review src/agent_bom/data/mitre_atlas_catalog.json, then retag the release."
+            exit 1
+          fi
+
+  build:
+    name: Build distribution
+    needs: [version-guard, mcp-registry-freshness-gate, atlas-catalog-freshness-gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-python
         with:
           python-version: "3.11"
 
       - name: Set up Node.js
-        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "22"
+          node-version: "24"
 
       - name: Build dashboard
         run: |
           cd ui && npm ci && NEXT_EXPORT=1 npm run build
           cp -r out ../src/agent_bom/ui_dist
+          python ../scripts/generate_ui_csp_hashes.py ../src/agent_bom/ui_dist
 
       - name: Build package
-        run: uv run --with build==1.4.0 python -m build
+        run: rm -rf dist/ && uv run --with build==1.4.0 python -m build
 
       - name: Verify package
-        run: uvx twine==6.2.0 check dist/*
+        run: |
+          uvx twine==6.2.0 check dist/*
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheel = next(Path("dist").glob("agent_bom-*.whl"))
+          required = {
+              "agent_bom/data/inventory.schema.json",
+              "agent_bom/data/mcp-intelligence.schema.json",
+              "agent_bom/ui_dist/csp-hashes.json",
+          }
+          with ZipFile(wheel) as archive:
+              names = set(archive.namelist())
+              csp_manifest = json.loads(archive.read("agent_bom/ui_dist/csp-hashes.json").decode("utf-8"))
+          missing = sorted(required - names)
+          if missing:
+              raise SystemExit(f"wheel is missing required package data: {', '.join(missing)}")
+          if not csp_manifest.get("script_hashes"):
+              raise SystemExit("wheel dashboard CSP hash manifest has no script hashes; packaged UI would fall back to unsafe-inline")
+          PY
+
+      - name: Smoke clean unlocked wheel MCP protocol
+        run: |
+          python -m venv "$RUNNER_TEMP/agent-bom-wheel-smoke"
+          "$RUNNER_TEMP/agent-bom-wheel-smoke/bin/pip" install --disable-pip-version-check dist/*.whl
+          "$RUNNER_TEMP/agent-bom-wheel-smoke/bin/python" scripts/smoke_mcp_wheel.py
 
       - name: Upload dist artifacts
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: python-package-distributions
           path: dist/
 
+      # src/agent_bom/ui_dist is gitignored and exists only here. Jobs that build
+      # a container run their own fresh checkout, so without this hand-off the
+      # published API image ships with no dashboard and every UI route 404s.
+      - name: Upload built dashboard
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dashboard-ui-dist
+          path: src/agent_bom/ui_dist
+          if-no-files-found: error
+
   pypi-publish:
     name: Publish to PyPI
-    needs: build
+    needs: [build, self-scan-gate, container-gate]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment:
       name: pypi
       url: https://pypi.org/p/agent-bom
@@ -60,62 +313,671 @@ jobs:
           path: dist/
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          attestations: true
+
+      - name: Verify PyPI provenance attestations
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          project = "agent-bom"
+          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          files = sorted(path.name for path in Path("dist").iterdir() if path.suffix in {".whl", ".gz"})
+          if not files:
+              raise SystemExit("No PyPI distribution files found in dist/")
+
+          headers = {"Accept": "application/vnd.pypi.integrity.v1+json"}
+          missing: list[str] = []
+          for filename in files:
+              encoded_filename = urllib.parse.quote(filename)
+              url = f"https://pypi.org/integrity/{project}/{version}/{encoded_filename}/provenance"
+              for attempt in range(1, 31):
+                  request = urllib.request.Request(url, headers=headers)
+                  try:
+                      with urllib.request.urlopen(request, timeout=10) as response:
+                          payload = json.loads(response.read().decode("utf-8"))
+                      count = sum(len(bundle.get("attestations", [])) for bundle in payload.get("attestation_bundles", []))
+                      if count > 0:
+                          print(f"PyPI provenance present for {filename}: {count} attestation(s)")
+                          break
+                  except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+                      if attempt == 30:
+                          print(f"PyPI provenance missing for {filename}: {exc}", file=sys.stderr)
+                          missing.append(filename)
+                          break
+                  time.sleep(10)
+          if missing:
+              raise SystemExit(f"Missing PyPI provenance attestations: {', '.join(missing)}")
+          PY
 
   docker-publish:
     name: Publish to Docker Hub
-    needs: build
+    needs: [build, self-scan-gate, container-gate]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
+      id-token: write       # required for SLSA provenance attestation
+      attestations: write   # required for SBOM + provenance attestations
+      packages: write       # required to push the same image to GHCR
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Extract version from tag
         id: meta
         run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
+      # Restore the dashboard the build job produced. This checkout cannot
+      # contain it (src/agent_bom/ui_dist is gitignored), and the Dockerfile's
+      # `COPY src/ ./src/` is what carries it into the installed wheel.
+      - name: Restore built dashboard into the build context
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dashboard-ui-dist
+          path: src/agent_bom/ui_dist
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Login to Docker Hub
-        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # GHCR carried only a stale `latest`: no release ever pushed a versioned
+      # tag there. Nine OpenClaw SKILL.md files instruct users to run
+      # `ghcr.io/msaad00/agent-bom:<version>`, check_release_consistency.py
+      # asserts those pins equal the release version, and
+      # demo-deploy-cloudrun.yml pulls that exact reference to deploy the hosted
+      # demo — so a number was kept perfectly in sync with an artifact that did
+      # not exist. Publishing the same digest to both registries makes the
+      # documented command true rather than merely consistent.
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build and push
-        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        id: build-api-image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
           build-args: VERSION=${{ steps.meta.outputs.version }}
+          provenance: true   # SLSA provenance attestation — enables Docker Scout policy evaluation
+          sbom: true         # SBOM attestation — enables Docker Scout supply chain policies
           tags: |
             agentbom/agent-bom:${{ steps.meta.outputs.version }}
             agentbom/agent-bom:latest
+            ghcr.io/${{ github.repository_owner }}/agent-bom:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/agent-bom:latest
           labels: |
             org.opencontainers.image.version=${{ steps.meta.outputs.version }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.title=agent-bom
-            org.opencontainers.image.description=Security scanner for AI infrastructure — from agent to runtime
+            org.opencontainers.image.description=Open security scanner for AI supply chain and infrastructure — agents, MCP, packages, containers, cloud, GPU, and runtime.
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign API image
+        run: cosign sign --yes "agentbom/agent-bom@${{ steps.build-api-image.outputs.digest }}"
+
+      - name: Attest API image provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: index.docker.io/agentbom/agent-bom
+          subject-digest: ${{ steps.build-api-image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Sync Docker Hub README
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHORT_DESCRIPTION="Open security scanner for AI supply chain and infrastructure: agents, MCP, cloud, GPU, runtime."
+          TOKEN=$(curl -sf -X POST "https://hub.docker.com/v2/users/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${DOCKERHUB_USERNAME}\",\"password\":\"${DOCKERHUB_TOKEN}\"}" \
+            | jq -r '.token')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::Docker Hub login failed"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          PUBLISHED_README="$RUNNER_TEMP/DOCKER_HUB_README.published.md"
+          python scripts/render_docker_storefront.py \
+            --version "${{ steps.meta.outputs.version }}" \
+            --input DOCKER_HUB_README.md \
+            --output "$PUBLISHED_README"
+          AGENT_BOM_RELEASE_FINALIZE=1 AGENT_BOM_DOCKER_README_PATH="$PUBLISHED_README" \
+            python scripts/check_release_consistency.py \
+            || { echo "::error::Rendered Docker Hub README failed finalization contract"; exit 1; }
+          DESCRIPTION=$(jq -Rs . < "$PUBLISHED_README")
+          SHORT_DESCRIPTION_JSON=$(printf '%s' "$SHORT_DESCRIPTION" | jq -Rs .)
+          RESPONSE_FILE=$(mktemp)
+          HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" -X PATCH \
+            "https://hub.docker.com/v2/repositories/agentbom/agent-bom/" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"full_description\": ${DESCRIPTION}, \"description\": ${SHORT_DESCRIPTION_JSON}}")
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::Docker Hub README sync failed (HTTP $HTTP_CODE)"
+            cat "$RESPONSE_FILE"
+            exit 1
+          fi
+          rm -f "$RESPONSE_FILE"
+
+  docker-publish-collector:
+    name: Publish cloud-SDK collector image
+    needs: [build, self-scan-gate, container-gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write       # required for SLSA provenance attestation
+      attestations: write   # required for SBOM + provenance attestations
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Extract version from tag
+        id: meta
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test collector container
+        run: |
+          set -euo pipefail
+          docker build -f deploy/docker/Dockerfile.collector -t agent-bom-collector:release-test .
+          # The collector ships the cloud SDK layer — assert the anchor SDKs are
+          # importable in the built image, not just that the CLI runs.
+          docker run --rm agent-bom-collector:release-test --version
+          docker run --rm --entrypoint python agent-bom-collector:release-test -c "import boto3, azure.identity, google.cloud.resourcemanager_v3, snowflake.connector"
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push collector image
+        id: build-collector-image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.collector
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: VERSION=${{ steps.meta.outputs.version }}
+          provenance: true
+          sbom: true
+          tags: |
+            agentbom/agent-bom-collector:${{ steps.meta.outputs.version }}
+            agentbom/agent-bom-collector:latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.title=agent-bom cloud-SDK collector
+            org.opencontainers.image.description=Read-only cloud collector — ships boto3/azure/google/snowflake SDKs independently of the control-plane release. No external MCP in the scan path.
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign collector image
+        run: cosign sign --yes "agentbom/agent-bom-collector@${{ steps.build-collector-image.outputs.digest }}"
+
+      - name: Attest collector image provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: index.docker.io/agentbom/agent-bom-collector
+          subject-digest: ${{ steps.build-collector-image.outputs.digest }}
+          push-to-registry: true
+
+  docker-publish-ui:
+    name: Publish UI image
+    needs: [build, self-scan-gate, container-gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Extract version from tag
+        id: meta
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test UI container
+        run: |
+          set -euo pipefail
+          cleanup() {
+            status=$?
+            if [ $status -ne 0 ]; then
+              docker logs agent-bom-ui-smoke || true
+            fi
+            docker stop agent-bom-ui-smoke >/dev/null 2>&1 || true
+            exit $status
+          }
+          docker build -f ui/Dockerfile -t agent-bom-ui:release-test ui
+          docker run -d --rm --name agent-bom-ui-smoke -p 3000:3000 -e NEXT_PUBLIC_API_URL= agent-bom-ui:release-test
+          trap cleanup EXIT
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3000/ >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:3000/ >/dev/null || {
+            echo "::error::UI container did not become healthy in time"
+            exit 1
+          }
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push UI image
+        id: build-ui-image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ui
+          file: ui/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            NEXT_PUBLIC_API_URL=
+          provenance: true
+          sbom: true
+          tags: |
+            agentbom/agent-bom-ui:${{ steps.meta.outputs.version }}
+            agentbom/agent-bom-ui:latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.title=agent-bom-ui
+            org.opencontainers.image.description=Standalone browser UI for the self-hosted agent-bom control plane. Requires the agent-bom API image.
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Sync UI Docker Hub README
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHORT_DESCRIPTION="Standalone browser UI for the self-hosted agent-bom control plane. Requires the agent-bom API image."
+          TOKEN=$(curl -sf -X POST "https://hub.docker.com/v2/users/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${DOCKERHUB_USERNAME}\",\"password\":\"${DOCKERHUB_TOKEN}\"}" \
+            | jq -r '.token')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::Docker Hub login failed"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          DESCRIPTION=$(jq -Rs . < DOCKER_HUB_UI_README.md)
+          SHORT_DESCRIPTION_JSON=$(printf '%s' "$SHORT_DESCRIPTION" | jq -Rs .)
+          RESPONSE_FILE=$(mktemp)
+          HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" -X PATCH \
+            "https://hub.docker.com/v2/repositories/agentbom/agent-bom-ui/" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"full_description\": ${DESCRIPTION}, \"description\": ${SHORT_DESCRIPTION_JSON}}")
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::Docker Hub UI README sync failed (HTTP $HTTP_CODE)"
+            cat "$RESPONSE_FILE"
+            exit 1
+          fi
+          rm -f "$RESPONSE_FILE"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign UI image
+        run: cosign sign --yes "agentbom/agent-bom-ui@${{ steps.build-ui-image.outputs.digest }}"
+
+      - name: Attest UI image provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: index.docker.io/agentbom/agent-bom-ui
+          subject-digest: ${{ steps.build-ui-image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify UI image tag on Docker Hub
+        # Compose/Helm pin agentbom/agent-bom-ui:<tag>. Fail closed if Hub has
+        # not exposed the tag after push (API image already has a pull/scan gate).
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          IMAGE="agentbom/agent-bom-ui:${VERSION}"
+          for attempt in 1 2 3 4 5 6; do
+            if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+              echo "OK: ${IMAGE} is pullable from the registry"
+              exit 0
+            fi
+            echo "Waiting for Hub to expose ${IMAGE} (attempt ${attempt}/6)…"
+            sleep 20
+          done
+          echo "::error::${IMAGE} was not pullable after publish — refuse to treat the release as complete"
+          exit 1
+
+  published-image-scan-gate:
+    name: Published image scan gate
+    needs: docker-publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      # Repository variable override, e.g. CRITICAL or CRITICAL,HIGH,MEDIUM
+      RELEASE_IMAGE_SCAN_FAIL_SEVERITIES: ${{ vars.RELEASE_IMAGE_SCAN_FAIL_SEVERITIES != '' && vars.RELEASE_IMAGE_SCAN_FAIL_SEVERITIES || 'CRITICAL,HIGH' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-python
+        with:
+          python-version: "3.11"
+
+      - name: Extract version from tag
+        id: meta
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Pull published API image
+        run: docker pull agentbom/agent-bom:${{ steps.meta.outputs.version }}
+
+      - name: Install Trivy
+        run: |
+          set -euo pipefail
+          TRIVY_VERSION="0.72.0"
+          TRIVY_SHA256="bbb64b9695866ce4a7a8f5c9592002c5961cab378577fa3f8a040df362b9b2ea"
+          TRIVY_ARCHIVE="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -fsSL -o "/tmp/${TRIVY_ARCHIVE}" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${TRIVY_ARCHIVE}"
+          echo "${TRIVY_SHA256}  /tmp/${TRIVY_ARCHIVE}" | sha256sum -c -
+          tar -xzf "/tmp/${TRIVY_ARCHIVE}" -C /tmp trivy
+          sudo install -m 0755 /tmp/trivy /usr/local/bin/trivy
+          trivy --version
+
+      - name: Trivy scan gate (published image)
+        # Cross-check the Docker Hub image after push. Severity threshold is
+        # configurable via the RELEASE_IMAGE_SCAN_FAIL_SEVERITIES repository
+        # variable (default CRITICAL,HIGH). Unfixable OS/package CVEs listed in
+        # .image-scan-ignore are excluded from the gate.
+        run: |
+          set -euo pipefail
+          IMAGE="agentbom/agent-bom:${{ steps.meta.outputs.version }}"
+          trivy image "$IMAGE" \
+            --severity "${RELEASE_IMAGE_SCAN_FAIL_SEVERITIES}" \
+            --ignore-unfixed \
+            --ignorefile .image-scan-ignore \
+            --exit-code 1 \
+            --format table
+          trivy image "$IMAGE" \
+            --severity "${RELEASE_IMAGE_SCAN_FAIL_SEVERITIES}" \
+            --ignore-unfixed \
+            --ignorefile .image-scan-ignore \
+            --format json \
+            -o trivy-published-image.json
+          trivy image "$IMAGE" \
+            --severity "${RELEASE_IMAGE_SCAN_FAIL_SEVERITIES}" \
+            --ignore-unfixed \
+            --ignorefile .image-scan-ignore \
+            --format sarif \
+            -o trivy-published-image.sarif
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        if: always() && hashFiles('trivy-published-image.sarif') != ''
+        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
+        with:
+          sarif_file: trivy-published-image.sarif
+          category: release-published-image-trivy
+
+      - name: Scan published API image with agent-bom (evidence)
+        run: uv run agent-bom image agentbom/agent-bom:${{ steps.meta.outputs.version }} --format json --output published-image-self-scan.json
+
+      - name: Upload published image scan artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: published-image-scan
+          path: |
+            trivy-published-image.json
+            trivy-published-image.sarif
+            published-image-self-scan.json
+          if-no-files-found: warn
+
+  helm-publish:
+    name: Publish Helm chart to OCI
+    needs: [version-guard, self-scan-gate, container-gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Extract version from tag
+        id: meta
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Helm
+        run: |
+          set -euo pipefail
+          HELM_VERSION="3.18.6"
+          HELM_SHA256="3f43c0aa57243852dd542493a0f54f1396c0bc8ec7296bbb2c01e802010819ce"
+          HELM_ARCHIVE="helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          curl -fsSLo "/tmp/${HELM_ARCHIVE}" "https://get.helm.sh/${HELM_ARCHIVE}"
+          echo "${HELM_SHA256}  /tmp/${HELM_ARCHIVE}" | sha256sum -c -
+          tar -xzf "/tmp/${HELM_ARCHIVE}" -C /tmp
+          sudo mv /tmp/linux-amd64/helm /usr/local/bin/helm
+          helm version
+
+      - name: Package release chart
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/agent-bom-chart
+          cp -R deploy/helm/agent-bom /tmp/agent-bom-chart
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          version = "${{ steps.meta.outputs.version }}"
+          chart = Path("/tmp/agent-bom-chart/Chart.yaml")
+          text = chart.read_text()
+          text = re.sub(r"^version: .+$", f"version: {version}", text, flags=re.MULTILINE)
+          text = re.sub(r'^appVersion: ".+"$', f'appVersion: "{version}"', text, flags=re.MULTILINE)
+          chart.write_text(text)
+          PY
+          mkdir -p dist/helm
+          helm package /tmp/agent-bom-chart --destination dist/helm
+
+      - name: Login to GHCR OCI registry
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "${GH_TOKEN}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push chart to OCI registry
+        run: helm push "dist/helm/agent-bom-${{ steps.meta.outputs.version }}.tgz" "oci://ghcr.io/${{ github.repository_owner }}/charts"
+
+      - name: Attest Helm chart package
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/helm/agent-bom-${{ steps.meta.outputs.version }}.tgz
+
+      - name: Upload Helm chart artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: helm-chart
+          path: dist/helm/agent-bom-${{ steps.meta.outputs.version }}.tgz
+
+  container-gate:
+    name: Container release gate
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Gate the same image shape that docker-publish ships: without this the
+      # candidate image differs from the published one and the dashboard
+      # assertion below would be meaningless.
+      - name: Restore built dashboard into the build context
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dashboard-ui-dist
+          path: src/agent_bom/ui_dist
+
+      - name: Build release candidate image
+        run: docker build -t agent-bom:release-test .
+
+      - name: Smoke test release image
+        run: docker run --rm agent-bom:release-test --version
+
+      - name: Dashboard release gate
+        # 0.97.5 published an API image with no agent_bom/ui_dist while the
+        # deployment guide told operators that single image serves the
+        # dashboard. A dashboard-less image still answers `/` with 200 (the
+        # JSON service card) and only 404s on the UI routes, so the status code
+        # alone proves nothing: assert the assets are installed AND that `/`
+        # returns the packaged dashboard document.
+        run: |
+          set -euo pipefail
+          cleanup() {
+            status=$?
+            if [ $status -ne 0 ]; then
+              docker logs agent-bom-dashboard-smoke || true
+            fi
+            docker stop agent-bom-dashboard-smoke >/dev/null 2>&1 || true
+            exit $status
+          }
+          docker run --rm --entrypoint python agent-bom:release-test -c '
+          import pathlib, sys
+          import agent_bom
+          index = pathlib.Path(agent_bom.__file__).parent / "ui_dist" / "index.html"
+          if not index.is_file():
+              sys.exit(f"packaged dashboard missing: {index} is not in the image")
+          print(f"packaged dashboard present: {index}")
+          '
+          docker run -d --rm --name agent-bom-dashboard-smoke -p 8422:8422 \
+            agent-bom:release-test serve --host 0.0.0.0 --port 8422 --api-key release-gate-key
+          trap cleanup EXIT
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8422/healthz >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          code=$(curl -sS -o /tmp/dashboard-root.html -w '%{http_code}' http://127.0.0.1:8422/)
+          if [ "$code" != "200" ]; then
+            echo "::error::GET / returned ${code}; the API image is not serving the bundled dashboard"
+            exit 1
+          fi
+          grep -q '/_next/static' /tmp/dashboard-root.html || {
+            echo "::error::GET / returned 200 but referenced no dashboard assets; the response is the API service card, not the packaged UI"
+            head -c 512 /tmp/dashboard-root.html
+            exit 1
+          }
+          echo "OK: the release candidate image serves the bundled dashboard at /"
+
+      - name: Image vulnerability scan gate
+        # Self-hosted release image gate (dogfood). The agent-bom:release-test
+        # image IS agent-bom, so it scans a saved tar of itself: native
+        # OS-layer (dpkg/rpm/apk) + app-dependency vulnerabilities at MEDIUM+
+        # severity (agent-bom has no separate UNKNOWN tier), unfixable findings
+        # excluded (= ignore-unfixed), and the .image-scan-ignore allowlist of
+        # known-unfixable base-image CVEs.
+        run: |
+          docker save agent-bom:release-test -o /tmp/agent-bom-release-test.tar
+          chmod 0644 /tmp/agent-bom-release-test.tar
+          docker run --rm \
+            -v /tmp/agent-bom-release-test.tar:/scan/image.tar:ro \
+            -v "$PWD/.image-scan-ignore:/scan/.image-scan-ignore:ro" \
+            agent-bom:release-test \
+            image --tar /scan/image.tar \
+            --ignore /scan/.image-scan-ignore \
+            --exclude-unfixable \
+            --fail-on-severity medium
 
   self-scan-gate:
     name: Self-scan release gate
-    needs: build
+    needs: [version-guard, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-python
         with:
           python-version: "3.11"
 
       - name: Install agent-bom (from source)
-        run: uv sync --extra dev
+        run: uv sync --frozen --extra dev
+
+      - name: Verify release consistency map
+        run: python scripts/check_release_consistency.py
+
+      - name: Verify release evidence matrix
+        run: python scripts/check_release_evidence_matrix.py
 
       - name: npm audit (ui/ deps) — block release on high/critical
         run: |
@@ -123,52 +985,235 @@ jobs:
           npm ci --ignore-scripts
           npm audit --audit-level=high
 
-      - name: Self dep scan — block release on critical CVE
+      - name: OSV scanner (ui lockfile) — block release on fixable CVEs
+        # Without pipefail the `| tee` below swallowed osv-scanner's exit code,
+        # so this release blocker could never block anything. Same defect as the
+        # CI twin in ci.yml; both are now covered by scripts/check_ci_pipefail.py.
+        shell: bash
         run: |
+          OSV_SCANNER_VERSION="v2.3.3"
+          OSV_SCANNER_SHA256="777b4bb7ddd10bdcc8a1aa398d37d05e91e866e7586f9cff3fca2f72b8153033"
+          curl -fsSL -o /tmp/osv-scanner \
+            "https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  /tmp/osv-scanner" | sha256sum -c -
+          install -m 0755 /tmp/osv-scanner /usr/local/bin/osv-scanner
+          status=0
+          osv-scanner scan --config osv-scanner.toml --lockfile=ui/package-lock.json 2>&1 | tee /tmp/osv-ui-release.txt || status=$?
+          if [ "$status" -ne 0 ]; then
+            FIXABLE=$(grep -E "^\|" /tmp/osv-ui-release.txt | grep -v "| -- " | grep -v "OSV URL" | grep -v "+--" | head -5 || true)
+            if [ -n "$FIXABLE" ]; then
+              echo "::error::osv-scanner found UI lockfile vulnerabilities with available fixes:"
+              echo "$FIXABLE"
+              exit 1
+            fi
+            echo "::warning::osv-scanner found only unfixable UI lockfile CVEs (no upstream fix) — passing"
+          fi
+
+      - name: pip-audit (shipping Python deps) — block release on high/critical or fixable CVEs
+        run: |
+          set +e
+          uv run --with pip-audit pip-audit --ignore-vuln CVE-2026-3219 \
+            -s osv \
+            --format json \
+            --output release-pip-audit.json
+          set -e
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("release-pip-audit.json")
+          if not path.is_file():
+              raise SystemExit("pip-audit did not produce release-pip-audit.json")
+          data = json.loads(path.read_text(encoding="utf-8"))
+          fixable = []
+          severe = []
+          for dependency in data.get("dependencies", []):
+              dep_name = dependency.get("name", "<unknown>")
+              dep_version = dependency.get("version", "<unknown>")
+              for vuln in dependency.get("vulns", []):
+                  vuln_id = vuln.get("id", "<unknown>")
+                  severity = str(vuln.get("severity") or vuln.get("severity_level") or "").upper()
+                  fix_versions = vuln.get("fix_versions") or []
+                  if severity in {"HIGH", "CRITICAL"}:
+                      severe.append(f"{dep_name} {dep_version} {vuln_id} severity={severity}")
+                  if fix_versions:
+                      fixable.append(f"{dep_name} {dep_version} {vuln_id} fixes={','.join(fix_versions)}")
+          if severe:
+              print("::error::pip-audit found HIGH/CRITICAL vulnerabilities:")
+              print("\n".join(severe[:20]))
+              raise SystemExit(1)
+          if fixable:
+              print("::error::pip-audit found vulnerabilities with available fixes:")
+              print("\n".join(fixable[:20]))
+              raise SystemExit(1)
+          print("pip-audit release gate passed: no HIGH/CRITICAL or fixable findings")
+          PY
+
+      - name: Self dep scan evidence — bounded, no opportunistic DB refresh
+        run: |
+          set +e
           mkdir -p sarif
-          uv run agent-bom scan --self-scan \
+          timeout 240s uv run agent-bom scan --self-scan \
             --format sarif \
             -o sarif/release-self-dep.sarif \
             --fail-on-severity critical \
+            --exclude-unfixable \
+            --no-auto-update-db \
             --quiet
+          scan_exit=$?
+          set -e
+
+          if [ "$scan_exit" -eq 124 ]; then
+            echo "::warning::agent-bom self-scan evidence timed out after 240s; pip-audit already enforced the dependency release gate."
+            cat > sarif/release-self-dep.sarif <<'EOF'
+          {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [
+              {
+                "tool": {
+                  "driver": {
+                    "name": "agent-bom release self-scan",
+                    "version": "${{ needs.version-guard.outputs.version }}",
+                    "informationUri": "https://github.com/msaad00/agent-bom"
+                  }
+                },
+                "results": []
+              }
+            ]
+          }
+          EOF
+            exit 0
+          fi
+
+          if [ "$scan_exit" -ne 0 ]; then
+            # Distinguish real critical findings from a coverage-limited scan.
+            # With --no-auto-update-db and no provisioned local vuln DB the scan
+            # falls back to remote lookups; when those are incomplete the run is
+            # partial and exits non-zero with zero results. pip-audit above is the
+            # enforcing dependency gate, so degrade partial-coverage to evidence-
+            # only (like the timeout branch) and fail only on real critical
+            # results. Count by security-severity >= 9.0 — not raw result count
+            # (skill medium/low SARIF rows are warning/note) and not level=error
+            # alone (high also maps to error). Unreadable SARIF → fail closed.
+            crit_results=$(python3 scripts/count_sarif_critical.py sarif/release-self-dep.sarif 2>/dev/null || echo unknown)
+            if [ "$crit_results" != "0" ]; then
+              echo "::error::agent-bom release self-scan found ${crit_results} critical finding(s) (exit ${scan_exit})"
+              exit "$scan_exit"
+            fi
+            echo "::warning::agent-bom self-scan evidence incomplete (exit ${scan_exit}, coverage-limited, 0 critical results); pip-audit already enforced the dependency release gate."
+          fi
+
+          if [ ! -s sarif/release-self-dep.sarif ]; then
+            echo "::warning::agent-bom self-scan produced no SARIF evidence; writing empty evidence (pip-audit enforced the dependency gate)."
+            cat > sarif/release-self-dep.sarif <<'EOF'
+          {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [
+              {
+                "tool": {
+                  "driver": {
+                    "name": "agent-bom release self-scan",
+                    "version": "${{ needs.version-guard.outputs.version }}",
+                    "informationUri": "https://github.com/msaad00/agent-bom"
+                  }
+                },
+                "results": []
+              }
+            ]
+          }
+          EOF
+          fi
+
+      - name: Align release self-scan SARIF category
+        if: always() && hashFiles('sarif/release-self-dep.sarif') != ''
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          # agent-bom's SARIF formatter pre-sets runs[].automationDetails.id to
+          # "agent-bom/<scan_id>". github/codeql-action/upload-sarif only injects
+          # its `category` input when automationDetails is absent, so the pre-set
+          # id wins and GitHub derives the category from it (the part before the
+          # final "/", i.e. "agent-bom") instead of "agent-bom-release-gate". Drop
+          # it so the upload `category` below applies.
+          #
+          # Also drop medium/low SKILL_RISK rows from the code-scanning upload.
+          # Release dependency enforcement is pip-audit/npm/osv; skill hygiene on
+          # first-party CLAUDE.md / docs must not open GitHub Security alerts.
+          # High/critical skill findings (security-severity >= 7.0) still upload.
+          path = Path("sarif/release-self-dep.sarif")
+          data = json.loads(path.read_text())
+          for run in data.get("runs", []):
+              run.pop("automationDetails", None)
+              rules = ((run.get("tool") or {}).get("driver") or {}).get("rules") or []
+              rules_by_id = {str(rule.get("id") or ""): rule for rule in rules if isinstance(rule, dict)}
+              kept = []
+              for result in run.get("results") or []:
+                  if not isinstance(result, dict):
+                      continue
+                  rule_id = str(result.get("ruleId") or "")
+                  if rule_id.startswith("finding/SKILL"):
+                      props = result.get("properties") or {}
+                      raw = props.get("security-severity")
+                      if raw is None:
+                          raw = (rules_by_id.get(rule_id) or {}).get("properties", {}).get("security-severity")
+                      try:
+                          score = float(raw)
+                      except (TypeError, ValueError):
+                          score = 0.0
+                      if score < 7.0:
+                          continue
+                  kept.append(result)
+              run["results"] = kept
+          path.write_text(json.dumps(data, indent=2) + "\n")
+          PY
 
       - name: Upload release self-scan SARIF
         if: always() && hashFiles('sarif/release-self-dep.sarif') != ''
-        uses: github/codeql-action/upload-sarif@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
+        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
         with:
           sarif_file: sarif/release-self-dep.sarif
           category: agent-bom-release-gate
 
   sbom:
     name: Generate CycloneDX SBOM
-    needs: build
+    needs: [build, self-scan-gate]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-python
         with:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync --frozen --extra dev
 
       - name: Generate CycloneDX SBOM (cyclonedx-py — standard)
         run: uv run --with cyclonedx-bom==7.2.2 cyclonedx-py environment -o agent-bom-sbom.cdx.json
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: agent-bom-sbom
           path: agent-bom-sbom.cdx.json
 
   sign:
     name: Sign distribution with Sigstore
-    needs: build
+    needs: [build, self-scan-gate]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
+      contents: read
       id-token: write  # required for Sigstore OIDC
     steps:
       - name: Download dist artifacts
@@ -178,7 +1223,7 @@ jobs:
           path: dist/
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign wheels and sdist
         run: |
@@ -187,15 +1232,16 @@ jobs:
           done
 
       - name: Upload signed bundles
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: python-package-signatures
           path: dist/*.sigstore.json
 
   provenance:
     name: Generate SLSA provenance
-    needs: build
+    needs: [build, self-scan-gate]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       id-token: write
       contents: read
@@ -208,19 +1254,55 @@ jobs:
           path: dist/
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*
 
+      - name: Export provenance bundles for release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p provenance
+          for f in dist/*.whl dist/*.tar.gz; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            artifact_path="$(pwd)/$f"
+            download_dir=$(mktemp -d)
+            (
+              cd "$download_dir"
+              gh attestation download "$artifact_path" \
+                --repo "${{ github.repository }}"
+            )
+            src=$(find "$download_dir" -maxdepth 1 -type f -name '*.jsonl' | head -n 1 || true)
+            if [ -z "$src" ] || [ ! -f "$src" ]; then
+              echo "Expected provenance bundle for $name was not downloaded" >&2
+              ls -la "$download_dir" >&2 || true
+              exit 1
+            fi
+            mv "$src" "provenance/${name}.intoto.jsonl"
+            rm -rf "$download_dir"
+          done
+
+      - name: Upload provenance artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: slsa-provenance
+          path: provenance/
+          if-no-files-found: error
+
   github-release:
     name: Create GitHub Release
-    # Only requires PyPI publish — Docker Hub is best-effort (needs external secrets)
-    needs: [pypi-publish, sign, provenance]
+    # Block the GitHub Release until the published-image Trivy gate passes.
+    # PyPI/Docker Hub artifacts may already be live; the gate still prevents
+    # minting signed release assets when the pushed image crosses the threshold.
+    needs: [pypi-publish, docker-publish, docker-publish-collector, docker-publish-ui, sign, provenance, sbom, helm-publish, published-image-scan-gate]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download dist artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -232,6 +1314,24 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: python-package-signatures
+          path: dist/
+
+      - name: Download provenance bundles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: slsa-provenance
+          path: dist/
+
+      - name: Download CycloneDX SBOM
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: agent-bom-sbom
+          path: dist/
+
+      - name: Download Helm chart artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: helm-chart
           path: dist/
 
       - name: Create or update GitHub Release
@@ -249,10 +1349,119 @@ jobs:
           fi
 
       - name: Update floating major tag (v0)
+        shell: bash
+        if: ${{ vars.AGENT_BOM_UPDATE_FLOATING_MAJOR_TAGS == '1' }}
         run: |
           MAJOR=$(echo "${{ github.ref_name }}" | grep -oP '^v\d+')
           if [ -n "$MAJOR" ]; then
             git tag -f "$MAJOR" "${{ github.ref_name }}"
-            git push origin "$MAJOR" --force
+            REMOTE_TAG_SHA="$(git ls-remote --tags origin "refs/tags/${MAJOR}" | awk '{print $1}')"
+            if [ -n "$REMOTE_TAG_SHA" ]; then
+              git push origin "refs/tags/${MAJOR}:refs/tags/${MAJOR}" \
+                --force-with-lease="refs/tags/${MAJOR}:${REMOTE_TAG_SHA}"
+            else
+              git push origin "refs/tags/${MAJOR}:refs/tags/${MAJOR}"
+            fi
             echo "Updated floating tag $MAJOR → ${{ github.ref_name }}"
           fi
+
+  docker-mcp-pin:
+    name: Sync Docker MCP submission pin
+    # The pin must name the commit the tag points at, which does not exist
+    # until the tag does — so it cannot be written by bump-version.py with the
+    # other version-bearing artifacts. The release run owns it here instead of
+    # SUBMISSION.md asking a human to remember. Never blocks the release: the
+    # artifacts are already published by the time this runs.
+    needs: github-release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-python
+
+      - name: Write the tagged commit into the submission pin
+        id: pin
+        run: |
+          python scripts/sync_docker_mcp_pin.py --set "${{ github.sha }}"
+          if git diff --quiet -- integrations/docker-mcp-registry/server.yaml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure signed automation commits
+        id: signing
+        if: steps.pin.outputs.changed == 'true'
+        env:
+          AUTOMATION_SSH_SIGNING_KEY: ${{ secrets.AUTOMATION_SSH_SIGNING_KEY }}
+        run: |
+          if [ -z "$AUTOMATION_SSH_SIGNING_KEY" ]; then
+            echo "AUTOMATION_SSH_SIGNING_KEY not configured — skipping PR creation."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$AUTOMATION_SSH_SIGNING_KEY" > "$HOME/.ssh/automation_signing_key"
+          chmod 600 "$HOME/.ssh/automation_signing_key"
+          ssh-keygen -y -f "$HOME/.ssh/automation_signing_key" > "$HOME/.ssh/automation_signing_key.pub"
+          eval "$(ssh-agent -s)"
+          ssh-add "$HOME/.ssh/automation_signing_key"
+          git config user.name "github-actions[bot]"
+          git config user.email "34316639+msaad00@users.noreply.github.com"
+          git config gpg.format ssh
+          git config user.signingkey "$HOME/.ssh/automation_signing_key.pub"
+          git config commit.gpgsign true
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open the pin-update PR
+        if: steps.pin.outputs.changed == 'true' && steps.signing.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          TAGGED_SHA: ${{ github.sha }}
+        run: |
+          BRANCH="chore/docker-mcp-pin-${TAG}"
+          git switch -C "$BRANCH" origin/main
+          python scripts/sync_docker_mcp_pin.py --set "$TAGGED_SHA"
+          git add integrations/docker-mcp-registry/server.yaml
+          git commit -S -m "chore(docker-mcp): pin the submission to ${TAG}"
+          git push --force-with-lease origin "$BRANCH"
+          TITLE="chore(docker-mcp): pin the submission to ${TAG}"
+          BODY="\`integrations/docker-mcp-registry/server.yaml\` builds the published
+          server from \`source.commit\`. That commit is the one \`${TAG}\` points at,
+          so it cannot be written before the tag exists — this PR is opened by the
+          release run instead of the step SUBMISSION.md used to ask a human to
+          remember.
+
+          **Pin:** \`${TAGGED_SHA}\` (\`${TAG}\`)
+
+          Merging this is what makes the next \`docker/mcp-registry\` submission
+          build the released code. Nothing else in the release depends on it."
+          PR_NUMBER=$(gh pr list --head "$BRANCH" --base main --json number --jq '.[0].number')
+          if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
+            gh pr edit "$PR_NUMBER" --title "$TITLE" --body "$BODY"
+          else
+            gh pr create --title "$TITLE" --body "$BODY" --base main
+          fi
+
+      - name: Pin already current
+        if: steps.pin.outputs.changed == 'false'
+        run: echo "Docker MCP submission pin already names ${{ github.sha }}."
+
+  deploy-mcp-sse:
+    name: Deploy MCP SSE
+    needs: github-release
+    if: ${{ vars.DEPLOY_TARGET == 'railway' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/deploy-mcp-sse.yml
+    secrets: inherit

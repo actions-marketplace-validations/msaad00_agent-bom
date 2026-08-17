@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Verify the scale-evidence documentation scaffold is release-ready.
+
+This checks structure and verifies measured pages point at checked-in raw
+artifacts without pretending local synthetic results cover the broader
+enterprise/EKS evidence tracked in #1806.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from subprocess import run
+
+ROOT = Path(__file__).resolve().parents[1]
+PERF_DIR = ROOT / "docs" / "perf"
+
+REQUIRED_FILES = (
+    PERF_DIR / "p95-p99-graph-query.md",
+    PERF_DIR / "graph-api-postgres-benchmark.md",
+    PERF_DIR / "ingest-throughput.md",
+    PERF_DIR / "fleet-reconciliation.md",
+)
+
+REQUIRED_MARKERS = (
+    "Evidence status:",
+    "Owner issue:",
+    "## Claim",
+    "## Scope",
+    "## Environment",
+    "## Commands",
+    "## Results",
+    "## Gaps",
+)
+
+
+def _check_file(path: Path) -> list[str]:
+    errors: list[str] = []
+    if not path.exists():
+        return [f"missing required evidence file: {path.relative_to(ROOT)}"]
+    text = path.read_text(encoding="utf-8")
+    for marker in REQUIRED_MARKERS:
+        if marker not in text:
+            errors.append(f"{path.relative_to(ROOT)} missing marker: {marker}")
+    if "TBD" not in text and "Evidence status: measured" not in text and "Evidence status: scaffolded" not in text:
+        errors.append(
+            f"{path.relative_to(ROOT)} must either keep TBD placeholders, declare measured evidence, or declare scaffolded evidence"
+        )
+    if "Evidence status: measured" in text:
+        artifacts = _extract_raw_artifacts(text)
+        if not artifacts:
+            errors.append(f"{path.relative_to(ROOT)} missing measured raw result artifact")
+        for artifact in artifacts:
+            if "*" in artifact:
+                if not list(ROOT.glob(artifact)):
+                    errors.append(f"{path.relative_to(ROOT)} references missing raw result artifact: {artifact}")
+                continue
+            if not (ROOT / artifact).exists():
+                errors.append(f"{path.relative_to(ROOT)} references missing raw result artifact: {artifact}")
+    return errors
+
+
+def _extract_raw_artifacts(text: str) -> list[str]:
+    marker = "Raw result artifact: `"
+    if marker in text:
+        return [text.split(marker, 1)[1].split("`", 1)[0]]
+
+    plural_marker = "Raw result artifacts:"
+    if plural_marker not in text:
+        return []
+    section = text.split(plural_marker, 1)[1].split("\n## ", 1)[0]
+    artifacts: list[str] = []
+    for line in section.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("- `") or "`" not in stripped[3:]:
+            continue
+        artifacts.append(stripped.split("`", 2)[1])
+    return artifacts
+
+
+def main() -> int:
+    errors: list[str] = []
+    for path in REQUIRED_FILES:
+        errors.extend(_check_file(path))
+    graph_result = run([sys.executable, "scripts/check_graph_scale_evidence.py"], cwd=ROOT, text=True, capture_output=True, check=False)
+    if graph_result.returncode != 0:
+        errors.append((graph_result.stderr or graph_result.stdout).strip() or "graph scale evidence check failed")
+    if errors:
+        for error in errors:
+            print(error, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

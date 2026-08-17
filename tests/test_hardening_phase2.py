@@ -220,8 +220,79 @@ class TestAuditHMAC:
         # Reload again without env var to restore ephemeral key
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("AGENT_BOM_AUDIT_HMAC_KEY", None)
+            os.environ.pop("AGENT_BOM_REQUIRE_AUDIT_HMAC", None)
             importlib.reload(audit_log)
             assert isinstance(audit_log._HMAC_KEY, bytes)
+
+    def test_require_audit_hmac_fails_closed(self):
+        """When production enforcement is enabled, missing HMAC key should fail closed."""
+        import importlib
+
+        from agent_bom.api import audit_log
+
+        with patch.dict(
+            os.environ,
+            {"AGENT_BOM_REQUIRE_AUDIT_HMAC": "1"},
+            clear=False,
+        ):
+            os.environ.pop("AGENT_BOM_AUDIT_HMAC_KEY", None)
+            with pytest.raises(RuntimeError, match="AGENT_BOM_REQUIRE_AUDIT_HMAC"):
+                importlib.reload(audit_log)
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGENT_BOM_AUDIT_HMAC_KEY", None)
+            os.environ.pop("AGENT_BOM_REQUIRE_AUDIT_HMAC", None)
+            importlib.reload(audit_log)
+
+    def test_production_env_requires_audit_hmac_by_default(self):
+        """Production environments should not silently fall back to ephemeral audit HMAC."""
+        import importlib
+
+        from agent_bom.api import audit_log
+
+        with patch.dict(os.environ, {"AGENT_BOM_ENV": "production"}, clear=False):
+            os.environ.pop("AGENT_BOM_AUDIT_HMAC_KEY", None)
+            os.environ.pop("AGENT_BOM_ALLOW_EPHEMERAL_AUDIT_HMAC", None)
+            with pytest.raises(RuntimeError, match="AGENT_BOM_AUDIT_HMAC_KEY is required"):
+                importlib.reload(audit_log)
+
+        with patch.dict(
+            os.environ,
+            {"AGENT_BOM_ENV": "production", "AGENT_BOM_ALLOW_EPHEMERAL_AUDIT_HMAC": "1"},
+            clear=False,
+        ):
+            os.environ.pop("AGENT_BOM_AUDIT_HMAC_KEY", None)
+            importlib.reload(audit_log)
+            status = audit_log.describe_audit_hmac_status()
+            assert status["status"] == "ephemeral"
+            assert status["required"] is False
+            assert status["required_reason"] == "not_required"
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGENT_BOM_AUDIT_HMAC_KEY", None)
+            os.environ.pop("AGENT_BOM_REQUIRE_AUDIT_HMAC", None)
+            os.environ.pop("AGENT_BOM_ENV", None)
+            os.environ.pop("AGENT_BOM_ALLOW_EPHEMERAL_AUDIT_HMAC", None)
+            importlib.reload(audit_log)
+
+    def test_clustered_control_plane_requires_audit_hmac_by_default(self):
+        """Clustered API replicas require a persistent audit HMAC key."""
+        import importlib
+
+        from agent_bom.api import audit_log
+
+        with patch.dict(os.environ, {"AGENT_BOM_CONTROL_PLANE_REPLICAS": "2"}, clear=False):
+            os.environ.pop("AGENT_BOM_AUDIT_HMAC_KEY", None)
+            os.environ.pop("AGENT_BOM_ALLOW_EPHEMERAL_AUDIT_HMAC", None)
+            with pytest.raises(RuntimeError, match="AGENT_BOM_AUDIT_HMAC_KEY is required"):
+                importlib.reload(audit_log)
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGENT_BOM_AUDIT_HMAC_KEY", None)
+            os.environ.pop("AGENT_BOM_REQUIRE_AUDIT_HMAC", None)
+            os.environ.pop("AGENT_BOM_CONTROL_PLANE_REPLICAS", None)
+            os.environ.pop("AGENT_BOM_ALLOW_EPHEMERAL_AUDIT_HMAC", None)
+            importlib.reload(audit_log)
 
 
 # ── Exception Narrowing ────────────────────────────────────────────────────
@@ -373,6 +444,7 @@ class TestInventoryCSV:
         agent = result["agents"][0]
         assert agent["name"] == "inventory-agent"
         assert agent["mcp_servers"][0]["name"] == "inventory-server"
+        assert agent["mcp_servers"][0]["packages"][0]["ecosystem"] == "pypi"
 
     def test_env_keys_parsed(self):
         from agent_bom.inventory import _load_csv_inventory
@@ -396,14 +468,19 @@ class TestInventoryCSV:
         with pytest.raises(ValueError, match="empty"):
             _load_csv_inventory(io.StringIO(""))
 
-    def test_rows_with_empty_name_skipped(self):
+    def test_rows_with_empty_name_skipped(self, monkeypatch):
+        from agent_bom import inventory
         from agent_bom.inventory import _load_csv_inventory
+
+        warnings: list[tuple[str, tuple[object, ...]]] = []
+        monkeypatch.setattr(inventory.logger, "warning", lambda msg, *args, **_kwargs: warnings.append((msg, args)))
 
         csv_data = "name,version,ecosystem\n,1.0,pypi\nfoo,2.0,pypi\n"
         result = _load_csv_inventory(io.StringIO(csv_data))
         pkgs = result["agents"][0]["mcp_servers"][0]["packages"]
         assert len(pkgs) == 1
         assert pkgs[0]["name"] == "foo"
+        assert any(message.startswith("Skipped %s CSV inventory row") and args == (1,) for message, args in warnings)
 
     def test_ecosystem_defaults_to_unknown(self):
         from agent_bom.inventory import _load_csv_inventory
@@ -433,6 +510,16 @@ class TestInventoryJSON:
 
         result = load_inventory(str(json_file))
         assert result == data
+
+    def test_invalid_json_schema_rejected(self, tmp_path):
+        from agent_bom.inventory import load_inventory
+
+        data = {"agents": [{}]}
+        json_file = tmp_path / "inventory.json"
+        json_file.write_text(json.dumps(data))
+
+        with pytest.raises(ValueError, match="Inventory schema validation failed"):
+            load_inventory(str(json_file))
 
     def test_csv_file_detected_by_extension(self, tmp_path):
         from agent_bom.inventory import load_inventory
@@ -479,4 +566,11 @@ class TestInventoryStdin:
 
         with patch("sys.stdin", io.StringIO("   ")):
             with pytest.raises(ValueError, match="Empty input"):
+                _load_from_stdin()
+
+    def test_stdin_invalid_schema_raises(self):
+        from agent_bom.inventory import _load_from_stdin
+
+        with patch("sys.stdin", io.StringIO(json.dumps({"agents": [{}]}))):
+            with pytest.raises(ValueError, match="Inventory schema validation failed"):
                 _load_from_stdin()

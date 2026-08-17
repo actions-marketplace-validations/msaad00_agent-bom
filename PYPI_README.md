@@ -1,0 +1,144 @@
+# agent-bom
+
+<!-- mcp-name: io.github.msaad00/agent-bom -->
+
+**Open security scanner and self-hosted control plane for AI, MCP, and cloud infrastructure.**
+
+Start with the demo, then choose the entrypoint that matches your first job:
+repo scan, image scan, cloud posture, fix plan, dashboard, MCP tools, or
+runtime review.
+
+```text
+better-sqlite3@9.0.0  (npm package)
+  |── OSV/GHSA finding  (critical · advisory-backed)
+  |── sqlite-mcp  (MCP Server · unverified · root)
+       |── Cursor IDE  (Agent · 4 servers · 12 tools)
+       |── ANTHROPIC_KEY, DB_URL, AWS_SECRET  (Credential env names visible)
+       |── query_db, read_file, write_file, run_shell  (Reachable tools)
+
+ Fix: upgrade better-sqlite3 → 11.7.0
+```
+
+Blast radius is the core idea: `package -> vulnerability finding -> MCP server (tools + credential env names) -> connected agents`. This schematic explains the model; emitted findings are backed by the configured advisory sources.
+
+Scan local agent configs, MCP servers, instruction files, lockfiles, containers, cloud estate, AI models/datasets, non-human identities, LLM cost, GPU surfaces, and runtime evidence.
+
+Try the built-in demo first:
+
+```bash
+agent-bom scan --demo --offline
+```
+
+The demo uses a curated sample so the output stays reproducible across releases. For real scans, run `agent-bom scan`, or add `-p .` to fold project manifests and lockfiles into the same result.
+
+If you want an inspectable sample before scanning your own repo:
+
+```bash
+agent-bom samples first-run
+agent-bom scan --inventory agent-bom-first-run/inventory.json -p agent-bom-first-run --enrich
+```
+
+The bundled first-run stack includes agent inventory, MCP server definitions,
+placeholder credential environment variable names, Python/npm manifests, and a
+prompt file. See `docs/FIRST_RUN.md` in the repository for the guided flow.
+
+<details>
+<summary><b>See the terminal demo</b></summary>
+
+![agent-bom demo](https://raw.githubusercontent.com/msaad00/agent-bom/main/docs/images/demo-latest.gif)
+
+</details>
+
+## Recommended starting points
+
+```bash
+pip install agent-bom
+
+agent-bom quickstart --dry-run --offline          # Scan, sample-data, and API/UI next steps
+agent-bom scan -p .                            # Repo + MCP + package blast radius
+agent-bom samples first-run                      # Inspectable sample AI stack
+agent-bom check flask@2.2.0 --ecosystem pypi     # Pre-install package verdict
+agent-bom image nginx:latest                     # Container image scan
+agent-bom scan -p . --remediate remediation.md # Fix-first remediation plan
+pip install 'agent-bom[ui]'                      # once, if you want the dashboard
+agent-bom serve                                  # API + dashboard + graph explorer
+```
+
+The base wheel is the scanner/CLI path. Install optional surfaces explicitly:
+`pip install 'agent-bom[mcp-server]'` for MCP server mode and
+`pip install 'agent-bom[ui]'` for the local API/dashboard process. Use
+`pip install 'agent-bom[all]'` for supported first-run extras; MLflow remains
+separate until its upstream CVE backlog is fixed. If an extra is missing, the
+command exits with the matching install hint.
+
+Self-hosted pilot:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/msaad00/agent-bom/main/deploy/docker-compose.pilot.yml -o docker-compose.pilot.yml
+docker compose -f docker-compose.pilot.yml up -d
+# Dashboard -> http://localhost:3000
+```
+
+Production chart from a checked-out repo:
+
+```bash
+helm upgrade --install agent-bom deploy/helm/agent-bom \
+  --namespace agent-bom --create-namespace \
+  -f deploy/helm/agent-bom/examples/eks-production-values.yaml
+```
+
+## Product views
+
+### Dashboard
+
+![agent-bom dashboard overview](https://raw.githubusercontent.com/msaad00/agent-bom/main/docs/images/dashboard-live.png)
+
+### Agent mesh graph
+
+![agent-bom agent mesh graph](https://raw.githubusercontent.com/msaad00/agent-bom/main/docs/images/mesh-live.png)
+
+## What it scans
+
+- **Agents + MCP** — MCP clients, servers, tools, transports, trust posture
+- **Skills + instructions** — `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.windsurfrules`, `skills/*`
+- **Package risk** — supply-chain scanning across 15 package ecosystems (including `mix.lock` / `pubspec.lock` for Hex and Pub) with OSV/GHSA enrichment and blast radius
+- **AI models + datasets** — malicious-model detection via safe pickle-opcode disassembly (no execution), model/dataset cards, and target-scoped PII/PHI dataset-file scanning
+- **Container images + IaC** — native OCI parsing plus Dockerfile, Terraform, CloudFormation, Helm, and Kubernetes coverage
+- **Cloud estate** — read-only, gated asset inventory across AWS/Azure/GCP plus AI/GPU posture and CIS benchmarks
+- **Identity (NHI)** — non-human identity discovery (Okta/Entra), credential-expiry posture, and access-review campaigns
+- **LLM cost** — spend forecasting, budget runway, chargeback/allocation, and seasonal-aware spend-anomaly detection
+- **Secrets + runtime** — MCP proxy/gateway, inline firewall enforcement, A2A/MCP auth posture, Shield SDK, secrets, and redaction surfaces
+- **Compliance + evidence** — mapped governance plus ZIP evidence bundles for auditors
+
+## Key features
+
+- **Blast radius + attack-path fusion** — multi-hop exposure paths over one `UnifiedGraph`, from package → finding → MCP server → credentials → connected agents
+- **CWE-aware impact** — RCE shows credential exposure, DoS does not; symbol-level CVE reachability joins CWE/CVE/CPE advisory context when OSV/GHSA carry affected symbols (Python, npm, Go)
+- **Portable outputs** — SARIF, CycloneDX, SPDX, OCSF, HTML, graph, JSON, ZIP evidence bundles, and more
+- **MCP server mode** — 81 MCP tools, 6 resources, and 8 workflow prompts exposed to MCP clients like Claude, Cursor, Windsurf, and Cortex CoCo / Cortex Code
+- **Skill bundle identity** — stable bundle hashes for skill and instruction file review
+- **Dependency confusion detection** — flags internal naming patterns
+- **VEX generation** — auto-triage with CWE/CVE/CPE-aware reachability (package + function-level when advisory symbols exist)
+
+Discovery and static/cloud scanning are read-only and agentless. Proxy,
+gateway, Shield, and control-plane write tools are separate, explicit runtime
+or authenticated operations. No secrets leave your machine unless you
+explicitly enable an outbound integration.
+
+## How the data moves
+
+![How agent-bom works](https://raw.githubusercontent.com/msaad00/agent-bom/main/docs/images/scan-pipeline-light.svg)
+
+## Blast radius
+
+![Blast radius](https://raw.githubusercontent.com/msaad00/agent-bom/main/docs/images/blast-radius-light.svg)
+
+## Links
+
+- [GitHub](https://github.com/msaad00/agent-bom)
+- [Docker Hub](https://hub.docker.com/r/agentbom/agent-bom)
+- [Documentation](https://github.com/msaad00/agent-bom#readme)
+- [Product brief](https://github.com/msaad00/agent-bom/blob/main/docs/PRODUCT_BRIEF.md)
+- [Verified metrics](https://github.com/msaad00/agent-bom/blob/main/docs/PRODUCT_METRICS.md)
+- [Enterprise controls map](https://github.com/msaad00/agent-bom/blob/main/docs/ENTERPRISE.md)
+- [Discord](https://discord.gg/3YmYPqKZh5)

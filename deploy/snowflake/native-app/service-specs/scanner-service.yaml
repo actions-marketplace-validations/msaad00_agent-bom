@@ -1,0 +1,41 @@
+spec:
+  containers:
+    - name: agent-bom-scanner
+      image: /agent_bom_provider/spcs/agent_bom_repo/agent-bom-scanner:v0_101_0
+      env:
+        AGENT_BOM_STORE_BACKEND: snowflake
+        AGENT_BOM_SNOWFLAKE_NATIVE_APP: "1"
+        AGENT_BOM_ENABLE_ADVISORY_EGRESS: "1"
+        AGENT_BOM_MCP_MODE: "0"
+        AGENT_BOM_LOG_LEVEL: "INFO"
+      command:
+        - agent-bom
+        - agents
+        - --snowflake
+        - --format
+        - json
+        - --output
+        - /tmp/agent-bom/snowflake-scan.json
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp/agent-bom
+      readinessProbe:
+        port: 8424
+        path: /health
+      resources:
+        requests:
+          memory: 512M
+          cpu: 0.5
+        limits:
+          memory: 2G
+          cpu: 2
+
+  volumes:
+    - name: tmp
+      source: local
+      size: 1Gi
+
+  endpoints:
+    - name: scanner
+      port: 8424
+      public: false

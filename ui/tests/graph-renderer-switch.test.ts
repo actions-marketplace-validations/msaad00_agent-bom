@@ -1,0 +1,103 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  decideGraphRenderer,
+  shouldVirtualizeReactFlowNodes,
+} from "@/lib/graph-renderer-switch";
+import {
+  LARGE_GRAPH_OVERVIEW_EDGE_THRESHOLD,
+  LARGE_GRAPH_OVERVIEW_NODE_THRESHOLD,
+} from "@/lib/large-graph-overview";
+
+describe("graph renderer switch", () => {
+  it("renders bounded roll-up cards eagerly before the initial fitView", () => {
+    expect(shouldVirtualizeReactFlowNodes({ rollupActive: true })).toBe(false);
+    expect(shouldVirtualizeReactFlowNodes({ rollupActive: false })).toBe(true);
+  });
+
+  it("keeps focused investigation modes on React Flow", () => {
+    const broadGraph = {
+      nodeCount: LARGE_GRAPH_OVERVIEW_NODE_THRESHOLD + 10,
+      edgeCount: LARGE_GRAPH_OVERVIEW_EDGE_THRESHOLD + 10,
+    };
+
+    expect(decideGraphRenderer({ ...broadGraph, captureMode: true })).toMatchObject({
+      kind: "react-flow",
+      reason: "capture-mode",
+      supportsInvestigation: true,
+    });
+    expect(decideGraphRenderer({ ...broadGraph, selectedAttackPath: true })).toMatchObject({
+      kind: "react-flow",
+      reason: "attack-path-focus",
+      supportsInvestigation: true,
+    });
+    expect(decideGraphRenderer({ ...broadGraph, reachabilityActive: true })).toMatchObject({
+      kind: "react-flow",
+      reason: "reachability-drill-in",
+      supportsInvestigation: true,
+    });
+    expect(decideGraphRenderer({ ...broadGraph, rollupActive: true })).toMatchObject({
+      kind: "react-flow",
+      reason: "estate-rollup-navigation",
+      supportsInvestigation: true,
+    });
+    expect(decideGraphRenderer({ ...broadGraph, graphOnlyFindings: true })).toMatchObject({
+      kind: "react-flow",
+      reason: "findings-only-fallback",
+      supportsInvestigation: true,
+    });
+  });
+
+  it("promotes broad graphs to the WebGL overview at the existing thresholds", () => {
+    expect(
+      decideGraphRenderer({
+        nodeCount: LARGE_GRAPH_OVERVIEW_NODE_THRESHOLD,
+        edgeCount: 20,
+      }),
+    ).toMatchObject({
+      kind: "webgl",
+      reason: "large-graph-webgl-overview",
+      supportsInvestigation: false,
+    });
+
+    expect(
+      decideGraphRenderer({
+        nodeCount: 20,
+        edgeCount: LARGE_GRAPH_OVERVIEW_EDGE_THRESHOLD,
+      }),
+    ).toMatchObject({
+      kind: "webgl",
+      reason: "large-graph-webgl-overview",
+      supportsInvestigation: false,
+    });
+  });
+
+  it("renders WebGL for broad graphs regardless of the retired opt-in flag", () => {
+    const broad = {
+      nodeCount: LARGE_GRAPH_OVERVIEW_NODE_THRESHOLD + 1,
+      edgeCount: LARGE_GRAPH_OVERVIEW_EDGE_THRESHOLD + 1,
+    };
+
+    expect(decideGraphRenderer(broad)).toMatchObject({
+      kind: "webgl",
+      reason: "large-graph-webgl-overview",
+      supportsInvestigation: false,
+    });
+
+    // The legacy ?webgl / renderer=webgl opt-in is gone; passing it changes
+    // nothing because WebGL is now the default for broad estates.
+    expect(decideGraphRenderer({ ...broad, webglEnabled: true })).toMatchObject({
+      kind: "webgl",
+      reason: "large-graph-webgl-overview",
+    });
+  });
+
+  it("uses React Flow for normal-sized interactive graphs", () => {
+    expect(decideGraphRenderer({ nodeCount: 42, edgeCount: 84 })).toMatchObject({
+      kind: "react-flow",
+      reason: "focused-interactive-graph",
+      interactive: true,
+      supportsInvestigation: true,
+    });
+  });
+});

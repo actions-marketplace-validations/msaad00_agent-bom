@@ -14,7 +14,9 @@ Shell alias (recommended):
 The guard exits with code 1 (blocking install) if any package has:
   - Critical or High CVEs (configurable via --min-severity)
   - Known-exploited vulnerabilities (CISA KEV)
-  - Malicious package indicators
+
+Malicious-package indicators are surfaced by ``agent-bom agents --fail-on-malicious``
+and policy rules; the pre-install guard does not yet block typosquats without CVEs.
 
 Use --allow-risky to install despite findings (logs a warning).
 """
@@ -27,6 +29,8 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
+
+from agent_bom.graph.severity import severity_policy_rank
 
 logger = logging.getLogger(__name__)
 
@@ -127,24 +131,40 @@ def _extract_npm_packages(args: list[str]) -> list[str]:
     return packages
 
 
-async def _check_package(name: str, ecosystem: str) -> dict:
-    """Check a single package for vulnerabilities using existing scanner."""
-    from agent_bom.scanners import scan_packages
+def _severity_value(severity: object) -> str:
+    """Return a normalized severity string from scanner model values."""
+    return str(getattr(severity, "value", severity) or "unknown").lower()
 
-    pkg_entry = type("Pkg", (), {"name": name, "version": "latest", "ecosystem": ecosystem, "vulnerabilities": []})()
+
+async def _check_package(name: str, ecosystem: str, min_severity: str = "high", block_kev: bool = True) -> dict:
+    """Check a single package for vulnerabilities using existing scanner."""
+    from agent_bom.models import Package
+    from agent_bom.scanners import ScanOptions, scan_packages
+
+    pkg_entry = Package(name=name, version="latest", ecosystem=ecosystem)
     try:
-        await scan_packages([pkg_entry])
+        await scan_packages([pkg_entry], options=ScanOptions(offline=False))
     except Exception as e:
-        logger.warning("Failed to scan %s: %s", name, e)
-        return {"name": name, "ecosystem": ecosystem, "error": str(e), "vulns": [], "blocked": False}
+        logger.warning("Failed to scan %s/%s; blocking install because no trustworthy verdict was produced: %s", ecosystem, name, e)
+        return {
+            "name": name,
+            "ecosystem": ecosystem,
+            "error": str(e),
+            "vulns": [],
+            "blocked": True,
+            "scan_failed": True,
+            "vuln_count": 0,
+        }
 
     cve_list = []
     blocked = False
+    min_rank = severity_policy_rank(min_severity)
     for v in getattr(pkg_entry, "vulnerabilities", []):
-        severity = getattr(v, "severity", "unknown")
+        severity = _severity_value(getattr(v, "severity", "unknown"))
         cve_id = getattr(v, "id", "unknown")
-        cve_list.append({"id": cve_id, "severity": severity})
-        if severity in ("critical", "high"):
+        is_kev = bool(getattr(v, "is_kev", False))
+        cve_list.append({"id": cve_id, "severity": severity, "is_kev": is_kev})
+        if severity_policy_rank(severity) >= min_rank or (block_kev and is_kev):
             blocked = True
 
     return {
@@ -192,9 +212,24 @@ async def guard_install(
 
     logger.info("Scanning %d package(s) before install: %s", len(packages), ", ".join(packages))
 
-    # Check packages concurrently
-    tasks = [_check_package(name, ecosystem) for name in packages]
-    results = await asyncio.gather(*tasks)
+    # Check packages concurrently (one failure must not abort siblings).
+    tasks = [_check_package(name, ecosystem, min_severity=min_severity, block_kev=block_kev) for name in packages]
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    results: list[dict] = []
+    for name, outcome in zip(packages, outcomes, strict=False):
+        if isinstance(outcome, BaseException):
+            from agent_bom.security import sanitize_error
+
+            results.append(
+                {
+                    "name": name,
+                    "blocked": True,
+                    "scan_failed": True,
+                    "error": sanitize_error(outcome if isinstance(outcome, Exception) else str(outcome)),
+                }
+            )
+        else:
+            results.append(outcome)
 
     for pkg_result in results:
         result.packages_checked += 1
@@ -205,7 +240,8 @@ async def guard_install(
             result.packages_clean += 1
             result.clean.append(pkg_result["name"])
 
-    if result.packages_blocked > 0 and not allow_risky:
+    scan_failed = any(pkg.get("scan_failed") for pkg in result.blocked)
+    if result.packages_blocked > 0 and (not allow_risky or scan_failed):
         result.install_allowed = False
     else:
         result.install_allowed = True
@@ -236,29 +272,39 @@ def run_guarded_install(
     result = guard_install_sync(tool, args, min_severity=min_severity, allow_risky=allow_risky)
 
     if not result.install_allowed:
-        print(f"\n  BLOCKED — {result.packages_blocked} package(s) have critical/high vulnerabilities:", file=sys.stderr)
-        for pkg in result.blocked:
+        failed = [pkg for pkg in result.blocked if pkg.get("scan_failed")]
+        vulnerable = [pkg for pkg in result.blocked if not pkg.get("scan_failed")]
+        if failed:
+            sys.stderr.write(f"\n  BLOCKED — security scan failed for {len(failed)} package(s):\n")
+            for pkg in failed:
+                sys.stderr.write(f"    {pkg['name']}: {pkg.get('error', 'unknown scan error')}\n")
+        if vulnerable:
+            sys.stderr.write(f"\n  BLOCKED — {len(vulnerable)} package(s) have vulnerabilities at or above policy:\n")
+        for pkg in vulnerable:
             vulns_str = ", ".join(v["id"] for v in pkg.get("vulns", [])[:5])
-            print(f"    {pkg['name']}: {pkg['vuln_count']} CVEs ({vulns_str})", file=sys.stderr)
-        print("\n  Use --allow-risky to install anyway, or fix the vulnerabilities first.", file=sys.stderr)
+            sys.stderr.write(f"    {pkg['name']}: {pkg['vuln_count']} CVEs ({vulns_str})\n")
+        if failed:
+            sys.stderr.write("\n  Resolve the scan failure before installing.\n")
+            return 1
+        sys.stderr.write("\n  Use --allow-risky to install anyway, or fix the vulnerabilities first.\n")
         return 1
 
     if result.packages_blocked > 0 and allow_risky:
-        print(f"\n  WARNING — installing {result.packages_blocked} package(s) with known vulnerabilities", file=sys.stderr)
+        sys.stderr.write(f"\n  WARNING — installing {result.packages_blocked} package(s) with known vulnerabilities\n")
         for pkg in result.blocked:
-            print(f"    {pkg['name']}: {pkg['vuln_count']} CVEs", file=sys.stderr)
+            sys.stderr.write(f"    {pkg['name']}: {pkg['vuln_count']} CVEs\n")
 
     if result.packages_checked > 0:
-        print(f"  {result.packages_clean}/{result.packages_checked} packages clean", file=sys.stderr)
+        sys.stderr.write(f"  {result.packages_clean}/{result.packages_checked} packages clean\n")
 
     # Execute the real install command
     real_cmd = _find_real_tool(tool)
     if not real_cmd:
-        print(f"  ERROR: Could not find real '{tool}' binary", file=sys.stderr)
+        sys.stderr.write(f"  ERROR: Could not find real '{tool}' binary\n")
         return 1
 
     full_cmd = [real_cmd] + args
-    logger.info("Executing: %s", " ".join(full_cmd))
+    logger.info("Executing guarded %s install for %d package(s)", tool, result.packages_checked)
     return subprocess.call(full_cmd)
 
 

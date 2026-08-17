@@ -1,35 +1,73 @@
+# Base image policy: node 24 LTS (sits inside ui/package.json engines: ">=22 <25").
+# Digest is pinned by dependabot's daily docker job; the
+# scripts/check_docker_base_policy.py CI gate accepts the
+# `# pending-digest` marker for at most one day after a major bump
+# so a Dockerfile change can land while dependabot catches up.
+# Tracking: #1961.
+
 # ── Stage 1: Install dependencies ─────────────────────────────────────────────
-FROM node:20-slim@sha256:d8a35d586fad3af7abb6fdb9ba972388395405f4d462da9e4a4ddcde67b5e0fb AS deps
+FROM node:24-bookworm-slim@sha256:03eae3ef7e88a9de535496fb488d67e02b9d96a063a8967bae657744ecd513f2 AS deps
 WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci --ignore-scripts
+# Next's webpack CSS pipeline requires lightningcss' native Linux binding.
+# Some npm versions omit optional platform bindings during lockfile-driven
+# installs, so pin the binding explicitly in the image. Buildx injects
+# TARGETARCH automatically (amd64 / arm64) when building multi-arch — pick
+# the matching prebuilt so `docker buildx --platform linux/amd64,linux/arm64`
+# does not try to install the x64 binary on an arm64 stage.
+ARG TARGETARCH
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) pkg="lightningcss-linux-x64-gnu@1.32.0" ;; \
+      arm64) pkg="lightningcss-linux-arm64-gnu@1.32.0" ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    npm install --no-save --ignore-scripts "$pkg"
 
 # ── Stage 2: Build ────────────────────────────────────────────────────────────
-FROM node:20-slim@sha256:d8a35d586fad3af7abb6fdb9ba972388395405f4d462da9e4a4ddcde67b5e0fb AS builder
+FROM node:24-bookworm-slim@sha256:03eae3ef7e88a9de535496fb488d67e02b9d96a063a8967bae657744ecd513f2 AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-ARG NEXT_PUBLIC_API_URL=http://localhost:8422
-ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 ENV NEXT_TELEMETRY_DISABLED=1
 
 RUN npm run build
 
 # ── Stage 3: Run ──────────────────────────────────────────────────────────────
-FROM node:20-slim@sha256:d8a35d586fad3af7abb6fdb9ba972388395405f4d462da9e4a4ddcde67b5e0fb AS runner
+FROM node:24-bookworm-slim@sha256:03eae3ef7e88a9de535496fb488d67e02b9d96a063a8967bae657744ecd513f2 AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 
+# Apply latest OS security patches (fixes base-image CVEs visible in Docker Scout)
+RUN apt-get update && apt-get upgrade -y --no-install-recommends && rm -rf /var/lib/apt/lists/*
+
+# The production image runs Next's standalone server with `node server.js`.
+# npm, npx, yarn, and corepack are build-time tooling only; removing them from
+# the runner avoids shipping their transitive package-manager CVE surface.
+RUN rm -rf \
+    /opt/yarn* \
+    /usr/local/bin/corepack \
+    /usr/local/bin/npm \
+    /usr/local/bin/npx \
+    /usr/local/bin/yarn \
+    /usr/local/bin/yarnpkg \
+    /usr/local/lib/node_modules/corepack \
+    /usr/local/lib/node_modules/npm
+
 RUN addgroup --system --gid 1001 nodejs && \
     adduser --system --uid 1001 nextjs
 
 # Copy standalone output
-COPY --from=builder /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --chown=nextjs:nodejs docker-entrypoint.sh ./docker-entrypoint.sh
+
+RUN chmod +x /app/docker-entrypoint.sh
 
 USER nextjs
 
@@ -40,4 +78,5 @@ ENV HOSTNAME="0.0.0.0"
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD node -e "const http = require('http'); http.get('http://localhost:3000', (r) => { process.exit(r.statusCode === 200 ? 0 : 1); }).on('error', () => process.exit(1));" || exit 1
 
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["node", "server.js"]

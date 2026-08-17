@@ -2,11 +2,14 @@
 
 import json
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 from click.testing import CliRunner
 
+import agent_bom.parsers as parsers
 from agent_bom.cli import main
 from agent_bom.discovery import parse_mcp_config
 from agent_bom.models import (
@@ -22,8 +25,14 @@ from agent_bom.models import (
 )
 from agent_bom.output import export_sarif, to_cyclonedx, to_json, to_sarif, to_spdx
 from agent_bom.parsers import parse_npm_packages, parse_pip_packages
+from tests.auth_helpers import disable_trusted_proxy_env, enable_trusted_proxy_env, proxy_headers
 
 # ─── Model Tests ────────────────────────────────────────────────────────────
+
+
+def test_agent_metadata_uses_typed_mapping_annotation():
+    hints = get_type_hints(Agent)
+    assert hints["metadata"] == dict[str, object]
 
 
 def test_package_no_vulns():
@@ -185,6 +194,27 @@ def test_npx_package_detection():
     assert packages[0].ecosystem == "npm"
 
 
+def test_npx_package_detection_uses_local_npx_cache(monkeypatch, tmp_path):
+    pkg_json = tmp_path / "_npx" / "abc123" / "node_modules" / "@modelcontextprotocol" / "server-filesystem" / "package.json"
+    pkg_json.parent.mkdir(parents=True)
+    pkg_json.write_text(json.dumps({"name": "@modelcontextprotocol/server-filesystem", "version": "1.2.3"}), encoding="utf-8")
+    monkeypatch.setenv("npm_config_cache", str(tmp_path))
+    server = MCPServer(
+        name="filesystem",
+        command="npx",
+        args=["@modelcontextprotocol/server-filesystem", "/tmp"],
+    )
+    from agent_bom.parsers import detect_npx_package
+
+    package = detect_npx_package(server)[0]
+
+    assert package.version == "1.2.3"
+    assert package.declared_version == "latest"
+    assert package.version_source == "tool_cache"
+    assert package.version_confidence == "high"
+    assert package.version_evidence[0]["path"] == str(pkg_json)
+
+
 def test_uvx_package_detection():
     server = MCPServer(
         name="mcp-server-fetch",
@@ -197,6 +227,55 @@ def test_uvx_package_detection():
     assert len(packages) == 1
     assert packages[0].name == "mcp-server-fetch"
     assert packages[0].ecosystem == "pypi"
+
+
+def test_uvx_package_detection_uses_local_uv_cache(monkeypatch, tmp_path):
+    metadata = tmp_path / "archive-v0" / "abc123" / "mcp_server_fetch-4.5.6.dist-info" / "METADATA"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text("Name: mcp-server-fetch\nVersion: 4.5.6\n", encoding="utf-8")
+    monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path))
+    server = MCPServer(
+        name="mcp-server-fetch",
+        command="uvx",
+        args=["mcp-server-fetch"],
+    )
+    from agent_bom.parsers import detect_uvx_package
+
+    package = detect_uvx_package(server)[0]
+
+    assert package.version == "4.5.6"
+    assert package.declared_version == "latest"
+    assert package.version_source == "tool_cache"
+    assert package.version_confidence == "high"
+    assert package.version_evidence[0]["path"] == str(metadata)
+
+
+def test_docker_image_package_detection():
+    server = MCPServer(
+        name="playwright-container",
+        command="docker",
+        args=["run", "--rm", "-e", "TOKEN", "-v", "/tmp:/tmp", "mcp/playwright:1.2.3"],
+    )
+    from agent_bom.parsers import detect_docker_image_package, extract_packages
+
+    packages = detect_docker_image_package(server)
+
+    assert len(packages) == 1
+    assert packages[0].name == "mcp/playwright"
+    assert packages[0].version == "1.2.3"
+    assert packages[0].ecosystem == "docker"
+    assert packages[0].version_source == "detected"
+    assert extract_packages(server)[0].name == "mcp/playwright"
+
+
+def test_docker_image_package_detection_defaults_unpinned_tag():
+    server = MCPServer(name="playwright-container", command="podman", args=["container", "run", "--rm", "ghcr.io/acme/mcp"])
+    from agent_bom.parsers import detect_docker_image_package
+
+    packages = detect_docker_image_package(server)
+
+    assert packages[0].name == "ghcr.io/acme/mcp"
+    assert packages[0].version == "latest"
 
 
 # ─── Fixtures ────────────────────────────────────────────────────────────────
@@ -254,9 +333,16 @@ def empty_report():
 
 
 def test_version_sync():
+    """Version in __init__.py must match pyproject.toml."""
+    import re
+    from pathlib import Path
+
     from agent_bom import __version__
 
-    assert __version__ == "0.70.12"
+    pyproject = Path(__file__).parent.parent / "pyproject.toml"
+    m = re.search(r'version\s*=\s*"([^"]+)"', pyproject.read_text())
+    assert m, "Could not find version in pyproject.toml"
+    assert __version__ == m.group(1)
 
 
 def test_report_version_matches():
@@ -393,23 +479,113 @@ def test_sarif_export_file(sample_report, tmp_path):
     assert len(data["runs"][0]["results"]) == 1
 
 
+def test_sarif_exclude_unfixable():
+    """exclude_unfixable=True drops findings without a fixed_version."""
+    unfixable_vuln = Vulnerability(
+        id="CVE-2024-9999",
+        summary="No fix available",
+        severity=Severity.HIGH,
+        cvss_score=7.5,
+        fixed_version=None,
+    )
+    fixable_vuln = Vulnerability(
+        id="CVE-2024-1111",
+        summary="Fix available",
+        severity=Severity.HIGH,
+        cvss_score=8.0,
+        fixed_version="2.0.0",
+    )
+    pkg = Package(name="pkg", version="1.0.0", ecosystem="npm", vulnerabilities=[unfixable_vuln, fixable_vuln])
+    server = MCPServer(name="s", command="node", args=[], packages=[pkg])
+    agent = Agent(name="a", agent_type=AgentType.CLAUDE_DESKTOP, config_path="/tmp/c.json", mcp_servers=[server])
+    br1 = BlastRadius(
+        vulnerability=unfixable_vuln,
+        package=pkg,
+        affected_servers=[server],
+        affected_agents=[agent],
+        exposed_credentials=[],
+        exposed_tools=[],
+    )
+    br2 = BlastRadius(
+        vulnerability=fixable_vuln,
+        package=pkg,
+        affected_servers=[server],
+        affected_agents=[agent],
+        exposed_credentials=[],
+        exposed_tools=[],
+    )
+    report = AIBOMReport(agents=[agent], blast_radii=[br1, br2])
+
+    # Without flag: both findings present
+    sarif_all = to_sarif(report)
+    assert len(sarif_all["runs"][0]["results"]) == 2
+
+    # With flag: only fixable finding present
+    sarif_filtered = to_sarif(report, exclude_unfixable=True)
+    assert len(sarif_filtered["runs"][0]["results"]) == 1
+    assert sarif_filtered["runs"][0]["results"][0]["ruleId"] == "CVE-2024-1111"
+    assert len(sarif_filtered["runs"][0]["tool"]["driver"]["rules"]) == 1
+
+
 # ─── JSON / CycloneDX Output Tests ───────────────────────────────────────────
 
 
 def test_json_output_structure(sample_report):
     data = to_json(sample_report)
+    assert data["schema_version"] == "1.0"
+    assert data["scan_run"]["schema_version"] == "1"
+    assert data["scan_run"]["scan_id"] == sample_report.scan_id
     assert "agents" in data
     assert "blast_radius" in data
+    assert data["blast_radius"][0]["schema_version"] == "1"
+    assert data["findings"][0]["schema_version"] == "1"
+    assert data["inventory_snapshot"]["schema_version"] == "1"
     assert data["summary"]["total_vulnerabilities"] == 1
     assert data["ai_bom_version"] == sample_report.tool_version
+    assert data["posture_grade"] == data["posture_scorecard"]["grade"]
+
+
+def test_json_output_includes_canonical_publish_dates(sample_report):
+    vuln = sample_report.agents[0].mcp_servers[0].packages[0].vulnerabilities[0]
+    vuln.published_at = "2026-03-21T12:00:00Z"
+    vuln.modified_at = "2026-03-23T09:00:00Z"
+    data = to_json(sample_report)
+    agent_vuln = data["agents"][0]["mcp_servers"][0]["packages"][0]["vulnerabilities"][0]
+    assert agent_vuln["published_at"] == "2026-03-21T12:00:00Z"
+    assert agent_vuln["modified_at"] == "2026-03-23T09:00:00Z"
+    assert data["blast_radius"][0]["published_at"] == "2026-03-21T12:00:00Z"
+    assert data["blast_radius"][0]["modified_at"] == "2026-03-23T09:00:00Z"
+
+
+def test_json_output_includes_dependency_reachability_evidence(sample_report):
+    package = sample_report.agents[0].mcp_servers[0].packages[0]
+    package.dependency_scope = "peer"
+    package.reachability_evidence = "declaration_only"
+
+    data = to_json(sample_report)
+    package_json = data["agents"][0]["mcp_servers"][0]["packages"][0]
+    assert package_json["dependency_scope"] == "peer"
+    assert package_json["reachability_evidence"] == "declaration_only"
 
 
 def test_cyclonedx_output_structure(sample_report):
     data = to_cyclonedx(sample_report)
     assert data["bomFormat"] == "CycloneDX"
-    assert data["specVersion"] == "1.6"
+    assert data["specVersion"] == "1.7"
     assert len(data["components"]) > 0
     assert "vulnerabilities" in data
+
+
+def test_cyclonedx_output_includes_dependency_reachability_evidence(sample_report):
+    package = sample_report.agents[0].mcp_servers[0].packages[0]
+    package.dependency_scope = "optional"
+    package.reachability_evidence = "declaration_only"
+
+    data = to_cyclonedx(sample_report)
+    package_component = next(component for component in data["components"] if component.get("type") == "library")
+    props = {prop["name"]: prop["value"] for prop in package_component["properties"]}
+    assert props["agent-bom:dependency-scope"] == "optional"
+    assert props["agent-bom:reachability-evidence"] == "declaration_only"
 
 
 # ─── CLI Tests ───────────────────────────────────────────────────────────────
@@ -425,13 +601,13 @@ def test_cli_version():
 def test_cli_scan_empty_dir_exits_0():
     runner = CliRunner()
     with tempfile.TemporaryDirectory() as tmpdir:
-        result = runner.invoke(main, ["scan", "--project", tmpdir])
+        result = runner.invoke(main, ["agents", "--project", tmpdir])
         assert result.exit_code == 0
 
 
 def test_cli_help_shows_exit_codes():
     runner = CliRunner()
-    result = runner.invoke(main, ["scan", "--help"])
+    result = runner.invoke(main, ["agents", "--help"])
     assert "Exit codes" in result.output
     assert "0" in result.output
     assert "1" in result.output
@@ -504,6 +680,101 @@ def test_diff_resolved_finding():
     assert len(diff["resolved"]) == 1
 
 
+def test_diff_reports_inventory_changes():
+    from agent_bom.history import diff_reports
+
+    baseline = {
+        "generated_at": "2025-01-01T00:00:00",
+        "inventory_snapshot": {
+            "agents": [{"id": "agent-1", "name": "claude"}],
+            "servers": [{"id": "srv-1", "name": "filesystem", "fingerprint": "fp-1", "auth_mode": "none"}],
+            "tools": [{"id": "tool-1", "name": "read_file", "fingerprint": "tool-fp-1", "risk_score": 1}],
+            "resources": [{"id": "res-1", "uri": "file:///workspace", "fingerprint": "res-fp-1", "risk_score": 1}],
+            "packages": [{"id": "pkg-1", "name": "requests", "version": "2.31.0"}],
+            "relationships": [
+                {"from": "agent-1", "to": "srv-1", "type": "uses"},
+                {"from": "srv-1", "to": "tool-1", "type": "exposes_tool"},
+            ],
+        },
+        "agents": [],
+        "blast_radius": [],
+    }
+    current = {
+        "generated_at": "2025-01-02T00:00:00",
+        "inventory_snapshot": {
+            "agents": [{"id": "agent-1", "name": "claude"}],
+            "servers": [
+                {"id": "srv-1", "name": "filesystem", "fingerprint": "fp-2"},
+                {"id": "srv-2", "name": "sqlite", "fingerprint": "fp-3"},
+            ],
+            "tools": [
+                {"id": "tool-1", "name": "read_file", "fingerprint": "tool-fp-2", "risk_score": 3},
+                {"id": "tool-2", "name": "write_file", "fingerprint": "tool-fp-3", "risk_score": 4},
+            ],
+            "resources": [
+                {"id": "res-1", "uri": "file:///workspace", "fingerprint": "res-fp-2", "risk_score": 2},
+            ],
+            "packages": [{"id": "pkg-1", "name": "requests", "version": "2.31.0"}],
+            "relationships": [
+                {"from": "agent-1", "to": "srv-1", "type": "uses"},
+                {"from": "srv-1", "to": "tool-1", "type": "exposes_tool"},
+                {"from": "srv-1", "to": "res-1", "type": "exposes_resource"},
+                {"from": "agent-1", "to": "srv-2", "type": "uses"},
+            ],
+        },
+        "agents": [],
+        "blast_radius": [],
+    }
+    diff = diff_reports(baseline, current)
+    assert diff["inventory_diff"]["summary"]["new_servers"] == 1
+    assert diff["inventory_diff"]["summary"]["changed_servers"] == 1
+    assert diff["inventory_diff"]["summary"]["new_tools"] == 1
+    assert diff["inventory_diff"]["summary"]["changed_tools"] == 1
+    assert diff["inventory_diff"]["summary"]["changed_resources"] == 1
+    assert diff["inventory_diff"]["summary"]["new_relationships"] == 2
+
+
+def test_diff_reports_inventory_uses_ai_bom_relationships():
+    from agent_bom.history import diff_reports
+
+    baseline = {
+        "generated_at": "2025-01-01T00:00:00",
+        "inventory_snapshot": {
+            "agents": [{"id": "agent-1", "name": "claude"}],
+            "servers": [{"id": "srv-1", "name": "filesystem", "fingerprint": "fp-1"}],
+            "tools": [{"id": "tool-1", "name": "read_file", "fingerprint": "tool-fp-1", "risk_score": 1}],
+            "resources": [],
+            "packages": [],
+        },
+        "ai_bom_entities": {
+            "relationships": [{"from": "srv-1", "to": "tool-1", "type": "exposes_tool"}],
+        },
+        "agents": [],
+        "blast_radius": [],
+    }
+    current = {
+        "generated_at": "2025-01-02T00:00:00",
+        "inventory_snapshot": {
+            "agents": [{"id": "agent-1", "name": "claude"}],
+            "servers": [{"id": "srv-1", "name": "filesystem", "fingerprint": "fp-1"}],
+            "tools": [{"id": "tool-1", "name": "read_file", "fingerprint": "tool-fp-1", "risk_score": 1}],
+            "resources": [],
+            "packages": [],
+        },
+        "ai_bom_entities": {
+            "relationships": [
+                {"from": "srv-1", "to": "tool-1", "type": "exposes_tool"},
+                {"from": "agent-1", "to": "srv-1", "type": "uses"},
+            ],
+        },
+        "agents": [],
+        "blast_radius": [],
+    }
+
+    diff = diff_reports(baseline, current)
+    assert diff["inventory_diff"]["summary"]["new_relationships"] == 1
+
+
 def test_cli_check_help():
     runner = CliRunner()
     result = runner.invoke(main, ["check", "--help"])
@@ -513,13 +784,13 @@ def test_cli_check_help():
 
 def test_cli_history_help():
     runner = CliRunner()
-    result = runner.invoke(main, ["history", "--help"])
+    result = runner.invoke(main, ["report", "history", "--help"])
     assert result.exit_code == 0
 
 
 def test_cli_diff_help():
     runner = CliRunner()
-    result = runner.invoke(main, ["diff", "--help"])
+    result = runner.invoke(main, ["report", "diff", "--help"])
     assert result.exit_code == 0
     assert "baseline" in result.output.lower()
 
@@ -616,7 +887,7 @@ def test_policy_template_command():
     runner = CliRunner()
     with tempfile.TemporaryDirectory() as tmpdir:
         out_file = str(Path(tmpdir) / "policy.json")
-        result = runner.invoke(main, ["policy-template", "-o", out_file])
+        result = runner.invoke(main, ["policy", "template", "-o", out_file])
         assert result.exit_code == 0
         data = json.loads(Path(out_file).read_text())
         assert "rules" in data
@@ -666,19 +937,22 @@ def test_spdx_output_structure(sample_report):
     from agent_bom.output import to_spdx
 
     data = to_spdx(sample_report)
-    assert data["spdxVersion"] == "SPDX-3.0"
-    assert data["dataLicense"] == "CC0-1.0"
-    assert "elements" in data
-    assert "relationships" in data
-    assert "creationInfo" in data
-    assert len(data["elements"]) > 0
+    # Canonical SPDX 3.0.1 JSON-LD: @context + @graph, no legacy top-level keys.
+    assert set(data) == {"@context", "@graph"}
+    assert data["@context"] == "https://spdx.org/rdf/3.0.1/spdx-context.jsonld"
+    graph = data["@graph"]
+    doc = next(n for n in graph if n["type"] == "SpdxDocument")
+    assert doc["dataLicense"] == "CC0-1.0"
+    ci = next(n for n in graph if n["type"] == "CreationInfo")
+    assert ci["specVersion"] == "3.0.1"
+    assert len(graph) > 0
 
 
 def test_spdx_has_vulnerability_elements(sample_report):
     from agent_bom.output import to_spdx
 
     data = to_spdx(sample_report)
-    vuln_elements = [e for e in data["elements"] if e.get("type") == "security/Vulnerability"]
+    vuln_elements = [e for e in data["@graph"] if e.get("type") == "security_Vulnerability"]
     assert len(vuln_elements) >= 1
     assert vuln_elements[0]["name"] == "CVE-2024-1234"
 
@@ -689,7 +963,8 @@ def test_spdx_export_file(sample_report, tmp_path):
     out = tmp_path / "test.spdx.json"
     export_spdx(sample_report, str(out))
     data = json.loads(out.read_text())
-    assert data["spdxVersion"] == "SPDX-3.0"
+    assert data["@context"] == "https://spdx.org/rdf/3.0.1/spdx-context.jsonld"
+    assert next(n for n in data["@graph"] if n["type"] == "CreationInfo")["specVersion"] == "3.0.1"
 
 
 def test_cli_scan_has_spdx_format():
@@ -785,6 +1060,32 @@ def test_mcp_registry_lookup_by_arg(tmp_path):
     assert packages[0].name == "@modelcontextprotocol/server-filesystem"
     assert packages[0].ecosystem == "npm"
     assert packages[0].resolved_from_registry is True
+    assert packages[0].version == packages[0].registry_version
+    assert packages[0].version_source == "registry_fallback"
+    assert packages[0].purl.startswith("pkg:npm/%40modelcontextprotocol/server-filesystem@")
+
+
+def test_mcp_registry_lookup_does_not_reverse_substring_match(monkeypatch):
+    from agent_bom.models import MCPServer
+    from agent_bom.parsers import lookup_mcp_registry
+
+    monkeypatch.setattr(
+        parsers,
+        "_registry_cache",
+        {
+            "@scope/filesystem": {
+                "package": "@scope/filesystem",
+                "ecosystem": "npm",
+                "latest_version": "1.0.0",
+                "command_patterns": ["filesystem"],
+                "verified": True,
+            }
+        },
+    )
+
+    server = MCPServer(name="fs", command="node", args=["fs"], env={})
+
+    assert lookup_mcp_registry(server) == []
 
 
 def test_mcp_registry_lookup_unknown_server():
@@ -919,7 +1220,7 @@ def test_image_to_purl_with_registry():
 
 
 def test_image_scan_no_tools(monkeypatch):
-    """scan_image raises ImageScanError when neither syft nor docker is available."""
+    """scan_image raises ImageScanError when docker is unavailable."""
     import shutil
 
     from agent_bom.image import ImageScanError, scan_image
@@ -929,61 +1230,61 @@ def test_image_scan_no_tools(monkeypatch):
         scan_image("nginx:latest")
 
 
-def test_scan_with_syft_preferred(monkeypatch):
-    """scan_image uses syft when grype is absent but syft is present."""
+def test_scan_image_uses_native_strategy(monkeypatch):
+    """scan_image returns native results from the Docker-backed scanner."""
     import shutil
-    import subprocess
 
     from agent_bom.image import scan_image
+    from agent_bom.models import Package
 
-    # Grype not available → falls through to syft
-    monkeypatch.setattr(shutil, "which", lambda cmd: None if cmd == "grype" else "/usr/bin/" + cmd)
-
-    # Return a minimal CycloneDX JSON from syft
-    fake_cdx = json.dumps(
-        {
-            "bomFormat": "CycloneDX",
-            "specVersion": "1.5",
-            "components": [{"name": "requests", "version": "2.31.0", "purl": "pkg:pypi/requests@2.31.0", "type": "library"}],
-        }
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/docker" if cmd == "docker" else None)
+    monkeypatch.setattr(
+        "agent_bom.image._scan_with_docker",
+        lambda image_ref, platform=None: [Package(name="requests", version="2.31.0", ecosystem="pypi")],
     )
-
-    def fake_run(cmd, **kwargs):
-        class R:
-            returncode = 0
-            stdout = fake_cdx
-            stderr = ""
-
-        return R()
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
     packages, strategy = scan_image("myapp:latest")
-    assert strategy == "syft"
+    assert strategy == "native"
     assert len(packages) == 1
     assert packages[0].name == "requests"
     assert packages[0].ecosystem == "pypi"
 
 
-def test_scan_with_syft_error(monkeypatch):
-    """scan_image raises ImageScanError when syft exits non-zero."""
+def test_scan_image_fails_when_native_extraction_fails(monkeypatch):
+    """scan_image does not silently downgrade empty native extraction into a clean scan."""
     import shutil
-    import subprocess
 
     from agent_bom.image import ImageScanError, scan_image
 
-    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/syft" if cmd == "syft" else None)
-
-    def fake_run(cmd, **kwargs):
-        class R:
-            returncode = 1
-            stdout = ""
-            stderr = "image not found"
-
-        return R()
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    with pytest.raises(ImageScanError, match="syft exited"):
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/docker" if cmd == "docker" else None)
+    monkeypatch.setattr(
+        "agent_bom.image._scan_with_docker",
+        lambda image_ref, platform=None: (_ for _ in ()).throw(
+            ImageScanError("Native image scan extracted 0 packages from nonexistent:latest")
+        ),
+    )
+    with pytest.raises(ImageScanError, match="0 packages"):
         scan_image("nonexistent:latest")
+
+
+def test_local_vuln_conversion_preserves_publish_dates():
+    from agent_bom.db.lookup import LocalVuln
+    from agent_bom.scanners import _local_vuln_to_vulnerability
+
+    lv = LocalVuln(
+        id="GHSA-test-1234",
+        summary="Example vuln",
+        severity="high",
+        cvss_score=7.5,
+        fixed_version="2.0.0",
+        published_at="2026-03-21T12:00:00Z",
+        modified_at="2026-03-23T09:00:00Z",
+        aliases=["CVE-2026-1234"],
+    )
+
+    vuln = _local_vuln_to_vulnerability(lv)
+    assert vuln.id == "CVE-2026-1234"
+    assert vuln.published_at == "2026-03-21T12:00:00Z"
+    assert vuln.modified_at == "2026-03-23T09:00:00Z"
 
 
 def test_cli_scan_has_image_flag():
@@ -992,9 +1293,65 @@ def test_cli_scan_has_image_flag():
     assert "--image" in result.output
 
 
+def test_cli_image_accepts_tarball_without_image_ref(monkeypatch, tmp_path):
+    seen = []
+    image_tar = tmp_path / "image.tar"
+    image_tar.write_bytes(b"")
+
+    def fake_scan(**kwargs):
+        seen.append(kwargs)
+
+    monkeypatch.setattr("agent_bom.cli.agents.scan.callback", fake_scan)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["image", "--tar", str(image_tar), "--quiet"])
+
+    assert result.exit_code == 0
+    assert seen[0]["images"] == ()
+    assert seen[0]["image_tars"] == (str(image_tar),)
+    assert seen[0]["_image_only"] is True
+    assert seen[0]["no_skill"] is True
+
+
+def test_cli_image_rejects_reference_and_tarball_together(monkeypatch):
+    def fake_scan(**_kwargs):
+        raise AssertionError("scan should not run when image input mode is ambiguous")
+
+    monkeypatch.setattr("agent_bom.cli.agents.scan.callback", fake_scan)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["image", "nginx:latest", "--tar", "image.tar"])
+
+    assert result.exit_code != 0
+    assert "Provide exactly one image reference or --tar/--image-tar path" in result.output
+
+
+def test_cli_image_output_json_extension_writes_report(monkeypatch, tmp_path):
+    from agent_bom.models import Package
+
+    output = tmp_path / "image-report.json"
+
+    monkeypatch.setattr(
+        "agent_bom.image.scan_image",
+        lambda image_ref, registry_user=None, registry_pass=None, platform=None: (
+            [Package(name="openssl", version="3.0.16", ecosystem="deb")],
+            "native",
+        ),
+    )
+    monkeypatch.setattr("agent_bom.cli.agents.scan_agents_sync", lambda *args, **kwargs: [])
+
+    result = CliRunner().invoke(main, ["image", "nginx:1.20.0", "-o", str(output), "--quiet"])
+
+    assert result.exit_code == 0, result.output
+    assert output.exists()
+    data = json.loads(output.read_text(encoding="utf-8"))
+    assert data["scan_sources"] == ["image"]
+    assert any(package["name"] == "openssl" for package in data["packages"])
+
+
 def test_cli_scan_has_k8s_flags():
     runner = CliRunner()
-    result = runner.invoke(main, ["scan", "--help"])
+    result = runner.invoke(main, ["scan", "--help-all"])
     assert "--k8s" in result.output
     assert "--namespace" in result.output
 
@@ -1206,6 +1563,24 @@ def test_html_contains_cytoscape_graph():
     assert "cy.nodes" in html
 
 
+def test_html_sidebar_dynamic_values_are_escaped_before_innerhtml():
+    from agent_bom.output.html import to_html
+
+    report, blast_radii = _make_report_with_vuln()
+    html = to_html(report, blast_radii)
+
+    assert "function escHtml(value)" in html
+    assert "function urlPart(value)" in html
+    assert "escHtml(d.summary)" in html
+    assert "escHtml(d.fixVersion)" in html
+    assert "escHtml(c)" in html
+    assert "escHtml(tl)" in html
+    assert "escHtml(vid)" in html
+    assert "urlPart(vid)" in html
+    assert "+ d.summary +" not in html
+    assert "+ d.fixVersion +" not in html
+
+
 def test_html_clean_report_shows_clean_status():
     from agent_bom.output.html import to_html
 
@@ -1236,6 +1611,19 @@ def test_html_export_writes_file(tmp_path):
     assert len(content) > 5000  # sanity check — should be a real file
 
 
+def test_html_export_offline_assets_omits_cdn_scripts(tmp_path):
+    from agent_bom.output.html import export_html
+
+    report, blast_radii = _make_report_with_vuln()
+    out = tmp_path / "report.html"
+    export_html(report, str(out), blast_radii, offline_assets=True)
+    content = out.read_text(encoding="utf-8")
+    assert "Offline HTML mode" in content
+    assert "https://cdn.jsdelivr.net" not in content
+    assert "https://unpkg.com" not in content
+    assert "cytoscape-popper" not in content
+
+
 def test_cli_scan_has_html_format():
     runner = CliRunner()
     result = runner.invoke(main, ["scan", "--help"])
@@ -1253,6 +1641,9 @@ def test_html_trust_assessment_section():
         "skill_name": "test-skill",
         "source_file": "/tmp/SKILL.md",
         "verdict": "suspicious",
+        "content_verdict": "benign",
+        "provenance_verdict": "unverified",
+        "overall_recommendation": "review",
         "confidence": "medium",
         "categories": [
             {"name": "Purpose & Capability", "key": "purpose", "level": "pass", "summary": "Standard tool"},
@@ -1267,6 +1658,9 @@ def test_html_trust_assessment_section():
     assert "Trust Assessment" in html
     assert "test-skill" in html
     assert "SUSPICIOUS" in html
+    assert "content: BENIGN" in html
+    assert "provenance: UNVERIFIED" in html
+    assert "recommendation: REVIEW" in html
     assert "medium confidence" in html
     assert "Purpose &amp; Capability" in html
     assert "Excessive credential access" in html
@@ -1284,7 +1678,7 @@ def test_html_trust_assessment_absent():
 
 def test_cli_open_flag_accepted():
     runner = CliRunner()
-    result = runner.invoke(main, ["scan", "--help"])
+    result = runner.invoke(main, ["scan", "--help-all"])
     assert "--open" in result.output
 
 
@@ -1384,7 +1778,7 @@ def test_prometheus_clean_report_zero_vulns():
 
 def test_cli_scan_has_prometheus_format():
     runner = CliRunner()
-    result = runner.invoke(main, ["scan", "--help"])
+    result = runner.invoke(main, ["scan", "--help-all"])
     assert "prometheus" in result.output
     assert "--push-gateway" in result.output
 
@@ -1503,7 +1897,7 @@ resource "aws_bedrockagent_agent" "analyst" {
     assert agent.source == "terraform"
     # Provider package should be Go ecosystem
     pkgs = [p for srv in agent.mcp_servers for p in srv.packages]
-    assert any(p.ecosystem == "Go" for p in pkgs)
+    assert any(p.ecosystem == "go" for p in pkgs)
 
 
 def test_terraform_scan_empty_dir(tmp_path):
@@ -1540,7 +1934,7 @@ variable "anthropic_api_key" {
 
 def test_cli_scan_has_tf_dir_flag():
     runner = CliRunner()
-    result = runner.invoke(main, ["scan", "--help"])
+    result = runner.invoke(main, ["scan", "--help-all"])
     assert "--tf-dir" in result.output
 
 
@@ -1563,7 +1957,7 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       NORMAL_VAR: "hello"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
 """)
     agents, warnings = scan_github_actions(str(tmp_path))
     assert len(agents) == 1
@@ -1572,7 +1966,8 @@ jobs:
     server = agent.mcp_servers[0]
     assert server.has_credentials
     assert "OPENAI_API_KEY" in server.env
-    assert len(warnings) == 1
+    assert any("AI credentials exposed" in warning for warning in warnings)
+    assert any("missing top-level permissions" in warning for warning in warnings)
 
 
 def test_gha_no_ai_workflow_not_flagged(tmp_path):
@@ -1588,12 +1983,12 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
       - run: pytest tests/
 """)
     agents, warnings = scan_github_actions(str(tmp_path))
     assert agents == []
-    assert warnings == []
+    assert warnings == ["CI hardening in ci.yml: missing top-level permissions: policy; declare least-privilege GITHUB_TOKEN permissions"]
 
 
 def test_gha_detects_ai_sdk_in_run_step(tmp_path):
@@ -1630,9 +2025,60 @@ def test_gha_no_workflows_dir(tmp_path):
     assert warnings == []
 
 
+def test_gha_flags_standard_pipeline_hardening_gaps(tmp_path):
+    """All workflows get general CI hardening checks, not only AI workflows."""
+    from agent_bom.github_actions import scan_github_actions
+
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "unsafe.yml").write_text("""
+name: Unsafe PR workflow
+on:
+  pull_request_target:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: org/reusable/.github/workflows/test.yml@main
+      - uses: ./local-action
+""")
+
+    agents, warnings = scan_github_actions(str(tmp_path))
+
+    assert agents == []
+    assert any("missing top-level permissions" in warning for warning in warnings)
+    assert any("pull_request_target" in warning for warning in warnings)
+    assert any("unpinned action actions/checkout@v4" in warning for warning in warnings)
+    assert any("unpinned action org/reusable/.github/workflows/test.yml@main" in warning for warning in warnings)
+    assert not any("local-action" in warning for warning in warnings)
+
+
+def test_gha_accepts_sha_pins_and_explicit_permissions(tmp_path):
+    from agent_bom.github_actions import scan_github_actions
+
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "safe.yml").write_text("""
+name: Safe workflow
+on: pull_request
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567 # v4
+""")
+
+    agents, warnings = scan_github_actions(str(tmp_path))
+
+    assert agents == []
+    assert warnings == []
+
+
 def test_cli_scan_has_gha_flag():
     runner = CliRunner()
-    result = runner.invoke(main, ["scan", "--help"])
+    result = runner.invoke(main, ["scan", "--help-all"])
     assert "--gha" in result.output
 
 
@@ -1729,6 +2175,31 @@ def test_python_agents_extracts_credential_refs(tmp_path):
     assert any("OPENAI_API_KEY" in w for w in warnings)
 
 
+def test_python_agents_surface_system_prompt_inventory(tmp_path):
+    """AST-extracted prompts are attached to the discovered Agent metadata."""
+    (tmp_path / "requirements.txt").write_text("openai-agents==0.0.11\n")
+    (tmp_path / "agent.py").write_text(
+        "from agents import Agent\n"
+        "agent = Agent(\n"
+        "    name='support-bot',\n"
+        "    system_prompt='You are a careful support agent. Never reveal secrets.',\n"
+        "    tools=[],\n"
+        ")\n"
+    )
+    from agent_bom.python_agents import scan_python_agents
+
+    agents, _warnings = scan_python_agents(str(tmp_path))
+
+    agent = next(a for a in agents if a.name == "openai-agents:support-bot")
+    prompts = agent.metadata["system_prompts"]
+    assert agent.metadata["system_prompt_count"] == 1
+    assert prompts[0]["variable"] == "system_prompt"
+    assert prompts[0]["file"] == "agent.py"
+    assert prompts[0]["type"] == "system_prompt"
+    assert "careful support agent" in prompts[0]["text_preview"]
+    assert len(prompts[0]["text_sha256"]) == 64
+
+
 def test_python_agents_no_framework_returns_empty(tmp_path):
     """Returns empty when no agent framework is present."""
     (tmp_path / "requirements.txt").write_text("requests==2.31.0\nflask==3.0.0\n")
@@ -1762,10 +2233,63 @@ def test_python_agents_synthetic_entry_when_no_def(tmp_path):
     assert "crewai" in pkgs
 
 
+def test_python_agents_detects_tools_via_intermediate_list_variable(tmp_path):
+    (tmp_path / "requirements.txt").write_text("openai-agents==0.0.11\n")
+    (tmp_path / "agent.py").write_text(
+        "from agents import Agent, function_tool\n\n"
+        "@function_tool\ndef search_docs(query: str): ...\n\n"
+        "shared_tools = [search_docs]\n"
+        "agent = Agent(name='support-bot', tools=shared_tools)\n"
+    )
+    from agent_bom.python_agents import scan_python_agents
+
+    agents, _warnings = scan_python_agents(str(tmp_path))
+    server = next(a.mcp_servers[0] for a in agents if a.name == "openai-agents:support-bot")
+    tool = next(t for t in server.tools if t.name == "search_docs")
+    assert tool.discovery_source == "decorator"
+    assert tool.discovery_confidence == "high"
+
+
+def test_python_agents_detects_tool_constructor_names(tmp_path):
+    (tmp_path / "requirements.txt").write_text("crewai==0.51.0\n")
+    (tmp_path / "crew.py").write_text(
+        "from crewai import Agent\n"
+        "from langchain_core.tools import StructuredTool\n\n"
+        "search_tool = StructuredTool(name='search_docs', description='Search docs', func=lambda query: query)\n"
+        "toolset = [search_tool]\n"
+        "agent = Agent(role='researcher', tools=toolset)\n"
+    )
+    from agent_bom.python_agents import scan_python_agents
+
+    agents, _warnings = scan_python_agents(str(tmp_path))
+    server = next(a.mcp_servers[0] for a in agents if a.name == "crewai:researcher")
+    tool = next(t for t in server.tools if t.name == "search_docs")
+    assert tool.discovery_source == "tool-constructor"
+    assert tool.discovery_confidence == "medium"
+
+
+def test_python_agents_detects_langgraph_positional_tools_arg(tmp_path):
+    (tmp_path / "requirements.txt").write_text("langgraph==0.2.0\n")
+    (tmp_path / "graph.py").write_text(
+        "from langgraph.prebuilt import create_react_agent\n"
+        "from langchain_core.tools import tool\n\n"
+        "@tool\ndef lookup_status(order_id: str): ...\n\n"
+        "toolset = [lookup_status]\n"
+        "agent = create_react_agent('gpt-4o-mini', toolset)\n"
+    )
+    from agent_bom.python_agents import scan_python_agents
+
+    agents, _warnings = scan_python_agents(str(tmp_path))
+    server = next(a.mcp_servers[0] for a in agents if a.name == "langchain:react-agent")
+    tool = next(t for t in server.tools if t.name == "lookup_status")
+    assert tool.discovery_source == "decorator+positional-tools-arg"
+    assert tool.discovery_confidence == "high"
+
+
 def test_cli_scan_has_agent_project_flag():
     """CLI scan command exposes --agent-project flag."""
     runner = CliRunner()
-    result = runner.invoke(main, ["scan", "--help"])
+    result = runner.invoke(main, ["scan", "--help-all"])
     assert result.exit_code == 0
     assert "--agent-project" in result.output
 
@@ -1802,17 +2326,45 @@ def test_api_import():
     assert app.title == "agent-bom API"
 
 
+def test_api_extra_import_error_message_names_missing_runtime_dependency():
+    """API import diagnostics should distinguish missing modules from install metadata drift."""
+    pytest.importorskip("fastapi", reason="fastapi not installed")
+    from agent_bom.api.server import _api_extra_import_error_message
+
+    message = _api_extra_import_error_message(ModuleNotFoundError("No module named 'sse_starlette'", name="sse_starlette"))
+
+    assert "sse_starlette" in message
+    assert "pip install 'agent-bom[api]'" in message
+    assert "same Python environment" in message
+    assert "fastapi" in message
+    assert "uvicorn" in message
+
+
 def test_api_health_endpoint():
-    """GET /health returns {status: ok}."""
+    """Public health is minimal; authenticated health carries diagnostics."""
     pytest.importorskip("fastapi", reason="fastapi not installed")
     from fastapi.testclient import TestClient
 
-    from agent_bom.api.server import app
+    from agent_bom.api.server import app, configure_api
 
     client = TestClient(app)
     resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+    assert "tracing" not in resp.json()
+    assert "storage" not in resp.json()
+
+    configure_api(api_key="health-contract-test")
+    try:
+        detailed = client.get(
+            "/v1/system/health",
+            headers={"Authorization": "Bearer health-contract-test"},
+        )
+        assert detailed.status_code == 200
+        assert "tracing" in detailed.json()
+        assert "storage" in detailed.json()
+    finally:
+        configure_api(api_key=None)
 
 
 def test_api_version_endpoint():
@@ -1877,12 +2429,19 @@ def test_api_jobs_list():
     assert "jobs" in resp.json()
 
 
-def test_cli_main_help_has_api_in_listing():
-    """Main --help lists the api subcommand."""
+def test_cli_main_help_hides_api_but_keeps_it_reachable():
+    """`api` is folded into `serve --no-ui`: hidden from the top-level listing
+    but still reachable as a back-compat alias."""
     runner = CliRunner()
     result = runner.invoke(main, ["--help"])
     assert result.exit_code == 0
-    assert "api" in result.output
+    # api no longer appears as its own listed verb under any section.
+    assert "\n  api " not in result.output
+    # ...but the command still resolves and runs.
+    assert main.get_command(None, "api") is not None
+    assert runner.invoke(main, ["api", "--help"]).exit_code == 0
+    # REST-only mode is now reachable via the canonical serve verb.
+    assert "--no-ui" in runner.invoke(main, ["serve", "--help"]).output
 
 
 # ─── v0.7.0 tests: Grype, OWASP, trust signals, registry ─────────────────────
@@ -1929,20 +2488,27 @@ def test_grype_scan_mock(monkeypatch, tmp_path):
     assert len(pkgs[0].vulnerabilities) == 1
     vuln = pkgs[0].vulnerabilities[0]
     assert vuln.id == "CVE-2023-32681"
+    assert vuln.severity == Severity.MEDIUM
     assert vuln.cvss_score == 6.1
     assert vuln.fixed_version == "2.31.0"
 
 
-def test_owasp_lm05_ai_package_only(sample_report):
-    """LLM05 should only apply to AI/ML framework packages, not generic ones."""
+def test_owasp_lm05_every_vulnerable_package(sample_report):
+    """LLM05 ("Supply Chain Vulnerabilities") applies to every vulnerable package.
+
+    The earlier narrow allow-list missed generic transport / HTTP / template
+    packages (starlette, requests, jinja2, form-data, etc.) that are reachable
+    from an agent via an MCP server and therefore ARE supply-chain risk by
+    OWASP's own definition. Every BlastRadius now carries LLM05.
+    """
     from agent_bom.owasp import tag_blast_radius
 
     br = sample_report.blast_radii[0]
-    # sample_report uses "test-pkg" (generic) — should NOT get LLM05
+    # sample_report uses "test-pkg" (generic) — still a supply-chain finding
     br.owasp_tags = tag_blast_radius(br)
-    assert "LLM05" not in br.owasp_tags
+    assert "LLM05" in br.owasp_tags
 
-    # AI framework package — should get LLM05
+    # AI framework package — also LLM05 (supply chain) plus AI-specific tags
     br.package = Package(name="langchain", version="0.1.0", ecosystem="pypi")
     br.owasp_tags = tag_blast_radius(br)
     assert "LLM05" in br.owasp_tags
@@ -2105,7 +2671,7 @@ def test_api_skill_audit_endpoint():
         assert len(body["findings"]) == 1
         assert body["findings"][0]["category"] == "shell_access"
     finally:
-        _get_store().delete("skill-audit-test")
+        _get_store().delete("skill-audit-test", all_tenants=True)
 
 
 def test_api_skill_audit_empty():
@@ -2132,7 +2698,7 @@ def test_api_skill_audit_empty():
         assert body["passed"] is True
         assert body["findings"] == []
     finally:
-        _get_store().delete("no-skill-audit-test")
+        _get_store().delete("no-skill-audit-test", all_tenants=True)
 
 
 # ── Resilient HTTP client tests ──────────────────────────────────────
@@ -2182,7 +2748,7 @@ def test_integrity_module_imports():
 def test_cli_scan_has_verify_integrity_flag():
     """The scan command accepts --verify-integrity."""
     runner = CliRunner()
-    result = runner.invoke(main, ["scan", "--help"])
+    result = runner.invoke(main, ["scan", "--help-all"])
     assert result.exit_code == 0
     assert "--verify-integrity" in result.output
 
@@ -2246,8 +2812,8 @@ def test_atlas_module_imports():
     assert len(ATLAS_TECHNIQUES) >= 50
 
 
-def test_atlas_supply_chain_always_present():
-    """AML.T0010 (ML Supply Chain Compromise) is always tagged on every blast radius."""
+def test_atlas_supply_chain_requires_ai_context():
+    """AML.T0010 is not inferred for a disconnected generic dependency."""
     from agent_bom.atlas import tag_blast_radius as tag_atlas
 
     br = BlastRadius(
@@ -2259,7 +2825,7 @@ def test_atlas_supply_chain_always_present():
         exposed_tools=[],
     )
     tags = tag_atlas(br)
-    assert "AML.T0010" in tags
+    assert "AML.T0010" not in tags
 
 
 def test_atlas_unsecured_credentials():
@@ -2490,8 +3056,8 @@ def test_scenario_enterprise_multi_agent():
     assert br1.risk_score > 0
     assert br2.risk_score > br1.risk_score  # CRITICAL > HIGH
 
-    # OWASP: credential + file tools (no LLM05 — glob is not an AI package)
-    assert "LLM05" not in br1.owasp_tags
+    # OWASP: supply-chain + credential + file-tool signals all fire
+    assert "LLM05" in br1.owasp_tags  # every vulnerable package is supply-chain
     assert "LLM06" in br1.owasp_tags  # credentials exposed
     assert "LLM07" in br1.owasp_tags  # read_file tool
 
@@ -2808,20 +3374,26 @@ def test_json_framework_summary_structure(sample_report):
         assert "triggered" in entry
 
 
-def test_json_framework_lm05_ai_package_only(sample_report):
-    """LLM05 only triggers for AI/ML packages, not generic packages."""
+def test_json_framework_lm05_triggers_for_every_vulnerable_package(sample_report):
+    """LLM05 ("Supply Chain Vulnerabilities") triggers for every vulnerable package.
+
+    Generic transport / HTTP / template packages that an agent depends on are
+    supply-chain risk by OWASP's own definition, so their blast-radius rows
+    trigger LLM05 in the JSON threat-framework summary.
+    """
     from agent_bom.owasp import tag_blast_radius as tag_owasp
 
-    # sample_report uses 'test-pkg' (npm) — not an AI package
+    # sample_report uses 'test-pkg' (npm) — still counts as supply-chain
     for br in sample_report.blast_radii:
         br.owasp_tags = tag_owasp(br)
         br.atlas_tags = []
 
     data = to_json(sample_report)
     owasp_entries = {e["code"]: e for e in data["threat_framework_summary"]["owasp_llm_top10"]}
-    assert owasp_entries["LLM05"]["triggered"] is False
+    assert owasp_entries["LLM05"]["triggered"] is True
 
-    # Now test with an AI package — should trigger LLM05
+    # AI package also triggers LLM05 (supply chain) — and will also fire
+    # AI-specific signals like LLM03 / LLM04 in richer scenarios
     ai_br = BlastRadius(
         vulnerability=Vulnerability(id="CVE-2024-AI", summary="AI vuln", severity=Severity.HIGH),
         package=Package(name="langchain", version="0.1.0", ecosystem="pypi"),
@@ -2849,8 +3421,8 @@ def test_json_framework_lm06_with_credentials(sample_report):
     assert owasp_entries["LLM06"]["triggered"] is True
 
 
-def test_json_framework_atlas_t0010_always(sample_report):
-    """AML.T0010 (ML Supply Chain Compromise) is always triggered."""
+def test_json_framework_atlas_t0010_for_confirmed_agent_path(sample_report):
+    """AML.T0010 is triggered for findings on the sample report's agent path."""
     from agent_bom.atlas import tag_blast_radius as tag_atlas
 
     for br in sample_report.blast_radii:
@@ -2872,6 +3444,59 @@ def test_json_framework_empty_when_no_findings():
     assert summary["total_atlas_triggered"] == 0
     assert all(e["triggered"] is False for e in summary["owasp_llm_top10"])
     assert all(e["triggered"] is False for e in summary["mitre_atlas"])
+
+
+def test_json_blast_radius_includes_explicit_package_fields(sample_report):
+    """Blast radius JSON should expose package fields directly for downstream consumers."""
+    data = to_json(sample_report)
+    item = data["blast_radius"][0]
+    assert item["package_name"] == sample_report.blast_radii[0].package.name
+    assert item["package_version"] == sample_report.blast_radii[0].package.version
+    assert item["package_stable_id"] == sample_report.blast_radii[0].package.stable_id
+
+
+def test_json_framework_summary_uses_vuln_level_tags_when_blast_tags_empty():
+    """Structured outputs should stay truthful even if only vuln-level tags are populated."""
+    from agent_bom.models import Package, Severity, Vulnerability
+    from agent_bom.vuln_compliance import tag_vulnerability
+
+    pkg = Package(name="langchain", version="0.1.0", ecosystem="pypi")
+    vuln = Vulnerability(id="CVE-2026-0001", summary="demo", severity=Severity.HIGH)
+    vuln.compliance_tags = tag_vulnerability(vuln, pkg)
+    br = BlastRadius(
+        vulnerability=vuln,
+        package=pkg,
+        affected_servers=[],
+        affected_agents=[],
+        exposed_credentials=[],
+        exposed_tools=[],
+    )
+    report = AIBOMReport(agents=[], blast_radii=[br])
+    data = to_json(report)
+    summary = data["threat_framework_summary"]
+    assert summary["total_owasp_triggered"] > 0
+    assert summary["total_atlas_triggered"] > 0
+
+
+def test_scan_agents_populates_intrinsic_framework_tags_without_compliance_flag(monkeypatch):
+    """Default scan output should still carry intrinsic framework tags."""
+    from agent_bom.models import Agent, AgentType, MCPServer, Package, Severity, Vulnerability
+    from agent_bom.scanners import scan_agents_sync
+
+    async def _seeded_scan(packages, resolve_transitive=False, **_kwargs):
+        return sum(len(pkg.vulnerabilities) for pkg in packages)
+
+    monkeypatch.setattr("agent_bom.scanners.scan_packages", _seeded_scan)
+
+    vuln = Vulnerability(id="CVE-2026-0002", summary="demo", severity=Severity.HIGH)
+    pkg = Package(name="langchain", version="0.1.0", ecosystem="pypi", vulnerabilities=[vuln])
+    server = MCPServer(name="srv", command="python", packages=[pkg])
+    agent = Agent(name="agt", agent_type=AgentType.CUSTOM, config_path="/tmp", mcp_servers=[server])
+
+    blast_radii = scan_agents_sync([agent], compliance_enabled=False)
+    assert blast_radii
+    assert blast_radii[0].owasp_tags
+    assert blast_radii[0].nist_csf_tags
 
 
 def test_print_threat_frameworks_no_crash(sample_report):
@@ -2914,13 +3539,12 @@ def test_remediation_plan_named_assets(sample_report):
 
 
 def test_remediation_plan_impact_score(sample_report):
-    """Impact score accounts for agents, creds, and vulns."""
+    """Remediation score mirrors the grouped blast-radius risk score."""
     from agent_bom.output import build_remediation_plan
 
     plan = build_remediation_plan(sample_report.blast_radii)
     item = plan[0]
-    # 1 agent * 10 + 1 cred * 3 + 1 vuln = 14
-    assert item["impact"] == 14
+    assert item["impact"] == round(sample_report.blast_radii[0].risk_score, 1)
 
 
 def test_remediation_json_in_output(sample_report):
@@ -2937,6 +3561,25 @@ def test_remediation_json_in_output(sample_report):
     assert isinstance(item["agents_pct"], int)
     assert isinstance(item["risk_narrative"], str)
     assert len(item["risk_narrative"]) > 10
+    assert item["priority"] == "P2"
+    assert item["action"].startswith("Upgrade test-pkg to 1.2.3")
+    assert "rotate exposed credentials" in item["action"]
+    assert item["command"]
+    assert "test-pkg" in item["command"]
+    assert "1.2.3" in item["command"]
+    assert item["verify_command"] == f"agent-bom check test-pkg@1.2.3 --ecosystem {item['ecosystem']}"
+
+
+def test_remediation_plan_commands(sample_report):
+    """Remediation plan exposes executable fix and verify commands."""
+    from agent_bom.output import build_remediation_plan
+
+    plan = build_remediation_plan(sample_report.blast_radii)
+    item = plan[0]
+    assert item["command"]
+    assert "test-pkg" in item["command"]
+    assert "1.2.3" in item["command"]
+    assert item["verify_command"] == f"agent-bom check test-pkg@1.2.3 --ecosystem {item['ecosystem']}"
 
 
 def test_remediation_json_percentages(sample_report):
@@ -3010,6 +3653,59 @@ def test_print_remediation_no_crash(sample_report):
     print_remediation_plan(sample_report)
 
 
+def test_remediation_narrative_omits_reach_clause_when_no_credentials():
+    """The risk narrative must not read "attacker … can reach no credentials".
+
+    When a fix frees zero credentials the credential-reach clause is meaningless
+    and reads as noise — suppress it (P2 honesty)."""
+    from rich.console import Console
+
+    import agent_bom.output as output_mod
+    from agent_bom.models import (
+        Agent,
+        AgentType,
+        AIBOMReport,
+        BlastRadius,
+        MCPServer,
+        Package,
+        Severity,
+        Vulnerability,
+    )
+    from agent_bom.output import print_remediation_plan
+
+    vuln = Vulnerability(
+        id="CVE-2025-9999",
+        summary="reachable bug",
+        severity=Severity.HIGH,
+        fixed_version="2.0.0",
+    )
+    agent = Agent(name="claude", agent_type=AgentType.CLAUDE_CODE, config_path="/tmp")
+    br = BlastRadius(
+        vulnerability=vuln,
+        package=Package(name="requests", version="1.0.0", ecosystem="pypi"),
+        affected_servers=[MCPServer(name="srv")],
+        affected_agents=[agent],
+        exposed_credentials=[],  # <- no credentials reachable
+        exposed_tools=[],
+        risk_score=6.0,
+    )
+    report = AIBOMReport(agents=[agent], blast_radii=[br])
+
+    recorder = Console(record=True, width=200, force_terminal=False)
+    original = output_mod.console
+    output_mod.console = recorder
+    try:
+        print_remediation_plan(report)
+    finally:
+        output_mod.console = original
+    text = recorder.export_text()
+
+    assert "no credentials" not in text
+    # The narrative still renders and still names the exploited vuln.
+    assert "if not fixed:" in text
+    assert "CVE-2025-9999" in text
+
+
 def test_json_ai_bom_identity(sample_report):
     """JSON output declares document_type and spec_version for AI-BOM identity."""
     data = to_json(sample_report)
@@ -3029,19 +3725,6 @@ def test_print_export_hint_no_crash(sample_report):
 # ---------------------------------------------------------------------------
 # Integration file validation
 # ---------------------------------------------------------------------------
-
-
-def test_toolhive_server_json_valid():
-    """ToolHive server.json should be valid JSON with required fields."""
-    import json as _json
-    from pathlib import Path
-
-    p = Path(__file__).parent.parent / "integrations" / "toolhive" / "server.json"
-    data = _json.loads(p.read_text())
-    assert data["name"] == "io.github.msaad00/agent-bom"
-    assert data["version"] == "0.70.12"
-    assert "packages" in data
-    assert data["packages"][0]["registryType"] == "oci"
 
 
 def test_mcp_registry_server_json_valid():
@@ -3109,7 +3792,7 @@ def test_openclaw_registry_skill_minimal_surface():
 
 
 def test_openclaw_skills_all_tools_covered():
-    """Core 32 MCP tools should be covered in the consolidated skill."""
+    """Core MCP tools should be covered in the consolidated skill."""
     from pathlib import Path
 
     p = Path(__file__).parent.parent / "integrations" / "openclaw" / "SKILL.md"
@@ -3178,6 +3861,9 @@ def test_cli_dry_run_shows_data_audit():
     assert "Sent to vulnerability APIs" in result.output
     assert "Credential detection" in result.output
     assert "NAMES only" in result.output
+    assert "AUTH_MODE" in result.output
+    assert "DB_CONNECTION_POOL_SIZE" in result.output
+    assert "not credentials" in result.output
 
 
 def test_permissions_md_has_full_config_paths():
@@ -3268,6 +3954,9 @@ def test_graph_html_export():
     assert "<!DOCTYPE html>" in content
     assert "cytoscape" in content
     assert "agent-bom Supply Chain Graph" in content
+    assert "Top risky paths" in content
+    assert "Focused path only" in content
+    assert "Credential exposure" in content
 
 
 def test_dockerfile_non_root():
@@ -3278,7 +3967,7 @@ def test_dockerfile_non_root():
     dockerfiles = [
         root / "Dockerfile",
         root / "deploy" / "docker" / "Dockerfile.sse",
-        root / "integrations" / "toolhive" / "Dockerfile.mcp",
+        root / "deploy" / "docker" / "Dockerfile.mcp",
     ]
     for df in dockerfiles:
         content = df.read_text()
@@ -3459,7 +4148,7 @@ def test_cli_scan_has_verbose_flag():
 def test_cli_scan_has_no_color_flag():
     """--no-color flag appears in scan --help."""
     runner = CliRunner()
-    result = runner.invoke(main, ["scan", "--help"])
+    result = runner.invoke(main, ["scan", "--help-all"])
     assert "--no-color" in result.output
 
 
@@ -3620,7 +4309,7 @@ def test_spdx_includes_declared_license():
     agent = Agent(name="a", agent_type=AgentType.CLAUDE_DESKTOP, config_path="/tmp/c.json", mcp_servers=[server])
     report = AIBOMReport(agents=[agent], blast_radii=[])
     spdx = to_spdx(report)
-    pkg_elements = [e for e in spdx["elements"] if e.get("declaredLicense")]
+    pkg_elements = [e for e in spdx["@graph"] if e.get("declaredLicense")]
     assert len(pkg_elements) >= 1
     assert pkg_elements[0]["declaredLicense"] == "BSD-3-Clause"
 
@@ -3636,6 +4325,31 @@ def test_json_output_includes_license():
     assert pkgs[0]["license"] == "MIT"
 
 
+def test_json_output_labels_unknown_severity_as_advisory_state():
+    """Structured JSON should distinguish advisory-only findings from scored severities."""
+    vuln = Vulnerability(id="GHSA-123", summary="Pending severity", severity=Severity.UNKNOWN)
+    pkg = Package(name="mystery", version="1.0.0", ecosystem="npm", vulnerabilities=[vuln])
+    server = MCPServer(name="s", command="npx", args=["-y", "mystery"], packages=[pkg])
+    agent = Agent(name="a", agent_type=AgentType.CLAUDE_DESKTOP, config_path="/tmp/c.json", mcp_servers=[server])
+    br = BlastRadius(
+        vulnerability=vuln,
+        package=pkg,
+        affected_agents=[agent],
+        affected_servers=[server],
+        exposed_credentials=[],
+        exposed_tools=[],
+    )
+    report = AIBOMReport(agents=[agent], blast_radii=[br])
+    data = to_json(report)
+    vuln_json = data["agents"][0]["mcp_servers"][0]["packages"][0]["vulnerabilities"][0]
+    blast_json = data["blast_radius"][0]
+    assert vuln_json["severity"] == "unknown"
+    assert vuln_json["severity_label"] == "advisory"
+    assert vuln_json["severity_state"] == "pending"
+    assert blast_json["severity_label"] == "advisory"
+    assert blast_json["severity_state"] == "pending"
+
+
 def test_api_posture_counts_empty():
     """GET /v1/posture/counts returns zero counts with no scans."""
     pytest.importorskip("fastapi", reason="fastapi not installed")
@@ -3643,8 +4357,13 @@ def test_api_posture_counts_empty():
 
     from agent_bom.api.server import app
 
+    tenant_id = "counts-empty"
     client = TestClient(app)
-    resp = client.get("/v1/posture/counts")
+    enable_trusted_proxy_env()
+    try:
+        resp = client.get("/v1/posture/counts", headers=proxy_headers(tenant=tenant_id))
+    finally:
+        disable_trusted_proxy_env()
     assert resp.status_code == 200
     body = resp.json()
     assert "critical" in body
@@ -3652,6 +4371,13 @@ def test_api_posture_counts_empty():
     assert "kev" in body
     assert "compound_issues" in body
     assert isinstance(body["total"], int)
+    assert body["deployment_mode"] == "local"
+    assert body["has_local_scan"] is False
+    assert body["has_fleet_ingest"] is False
+    assert body["has_cluster_scan"] is False
+    assert body["has_ci_cd_scan"] is False
+    assert "services" in body
+    assert body["services"]["cloud_accounts"]["state"] == "locked"
 
 
 def test_api_posture_counts_with_data():
@@ -3661,11 +4387,14 @@ def test_api_posture_counts_with_data():
 
     from agent_bom.api.server import JobStatus, ScanJob, ScanRequest, _get_store, app
 
+    tenant_id = "counts-with-data"
     client = TestClient(app)
+    observed_at = datetime.now(timezone.utc).isoformat()
     job = ScanJob(
         job_id="counts-test-001",
+        tenant_id=tenant_id,
         status=JobStatus.DONE,
-        created_at="2026-01-01T00:00:00Z",
+        created_at=observed_at,
         request=ScanRequest(),
         result={
             "blast_radius": [
@@ -3687,11 +4416,19 @@ def test_api_posture_counts_with_data():
                     "reachable_tools": [],
                     "exposed_credentials": [],
                 },
-            ]
+            ],
+            "has_mcp_context": True,
+            "has_agent_context": True,
+            "scan_sources": ["agent_discovery", "github_actions", "sbom"],
+            "runtime_session_graph": {"node_count": 2, "edge_count": 1},
         },
     )
     _get_store().put(job)
-    resp = client.get("/v1/posture/counts")
+    enable_trusted_proxy_env()
+    try:
+        resp = client.get("/v1/posture/counts", headers=proxy_headers(tenant=tenant_id))
+    finally:
+        disable_trusted_proxy_env()
     assert resp.status_code == 200
     body = resp.json()
     assert body["critical"] >= 1
@@ -3699,3 +4436,44 @@ def test_api_posture_counts_with_data():
     assert body["kev"] >= 1
     assert body["compound_issues"] >= 1  # KEV + reachable_tools
     assert body["total"] >= 2
+    assert body["deployment_mode"] == "local"
+    assert body["has_local_scan"] is True
+    assert body["has_ci_cd_scan"] is True
+    assert body["has_registry"] is True
+    assert body["has_proxy"] is True
+    assert body["has_traces"] is True
+
+
+def test_api_posture_counts_ci_cd_only_is_not_treated_as_local_runtime():
+    """GitHub Actions scans should surface CI/CD context without implying local runtime deployment."""
+    pytest.importorskip("fastapi", reason="fastapi not installed")
+    from fastapi.testclient import TestClient
+
+    from agent_bom.api.server import JobStatus, ScanJob, ScanRequest, _get_store, app
+
+    tenant_id = "counts-ci-only"
+    client = TestClient(app)
+    job = ScanJob(
+        job_id="counts-test-ci-001",
+        tenant_id=tenant_id,
+        status=JobStatus.DONE,
+        created_at="2026-01-02T00:00:00Z",
+        request=ScanRequest(),
+        result={
+            "blast_radius": [],
+            "scan_sources": ["github_actions"],
+        },
+    )
+    _get_store().put(job)
+    enable_trusted_proxy_env()
+    try:
+        resp = client.get("/v1/posture/counts", headers=proxy_headers(tenant=tenant_id))
+    finally:
+        disable_trusted_proxy_env()
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deployment_mode"] == "local"
+    assert body["has_ci_cd_scan"] is True
+    assert body["has_local_scan"] is False
+    assert body["has_fleet_ingest"] is False
+    assert body["has_cluster_scan"] is False

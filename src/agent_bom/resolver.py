@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+import time
+from collections import defaultdict
 from typing import Optional
 
 import httpx
 from rich.console import Console
 
-from agent_bom.http_client import create_client, request_with_retry
+from agent_bom.http_client import (
+    create_client,
+    registry_breaker_tripped,
+    request_with_retry,
+    reset_rate_limit_breaker,
+)
 from agent_bom.models import Package
 
 console = Console(stderr=True)
@@ -17,6 +25,300 @@ _logger = logging.getLogger(__name__)
 
 NPM_REGISTRY = "https://registry.npmjs.org"
 PYPI_API = "https://pypi.org/pypi"
+_INVALID_VERSIONS = {"latest", "unknown", "", "{{VERSION}}"}
+_RESOLVE_CONCURRENCY = 8
+_NPM_RESOLVE_CONCURRENCY = 3
+_NPM_LATEST_CACHE: dict[str, dict | None] = {}
+_PYPI_INFO_CACHE: dict[str, dict | None] = {}
+_NPM_LATEST_INFLIGHT: dict[str, asyncio.Future[dict | None]] = {}
+_PYPI_INFO_INFLIGHT: dict[str, asyncio.Future[dict | None]] = {}
+_NPM_RATE_LIMIT_UNTIL = 0.0
+_NPM_RATE_LIMIT_HITS = 0
+_NPM_RATE_LIMIT_MAX_COOLDOWN = 20.0
+_RESOLVER_STATE_LOCK = threading.RLock()
+_PERF_TEMPLATE = {
+    "registry_cache_hits": 0,
+    "registry_cache_misses": 0,
+    "registry_network_requests": 0,
+    "npm_rate_limit_events": 0,
+    "npm_rate_limit_short_circuits": 0,
+    "version_candidates": 0,
+    "version_unique_lookups": 0,
+    "version_reused_entries": 0,
+    "version_resolved_live": 0,
+    "version_resolved_fallback": 0,
+    "version_unresolved": 0,
+    "license_candidates": 0,
+    "license_unique_lookups": 0,
+    "license_reused_entries": 0,
+    "license_enriched": 0,
+    "license_deps_dev_lookups": 0,
+    "supply_chain_candidates": 0,
+    "supply_chain_unique_lookups": 0,
+    "supply_chain_reused_entries": 0,
+    "supply_chain_enriched": 0,
+    "supply_chain_deps_dev_fallbacks": 0,
+}
+_PERF_STATS = dict(_PERF_TEMPLATE)
+
+
+def reset_performance_stats() -> None:
+    """Reset per-scan resolver performance counters."""
+    global _NPM_RATE_LIMIT_UNTIL, _NPM_RATE_LIMIT_HITS  # noqa: PLW0603
+    with _RESOLVER_STATE_LOCK:
+        _PERF_STATS.clear()
+        _PERF_STATS.update(_PERF_TEMPLATE)
+        _NPM_RATE_LIMIT_UNTIL = 0.0
+        _NPM_RATE_LIMIT_HITS = 0
+    # Start each scan with a fresh registry rate-limit breaker.
+    reset_rate_limit_breaker()
+
+
+def _bump_perf(key: str, delta: int = 1) -> None:
+    with _RESOLVER_STATE_LOCK:
+        _PERF_STATS[key] = int(_PERF_STATS.get(key, 0)) + delta
+
+
+def consume_performance_stats() -> dict[str, dict[str, int]]:
+    """Return and reset resolver performance counters."""
+    with _RESOLVER_STATE_LOCK:
+        registry_hits = int(_PERF_STATS["registry_cache_hits"])
+        registry_misses = int(_PERF_STATS["registry_cache_misses"])
+        version_candidates = int(_PERF_STATS["version_candidates"])
+        version_reused = int(_PERF_STATS["version_reused_entries"])
+        license_candidates = int(_PERF_STATS["license_candidates"])
+        license_reused = int(_PERF_STATS["license_reused_entries"])
+        supply_candidates = int(_PERF_STATS["supply_chain_candidates"])
+        supply_reused = int(_PERF_STATS["supply_chain_reused_entries"])
+        registry_network_requests = int(_PERF_STATS["registry_network_requests"])
+        npm_rate_limit_events = int(_PERF_STATS["npm_rate_limit_events"])
+        npm_rate_limit_short_circuits = int(_PERF_STATS["npm_rate_limit_short_circuits"])
+        version_unique_lookups = int(_PERF_STATS["version_unique_lookups"])
+        version_resolved_live = int(_PERF_STATS["version_resolved_live"])
+        version_resolved_fallback = int(_PERF_STATS["version_resolved_fallback"])
+        version_unresolved = int(_PERF_STATS["version_unresolved"])
+        license_unique_lookups = int(_PERF_STATS["license_unique_lookups"])
+        license_enriched = int(_PERF_STATS["license_enriched"])
+        license_deps_dev_lookups = int(_PERF_STATS["license_deps_dev_lookups"])
+        supply_chain_unique_lookups = int(_PERF_STATS["supply_chain_unique_lookups"])
+        supply_chain_enriched = int(_PERF_STATS["supply_chain_enriched"])
+        supply_chain_deps_dev_fallbacks = int(_PERF_STATS["supply_chain_deps_dev_fallbacks"])
+        _PERF_STATS.clear()
+        _PERF_STATS.update(_PERF_TEMPLATE)
+    snapshot = {
+        "registry_metadata": {
+            "cache_hits": registry_hits,
+            "cache_misses": registry_misses,
+            "network_requests": registry_network_requests,
+            "npm_rate_limit_events": npm_rate_limit_events,
+            "npm_rate_limit_short_circuits": npm_rate_limit_short_circuits,
+        },
+        "version_resolution": {
+            "candidates": version_candidates,
+            "unique_lookups": version_unique_lookups,
+            "reused_entries": version_reused,
+            "resolved_live": version_resolved_live,
+            "resolved_fallback": version_resolved_fallback,
+            "unresolved": version_unresolved,
+        },
+        "license_enrichment": {
+            "candidates": license_candidates,
+            "unique_lookups": license_unique_lookups,
+            "reused_entries": license_reused,
+            "enriched": license_enriched,
+            "deps_dev_lookups": license_deps_dev_lookups,
+        },
+        "supply_chain_enrichment": {
+            "candidates": supply_candidates,
+            "unique_lookups": supply_chain_unique_lookups,
+            "reused_entries": supply_reused,
+            "enriched": supply_chain_enriched,
+            "deps_dev_fallbacks": supply_chain_deps_dev_fallbacks,
+        },
+    }
+    total_registry_lookups = registry_hits + registry_misses
+    if total_registry_lookups:
+        snapshot["registry_metadata"]["cache_hit_rate_pct"] = int(round((registry_hits / total_registry_lookups) * 100))
+    if version_candidates:
+        snapshot["version_resolution"]["reuse_rate_pct"] = int(round((version_reused / version_candidates) * 100))
+    if license_candidates:
+        snapshot["license_enrichment"]["reuse_rate_pct"] = int(round((license_reused / license_candidates) * 100))
+    if supply_candidates:
+        snapshot["supply_chain_enrichment"]["reuse_rate_pct"] = int(round((supply_reused / supply_candidates) * 100))
+    return snapshot
+
+
+def _apply_registry_version_fallback(pkg: Package) -> bool:
+    """Use bundled registry metadata when live resolution is unavailable.
+
+    This preserves scan continuity under registry pressure instead of leaving
+    versionless packages to silently degrade or be skipped downstream.
+    """
+    fallback_version = getattr(pkg, "registry_version", None)
+    if not fallback_version or fallback_version in _INVALID_VERSIONS:
+        return False
+    pkg.version = fallback_version
+    pkg.purl = f"pkg:{pkg.ecosystem}/{pkg.name}@{fallback_version}"
+    pkg.version_source = "registry_fallback"
+    return True
+
+
+def _resolution_key(pkg: Package) -> tuple[str, str]:
+    """Stable key for deduping identical registry lookups within one run."""
+    return (pkg.ecosystem.lower(), pkg.name.lower())
+
+
+def _copy_resolution_fields(source: Package, target: Package) -> bool:
+    """Copy resolved version metadata from *source* to *target*."""
+    if source.version in _INVALID_VERSIONS:
+        return False
+    target.version = source.version
+    target.purl = source.purl
+    if source.license and not target.license:
+        target.license = source.license
+    if source.version_source == "registry_fallback":
+        target.version_source = "registry_fallback"
+    return True
+
+
+def _npm_rate_limit_active() -> bool:
+    with _RESOLVER_STATE_LOCK:
+        return time.monotonic() < _NPM_RATE_LIMIT_UNTIL
+
+
+def _record_npm_rate_limit(response: httpx.Response | None) -> None:
+    """Open a short cooldown window after npm rate limiting.
+
+    Once npm starts returning 429s, preserve scan continuity by reusing
+    cached/bundled data instead of repeatedly waiting through retries for
+    every remaining unresolved package in the same run.
+    """
+    global _NPM_RATE_LIMIT_UNTIL, _NPM_RATE_LIMIT_HITS  # noqa: PLW0603
+
+    wait = 5.0
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                wait = min(float(retry_after), _NPM_RATE_LIMIT_MAX_COOLDOWN)
+            except ValueError:
+                wait = 5.0
+    with _RESOLVER_STATE_LOCK:
+        _NPM_RATE_LIMIT_HITS += 1
+        _PERF_STATS["npm_rate_limit_events"] = int(_PERF_STATS.get("npm_rate_limit_events", 0)) + 1
+        _NPM_RATE_LIMIT_UNTIL = max(_NPM_RATE_LIMIT_UNTIL, time.monotonic() + wait)
+
+
+def _npm_rate_limit_hits() -> int:
+    with _RESOLVER_STATE_LOCK:
+        return _NPM_RATE_LIMIT_HITS
+
+
+async def _get_npm_latest_doc(package_name: str, client: httpx.AsyncClient) -> dict | None:
+    """Return cached npm `/latest` JSON for a package."""
+    cache_key = package_name.lower()
+    owner = False
+    with _RESOLVER_STATE_LOCK:
+        if cache_key in _NPM_LATEST_CACHE:
+            _PERF_STATS["registry_cache_hits"] = int(_PERF_STATS.get("registry_cache_hits", 0)) + 1
+            return _NPM_LATEST_CACHE[cache_key]
+        # Skip the live lookup if the breaker is open or a cooldown is active —
+        # the http_client breaker also enforces this, but short-circuiting here
+        # avoids constructing the request/future at all.
+        if time.monotonic() < _NPM_RATE_LIMIT_UNTIL or registry_breaker_tripped(NPM_REGISTRY):
+            _PERF_STATS["npm_rate_limit_short_circuits"] = int(_PERF_STATS.get("npm_rate_limit_short_circuits", 0)) + 1
+            return None
+        inflight = _NPM_LATEST_INFLIGHT.get(cache_key)
+        if inflight is None:
+            inflight = asyncio.get_running_loop().create_future()
+            _NPM_LATEST_INFLIGHT[cache_key] = inflight
+            _PERF_STATS["registry_cache_misses"] = int(_PERF_STATS.get("registry_cache_misses", 0)) + 1
+            _PERF_STATS["registry_network_requests"] = int(_PERF_STATS.get("registry_network_requests", 0)) + 1
+            owner = True
+    if not owner:
+        return await inflight
+
+    encoded_name = package_name.replace("/", "%2F")
+    inflight = _NPM_LATEST_INFLIGHT[cache_key]
+    try:
+        response = await request_with_retry(
+            client,
+            "GET",
+            f"{NPM_REGISTRY}/{encoded_name}/latest",
+        )
+        data: dict | None = None
+        if response and response.status_code == 429:
+            _record_npm_rate_limit(response)
+            if not inflight.done():
+                inflight.set_result(None)
+            return None
+        if response and response.status_code == 200:
+            try:
+                parsed = response.json()
+                if isinstance(parsed, dict):
+                    data = parsed
+            except ValueError as exc:
+                _logger.debug("Failed to parse npm metadata for %s: %s", package_name, exc)
+        with _RESOLVER_STATE_LOCK:
+            _NPM_LATEST_CACHE[cache_key] = data
+        if not inflight.done():
+            inflight.set_result(data)
+        return data
+    except Exception as exc:
+        if not inflight.done():
+            inflight.set_exception(exc)
+        raise
+    finally:
+        with _RESOLVER_STATE_LOCK:
+            _NPM_LATEST_INFLIGHT.pop(cache_key, None)
+
+
+async def _get_pypi_info_doc(package_name: str, client: httpx.AsyncClient) -> dict | None:
+    """Return cached PyPI `info` JSON for a package."""
+    cache_key = package_name.lower()
+    owner = False
+    with _RESOLVER_STATE_LOCK:
+        if cache_key in _PYPI_INFO_CACHE:
+            _PERF_STATS["registry_cache_hits"] = int(_PERF_STATS.get("registry_cache_hits", 0)) + 1
+            return _PYPI_INFO_CACHE[cache_key]
+        inflight = _PYPI_INFO_INFLIGHT.get(cache_key)
+        if inflight is None:
+            inflight = asyncio.get_running_loop().create_future()
+            _PYPI_INFO_INFLIGHT[cache_key] = inflight
+            _PERF_STATS["registry_cache_misses"] = int(_PERF_STATS.get("registry_cache_misses", 0)) + 1
+            _PERF_STATS["registry_network_requests"] = int(_PERF_STATS.get("registry_network_requests", 0)) + 1
+            owner = True
+    if not owner:
+        return await inflight
+
+    inflight = _PYPI_INFO_INFLIGHT[cache_key]
+    try:
+        response = await request_with_retry(
+            client,
+            "GET",
+            f"{PYPI_API}/{package_name}/json",
+        )
+        info: dict | None = None
+        if response and response.status_code == 200:
+            try:
+                parsed = response.json()
+                maybe_info = parsed.get("info", {}) if isinstance(parsed, dict) else {}
+                if isinstance(maybe_info, dict):
+                    info = maybe_info
+            except ValueError as exc:
+                _logger.debug("Failed to parse PyPI metadata for %s: %s", package_name, exc)
+        with _RESOLVER_STATE_LOCK:
+            _PYPI_INFO_CACHE[cache_key] = info
+        if not inflight.done():
+            inflight.set_result(info)
+        return info
+    except Exception as exc:
+        if not inflight.done():
+            inflight.set_exception(exc)
+        raise
+    finally:
+        with _RESOLVER_STATE_LOCK:
+            _PYPI_INFO_INFLIGHT.pop(cache_key, None)
 
 
 async def resolve_npm_metadata(
@@ -24,23 +326,14 @@ async def resolve_npm_metadata(
     client: httpx.AsyncClient,
 ) -> tuple[Optional[str], Optional[str]]:
     """Return (version, license) from npm registry."""
-    encoded_name = package_name.replace("/", "%2F")
-    response = await request_with_retry(
-        client,
-        "GET",
-        f"{NPM_REGISTRY}/{encoded_name}/latest",
-    )
-    if response and response.status_code == 200:
-        try:
-            data = response.json()
-            version = data.get("version")
-            lic = data.get("license")
-            # license can be a string or {"type": "MIT"} object
-            if isinstance(lic, dict):
-                lic = lic.get("type")
-            return version, lic if isinstance(lic, str) else None
-        except (ValueError, KeyError) as exc:
-            _logger.debug("Failed to parse npm metadata for %s: %s", package_name, exc)
+    data = await _get_npm_latest_doc(package_name, client)
+    if data:
+        version = data.get("version")
+        lic = data.get("license")
+        # license can be a string or {"type": "MIT"} object
+        if isinstance(lic, dict):
+            lic = lic.get("type")
+        return version, lic if isinstance(lic, str) else None
     return None, None
 
 
@@ -49,12 +342,10 @@ async def resolve_npm_supply_chain(
     client: httpx.AsyncClient,
 ) -> None:
     """Enrich a Package with npm registry supply chain metadata."""
-    encoded_name = pkg.name.replace("/", "%2F")
-    response = await request_with_retry(client, "GET", f"{NPM_REGISTRY}/{encoded_name}/latest")
-    if not response or response.status_code != 200:
+    data = await _get_npm_latest_doc(pkg.name, client)
+    if not data:
         return
     try:
-        data = response.json()
         if not pkg.description:
             pkg.description = (data.get("description") or "")[:300] or None
         if not pkg.homepage:
@@ -80,22 +371,25 @@ async def resolve_pypi_metadata(
     client: httpx.AsyncClient,
 ) -> tuple[Optional[str], Optional[str]]:
     """Return (version, license) from PyPI."""
-    response = await request_with_retry(
-        client,
-        "GET",
-        f"{PYPI_API}/{package_name}/json",
-    )
-    if response and response.status_code == 200:
-        try:
-            info = response.json().get("info", {})
-            version = info.get("version")
-            lic = info.get("license")
-            # PyPI license can be empty string or "UNKNOWN"
-            if lic and lic.upper() not in ("UNKNOWN", ""):
-                return version, lic
-            return version, None
-        except (ValueError, KeyError) as exc:
-            _logger.debug("Failed to parse PyPI metadata for %s: %s", package_name, exc)
+    info = await _get_pypi_info_doc(package_name, client)
+    if info:
+        version = info.get("version")
+        lic = info.get("license")
+        # PyPI license can be empty string, "UNKNOWN", or full license text.
+        # Prefer the SPDX classifier; fall back to first line of license field.
+        if lic and lic.upper() not in ("UNKNOWN", ""):
+            # If license field is multi-line (full text), extract SPDX from classifiers
+            if "\n" in lic or len(lic) > 120:
+                classifiers = info.get("classifiers") or []
+                for c in classifiers:
+                    if c.startswith("License :: OSI Approved :: "):
+                        lic = c.split(" :: ")[-1]
+                        break
+                else:
+                    # No classifier — take first line, capped
+                    lic = lic.split("\n", 1)[0][:80]
+            return version, lic
+        return version, None
     return None, None
 
 
@@ -104,11 +398,10 @@ async def resolve_pypi_supply_chain(
     client: httpx.AsyncClient,
 ) -> None:
     """Enrich a Package with PyPI supply chain metadata."""
-    response = await request_with_retry(client, "GET", f"{PYPI_API}/{pkg.name}/json")
-    if not response or response.status_code != 200:
+    info = await _get_pypi_info_doc(pkg.name, client)
+    if not info:
         return
     try:
-        info = response.json().get("info", {})
         if not pkg.description:
             pkg.description = (info.get("summary") or "")[:300] or None
         if not pkg.homepage:
@@ -129,7 +422,7 @@ async def resolve_pypi_supply_chain(
 
 
 async def resolve_package_version(pkg: Package, client: httpx.AsyncClient) -> bool:
-    if pkg.version not in ("latest", "unknown", ""):
+    if pkg.version not in _INVALID_VERSIONS - {"{{VERSION}}"}:
         return False
     version, lic = None, None
     if pkg.ecosystem == "npm":
@@ -158,7 +451,7 @@ async def resolve_package_version(pkg: Package, client: httpx.AsyncClient) -> bo
         if lic and not pkg.license:
             pkg.license = lic
         return True
-    return False
+    return _apply_registry_version_fallback(pkg)
 
 
 async def enrich_licenses(packages: list[Package], client: httpx.AsyncClient) -> int:
@@ -169,39 +462,59 @@ async def enrich_licenses(packages: list[Package], client: httpx.AsyncClient) ->
     need_license = [p for p in packages if not p.license and p.version not in ("latest", "unknown", "")]
     if not need_license:
         return 0
+    _bump_perf("license_candidates", len(need_license))
     count = 0
-    deps_dev_batch = []
+    registry_groups: dict[tuple[str, str], list[Package]] = defaultdict(list)
+    deps_dev_groups: dict[tuple[str, str, str], list[Package]] = defaultdict(list)
     for pkg in need_license:
-        _, lic = None, None
-        if pkg.ecosystem == "npm":
-            _, lic = await resolve_npm_metadata(pkg.name, client)
-        elif pkg.ecosystem == "pypi":
-            _, lic = await resolve_pypi_metadata(pkg.name, client)
+        eco = pkg.ecosystem.lower()
+        if eco in ("npm", "pypi"):
+            registry_groups[(eco, pkg.name.lower())].append(pkg)
         else:
-            # Queue for deps.dev fallback (go, cargo, maven, nuget)
-            deps_dev_batch.append(pkg)
-            continue
-        if lic:
-            pkg.license = lic
-            count += 1
+            deps_dev_groups[(eco, pkg.name, pkg.version)].append(pkg)
+    _bump_perf("license_unique_lookups", len(registry_groups) + len(deps_dev_groups))
+    _bump_perf("license_reused_entries", len(need_license) - len(registry_groups) - len(deps_dev_groups))
+
+    async def _resolve_registry_license(key: tuple[str, str], grouped: list[Package]) -> tuple[list[Package], str | None]:
+        eco, _name = key
+        representative = grouped[0]
+        if eco == "npm":
+            _, lic = await resolve_npm_metadata(representative.name, client)
+        else:
+            _, lic = await resolve_pypi_metadata(representative.name, client)
+        return grouped, lic
+
+    if registry_groups:
+        tasks = [_resolve_registry_license(key, grouped) for key, grouped in registry_groups.items()]
+        for grouped, lic in await asyncio.gather(*tasks):
+            if not lic:
+                continue
+            for pkg in grouped:
+                if not pkg.license:
+                    pkg.license = lic
+                    count += 1
+                    _bump_perf("license_enriched")
 
     # deps.dev fallback for non-npm/non-pypi ecosystems
-    if deps_dev_batch:
+    if deps_dev_groups:
         try:
             from agent_bom.deps_dev import get_package_info
 
-            for pkg in deps_dev_batch:
+            _bump_perf("license_deps_dev_lookups", len(deps_dev_groups))
+            for (_eco, _name, _version), grouped in deps_dev_groups.items():
+                pkg = grouped[0]
                 info = await get_package_info(pkg.ecosystem, pkg.name, pkg.version, client)
                 if info:
                     licenses = info.get("licenses", [])
                     spdx_ids = [lic for lic in licenses if isinstance(lic, str) and lic]
                     if spdx_ids:
-                        pkg.license = spdx_ids[0]
-                        if len(spdx_ids) > 1:
-                            pkg.license_expression = " AND ".join(spdx_ids)
-                        else:
-                            pkg.license_expression = spdx_ids[0]
-                        count += 1
+                        license_value = spdx_ids[0]
+                        license_expression = " AND ".join(spdx_ids) if len(spdx_ids) > 1 else spdx_ids[0]
+                        for member in grouped:
+                            member.license = license_value
+                            member.license_expression = license_expression
+                            count += 1
+                            _bump_perf("license_enriched")
         except ImportError:
             pass  # deps_dev module not available — skip gracefully
 
@@ -222,46 +535,218 @@ async def enrich_supply_chain_metadata(
     need_meta = [p for p in packages if not p.description and p.version not in ("latest", "unknown", "") and p.ecosystem in ("npm", "pypi")]
     if not need_meta:
         return 0
-
-    count = 0
+    _bump_perf("supply_chain_candidates", len(need_meta))
+    groups: dict[tuple[str, str], list[Package]] = defaultdict(list)
     for pkg in need_meta:
+        groups[(pkg.ecosystem.lower(), pkg.name.lower())].append(pkg)
+    _bump_perf("supply_chain_unique_lookups", len(groups))
+    _bump_perf("supply_chain_reused_entries", len(need_meta) - len(groups))
+    count = 0
+    for (_eco, _name), grouped in groups.items():
+        pkg = grouped[0]
         try:
             if pkg.ecosystem == "npm":
                 await resolve_npm_supply_chain(pkg, client)
             elif pkg.ecosystem == "pypi":
                 await resolve_pypi_supply_chain(pkg, client)
-            if pkg.description or pkg.homepage or pkg.repository_url:
-                count += 1
+
+            # Fallback: deps.dev often still provides homepage/source links when
+            # registry metadata is unavailable or rate-limited.
+            if not (pkg.description or pkg.homepage or pkg.repository_url):
+                try:
+                    from agent_bom.deps_dev import get_package_info
+
+                    _bump_perf("supply_chain_deps_dev_fallbacks")
+                    info = await get_package_info(pkg.ecosystem, pkg.name, pkg.version, client)
+                    if info:
+                        links = info.get("links", [])
+                        for link in links:
+                            label = (link.get("label") or "").lower()
+                            url = link.get("url") or ""
+                            if not url:
+                                continue
+                            if "homepage" in label and not pkg.homepage:
+                                pkg.homepage = url
+                            elif ("source" in label or "repo" in label) and not pkg.repository_url:
+                                pkg.repository_url = url
+                        if not pkg.description:
+                            desc = info.get("description")
+                            if desc:
+                                pkg.description = desc[:300]
+                except Exception:  # noqa: BLE001
+                    pass
+
+            for peer in grouped[1:]:
+                if pkg.description and not peer.description:
+                    peer.description = pkg.description
+                if pkg.homepage and not peer.homepage:
+                    peer.homepage = pkg.homepage
+                if pkg.repository_url and not peer.repository_url:
+                    peer.repository_url = pkg.repository_url
+                if pkg.author and not peer.author:
+                    peer.author = pkg.author
+                if pkg.supplier and not peer.supplier:
+                    peer.supplier = pkg.supplier
+
+            for member in grouped:
+                if member.description or member.homepage or member.repository_url:
+                    count += 1
+                    _bump_perf("supply_chain_enriched")
         except Exception as exc:  # noqa: BLE001
             _logger.warning("Failed to enrich supply chain metadata for %s@%s: %s", pkg.name, pkg.version, exc)
             continue
     return count
 
 
-async def resolve_all_versions(packages: list[Package]) -> int:
+async def resolve_all_versions(
+    packages: list[Package],
+    *,
+    quiet: bool = False,
+    global_timeout: float = 30.0,
+) -> int:
+    """Resolve unresolved package versions from registries.
+
+    Args:
+        packages: Packages to resolve.
+        quiet: Suppress console output.
+        global_timeout: Max total seconds for all resolution (prevents hangs).
+    """
     unresolved = [p for p in packages if p.version in ("latest", "unknown", "")]
     if not unresolved:
         return 0
+    _bump_perf("version_candidates", len(unresolved))
+    npm_rate_limit_hits_before = _npm_rate_limit_hits()
     resolved_count = 0
-    async with create_client(timeout=15.0) as client:
-        tasks = [resolve_package_version(pkg, client) for pkg in unresolved]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for i, result in enumerate(results):
-            if result is True:
-                resolved_count += 1
-                lic_tag = f" ({unresolved[i].license})" if unresolved[i].license else ""
-                console.print(f"  [green]✓[/green] Resolved {unresolved[i].name} → {unresolved[i].version}{lic_tag}")
-            elif isinstance(result, Exception):
-                console.print(f"  [yellow]⚠[/yellow] Failed to resolve {unresolved[i].name}: {result}")
-        # Enrich licenses for packages that already had versions
-        lic_count = await enrich_licenses(packages, client)
-        if lic_count:
-            console.print(f"  [green]✓[/green] Enriched {lic_count} package license(s)")
+    groups: dict[tuple[str, str], list[Package]] = defaultdict(list)
+    for pkg in unresolved:
+        groups[_resolution_key(pkg)].append(pkg)
+    representatives = [members[0] for members in groups.values()]
+    _bump_perf("version_unique_lookups", len(representatives))
+    _bump_perf("version_reused_entries", len(unresolved) - len(representatives))
+    try:
+        async with create_client(timeout=10.0) as client:
+            npm_semaphore = asyncio.Semaphore(_NPM_RESOLVE_CONCURRENCY)
+            default_semaphore = asyncio.Semaphore(_RESOLVE_CONCURRENCY)
+
+            async def _resolve_with_limit(pkg: Package) -> bool:
+                semaphore = npm_semaphore if pkg.ecosystem.lower() == "npm" else default_semaphore
+                async with semaphore:
+                    return await resolve_package_version(pkg, client)
+
+            tasks = {asyncio.create_task(_resolve_with_limit(pkg)): pkg for pkg in representatives}
+            done, pending = await asyncio.wait(tasks.keys(), timeout=global_timeout)
+
+            for task in done:
+                pkg = tasks[task]
+                peers = groups[_resolution_key(pkg)]
+                result: bool | Exception
+                try:
+                    result = task.result()
+                except Exception as exc:  # noqa: BLE001
+                    result = exc
+                if result is True:
+                    peer_resolved = 0
+                    for peer in peers:
+                        if peer is pkg:
+                            peer_resolved += 1
+                            continue
+                        if _copy_resolution_fields(pkg, peer):
+                            peer_resolved += 1
+                    resolved_count += peer_resolved
+                    if pkg.version_source == "registry_fallback":
+                        _bump_perf("version_resolved_fallback", peer_resolved)
+                    else:
+                        _bump_perf("version_resolved_live", peer_resolved)
+                    if not quiet:
+                        lic_tag = ""
+                        if pkg.license:
+                            short_lic = (pkg.license or "").split("\n", 1)[0][:60]
+                            lic_tag = f" ({short_lic})"
+                        icon = "[green]✓[/green]"
+                        note = ""
+                        if pkg.version_source == "registry_fallback":
+                            icon = "[yellow]↺[/yellow]"
+                            note = " [dim](bundled registry fallback)[/dim]"
+                        peer_note = f" [dim](applied to {len(peers)} package entries)[/dim]" if len(peers) > 1 else ""
+                        console.print(f"  {icon} Resolved {pkg.name} → {pkg.version}{lic_tag}{note}{peer_note}")
+                elif isinstance(result, Exception):
+                    if not quiet:
+                        console.print(f"  [yellow]⚠[/yellow] Failed to resolve {pkg.name}: {result}")
+                elif not quiet:
+                    console.print(f"  [yellow]⚠[/yellow] Could not resolve {pkg.name} from live registries")
+
+            for task in pending:
+                pkg = tasks[task]
+                peers = groups[_resolution_key(pkg)]
+                task.cancel()
+                group_fallbacks = 0
+                if _apply_registry_version_fallback(pkg):
+                    group_fallbacks += 1
+                for peer in peers:
+                    if peer is pkg:
+                        continue
+                    if not _copy_resolution_fields(pkg, peer):
+                        if _apply_registry_version_fallback(peer):
+                            group_fallbacks += 1
+                    else:
+                        group_fallbacks += 1
+                if group_fallbacks:
+                    resolved_count += group_fallbacks
+                    _bump_perf("version_resolved_fallback", group_fallbacks)
+                    if not quiet:
+                        console.print(
+                            f"  [yellow]↺[/yellow] Resolved {pkg.name} → {pkg.version} "
+                            f"[dim](bundled registry fallback after timeout"
+                            f"{'; applied to ' + str(len(peers)) + ' package entries' if len(peers) > 1 else ''})[/dim]"
+                        )
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+            # Enrich licenses for packages that already had versions
+            lic_count = await enrich_licenses(packages, client)
+            if lic_count and not quiet:
+                console.print(f"  [green]✓[/green] Enriched {lic_count} package license(s)")
+
+            unresolved_after = [p for p in unresolved if p.version in ("latest", "unknown", "")]
+            if unresolved_after:
+                _bump_perf("version_unresolved", len(unresolved_after))
+            if unresolved_after and not quiet:
+                fallback_count = sum(1 for p in unresolved if p.version_source == "registry_fallback")
+                console.print(
+                    "  [yellow]⚠[/yellow] Some package versions remain unresolved "
+                    f"({len(unresolved_after)} package(s)); scan continues with explicit partial coverage"
+                )
+                if fallback_count:
+                    console.print(
+                        f"  [yellow]↺[/yellow] Preserved scan continuity for {fallback_count} package(s) using bundled registry versions"
+                    )
+            npm_rate_limit_hits = _npm_rate_limit_hits() - npm_rate_limit_hits_before
+            breaker_open = registry_breaker_tripped(NPM_REGISTRY)
+            if (npm_rate_limit_hits or breaker_open) and not quiet:
+                fallback_count = sum(1 for p in unresolved if p.version_source == "registry_fallback")
+                breaker_note = " — circuit breaker opened, stopped live npm lookups for the rest of this scan" if breaker_open else ""
+                console.print(
+                    f"  [yellow]⚠[/yellow] npm registry rate-limited "
+                    f"({npm_rate_limit_hits} event(s)){breaker_note}; "
+                    f"used cached/bundled versions for {fallback_count} package(s)"
+                )
+    except asyncio.TimeoutError:
+        _logger.warning(
+            "Version resolution timed out after %.0fs (%d/%d resolved)",
+            global_timeout,
+            resolved_count,
+            len(unresolved),
+        )
+        if not quiet:
+            n_done, n_total = resolved_count, len(unresolved)
+            console.print(
+                f"  [yellow]⚠[/yellow] Version resolution timed out ({n_done}/{n_total} resolved) — scanning with available versions"
+            )
     return resolved_count
 
 
-def resolve_all_versions_sync(packages: list[Package]) -> int:
-    return asyncio.run(resolve_all_versions(packages))
+def resolve_all_versions_sync(packages: list[Package], *, quiet: bool = False) -> int:
+    return asyncio.run(resolve_all_versions(packages, quiet=quiet))
 
 
 # Backward-compatible aliases (used by registry.py)

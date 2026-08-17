@@ -1,0 +1,371 @@
+"""Idempotency key storage for retry-safe write endpoints."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sqlite3
+import threading
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Protocol
+
+from agent_bom.api.postgres_common import ConnectionPool, _ensure_tenant_rls, _get_pool, _tenant_connection
+from agent_bom.api.storage_schema import ensure_postgres_schema_version, ensure_sqlite_schema_version
+
+# Fixed namespace for content-derived batch ids so an identical write resent
+# without an ``Idempotency-Key`` header still collapses onto one logical batch
+# (stable observation dedup key) instead of minting a fresh random batch id.
+_BATCH_ID_NAMESPACE = uuid.UUID("6f6b4b2e-2c1a-4d9e-9d3b-8a1f0c5e7d42")
+_DEFAULT_IDEMPOTENCY_TTL_HOURS = 24
+
+
+def deterministic_batch_id(seed: str) -> str:
+    """Return a stable batch id derived from *seed* (idempotency key or hash).
+
+    A pure function of the seed: the same request content (or the same explicit
+    ``Idempotency-Key``) always yields the same batch id, so replays dedup rather
+    than inflate per-batch observation counts.
+    """
+    return str(uuid.uuid5(_BATCH_ID_NAMESPACE, seed or ""))
+
+
+def _idempotency_ttl_hours() -> int:
+    raw = os.environ.get("AGENT_BOM_IDEMPOTENCY_TTL_HOURS")
+    if raw is None:
+        return _DEFAULT_IDEMPOTENCY_TTL_HOURS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _DEFAULT_IDEMPOTENCY_TTL_HOURS
+
+
+@dataclass
+class IdempotencyRecord:
+    endpoint: str
+    tenant_id: str
+    source_id: str
+    idempotency_key: str
+    request_hash: str
+    response_json: str
+    created_at: str
+
+
+class IdempotencyConflictError(RuntimeError):
+    """Raised when a key is reused for a different request payload."""
+
+
+class IdempotencyPayloadError(ValueError):
+    """Raised when a request payload cannot be fingerprinted.
+
+    Pydantic's serializer aborts with ``ValueError: Circular reference detected
+    (depth exceeded)`` on a deeply nested body, and ``json.dumps`` can hit the
+    interpreter recursion limit on the same input. Both are caller-controlled,
+    so they must land as a 422 instead of escaping as an unhandled 500.
+    """
+
+
+class IdempotencyStore(Protocol):
+    def get(
+        self,
+        endpoint: str,
+        tenant_id: str,
+        source_id: str,
+        idempotency_key: str,
+        *,
+        request_hash: str = "",
+    ) -> dict[str, Any] | None: ...
+    def put(
+        self,
+        endpoint: str,
+        tenant_id: str,
+        source_id: str,
+        idempotency_key: str,
+        response: dict[str, Any],
+        *,
+        request_hash: str = "",
+    ) -> None: ...
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_request_payload(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return {
+            str(key): _normalize_request_payload(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key) != "idempotency_key"
+        }
+    if isinstance(value, list | tuple):
+        return [_normalize_request_payload(item) for item in value]
+    return value
+
+
+def idempotency_request_fingerprint(payload: Any) -> str:
+    """Return a stable fingerprint for comparing idempotent write retries.
+
+    Raises:
+        IdempotencyPayloadError: when the caller's payload is too deeply nested
+            (or otherwise cyclic) to normalize. Callers surface this as 422.
+    """
+    try:
+        normalized = _normalize_request_payload(payload or {})
+        encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"), default=str)
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise IdempotencyPayloadError("Request payload is too deeply nested to process") from exc
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _ensure_request_hash_matches(stored_hash: str, request_hash: str) -> None:
+    if stored_hash and request_hash and stored_hash != request_hash:
+        raise IdempotencyConflictError("Idempotency key was reused with a different request payload")
+
+
+class InMemoryIdempotencyStore:
+    def __init__(self, ttl_hours: int = 24) -> None:
+        self._records: dict[tuple[str, str, str, str], IdempotencyRecord] = {}
+        self._ttl = timedelta(hours=ttl_hours)
+        self._lock = threading.Lock()
+
+    def _prune(self) -> None:
+        cutoff = datetime.now(timezone.utc) - self._ttl
+        stale = [key for key, record in self._records.items() if datetime.fromisoformat(record.created_at) < cutoff]
+        for key in stale:
+            self._records.pop(key, None)
+
+    def get(
+        self,
+        endpoint: str,
+        tenant_id: str,
+        source_id: str,
+        idempotency_key: str,
+        *,
+        request_hash: str = "",
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            self._prune()
+            record = self._records.get((endpoint, tenant_id, source_id, idempotency_key))
+            if record:
+                _ensure_request_hash_matches(record.request_hash, request_hash)
+            return json.loads(record.response_json) if record else None
+
+    def put(
+        self,
+        endpoint: str,
+        tenant_id: str,
+        source_id: str,
+        idempotency_key: str,
+        response: dict[str, Any],
+        *,
+        request_hash: str = "",
+    ) -> None:
+        with self._lock:
+            self._prune()
+            self._records[(endpoint, tenant_id, source_id, idempotency_key)] = IdempotencyRecord(
+                endpoint=endpoint,
+                tenant_id=tenant_id,
+                source_id=source_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                response_json=json.dumps(response, sort_keys=True),
+                created_at=_utcnow(),
+            )
+
+
+class SQLiteIdempotencyStore:
+    def __init__(self, db_path: str = "agent_bom_jobs.db", ttl_hours: int | None = None) -> None:
+        self._db_path = db_path
+        self._ttl_hours = ttl_hours
+        self._local = threading.local()
+        self._init_db()
+
+    def _prune(self) -> None:
+        """Delete idempotency keys past the TTL (keyed on ``idx_idempotency_created_at``)."""
+        ttl = self._ttl_hours if self._ttl_hours is not None else _idempotency_ttl_hours()
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=max(1, int(ttl)))).isoformat()
+        self._conn.execute("DELETE FROM idempotency_keys WHERE created_at < ?", (cutoff,))
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        if not hasattr(self._local, "conn") or self._local.conn is None:
+            self._local.conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            self._local.conn.execute("PRAGMA journal_mode=WAL")
+        conn: sqlite3.Connection = self._local.conn
+        return conn
+
+    def _init_db(self) -> None:
+        ensure_sqlite_schema_version(self._conn, "idempotency")
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS idempotency_keys (
+                endpoint TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                request_hash TEXT NOT NULL DEFAULT '',
+                response_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (endpoint, tenant_id, source_id, idempotency_key)
+            )
+            """
+        )
+        columns = {str(row[1]) for row in self._conn.execute("PRAGMA table_info(idempotency_keys)").fetchall()}
+        if "request_hash" not in columns:
+            self._conn.execute("ALTER TABLE idempotency_keys ADD COLUMN request_hash TEXT NOT NULL DEFAULT ''")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_idempotency_created_at ON idempotency_keys(created_at)")
+        self._conn.commit()
+
+    def get(
+        self,
+        endpoint: str,
+        tenant_id: str,
+        source_id: str,
+        idempotency_key: str,
+        *,
+        request_hash: str = "",
+    ) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            """SELECT response_json, request_hash FROM idempotency_keys
+               WHERE endpoint = ? AND tenant_id = ? AND source_id = ? AND idempotency_key = ?""",
+            (endpoint, tenant_id, source_id, idempotency_key),
+        ).fetchone()
+        if row:
+            _ensure_request_hash_matches(str(row[1] or ""), request_hash)
+        return json.loads(row[0]) if row else None
+
+    def put(
+        self,
+        endpoint: str,
+        tenant_id: str,
+        source_id: str,
+        idempotency_key: str,
+        response: dict[str, Any],
+        *,
+        request_hash: str = "",
+    ) -> None:
+        self._conn.execute(
+            """INSERT OR REPLACE INTO idempotency_keys
+               (endpoint, tenant_id, source_id, idempotency_key, request_hash, response_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                endpoint,
+                tenant_id,
+                source_id,
+                idempotency_key,
+                request_hash,
+                json.dumps(response, sort_keys=True),
+                _utcnow(),
+            ),
+        )
+        # Prune expired keys on write so the table cannot grow without bound.
+        self._prune()
+        self._conn.commit()
+
+
+class PostgresIdempotencyStore:
+    """PostgreSQL-backed idempotency store for multi-replica deployments.
+
+    Mirrors :class:`SQLiteIdempotencyStore` semantics — replay the cached
+    response for a repeated ``Idempotency-Key``, raise
+    :class:`IdempotencyConflictError` (surfaced as HTTP 409) when the same key
+    is reused with a different request body, and prune past-TTL rows on write —
+    but shares state across every API replica through Postgres. The per-process
+    :class:`InMemoryIdempotencyStore` fallback silently dropped that guarantee
+    on clustered Postgres deployments: a retried ``POST /v1/findings/bulk`` that
+    landed on a different replica (or after a restart) was not recognized.
+
+    The table is tenant-scoped and registered under ``FORCE ROW LEVEL SECURITY``
+    via the shared :func:`_ensure_tenant_rls` helper, exactly like every other
+    control-plane table, so it never bypasses the tenancy backstop.
+    """
+
+    def __init__(self, pool: ConnectionPool | None = None, ttl_hours: int | None = None) -> None:
+        self._pool = pool or _get_pool()
+        self._ttl_hours = ttl_hours
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        with self._pool.connection() as conn:
+            if not ensure_postgres_schema_version(conn, "idempotency"):
+                return
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS idempotency_keys (
+                    endpoint TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    request_hash TEXT NOT NULL DEFAULT '',
+                    response_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (endpoint, tenant_id, source_id, idempotency_key)
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_idempotency_created_at ON idempotency_keys(created_at)")
+            _ensure_tenant_rls(conn, "idempotency_keys", "tenant_id")
+            conn.commit()
+
+    def _prune(self, conn: Any) -> None:
+        """Delete idempotency keys past the TTL (keyed on ``idx_idempotency_created_at``)."""
+        ttl = self._ttl_hours if self._ttl_hours is not None else _idempotency_ttl_hours()
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=max(1, int(ttl)))).isoformat()
+        conn.execute("DELETE FROM idempotency_keys WHERE created_at < %s", (cutoff,))
+
+    def get(
+        self,
+        endpoint: str,
+        tenant_id: str,
+        source_id: str,
+        idempotency_key: str,
+        *,
+        request_hash: str = "",
+    ) -> dict[str, Any] | None:
+        with _tenant_connection(self._pool) as conn:
+            row = conn.execute(
+                """SELECT response_json, request_hash FROM idempotency_keys
+                   WHERE endpoint = %s AND tenant_id = %s AND source_id = %s AND idempotency_key = %s""",
+                (endpoint, tenant_id, source_id, idempotency_key),
+            ).fetchone()
+        if row:
+            _ensure_request_hash_matches(str(row[1] or ""), request_hash)
+        return json.loads(row[0]) if row else None
+
+    def put(
+        self,
+        endpoint: str,
+        tenant_id: str,
+        source_id: str,
+        idempotency_key: str,
+        response: dict[str, Any],
+        *,
+        request_hash: str = "",
+    ) -> None:
+        with _tenant_connection(self._pool) as conn:
+            conn.execute(
+                """INSERT INTO idempotency_keys
+                   (endpoint, tenant_id, source_id, idempotency_key, request_hash, response_json, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (endpoint, tenant_id, source_id, idempotency_key) DO UPDATE SET
+                       request_hash = EXCLUDED.request_hash,
+                       response_json = EXCLUDED.response_json,
+                       created_at = EXCLUDED.created_at""",
+                (
+                    endpoint,
+                    tenant_id,
+                    source_id,
+                    idempotency_key,
+                    request_hash,
+                    json.dumps(response, sort_keys=True),
+                    _utcnow(),
+                ),
+            )
+            # Prune expired keys on write so the table cannot grow without bound.
+            self._prune(conn)
+            conn.commit()

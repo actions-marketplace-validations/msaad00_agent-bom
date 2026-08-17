@@ -1,4 +1,4 @@
-"""Tests for external scanner JSON ingestion (Trivy, Grype, Syft)."""
+"""Tests for external scanner JSON ingestion (Trivy, Grype, Syft, SARIF)."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from agent_bom.models import Severity
 from agent_bom.parsers.external_scanners import (
     detect_and_parse,
     parse_grype_json,
+    parse_sarif_json,
     parse_syft_json,
     parse_trivy_json,
 )
@@ -65,7 +66,7 @@ TRIVY_MULTIPLE_ECOSYSTEMS = {
     ]
 }
 
-TRIVY_EMPTY = {"Results": []}
+TRIVY_EMPTY: dict[str, list[object]] = {"Results": []}
 
 # ── Grype fixtures ─────────────────────────────────────────────────────────
 
@@ -103,7 +104,7 @@ GRYPE_MULTIPLE_TYPES = {
     ]
 }
 
-GRYPE_EMPTY = {"matches": []}
+GRYPE_EMPTY: dict[str, list[object]] = {"matches": []}
 
 # ── Syft fixtures ──────────────────────────────────────────────────────────
 
@@ -160,6 +161,13 @@ def test_parse_trivy_fixed_version():
     assert packages[0].vulnerabilities[0].fixed_version == "2.31.0"
 
 
+def test_parse_trivy_confidence_uses_preserved_fields():
+    packages = parse_trivy_json(TRIVY_BASIC)
+    vuln = packages[0].vulnerabilities[0]
+
+    assert vuln.confidence == pytest.approx(0.35)
+
+
 def test_parse_trivy_empty_results():
     packages = parse_trivy_json(TRIVY_EMPTY)
     assert packages == []
@@ -193,6 +201,77 @@ def test_parse_trivy_ghsa_cvss_fallback():
     }
     packages = parse_trivy_json(data)
     assert packages[0].vulnerabilities[0].cvss_score == 5.3
+
+
+@pytest.mark.parametrize(
+    ("vendor", "score"),
+    [
+        ("redhat", 6.1),
+        ("amazon", 7.0),
+        ("oracle", 8.2),
+    ],
+)
+def test_parse_trivy_vendor_cvss_sources(vendor: str, score: float) -> None:
+    data = {
+        "Results": [
+            {
+                "Target": "image",
+                "Type": "rpm",
+                "Vulnerabilities": [
+                    {
+                        "VulnerabilityID": "CVE-2024-99999",
+                        "PkgName": "openssl",
+                        "InstalledVersion": "1.1.1",
+                        "Severity": "HIGH",
+                        "CVSS": {vendor: {"V3Score": score}},
+                    }
+                ],
+            }
+        ]
+    }
+    packages = parse_trivy_json(data)
+    assert packages[0].vulnerabilities[0].cvss_score == score
+
+
+def test_parse_trivy_preserves_advisory_metadata():
+    data = {
+        "Results": [
+            {
+                "Target": "requirements.txt",
+                "Type": "pip",
+                "Vulnerabilities": [
+                    {
+                        "VulnerabilityID": "CVE-2024-11111",
+                        "PkgName": "django",
+                        "InstalledVersion": "4.2.0",
+                        "Severity": "HIGH",
+                        "SeveritySource": "ghsa",
+                        "Title": "Django advisory",
+                        "DataSource": {
+                            "ID": "ghsa",
+                            "Name": "GitHub Security Advisory pip",
+                            "URL": "https://github.com/advisories",
+                        },
+                        "VendorIDs": ["GHSA-abcd-efgh-ijkl"],
+                        "CweIDs": ["CWE-79", "CWE-352"],
+                        "PublishedDate": "2024-01-02T03:04:05Z",
+                        "LastModifiedDate": "2024-01-03T03:04:05Z",
+                    }
+                ],
+            }
+        ]
+    }
+
+    packages = parse_trivy_json(data)
+
+    vuln = packages[0].vulnerabilities[0]
+    assert vuln.cwe_ids == ["CWE-79", "CWE-352"]
+    assert vuln.aliases == ["GHSA-abcd-efgh-ijkl"]
+    assert vuln.severity_source == "ghsa"
+    assert vuln.published_at == "2024-01-02T03:04:05Z"
+    assert vuln.modified_at == "2024-01-03T03:04:05Z"
+    assert vuln.advisory_sources == ["ghsa"]
+    assert vuln.confidence == pytest.approx(0.30)
 
 
 # ── Grype tests ────────────────────────────────────────────────────────────
@@ -233,6 +312,13 @@ def test_parse_grype_cvss_score():
     assert packages[0].vulnerabilities[0].cvss_score == 8.1
 
 
+def test_parse_grype_confidence_uses_preserved_fields():
+    packages = parse_grype_json(GRYPE_BASIC)
+    vuln = packages[0].vulnerabilities[0]
+
+    assert vuln.confidence == pytest.approx(0.35)
+
+
 def test_parse_grype_unfixed_no_fixed_version():
     """fix.state != 'fixed' → fixed_version is None."""
     data = {
@@ -249,6 +335,49 @@ def test_parse_grype_unfixed_no_fixed_version():
     }
     packages = parse_grype_json(data)
     assert packages[0].vulnerabilities[0].fixed_version is None
+
+
+def test_parse_grype_preserves_advisory_metadata():
+    data = {
+        "matches": [
+            {
+                "vulnerability": {
+                    "id": "GHSA-abcd-efgh-ijkl",
+                    "severity": "High",
+                    "namespace": "github:language:python",
+                    "dataSource": "https://github.com/advisories/GHSA-abcd-efgh-ijkl",
+                    "description": "Django advisory",
+                    "cwes": ["CWE-79", "CWE-352"],
+                    "aliases": ["PYSEC-2024-1"],
+                    "relatedVulnerabilities": [
+                        {
+                            "id": "CVE-2024-22222",
+                            "namespace": "nvd:cpe",
+                            "dataSource": "https://nvd.nist.gov/vuln/detail/CVE-2024-22222",
+                        }
+                    ],
+                    "publishedDate": "2024-02-02T00:00:00Z",
+                    "modifiedDate": "2024-02-03T00:00:00Z",
+                },
+                "artifact": {
+                    "name": "django",
+                    "version": "4.2.0",
+                    "type": "python",
+                },
+            }
+        ]
+    }
+
+    packages = parse_grype_json(data)
+
+    vuln = packages[0].vulnerabilities[0]
+    assert vuln.cwe_ids == ["CWE-79", "CWE-352"]
+    assert vuln.aliases == ["PYSEC-2024-1", "CVE-2024-22222"]
+    assert vuln.severity_source == "github:language:python"
+    assert vuln.published_at == "2024-02-02T00:00:00Z"
+    assert vuln.modified_at == "2024-02-03T00:00:00Z"
+    assert vuln.advisory_sources == ["github:language:python"]
+    assert vuln.confidence == pytest.approx(0.30)
 
 
 # ── Syft tests ─────────────────────────────────────────────────────────────
@@ -296,3 +425,55 @@ def test_detect_syft():
 def test_detect_unknown_raises():
     with pytest.raises(ValueError, match="Unrecognized scanner JSON format"):
         detect_and_parse({"foo": "bar"})
+
+
+SARIF_BASIC = {
+    "version": "2.1.0",
+    "runs": [
+        {
+            "tool": {
+                "driver": {
+                    "name": "bandit",
+                    "rules": [
+                        {
+                            "id": "B105",
+                            "properties": {"tags": ["CWE-259"]},
+                        }
+                    ],
+                }
+            },
+            "results": [
+                {
+                    "ruleId": "B105",
+                    "level": "warning",
+                    "message": {"text": "Possible hardcoded password"},
+                    "locations": [
+                        {
+                            "physicalLocation": {
+                                "artifactLocation": {"uri": "src/app.py"},
+                                "region": {"startLine": 12},
+                            }
+                        }
+                    ],
+                }
+            ],
+        }
+    ],
+}
+
+
+def test_parse_sarif_json_groups_by_file():
+    packages = parse_sarif_json(SARIF_BASIC)
+    assert len(packages) == 1
+    pkg = packages[0]
+    assert pkg.ecosystem == "sast"
+    assert pkg.name == "src/app.py"
+    assert len(pkg.vulnerabilities) == 1
+    assert pkg.vulnerabilities[0].id == "B105"
+    assert pkg.vulnerabilities[0].cwe_ids == ["CWE-259"]
+
+
+def test_detect_sarif():
+    packages = detect_and_parse(SARIF_BASIC)
+    assert len(packages) == 1
+    assert packages[0].name == "src/app.py"

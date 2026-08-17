@@ -11,6 +11,7 @@ from agent_bom.remediate import (
     generate_credential_fixes,
     generate_package_fixes,
 )
+from agent_bom.remediation_commands import build_fix_command, build_verify_command
 
 # ── Credential fix tests ────────────────────────────────────────────────────
 
@@ -103,6 +104,18 @@ def test_package_fix_pypi():
     assert "2.32.0" in fix.command
 
 
+def test_build_verify_command_normalizes_ecosystem():
+    """Verification commands normalize ecosystem names for the CLI."""
+    command = build_verify_command("PyPI", "requests", "2.32.0")
+    assert command == "agent-bom check requests@2.32.0 --ecosystem pypi"
+
+
+def test_build_fix_command_rejects_unsafe_values():
+    """Remediation command builder refuses shell metacharacters."""
+    command = build_fix_command("npm", "left-pad; rm -rf /", "1.3.0")
+    assert command is None
+
+
 # ── Export tests ──────────────────────────────────────────────────────────────
 
 
@@ -159,8 +172,9 @@ def test_export_sh(tmp_path):
     content = out.read_text()
     assert content.startswith("#!/usr/bin/env bash")
     assert "npm install axios@0.21.1" in content
-    # Verify file is executable
+    # Generated commands require explicit review/invocation and are not executable by default.
     import stat
 
     mode = out.stat().st_mode
-    assert mode & stat.S_IXUSR
+    assert not mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    assert stat.S_IMODE(mode) == 0o600

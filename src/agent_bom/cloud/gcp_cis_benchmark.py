@@ -33,15 +33,160 @@ Install: ``pip install 'agent-bom[gcp]'``
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-from .aws_cis_benchmark import CheckStatus, CISCheckResult
+from .aws_cis_benchmark import CheckStatus, CISCheckResult, finalize_read_coverage
+from .aws_inventory import is_access_denied_error
 from .base import CloudDiscoveryError
 
+try:
+    from .normalization import sanitize_discovery_warning
+except Exception:  # pragma: no cover - normalization always present in practice
+
+    def sanitize_discovery_warning(value: Any, *, max_len: int = 500) -> str:  # type: ignore[misc]
+        return str(value)[:max_len]
+
+
 logger = logging.getLogger(__name__)
+
+
+def _import_google_cloud_module(module: str) -> Any:
+    """Import optional Google Cloud SDK modules without requiring mypy stubs."""
+    return importlib.import_module(f"google.cloud.{module}")
+
+
+# ---------------------------------------------------------------------------
+# Credential threading
+# ---------------------------------------------------------------------------
+#
+# CIS checks build their own service clients inline. AWS/Azure CIS thread an
+# explicit credential into every client; GCP must do the same so the benchmark
+# works when called with an explicit credential (or no ambient ADC). The runner
+# stores the resolved credential in a module-local context for the duration of a
+# (sequential) benchmark run, and the client factories below pick it up. When no
+# credential is supplied the factories pass nothing, so the SDK falls back to
+# Application Default Credentials exactly as before.
+
+
+@dataclass
+class _CredentialContext:
+    """Thread-local-ish holder for the credential threaded through a run."""
+
+    credentials: Any = None
+
+
+_CTX = threading.local()
+
+
+def _ctx() -> _CredentialContext:
+    ctx = getattr(_CTX, "value", None)
+    if ctx is None:
+        ctx = _CredentialContext()
+        _CTX.value = ctx
+    return ctx
+
+
+def _set_credentials(credentials: Any) -> None:
+    _ctx().credentials = credentials
+
+
+def _clear_credentials() -> None:
+    _ctx().credentials = None
+
+
+def _creds_kwargs() -> dict[str, Any]:
+    """Return ``{"credentials": ...}`` when a credential is threaded, else ``{}``.
+
+    Passing an empty dict preserves the ADC fallback behaviour for callers that
+    do not supply an explicit credential.
+    """
+    creds = _ctx().credentials
+    return {"credentials": creds} if creds is not None else {}
+
+
+def _discovery_client(service: str, version: str) -> Any:
+    """Build a googleapiclient discovery client threading the run credential."""
+    import googleapiclient.discovery
+
+    return googleapiclient.discovery.build(service, version, cache_discovery=False, **_creds_kwargs())
+
+
+def _gcp_paginate_list(resource_api: Any, items_key: str, **list_kwargs: Any) -> list[dict]:
+    """Collect all pages from a googleapiclient ``*.list`` resource.
+
+    Stops when ``list_next`` returns ``None`` or when the response has no
+    string page token. MagicMock stubs that omit ``list_next = None`` used to
+    hang forever because MagickMock is truthy — require an explicit string
+    token before advancing.
+    """
+    items: list[dict] = []
+    request = resource_api.list(**list_kwargs)
+    seen_requests: set[int] = set()
+    while request is not None:
+        request_id = id(request)
+        if request_id in seen_requests:
+            break
+        seen_requests.add(request_id)
+        response = request.execute()
+        if not isinstance(response, dict):
+            break
+        items.extend(response.get(items_key, []) or [])
+        next_token = response.get("nextPageToken") or response.get("pageToken")
+        if not isinstance(next_token, str) or not next_token.strip():
+            break
+        next_request = resource_api.list_next(request, response)
+        if next_request is None or next_request is request:
+            break
+        request = next_request
+    return items
+
+
+def _gcp_cloud_sql_instances(project_id: str) -> list[dict]:
+    sqladmin = _discovery_client("sqladmin", "v1beta4")
+    return _gcp_paginate_list(sqladmin.instances(), "items", project=project_id)
+
+
+def _gcp_managed_zones(project_id: str) -> list[dict]:
+    """Return every Cloud DNS managed zone in the project (all pages).
+
+    A single ``managedZones.list`` page caps at 100 zones; reading only the
+    first page silently drops later zones, so a non-DNSSEC / unlogged zone
+    beyond page one would be a false PASS. Paginate to stay complete.
+    """
+    dns = _discovery_client("dns", "v1")
+    return _gcp_paginate_list(dns.managedZones(), "managedZones", project=project_id)
+
+
+def _gcp_bigquery_datasets(bq: Any, project_id: str) -> list[dict]:
+    """Return every BigQuery dataset in the project (all pages).
+
+    ``datasets.list`` is paginated; reading only the first page would let a
+    publicly-accessible / unencrypted dataset on a later page pass unseen.
+    """
+    return _gcp_paginate_list(bq.datasets(), "datasets", projectId=project_id)
+
+
+def _gcp_kms_crypto_keys(project_id: str) -> list[dict]:
+    """Return every Cloud KMS crypto key in the project (all locations/key rings)."""
+    kms = _discovery_client("cloudkms", "v1")
+    keys: list[dict] = []
+    locations = _gcp_paginate_list(kms.projects().locations(), "locations", name=f"projects/{project_id}")
+    for loc in locations:
+        loc_name = loc.get("name", "")
+        if not loc_name:
+            continue
+        keyrings = _gcp_paginate_list(kms.projects().locations().keyRings(), "keyRings", parent=loc_name)
+        for kr in keyrings:
+            kr_name = kr.get("name", "")
+            if not kr_name:
+                continue
+            keys.extend(_gcp_paginate_list(kms.projects().locations().keyRings().cryptoKeys(), "cryptoKeys", parent=kr_name))
+    return keys
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +201,11 @@ class GCPCISReport:
     benchmark_version: str = "3.0"
     checks: list[CISCheckResult] = field(default_factory=list)
     project_id: str = ""
+    # Populated only by the multi-project fan-out: the projects actually
+    # evaluated and any per-project warnings (e.g. a project skipped because the
+    # credential could not read it). Empty for a single-project run.
+    projects_scanned: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def passed(self) -> int:
@@ -66,24 +216,42 @@ class GCPCISReport:
         return sum(1 for c in self.checks if c.status == CheckStatus.FAIL)
 
     @property
+    def errored(self) -> int:
+        return sum(1 for c in self.checks if c.status == CheckStatus.ERROR)
+
+    @property
+    def not_applicable(self) -> int:
+        return sum(1 for c in self.checks if c.status == CheckStatus.NOT_APPLICABLE)
+
+    @property
+    def evaluated(self) -> int:
+        return self.passed + self.failed
+
+    @property
     def total(self) -> int:
         return len(self.checks)
 
     @property
     def pass_rate(self) -> float:
-        evaluated = sum(1 for c in self.checks if c.status in (CheckStatus.PASS, CheckStatus.FAIL))
-        return (self.passed / evaluated * 100) if evaluated else 0.0
+        return (self.passed / self.evaluated * 100) if self.evaluated else 0.0
 
     def to_dict(self) -> dict:
+        from agent_bom.cloud.benchmark_manifests import benchmark_manifest
         from agent_bom.mitre_attack import tag_cis_check
 
         return {
             "benchmark": "CIS Google Cloud Platform Foundation",
             "benchmark_version": self.benchmark_version,
+            "benchmark_manifest": benchmark_manifest("gcp"),
             "project_id": self.project_id,
+            "projects_scanned": self.projects_scanned,
+            "warnings": self.warnings,
             "pass_rate": round(self.pass_rate, 1),
             "passed": self.passed,
             "failed": self.failed,
+            "errored": self.errored,
+            "not_applicable": self.not_applicable,
+            "evaluated": self.evaluated,
             "total": self.total,
             "checks": [
                 {
@@ -94,7 +262,11 @@ class GCPCISReport:
                     "evidence": c.evidence,
                     "resource_ids": c.resource_ids,
                     "recommendation": c.recommendation,
+                    "remediation": c.remediation,
                     "cis_section": c.cis_section,
+                    # Per-check project attribution for the multi-project fan-out;
+                    # empty string on a single-project run.
+                    "project_id": c.account_id,
                     "attack_techniques": tag_cis_check(c),
                 }
                 for c in self.checks
@@ -124,16 +296,14 @@ def _check_1_1(project_id: str) -> CISCheckResult:
     """CIS 1.1 — Ensure corporate login credentials are used."""
     result = CISCheckResult(
         check_id="1.1",
-        title="Ensure that corporate login credentials are used",
+        title="Corporate login credentials used",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Remove IAM bindings for members using gmail.com accounts. Use corporate/organisational login credentials instead.",
         cis_section=_IAM_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        crm = googleapiclient.discovery.build("cloudresourcemanager", "v1", cache_discovery=False)
+        crm = _discovery_client("cloudresourcemanager", "v1")
         policy = crm.projects().getIamPolicy(resource=project_id, body={}).execute()
         bindings = policy.get("bindings", [])
 
@@ -155,18 +325,18 @@ def _check_1_1(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed. Install with: pip install google-api-python-client"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check IAM policy for gmail accounts: {exc}"
+        result.evidence = f"Could not check IAM policy for gmail accounts: {sanitize_discovery_warning(exc)}"
     return result
 
 
 def _check_1_2(project_id: str) -> CISCheckResult:
-    """CIS 1.2 — Ensure multi-factor authentication is enforced for all users."""
+    """CIS 1.2 — MFA enforced for all users."""
     return CISCheckResult(
         check_id="1.2",
-        title="Ensure multi-factor authentication is enforced for all users",
+        title="MFA enforced for all users",
         status=CheckStatus.NOT_APPLICABLE,
         severity="high",
-        evidence="MFA enforcement is configured at the Google Workspace / Cloud Identity level and cannot be verified via project-level API calls. Manual verification required.",
+        evidence="MFA enforcement is configured at the Google Workspace / Cloud Identity level and cannot be verified via project-level API calls. Manual verification required.",  # noqa: E501 (CIS remediation/log-filter string — kept verbatim for copy-paste)
         recommendation="Enable 2-Step Verification enforcement in Google Workspace Admin Console under Security > 2-Step Verification.",
         cis_section=_IAM_SECTION,
     )
@@ -176,10 +346,10 @@ def _check_1_3(project_id: str) -> CISCheckResult:
     """CIS 1.3 — Ensure Security Key enforcement is enabled for all admin accounts."""
     return CISCheckResult(
         check_id="1.3",
-        title="Ensure Security Key enforcement is enabled for all admin accounts",
+        title="Security Key enforcement for admin accounts",
         status=CheckStatus.NOT_APPLICABLE,
         severity="high",
-        evidence="Security Key enforcement is configured at the Google Workspace / Cloud Identity level and cannot be verified via project-level API calls. Manual verification required.",
+        evidence="Security Key enforcement is configured at the Google Workspace / Cloud Identity level and cannot be verified via project-level API calls. Manual verification required.",  # noqa: E501 (CIS remediation/log-filter string — kept verbatim for copy-paste)
         recommendation="Enforce Security Key usage for all admin accounts in Google Workspace Admin Console.",
         cis_section=_IAM_SECTION,
     )
@@ -189,7 +359,7 @@ def _check_1_4(project_id: str) -> CISCheckResult:
     """CIS 1.4 — Ensure service account keys are not created for user-managed service accounts."""
     result = CISCheckResult(
         check_id="1.4",
-        title="Ensure service account keys are not created for user-managed service accounts",
+        title="No user-managed service account keys",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation=(
@@ -198,10 +368,9 @@ def _check_1_4(project_id: str) -> CISCheckResult:
         cis_section=_IAM_SECTION,
     )
     try:
-        import googleapiclient.discovery
         from google.oauth2 import service_account as _sa  # noqa: F401 — availability check
 
-        iam_service = googleapiclient.discovery.build("iam", "v1", cache_discovery=False)
+        iam_service = _discovery_client("iam", "v1")
         sa_list = iam_service.projects().serviceAccounts().list(name=f"projects/{project_id}").execute()
         service_accounts = sa_list.get("accounts", [])
 
@@ -227,7 +396,7 @@ def _check_1_4(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed. Install with: pip install google-api-python-client"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check service account keys: {exc}"
+        result.evidence = f"Could not check service account keys: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -235,7 +404,7 @@ def _check_1_5(project_id: str) -> CISCheckResult:
     """CIS 1.5 — Ensure primitive roles (Owner/Editor) are not used on the project."""
     result = CISCheckResult(
         check_id="1.5",
-        title="Ensure primitive roles (Owner/Editor) are not assigned at project level",
+        title="No primitive roles (Owner/Editor) at project level",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Replace primitive Owner/Editor bindings with predefined or custom roles following least privilege.",
@@ -243,9 +412,7 @@ def _check_1_5(project_id: str) -> CISCheckResult:
     )
     primitive_roles = {"roles/owner", "roles/editor"}
     try:
-        import googleapiclient.discovery
-
-        crm = googleapiclient.discovery.build("cloudresourcemanager", "v1", cache_discovery=False)
+        crm = _discovery_client("cloudresourcemanager", "v1")
         policy = crm.projects().getIamPolicy(resource=project_id, body={}).execute()
         bindings = policy.get("bindings", [])
 
@@ -271,7 +438,7 @@ def _check_1_5(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed. Install with: pip install google-api-python-client"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check IAM policy: {exc}"
+        result.evidence = f"Could not check IAM policy: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -279,7 +446,7 @@ def _check_1_6(project_id: str) -> CISCheckResult:
     """CIS 1.6 — Ensure service account has no admin privileges."""
     result = CISCheckResult(
         check_id="1.6",
-        title="Ensure service account has no admin privileges",
+        title="Service accounts lack admin privileges",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation=(
@@ -289,9 +456,7 @@ def _check_1_6(project_id: str) -> CISCheckResult:
     )
     admin_roles = {"roles/owner", "roles/editor", "roles/iam.admin"}
     try:
-        import googleapiclient.discovery
-
-        crm = googleapiclient.discovery.build("cloudresourcemanager", "v1", cache_discovery=False)
+        crm = _discovery_client("cloudresourcemanager", "v1")
         policy = crm.projects().getIamPolicy(resource=project_id, body={}).execute()
         bindings = policy.get("bindings", [])
 
@@ -316,7 +481,7 @@ def _check_1_6(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed. Install with: pip install google-api-python-client"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check service account admin privileges: {exc}"
+        result.evidence = f"Could not check service account admin privileges: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -324,7 +489,7 @@ def _check_1_7(project_id: str) -> CISCheckResult:
     """CIS 1.7 — Ensure user-managed service accounts do not have admin privileges."""
     result = CISCheckResult(
         check_id="1.7",
-        title="Ensure user-managed service accounts do not have admin privileges",
+        title="User-managed service accounts lack admin privileges",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation=(
@@ -339,9 +504,7 @@ def _check_1_7(project_id: str) -> CISCheckResult:
         "roles/compute.admin",
     }
     try:
-        import googleapiclient.discovery
-
-        crm = googleapiclient.discovery.build("cloudresourcemanager", "v1", cache_discovery=False)
+        crm = _discovery_client("cloudresourcemanager", "v1")
         policy = crm.projects().getIamPolicy(resource=project_id, body={}).execute()
         bindings = policy.get("bindings", [])
 
@@ -366,7 +529,7 @@ def _check_1_7(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed. Install with: pip install google-api-python-client"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check user-managed service account admin privileges: {exc}"
+        result.evidence = f"Could not check user-managed service account admin privileges: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -374,18 +537,16 @@ def _check_1_8(project_id: str) -> CISCheckResult:
     """CIS 1.8 — Ensure rotation for user-managed service account keys is within 90 days."""
     result = CISCheckResult(
         check_id="1.8",
-        title="Ensure user-managed service account keys are rotated within 90 days",
+        title="User-managed service account keys rotated within 90 days",
         status=CheckStatus.ERROR,
         severity="medium",
-        recommendation="Rotate user-managed service account keys every 90 days or less. Prefer short-lived credentials via Workload Identity.",
+        recommendation="Rotate user-managed service account keys every 90 days or less. Prefer short-lived credentials via Workload Identity.",  # noqa: E501 (CIS remediation/log-filter string — kept verbatim for copy-paste)
         cis_section=_IAM_SECTION,
     )
     try:
         import datetime
 
-        import googleapiclient.discovery
-
-        iam_service = googleapiclient.discovery.build("iam", "v1", cache_discovery=False)
+        iam_service = _discovery_client("iam", "v1")
         sa_list = iam_service.projects().serviceAccounts().list(name=f"projects/{project_id}").execute()
         service_accounts = sa_list.get("accounts", [])
 
@@ -417,7 +578,7 @@ def _check_1_8(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check service account key rotation: {exc}"
+        result.evidence = f"Could not check service account key rotation: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -425,32 +586,25 @@ def _check_1_9(project_id: str) -> CISCheckResult:
     """CIS 1.9 — Ensure Cloud KMS encryption keys are not anonymously or publicly accessible."""
     result = CISCheckResult(
         check_id="1.9",
-        title="Ensure Cloud KMS encryption keys are not anonymously or publicly accessible",
+        title="Cloud KMS keys not publicly accessible",
         status=CheckStatus.ERROR,
         severity="critical",
         recommendation="Remove allUsers and allAuthenticatedUsers from Cloud KMS key IAM policies.",
         cis_section=_IAM_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        kms = googleapiclient.discovery.build("cloudkms", "v1", cache_discovery=False)
-        locations = kms.projects().locations().list(name=f"projects/{project_id}").execute()
+        kms = _discovery_client("cloudkms", "v1")
         public_keys: list[str] = []
 
-        for loc in locations.get("locations", []):
-            loc_name = loc.get("name", "")
-            keyrings = kms.projects().locations().keyRings().list(parent=loc_name).execute()
-            for kr in keyrings.get("keyRings", []):
-                kr_name = kr.get("name", "")
-                keys_resp = kms.projects().locations().keyRings().cryptoKeys().list(parent=kr_name).execute()
-                for key in keys_resp.get("cryptoKeys", []):
-                    key_name = key.get("name", "")
-                    policy = kms.projects().locations().keyRings().cryptoKeys().getIamPolicy(resource=key_name).execute()
-                    for binding in policy.get("bindings", []):
-                        members = binding.get("members", [])
-                        if "allUsers" in members or "allAuthenticatedUsers" in members:
-                            public_keys.append(key_name)
+        for key in _gcp_kms_crypto_keys(project_id):
+            key_name = key.get("name", "")
+            if not key_name:
+                continue
+            policy = kms.projects().locations().keyRings().cryptoKeys().getIamPolicy(resource=key_name).execute()
+            for binding in policy.get("bindings", []):
+                members = binding.get("members", [])
+                if "allUsers" in members or "allAuthenticatedUsers" in members:
+                    public_keys.append(key_name)
 
         if public_keys:
             result.status = CheckStatus.FAIL
@@ -464,7 +618,7 @@ def _check_1_9(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check KMS key IAM policies: {exc}"
+        result.evidence = f"Could not check KMS key IAM policies: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -472,36 +626,26 @@ def _check_1_10(project_id: str) -> CISCheckResult:
     """CIS 1.10 — Ensure KMS encryption keys are rotated within a period of 90 days."""
     result = CISCheckResult(
         check_id="1.10",
-        title="Ensure KMS encryption keys are rotated within 90 days",
+        title="KMS keys rotated within 90 days",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Set a rotation period of 90 days or less on all Cloud KMS encryption keys.",
         cis_section=_IAM_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        kms = googleapiclient.discovery.build("cloudkms", "v1", cache_discovery=False)
-        locations = kms.projects().locations().list(name=f"projects/{project_id}").execute()
         failing: list[str] = []
         max_rotation_seconds = 90 * 24 * 60 * 60  # 90 days in seconds
 
-        for loc in locations.get("locations", []):
-            loc_name = loc.get("name", "")
-            keyrings = kms.projects().locations().keyRings().list(parent=loc_name).execute()
-            for kr in keyrings.get("keyRings", []):
-                kr_name = kr.get("name", "")
-                keys_resp = kms.projects().locations().keyRings().cryptoKeys().list(parent=kr_name).execute()
-                for key in keys_resp.get("cryptoKeys", []):
-                    key_name = key.get("name", "")
-                    rotation_period = key.get("rotationPeriod", "")
-                    if not rotation_period:
-                        failing.append(key_name)
-                    else:
-                        # rotationPeriod is like "7776000s"
-                        period_s = int(rotation_period.rstrip("s"))
-                        if period_s > max_rotation_seconds:
-                            failing.append(key_name)
+        for key in _gcp_kms_crypto_keys(project_id):
+            key_name = key.get("name", "")
+            rotation_period = key.get("rotationPeriod", "")
+            if not rotation_period:
+                failing.append(key_name)
+            else:
+                # rotationPeriod is like "7776000s"
+                period_s = int(rotation_period.rstrip("s"))
+                if period_s > max_rotation_seconds:
+                    failing.append(key_name)
 
         if failing:
             result.status = CheckStatus.FAIL
@@ -515,7 +659,7 @@ def _check_1_10(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check KMS key rotation: {exc}"
+        result.evidence = f"Could not check KMS key rotation: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -523,16 +667,14 @@ def _check_1_11(project_id: str) -> CISCheckResult:
     """CIS 1.11 — Ensure separation of duties is enforced while assigning KMS-related roles."""
     result = CISCheckResult(
         check_id="1.11",
-        title="Ensure separation of duties is enforced while assigning KMS-related roles",
+        title="Separation of duties for KMS role assignment",
         status=CheckStatus.ERROR,
         severity="high",
-        recommendation="Ensure no user has both cloudkms.admin and any of cloudkms.cryptoKeyEncrypterDecrypter, cloudkms.cryptoKeyEncrypter, or cloudkms.cryptoKeyDecrypter roles.",
+        recommendation="Ensure no user has both cloudkms.admin and any of cloudkms.cryptoKeyEncrypterDecrypter, cloudkms.cryptoKeyEncrypter, or cloudkms.cryptoKeyDecrypter roles.",  # noqa: E501 (CIS remediation/log-filter string — kept verbatim for copy-paste)
         cis_section=_IAM_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        crm = googleapiclient.discovery.build("cloudresourcemanager", "v1", cache_discovery=False)
+        crm = _discovery_client("cloudresourcemanager", "v1")
         policy = crm.projects().getIamPolicy(resource=project_id, body={}).execute()
         bindings = policy.get("bindings", [])
 
@@ -568,7 +710,7 @@ def _check_1_11(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check KMS role separation: {exc}"
+        result.evidence = f"Could not check KMS role separation: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -576,16 +718,14 @@ def _check_1_12(project_id: str) -> CISCheckResult:
     """CIS 1.12 — Ensure API keys are restricted to only APIs the application needs."""
     result = CISCheckResult(
         check_id="1.12",
-        title="Ensure API keys are restricted to only APIs the application needs",
+        title="API keys restricted to needed APIs",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Restrict each API key to only the specific APIs required by the application.",
         cis_section=_IAM_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        apikeys = googleapiclient.discovery.build("apikeys", "v2", cache_discovery=False)
+        apikeys = _discovery_client("apikeys", "v2")
         keys_resp = apikeys.projects().locations().keys().list(parent=f"projects/{project_id}/locations/global").execute()
         keys = keys_resp.get("keys", [])
 
@@ -611,7 +751,7 @@ def _check_1_12(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check API key restrictions: {exc}"
+        result.evidence = f"Could not check API key restrictions: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -619,16 +759,14 @@ def _check_1_13(project_id: str) -> CISCheckResult:
     """CIS 1.13 — Ensure API keys are restricted to specific hosts and apps."""
     result = CISCheckResult(
         check_id="1.13",
-        title="Ensure API keys are restricted to specific hosts and apps",
+        title="API keys restricted to specific hosts and apps",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Add application restrictions (HTTP referrers, IP addresses, Android/iOS apps) to each API key.",
         cis_section=_IAM_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        apikeys = googleapiclient.discovery.build("apikeys", "v2", cache_discovery=False)
+        apikeys = _discovery_client("apikeys", "v2")
         keys_resp = apikeys.projects().locations().keys().list(parent=f"projects/{project_id}/locations/global").execute()
         keys = keys_resp.get("keys", [])
 
@@ -656,7 +794,7 @@ def _check_1_13(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check API key host/app restrictions: {exc}"
+        result.evidence = f"Could not check API key host/app restrictions: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -664,7 +802,7 @@ def _check_1_14(project_id: str) -> CISCheckResult:
     """CIS 1.14 — Ensure API keys are rotated within 90 days."""
     result = CISCheckResult(
         check_id="1.14",
-        title="Ensure API keys are rotated within 90 days",
+        title="API keys rotated within 90 days",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Rotate API keys every 90 days or less to reduce the impact of compromised keys.",
@@ -673,9 +811,7 @@ def _check_1_14(project_id: str) -> CISCheckResult:
     try:
         import datetime
 
-        import googleapiclient.discovery
-
-        apikeys = googleapiclient.discovery.build("apikeys", "v2", cache_discovery=False)
+        apikeys = _discovery_client("apikeys", "v2")
         keys_resp = apikeys.projects().locations().keys().list(parent=f"projects/{project_id}/locations/global").execute()
         keys = keys_resp.get("keys", [])
 
@@ -702,7 +838,7 @@ def _check_1_14(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check API key rotation: {exc}"
+        result.evidence = f"Could not check API key rotation: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -710,16 +846,14 @@ def _check_1_15(project_id: str) -> CISCheckResult:
     """CIS 1.15 — Ensure essential contacts is configured for the organization."""
     result = CISCheckResult(
         check_id="1.15",
-        title="Ensure essential contacts is configured for the organization",
+        title="Essential contacts configured for the org",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Configure Essential Contacts for SECURITY, TECHNICAL, and BILLING notification categories.",
         cis_section=_IAM_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        essentialcontacts = googleapiclient.discovery.build("essentialcontacts", "v1", cache_discovery=False)
+        essentialcontacts = _discovery_client("essentialcontacts", "v1")
         contacts = essentialcontacts.projects().contacts().list(parent=f"projects/{project_id}").execute()
         contact_list = contacts.get("contacts", [])
 
@@ -746,7 +880,7 @@ def _check_1_15(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check essential contacts: {exc}"
+        result.evidence = f"Could not check essential contacts: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -759,16 +893,14 @@ def _check_2_1(project_id: str) -> CISCheckResult:
     """CIS 2.1 — Ensure Cloud Audit Logs is configured to log Admin Activity and Data Access."""
     result = CISCheckResult(
         check_id="2.1",
-        title="Ensure Cloud Audit Logs is configured for all services",
+        title="Cloud Audit Logs configured for all services",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable DATA_READ and DATA_WRITE audit log types for all services in the project IAM policy.",
         cis_section=_LOGGING_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        crm = googleapiclient.discovery.build("cloudresourcemanager", "v1", cache_discovery=False)
+        crm = _discovery_client("cloudresourcemanager", "v1")
         policy = crm.projects().getIamPolicy(resource=project_id, body={}).execute()
         audit_configs = policy.get("auditConfigs", [])
 
@@ -792,7 +924,7 @@ def _check_2_1(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed. Install with: pip install google-api-python-client"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check audit log configuration: {exc}"
+        result.evidence = f"Could not check audit log configuration: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -800,7 +932,7 @@ def _check_2_2(project_id: str) -> CISCheckResult:
     """CIS 2.2 — Ensure a log sink is configured for all log entries."""
     result = CISCheckResult(
         check_id="2.2",
-        title="Ensure a log sink is configured to export all log entries",
+        title="Log sink exports all log entries",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation=(
@@ -810,9 +942,9 @@ def _check_2_2(project_id: str) -> CISCheckResult:
         cis_section=_LOGGING_SECTION,
     )
     try:
-        from google.cloud import logging_v2
+        logging_v2 = _import_google_cloud_module("logging_v2")
 
-        client = logging_v2.ConfigServiceV2Client()
+        client = logging_v2.ConfigServiceV2Client(**_creds_kwargs())
         parent = f"projects/{project_id}"
         sinks = list(client.list_sinks(parent=parent))
 
@@ -833,7 +965,7 @@ def _check_2_2(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-logging not installed. Install with: pip install google-cloud-logging"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check log sinks: {exc}"
+        result.evidence = f"Could not check log sinks: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -841,16 +973,16 @@ def _check_2_3(project_id: str) -> CISCheckResult:
     """CIS 2.3 — Ensure log metric filter and alerts exist for Project Ownership changes."""
     result = CISCheckResult(
         check_id="2.3",
-        title="Ensure log metric filter and alerts exist for Project Ownership changes",
+        title="Log metric filter and alerts for Project Ownership changes",
         status=CheckStatus.ERROR,
         severity="medium",
-        recommendation='Create a log metric filter for (protoPayload.serviceName="cloudresourcemanager.googleapis.com") AND (ProjectOwnership OR projectOwnerInvitee).',
+        recommendation='Create a log metric filter for (protoPayload.serviceName="cloudresourcemanager.googleapis.com") AND (ProjectOwnership OR projectOwnerInvitee).',  # noqa: E501 (CIS remediation/log-filter string — kept verbatim for copy-paste)
         cis_section=_LOGGING_SECTION,
     )
     try:
-        from google.cloud import logging_v2
+        logging_v2 = _import_google_cloud_module("logging_v2")
 
-        client = logging_v2.MetricsServiceV2Client()
+        client = logging_v2.MetricsServiceV2Client(**_creds_kwargs())
         parent = f"projects/{project_id}"
         metrics = list(client.list_log_metrics(parent=parent))
 
@@ -868,7 +1000,7 @@ def _check_2_3(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-logging not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check log metrics: {exc}"
+        result.evidence = f"Could not check log metrics: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -876,16 +1008,16 @@ def _check_2_4(project_id: str) -> CISCheckResult:
     """CIS 2.4 — Ensure log metric filter and alerts exist for Audit Configuration changes."""
     result = CISCheckResult(
         check_id="2.4",
-        title="Ensure log metric filter and alerts exist for Audit Configuration changes",
+        title="Log metric filter and alerts for Audit Configuration changes",
         status=CheckStatus.ERROR,
         severity="medium",
-        recommendation='Create a log metric filter for protoPayload.methodName="SetIamPolicy" AND protoPayload.serviceData.policyDelta.auditConfigDeltas:*.',
+        recommendation='Create a log metric filter for protoPayload.methodName="SetIamPolicy" AND protoPayload.serviceData.policyDelta.auditConfigDeltas:*.',  # noqa: E501 (CIS remediation/log-filter string — kept verbatim for copy-paste)
         cis_section=_LOGGING_SECTION,
     )
     try:
-        from google.cloud import logging_v2
+        logging_v2 = _import_google_cloud_module("logging_v2")
 
-        client = logging_v2.MetricsServiceV2Client()
+        client = logging_v2.MetricsServiceV2Client(**_creds_kwargs())
         parent = f"projects/{project_id}"
         metrics = list(client.list_log_metrics(parent=parent))
 
@@ -903,7 +1035,7 @@ def _check_2_4(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-logging not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check log metrics: {exc}"
+        result.evidence = f"Could not check log metrics: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -911,16 +1043,16 @@ def _check_2_5(project_id: str) -> CISCheckResult:
     """CIS 2.5 — Ensure log metric filter and alerts exist for Custom Role changes."""
     result = CISCheckResult(
         check_id="2.5",
-        title="Ensure log metric filter and alerts exist for Custom Role changes",
+        title="Log metric filter and alerts for Custom Role changes",
         status=CheckStatus.ERROR,
         severity="medium",
-        recommendation='Create a log metric filter for resource.type="iam_role" AND (methodName="google.iam.admin.v1.CreateRole" OR methodName="google.iam.admin.v1.DeleteRole" OR methodName="google.iam.admin.v1.UpdateRole").',
+        recommendation='Create a log metric filter for resource.type="iam_role" AND (methodName="google.iam.admin.v1.CreateRole" OR methodName="google.iam.admin.v1.DeleteRole" OR methodName="google.iam.admin.v1.UpdateRole").',  # noqa: E501 (CIS remediation/log-filter string — kept verbatim for copy-paste)
         cis_section=_LOGGING_SECTION,
     )
     try:
-        from google.cloud import logging_v2
+        logging_v2 = _import_google_cloud_module("logging_v2")
 
-        client = logging_v2.MetricsServiceV2Client()
+        client = logging_v2.MetricsServiceV2Client(**_creds_kwargs())
         parent = f"projects/{project_id}"
         metrics = list(client.list_log_metrics(parent=parent))
 
@@ -938,7 +1070,7 @@ def _check_2_5(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-logging not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check log metrics: {exc}"
+        result.evidence = f"Could not check log metrics: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -946,16 +1078,16 @@ def _check_2_6(project_id: str) -> CISCheckResult:
     """CIS 2.6 — Ensure log metric filter and alerts exist for VPC Network Firewall Rule changes."""
     result = CISCheckResult(
         check_id="2.6",
-        title="Ensure log metric filter and alerts exist for VPC Network Firewall Rule changes",
+        title="Log metric filter and alerts for VPC firewall rule changes",
         status=CheckStatus.ERROR,
         severity="medium",
-        recommendation='Create a log metric filter for resource.type="gce_firewall_rule" AND (methodName:"compute.firewalls.patch" OR methodName:"compute.firewalls.insert" OR methodName:"compute.firewalls.delete").',
+        recommendation='Create a log metric filter for resource.type="gce_firewall_rule" AND (methodName:"compute.firewalls.patch" OR methodName:"compute.firewalls.insert" OR methodName:"compute.firewalls.delete").',  # noqa: E501 (CIS remediation/log-filter string — kept verbatim for copy-paste)
         cis_section=_LOGGING_SECTION,
     )
     try:
-        from google.cloud import logging_v2
+        logging_v2 = _import_google_cloud_module("logging_v2")
 
-        client = logging_v2.MetricsServiceV2Client()
+        client = logging_v2.MetricsServiceV2Client(**_creds_kwargs())
         parent = f"projects/{project_id}"
         metrics = list(client.list_log_metrics(parent=parent))
 
@@ -973,7 +1105,7 @@ def _check_2_6(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-logging not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check log metrics: {exc}"
+        result.evidence = f"Could not check log metrics: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -981,16 +1113,16 @@ def _check_2_7(project_id: str) -> CISCheckResult:
     """CIS 2.7 — Ensure log metric filter and alerts exist for VPC Network Route changes."""
     result = CISCheckResult(
         check_id="2.7",
-        title="Ensure log metric filter and alerts exist for VPC Network Route changes",
+        title="Log metric filter and alerts for VPC route changes",
         status=CheckStatus.ERROR,
         severity="medium",
-        recommendation='Create a log metric filter for resource.type="gce_route" AND (methodName:"compute.routes.delete" OR methodName:"compute.routes.insert").',
+        recommendation='Create a log metric filter for resource.type="gce_route" AND (methodName:"compute.routes.delete" OR methodName:"compute.routes.insert").',  # noqa: E501 (CIS remediation/log-filter string — kept verbatim for copy-paste)
         cis_section=_LOGGING_SECTION,
     )
     try:
-        from google.cloud import logging_v2
+        logging_v2 = _import_google_cloud_module("logging_v2")
 
-        client = logging_v2.MetricsServiceV2Client()
+        client = logging_v2.MetricsServiceV2Client(**_creds_kwargs())
         parent = f"projects/{project_id}"
         metrics = list(client.list_log_metrics(parent=parent))
 
@@ -1008,7 +1140,7 @@ def _check_2_7(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-logging not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check log metrics: {exc}"
+        result.evidence = f"Could not check log metrics: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1016,16 +1148,16 @@ def _check_2_8(project_id: str) -> CISCheckResult:
     """CIS 2.8 — Ensure log metric filter and alerts exist for VPC Network changes."""
     result = CISCheckResult(
         check_id="2.8",
-        title="Ensure log metric filter and alerts exist for VPC Network changes",
+        title="Log metric filter and alerts for VPC network changes",
         status=CheckStatus.ERROR,
         severity="medium",
-        recommendation='Create a log metric filter for resource.type="gce_network" AND (methodName:"compute.networks.insert" OR methodName:"compute.networks.patch" OR methodName:"compute.networks.delete" OR methodName:"compute.networks.removePeering" OR methodName:"compute.networks.addPeering").',
+        recommendation='Create a log metric filter for resource.type="gce_network" AND (methodName:"compute.networks.insert" OR methodName:"compute.networks.patch" OR methodName:"compute.networks.delete" OR methodName:"compute.networks.removePeering" OR methodName:"compute.networks.addPeering").',  # noqa: E501 (CIS remediation/log-filter string — kept verbatim for copy-paste)
         cis_section=_LOGGING_SECTION,
     )
     try:
-        from google.cloud import logging_v2
+        logging_v2 = _import_google_cloud_module("logging_v2")
 
-        client = logging_v2.MetricsServiceV2Client()
+        client = logging_v2.MetricsServiceV2Client(**_creds_kwargs())
         parent = f"projects/{project_id}"
         metrics = list(client.list_log_metrics(parent=parent))
 
@@ -1043,7 +1175,7 @@ def _check_2_8(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-logging not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check log metrics: {exc}"
+        result.evidence = f"Could not check log metrics: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1051,16 +1183,16 @@ def _check_2_9(project_id: str) -> CISCheckResult:
     """CIS 2.9 — Ensure log metric filter and alerts exist for Cloud Storage IAM permission changes."""
     result = CISCheckResult(
         check_id="2.9",
-        title="Ensure log metric filter and alerts exist for Cloud Storage IAM permission changes",
+        title="Log metric filter and alerts for Cloud Storage IAM changes",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation='Create a log metric filter for resource.type="gcs_bucket" AND protoPayload.methodName="storage.setIamPermissions".',
         cis_section=_LOGGING_SECTION,
     )
     try:
-        from google.cloud import logging_v2
+        logging_v2 = _import_google_cloud_module("logging_v2")
 
-        client = logging_v2.MetricsServiceV2Client()
+        client = logging_v2.MetricsServiceV2Client(**_creds_kwargs())
         parent = f"projects/{project_id}"
         metrics = list(client.list_log_metrics(parent=parent))
 
@@ -1078,7 +1210,7 @@ def _check_2_9(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-logging not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check log metrics: {exc}"
+        result.evidence = f"Could not check log metrics: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1086,16 +1218,16 @@ def _check_2_10(project_id: str) -> CISCheckResult:
     """CIS 2.10 — Ensure log metric filter and alerts exist for SQL instance configuration changes."""
     result = CISCheckResult(
         check_id="2.10",
-        title="Ensure log metric filter and alerts exist for SQL instance configuration changes",
+        title="Log metric filter and alerts for SQL instance config changes",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation='Create a log metric filter for protoPayload.methodName="cloudsql.instances.update".',
         cis_section=_LOGGING_SECTION,
     )
     try:
-        from google.cloud import logging_v2
+        logging_v2 = _import_google_cloud_module("logging_v2")
 
-        client = logging_v2.MetricsServiceV2Client()
+        client = logging_v2.MetricsServiceV2Client(**_creds_kwargs())
         parent = f"projects/{project_id}"
         metrics = list(client.list_log_metrics(parent=parent))
 
@@ -1113,7 +1245,7 @@ def _check_2_10(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-logging not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check log metrics: {exc}"
+        result.evidence = f"Could not check log metrics: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1121,16 +1253,16 @@ def _check_2_11(project_id: str) -> CISCheckResult:
     """CIS 2.11 — Ensure log metric filter and alerts exist for DNS Zone changes."""
     result = CISCheckResult(
         check_id="2.11",
-        title="Ensure log metric filter and alerts exist for DNS Zone changes",
+        title="Log metric filter and alerts for DNS zone changes",
         status=CheckStatus.ERROR,
         severity="medium",
-        recommendation='Create a log metric filter for resource.type="dns_managed_zone" AND (methodName:"dns.managedZones.create" OR methodName:"dns.managedZones.patch" OR methodName:"dns.managedZones.update" OR methodName:"dns.managedZones.delete").',
+        recommendation='Create a log metric filter for resource.type="dns_managed_zone" AND (methodName:"dns.managedZones.create" OR methodName:"dns.managedZones.patch" OR methodName:"dns.managedZones.update" OR methodName:"dns.managedZones.delete").',  # noqa: E501 (CIS remediation/log-filter string — kept verbatim for copy-paste)
         cis_section=_LOGGING_SECTION,
     )
     try:
-        from google.cloud import logging_v2
+        logging_v2 = _import_google_cloud_module("logging_v2")
 
-        client = logging_v2.MetricsServiceV2Client()
+        client = logging_v2.MetricsServiceV2Client(**_creds_kwargs())
         parent = f"projects/{project_id}"
         metrics = list(client.list_log_metrics(parent=parent))
 
@@ -1148,7 +1280,7 @@ def _check_2_11(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-logging not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check log metrics: {exc}"
+        result.evidence = f"Could not check log metrics: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1156,18 +1288,14 @@ def _check_2_12(project_id: str) -> CISCheckResult:
     """CIS 2.12 — Ensure Cloud DNS logging is enabled for all VPC networks."""
     result = CISCheckResult(
         check_id="2.12",
-        title="Ensure Cloud DNS logging is enabled for all VPC networks",
+        title="Cloud DNS logging enabled for all VPC networks",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable DNS logging on all Cloud DNS managed zones by setting the logging configuration.",
         cis_section=_LOGGING_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        dns = googleapiclient.discovery.build("dns", "v1", cache_discovery=False)
-        zones_resp = dns.managedZones().list(project=project_id).execute()
-        zones = zones_resp.get("managedZones", [])
+        zones = _gcp_managed_zones(project_id)
 
         failing: list[str] = []
         for zone in zones:
@@ -1191,7 +1319,7 @@ def _check_2_12(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check Cloud DNS logging: {exc}"
+        result.evidence = f"Could not check Cloud DNS logging: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1204,16 +1332,16 @@ def _check_3_1(project_id: str) -> CISCheckResult:
     """CIS 3.1 — Ensure the default VPC network does not exist in a project."""
     result = CISCheckResult(
         check_id="3.1",
-        title="Ensure the default VPC network does not exist in the project",
+        title="No default VPC network in the project",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Delete the 'default' VPC network and create custom VPC networks with explicit firewall rules.",
         cis_section=_NETWORK_SECTION,
     )
     try:
-        from google.cloud import compute_v1
+        compute_v1 = _import_google_cloud_module("compute_v1")
 
-        client = compute_v1.NetworksClient()
+        client = compute_v1.NetworksClient(**_creds_kwargs())
         networks = list(client.list(project=project_id))
         default_net = next((n for n in networks if n.name == "default"), None)
 
@@ -1229,7 +1357,7 @@ def _check_3_1(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-compute not installed. Install with: pip install google-cloud-compute"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check VPC networks: {exc}"
+        result.evidence = f"Could not check VPC networks: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1237,16 +1365,16 @@ def _check_3_2(project_id: str) -> CISCheckResult:
     """CIS 3.2 — Ensure legacy networks do not exist in the project."""
     result = CISCheckResult(
         check_id="3.2",
-        title="Ensure legacy networks do not exist in the project",
+        title="No legacy networks in the project",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Delete legacy networks and create VPC networks with custom subnet mode instead.",
         cis_section=_NETWORK_SECTION,
     )
     try:
-        from google.cloud import compute_v1
+        compute_v1 = _import_google_cloud_module("compute_v1")
 
-        client = compute_v1.NetworksClient()
+        client = compute_v1.NetworksClient(**_creds_kwargs())
         networks = list(client.list(project=project_id))
         legacy: list[str] = []
 
@@ -1267,7 +1395,7 @@ def _check_3_2(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-compute not installed. Install with: pip install google-cloud-compute"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check for legacy networks: {exc}"
+        result.evidence = f"Could not check for legacy networks: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1275,18 +1403,14 @@ def _check_3_3(project_id: str) -> CISCheckResult:
     """CIS 3.3 — Ensure DNSSEC is enabled for Cloud DNS."""
     result = CISCheckResult(
         check_id="3.3",
-        title="Ensure that DNSSEC is enabled for Cloud DNS",
+        title="DNSSEC enabled for Cloud DNS",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable DNSSEC on all public Cloud DNS managed zones.",
         cis_section=_NETWORK_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        dns = googleapiclient.discovery.build("dns", "v1", cache_discovery=False)
-        zones_resp = dns.managedZones().list(project=project_id).execute()
-        zones = zones_resp.get("managedZones", [])
+        zones = _gcp_managed_zones(project_id)
 
         failing: list[str] = []
         public_zones = [z for z in zones if z.get("visibility", "public") == "public"]
@@ -1310,7 +1434,7 @@ def _check_3_3(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check DNSSEC configuration: {exc}"
+        result.evidence = f"Could not check DNSSEC configuration: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1318,18 +1442,14 @@ def _check_3_4(project_id: str) -> CISCheckResult:
     """CIS 3.4 — Ensure RSASHA1 is not used for key-signing in DNSSEC."""
     result = CISCheckResult(
         check_id="3.4",
-        title="Ensure that RSASHA1 is not used for the key-signing key in Cloud DNS DNSSEC",
+        title="RSASHA1 not used for DNSSEC key-signing key",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Use RSASHA256, RSASHA512, or ECDSAP256SHA256 for DNSSEC key-signing keys instead of RSASHA1.",
         cis_section=_NETWORK_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        dns = googleapiclient.discovery.build("dns", "v1", cache_discovery=False)
-        zones_resp = dns.managedZones().list(project=project_id).execute()
-        zones = zones_resp.get("managedZones", [])
+        zones = _gcp_managed_zones(project_id)
 
         failing: list[str] = []
         for zone in zones:
@@ -1352,7 +1472,7 @@ def _check_3_4(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check DNSSEC key-signing algorithm: {exc}"
+        result.evidence = f"Could not check DNSSEC key-signing algorithm: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1360,18 +1480,14 @@ def _check_3_5(project_id: str) -> CISCheckResult:
     """CIS 3.5 — Ensure RSASHA1 is not used for zone-signing in DNSSEC."""
     result = CISCheckResult(
         check_id="3.5",
-        title="Ensure that RSASHA1 is not used for the zone-signing key in Cloud DNS DNSSEC",
+        title="RSASHA1 not used for DNSSEC zone-signing key",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Use RSASHA256, RSASHA512, or ECDSAP256SHA256 for DNSSEC zone-signing keys instead of RSASHA1.",
         cis_section=_NETWORK_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        dns = googleapiclient.discovery.build("dns", "v1", cache_discovery=False)
-        zones_resp = dns.managedZones().list(project=project_id).execute()
-        zones = zones_resp.get("managedZones", [])
+        zones = _gcp_managed_zones(project_id)
 
         failing: list[str] = []
         for zone in zones:
@@ -1394,7 +1510,7 @@ def _check_3_5(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check DNSSEC zone-signing algorithm: {exc}"
+        result.evidence = f"Could not check DNSSEC zone-signing algorithm: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1402,16 +1518,16 @@ def _check_3_8(project_id: str) -> CISCheckResult:
     """CIS 3.8 — Ensure Firewall Rules for ICMP are not open to the world."""
     result = CISCheckResult(
         check_id="3.8",
-        title="Ensure that Firewall Rules for ICMP are not open to the world",
+        title="ICMP firewall rules not open to the world",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Remove or restrict firewall rules that allow ICMP from 0.0.0.0/0 or ::/0.",
         cis_section=_NETWORK_SECTION,
     )
     try:
-        from google.cloud import compute_v1
+        compute_v1 = _import_google_cloud_module("compute_v1")
 
-        client = compute_v1.FirewallsClient()
+        client = compute_v1.FirewallsClient(**_creds_kwargs())
         rules = list(client.list(project=project_id))
         failing: list[str] = []
 
@@ -1440,7 +1556,7 @@ def _check_3_8(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-compute not installed. Install with: pip install google-cloud-compute"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check firewall rules: {exc}"
+        result.evidence = f"Could not check firewall rules: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1448,16 +1564,16 @@ def _check_3_10(project_id: str) -> CISCheckResult:
     """CIS 3.10 — Ensure private Google access is enabled for all subnets."""
     result = CISCheckResult(
         check_id="3.10",
-        title="Ensure Private Google Access is enabled for all subnets in a VPC",
+        title="Private Google Access enabled on all subnets",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable Private Google Access on all subnets to allow VMs without external IPs to reach Google APIs.",
         cis_section=_NETWORK_SECTION,
     )
     try:
-        from google.cloud import compute_v1
+        compute_v1 = _import_google_cloud_module("compute_v1")
 
-        client = compute_v1.SubnetworksClient()
+        client = compute_v1.SubnetworksClient(**_creds_kwargs())
         agg = client.aggregated_list(project=project_id)
         failing: list[str] = []
         total = 0
@@ -1480,7 +1596,7 @@ def _check_3_10(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-compute not installed. Install with: pip install google-cloud-compute"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check Private Google Access: {exc}"
+        result.evidence = f"Could not check Private Google Access: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1488,16 +1604,16 @@ def _check_3_9(project_id: str) -> CISCheckResult:
     """CIS 3.9 — Ensure VPC Flow Logs are enabled for every subnet."""
     result = CISCheckResult(
         check_id="3.9",
-        title="Ensure VPC Flow Logs are enabled for every subnet",
+        title="VPC Flow Logs enabled on every subnet",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable VPC Flow Logs on all subnets for network monitoring and forensics.",
         cis_section=_NETWORK_SECTION,
     )
     try:
-        from google.cloud import compute_v1
+        compute_v1 = _import_google_cloud_module("compute_v1")
 
-        client = compute_v1.SubnetworksClient()
+        client = compute_v1.SubnetworksClient(**_creds_kwargs())
         agg = client.aggregated_list(project=project_id)
         failing: list[str] = []
         total = 0
@@ -1521,7 +1637,7 @@ def _check_3_9(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-compute not installed. Install with: pip install google-cloud-compute"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check VPC Flow Logs: {exc}"
+        result.evidence = f"Could not check VPC Flow Logs: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1529,16 +1645,16 @@ def _check_3_6(project_id: str) -> CISCheckResult:
     """CIS 3.6 — Ensure SSH access is restricted from the internet."""
     result = CISCheckResult(
         check_id="3.6",
-        title="Ensure that SSH access is restricted from the internet (port 22)",
+        title="SSH (port 22) restricted from the internet",
         status=CheckStatus.ERROR,
         severity="critical",
         recommendation="Remove or restrict firewall rules that allow TCP port 22 from 0.0.0.0/0 or ::/0.",
         cis_section=_NETWORK_SECTION,
     )
     try:
-        from google.cloud import compute_v1
+        compute_v1 = _import_google_cloud_module("compute_v1")
 
-        client = compute_v1.FirewallsClient()
+        client = compute_v1.FirewallsClient(**_creds_kwargs())
         rules = list(client.list(project=project_id))
         failing: list[str] = []
 
@@ -1568,7 +1684,7 @@ def _check_3_6(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-compute not installed. Install with: pip install google-cloud-compute"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check firewall rules: {exc}"
+        result.evidence = f"Could not check firewall rules: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1576,16 +1692,16 @@ def _check_3_7(project_id: str) -> CISCheckResult:
     """CIS 3.7 — Ensure RDP access is restricted from the internet."""
     result = CISCheckResult(
         check_id="3.7",
-        title="Ensure that RDP access is restricted from the internet (port 3389)",
+        title="RDP (port 3389) restricted from the internet",
         status=CheckStatus.ERROR,
         severity="critical",
         recommendation="Remove or restrict firewall rules that allow TCP port 3389 from 0.0.0.0/0 or ::/0.",
         cis_section=_NETWORK_SECTION,
     )
     try:
-        from google.cloud import compute_v1
+        compute_v1 = _import_google_cloud_module("compute_v1")
 
-        client = compute_v1.FirewallsClient()
+        client = compute_v1.FirewallsClient(**_creds_kwargs())
         rules = list(client.list(project=project_id))
         failing: list[str] = []
 
@@ -1615,7 +1731,7 @@ def _check_3_7(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-compute not installed. Install with: pip install google-cloud-compute"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check firewall rules: {exc}"
+        result.evidence = f"Could not check firewall rules: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1628,7 +1744,7 @@ def _check_4_1(project_id: str) -> CISCheckResult:
     """CIS 4.1 — Ensure instances are not configured to use default service account."""
     result = CISCheckResult(
         check_id="4.1",
-        title="Ensure instances are not configured to use default service account",
+        title="Instances not using default service account",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation=(
@@ -1637,9 +1753,9 @@ def _check_4_1(project_id: str) -> CISCheckResult:
         cis_section=_COMPUTE_SECTION,
     )
     try:
-        from google.cloud import compute_v1
+        compute_v1 = _import_google_cloud_module("compute_v1")
 
-        client = compute_v1.InstancesClient()
+        client = compute_v1.InstancesClient(**_creds_kwargs())
         agg = client.aggregated_list(project=project_id)
         failing: list[str] = []
         total = 0
@@ -1665,7 +1781,7 @@ def _check_4_1(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-compute not installed. Install with: pip install google-cloud-compute"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check instance service accounts: {exc}"
+        result.evidence = f"Could not check instance service accounts: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1673,16 +1789,16 @@ def _check_4_2(project_id: str) -> CISCheckResult:
     """CIS 4.2 — Ensure instances are not configured to use the default service account with full access."""
     result = CISCheckResult(
         check_id="4.2",
-        title="Ensure instances are not configured to use the default service account with full access to all APIs",
+        title="Instances not using default service account with full API access",
         status=CheckStatus.ERROR,
         severity="high",
-        recommendation="Remove the default service account or restrict its scopes. Do not use https://www.googleapis.com/auth/cloud-platform scope with the default SA.",
+        recommendation="Remove the default service account or restrict its scopes. Do not use https://www.googleapis.com/auth/cloud-platform scope with the default SA.",  # noqa: E501 (CIS remediation/log-filter string — kept verbatim for copy-paste)
         cis_section=_COMPUTE_SECTION,
     )
     try:
-        from google.cloud import compute_v1
+        compute_v1 = _import_google_cloud_module("compute_v1")
 
-        client = compute_v1.InstancesClient()
+        client = compute_v1.InstancesClient(**_creds_kwargs())
         agg = client.aggregated_list(project=project_id)
         failing: list[str] = []
         total = 0
@@ -1712,7 +1828,7 @@ def _check_4_2(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-compute not installed. Install with: pip install google-cloud-compute"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check instance service account scopes: {exc}"
+        result.evidence = f"Could not check instance service account scopes: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1720,7 +1836,7 @@ def _check_4_3(project_id: str) -> CISCheckResult:
     """CIS 4.3 — Ensure 'Block Project-wide SSH Keys' is enabled for VM instances."""
     result = CISCheckResult(
         check_id="4.3",
-        title="Ensure 'Block Project-wide SSH Keys' is enabled for VM instances",
+        title="Block Project-wide SSH Keys enabled on VMs",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation=(
@@ -1729,9 +1845,9 @@ def _check_4_3(project_id: str) -> CISCheckResult:
         cis_section=_COMPUTE_SECTION,
     )
     try:
-        from google.cloud import compute_v1
+        compute_v1 = _import_google_cloud_module("compute_v1")
 
-        client = compute_v1.InstancesClient()
+        client = compute_v1.InstancesClient(**_creds_kwargs())
         agg = client.aggregated_list(project=project_id)
         failing: list[str] = []
         total = 0
@@ -1763,7 +1879,7 @@ def _check_4_3(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-compute not installed. Install with: pip install google-cloud-compute"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check instance SSH key metadata: {exc}"
+        result.evidence = f"Could not check instance SSH key metadata: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1771,16 +1887,16 @@ def _check_4_4(project_id: str) -> CISCheckResult:
     """CIS 4.4 — Ensure OS login is enabled for a project."""
     result = CISCheckResult(
         check_id="4.4",
-        title="Ensure OS Login is enabled for a project",
+        title="OS Login enabled for the project",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Set the 'enable-oslogin' metadata key to 'TRUE' at the project level.",
         cis_section=_COMPUTE_SECTION,
     )
     try:
-        from google.cloud import compute_v1
+        compute_v1 = _import_google_cloud_module("compute_v1")
 
-        client = compute_v1.ProjectsClient()
+        client = compute_v1.ProjectsClient(**_creds_kwargs())
         project = client.get(project=project_id)
         metadata = getattr(project, "common_instance_metadata", None)
         items = list(getattr(metadata, "items", []) or []) if metadata else []
@@ -1804,7 +1920,7 @@ def _check_4_4(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-compute not installed. Install with: pip install google-cloud-compute"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check OS Login configuration: {exc}"
+        result.evidence = f"Could not check OS Login configuration: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1812,16 +1928,16 @@ def _check_4_5(project_id: str) -> CISCheckResult:
     """CIS 4.5 — Ensure 'Enable connecting to serial ports' is not enabled for VM instances."""
     result = CISCheckResult(
         check_id="4.5",
-        title="Ensure 'Enable connecting to serial ports' is not enabled for VM instances",
+        title="Serial-port connection disabled on VMs",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Set 'serial-port-enable' metadata to 'false' or remove it from all VM instances.",
         cis_section=_COMPUTE_SECTION,
     )
     try:
-        from google.cloud import compute_v1
+        compute_v1 = _import_google_cloud_module("compute_v1")
 
-        client = compute_v1.InstancesClient()
+        client = compute_v1.InstancesClient(**_creds_kwargs())
         agg = client.aggregated_list(project=project_id)
         failing: list[str] = []
         total = 0
@@ -1850,7 +1966,7 @@ def _check_4_5(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-compute not installed. Install with: pip install google-cloud-compute"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check serial port configuration: {exc}"
+        result.evidence = f"Could not check serial port configuration: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1858,16 +1974,16 @@ def _check_4_6(project_id: str) -> CISCheckResult:
     """CIS 4.6 — Ensure IP forwarding is not enabled on instances."""
     result = CISCheckResult(
         check_id="4.6",
-        title="Ensure that IP forwarding is not enabled on Instances",
+        title="IP forwarding disabled on instances",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Disable IP forwarding on instances unless explicitly required for NAT or routing functions.",
         cis_section=_COMPUTE_SECTION,
     )
     try:
-        from google.cloud import compute_v1
+        compute_v1 = _import_google_cloud_module("compute_v1")
 
-        client = compute_v1.InstancesClient()
+        client = compute_v1.InstancesClient(**_creds_kwargs())
         agg = client.aggregated_list(project=project_id)
         failing: list[str] = []
         total = 0
@@ -1890,7 +2006,7 @@ def _check_4_6(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-compute not installed. Install with: pip install google-cloud-compute"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check IP forwarding: {exc}"
+        result.evidence = f"Could not check IP forwarding: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1898,16 +2014,16 @@ def _check_4_7(project_id: str) -> CISCheckResult:
     """CIS 4.7 — Ensure VM disks for critical VMs are encrypted with CSEK."""
     result = CISCheckResult(
         check_id="4.7",
-        title="Ensure VM disks for critical VMs are encrypted with Customer-Supplied Encryption Keys (CSEK)",
+        title="Critical VM disks encrypted with CSEK",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Encrypt VM disks with Customer-Supplied Encryption Keys (CSEK) for critical workloads.",
         cis_section=_COMPUTE_SECTION,
     )
     try:
-        from google.cloud import compute_v1
+        compute_v1 = _import_google_cloud_module("compute_v1")
 
-        client = compute_v1.DisksClient()
+        client = compute_v1.DisksClient(**_creds_kwargs())
         agg = client.aggregated_list(project=project_id)
         no_csek: list[str] = []
         total = 0
@@ -1931,7 +2047,7 @@ def _check_4_7(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-compute not installed. Install with: pip install google-cloud-compute"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check disk encryption: {exc}"
+        result.evidence = f"Could not check disk encryption: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1939,16 +2055,16 @@ def _check_4_8(project_id: str) -> CISCheckResult:
     """CIS 4.8 — Ensure Compute instances are launched with Shielded VM enabled."""
     result = CISCheckResult(
         check_id="4.8",
-        title="Ensure Compute instances are launched with Shielded VM enabled",
+        title="Compute instances launched with Shielded VM",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable Shielded VM features (vTPM and Integrity Monitoring) on all Compute instances.",
         cis_section=_COMPUTE_SECTION,
     )
     try:
-        from google.cloud import compute_v1
+        compute_v1 = _import_google_cloud_module("compute_v1")
 
-        client = compute_v1.InstancesClient()
+        client = compute_v1.InstancesClient(**_creds_kwargs())
         agg = client.aggregated_list(project=project_id)
         failing: list[str] = []
         total = 0
@@ -1977,7 +2093,7 @@ def _check_4_8(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-compute not installed. Install with: pip install google-cloud-compute"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check Shielded VM configuration: {exc}"
+        result.evidence = f"Could not check Shielded VM configuration: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -1985,16 +2101,16 @@ def _check_4_9(project_id: str) -> CISCheckResult:
     """CIS 4.9 — Ensure that Compute instances do not have public IP addresses."""
     result = CISCheckResult(
         check_id="4.9",
-        title="Ensure that Compute instances do not have public IP addresses",
+        title="Compute instances lack public IP addresses",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Remove external IP addresses from Compute instances. Use Cloud NAT or IAP for outbound/inbound access.",
         cis_section=_COMPUTE_SECTION,
     )
     try:
-        from google.cloud import compute_v1
+        compute_v1 = _import_google_cloud_module("compute_v1")
 
-        client = compute_v1.InstancesClient()
+        client = compute_v1.InstancesClient(**_creds_kwargs())
         agg = client.aggregated_list(project=project_id)
         failing: list[str] = []
         total = 0
@@ -2025,7 +2141,7 @@ def _check_4_9(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-compute not installed. Install with: pip install google-cloud-compute"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check instance public IPs: {exc}"
+        result.evidence = f"Could not check instance public IPs: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -2033,16 +2149,16 @@ def _check_4_11(project_id: str) -> CISCheckResult:
     """CIS 4.11 — Ensure that Compute instances have Confidential Computing enabled."""
     result = CISCheckResult(
         check_id="4.11",
-        title="Ensure that Compute instances have Confidential Computing enabled",
+        title="Confidential Computing enabled on instances",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable Confidential Computing on Compute instances for memory encryption.",
         cis_section=_COMPUTE_SECTION,
     )
     try:
-        from google.cloud import compute_v1
+        compute_v1 = _import_google_cloud_module("compute_v1")
 
-        client = compute_v1.InstancesClient()
+        client = compute_v1.InstancesClient(**_creds_kwargs())
         agg = client.aggregated_list(project=project_id)
         failing: list[str] = []
         total = 0
@@ -2066,7 +2182,7 @@ def _check_4_11(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-compute not installed. Install with: pip install google-cloud-compute"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check Confidential Computing: {exc}"
+        result.evidence = f"Could not check Confidential Computing: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -2079,21 +2195,24 @@ def _check_5_1(project_id: str) -> CISCheckResult:
     """CIS 5.1 — Ensure Cloud Storage buckets are not publicly accessible."""
     result = CISCheckResult(
         check_id="5.1",
-        title="Ensure that Cloud Storage bucket is not anonymously or publicly accessible",
+        title="Cloud Storage buckets not publicly accessible",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Remove allUsers and allAuthenticatedUsers from bucket IAM policies.",
         cis_section=_STORAGE_SECTION,
     )
     try:
-        from google.cloud import storage
+        storage = _import_google_cloud_module("storage")
 
-        client = storage.Client(project=project_id)
+        client = storage.Client(project=project_id, **_creds_kwargs())
         public_buckets: list[str] = []
+        inspected = 0
+        denied: list[str] = []
 
         for bucket in client.list_buckets():
             try:
                 policy = bucket.get_iam_policy(requested_policy_version=3)
+                inspected += 1
                 for binding in policy.bindings:
                     members = binding.get("members", [])
                     if "allUsers" in members or "allAuthenticatedUsers" in members:
@@ -2101,6 +2220,8 @@ def _check_5_1(project_id: str) -> CISCheckResult:
                         break
             except Exception as exc:
                 # IAM check is best-effort per bucket
+                if is_access_denied_error(exc):
+                    denied.append(bucket.name)
                 logger.debug("Could not check IAM policy for bucket %s: %s", bucket.name, exc)
 
         if public_buckets:
@@ -2108,14 +2229,20 @@ def _check_5_1(project_id: str) -> CISCheckResult:
             result.evidence = f"Publicly accessible buckets: {', '.join(public_buckets[:10])}"
             result.resource_ids = public_buckets
         else:
-            result.status = CheckStatus.PASS
-            result.evidence = "No buckets with public (allUsers/allAuthenticatedUsers) IAM bindings found."
+            finalize_read_coverage(
+                result,
+                inspected=inspected,
+                denied=denied,
+                permission="storage.buckets.getIamPolicy",
+                resource_kind="bucket",
+                pass_evidence="No buckets with public (allUsers/allAuthenticatedUsers) IAM bindings found.",
+            )
     except ImportError:
         result.status = CheckStatus.ERROR
         result.evidence = "google-cloud-storage not installed. Install with: pip install google-cloud-storage"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check Cloud Storage buckets: {exc}"
+        result.evidence = f"Could not check Cloud Storage buckets: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -2123,16 +2250,16 @@ def _check_5_2(project_id: str) -> CISCheckResult:
     """CIS 5.2 — Ensure that Cloud Storage buckets have uniform bucket-level access enabled."""
     result = CISCheckResult(
         check_id="5.2",
-        title="Ensure that Cloud Storage buckets have uniform bucket-level access enabled",
+        title="Uniform bucket-level access enabled on buckets",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Enable uniform bucket-level access on all Cloud Storage buckets to use IAM exclusively for access control.",
         cis_section=_STORAGE_SECTION,
     )
     try:
-        from google.cloud import storage
+        storage = _import_google_cloud_module("storage")
 
-        client = storage.Client(project=project_id)
+        client = storage.Client(project=project_id, **_creds_kwargs())
         failing: list[str] = []
         total = 0
 
@@ -2154,7 +2281,7 @@ def _check_5_2(project_id: str) -> CISCheckResult:
         result.evidence = "google-cloud-storage not installed. Install with: pip install google-cloud-storage"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check bucket uniform access: {exc}"
+        result.evidence = f"Could not check bucket uniform access: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -2167,18 +2294,14 @@ def _check_6_1(project_id: str) -> CISCheckResult:
     """CIS 6.1 — Ensure Cloud SQL database instances require all incoming connections to use SSL."""
     result = CISCheckResult(
         check_id="6.1",
-        title="Ensure Cloud SQL database instances require all incoming connections to use SSL",
+        title="Cloud SQL requires SSL for all connections",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable 'Require SSL' (requireSsl) on all Cloud SQL instances to encrypt connections in transit.",
         cis_section=_SQL_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        sqladmin = googleapiclient.discovery.build("sqladmin", "v1beta4", cache_discovery=False)
-        resp = sqladmin.instances().list(project=project_id).execute()
-        instances = resp.get("items", [])
+        instances = _gcp_cloud_sql_instances(project_id)
 
         failing: list[str] = []
         for inst in instances:
@@ -2201,7 +2324,7 @@ def _check_6_1(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed. Install with: pip install google-api-python-client"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check Cloud SQL SSL configuration: {exc}"
+        result.evidence = f"Could not check Cloud SQL SSL configuration: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -2209,18 +2332,14 @@ def _check_6_2(project_id: str) -> CISCheckResult:
     """CIS 6.2 — Ensure Cloud SQL database instances do not have public IPs."""
     result = CISCheckResult(
         check_id="6.2",
-        title="Ensure that Cloud SQL database instances do not have public IPs",
+        title="Cloud SQL instances lack public IPs",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Remove public IP addresses from Cloud SQL instances and use private IP or Cloud SQL Proxy instead.",
         cis_section=_SQL_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        sqladmin = googleapiclient.discovery.build("sqladmin", "v1beta4", cache_discovery=False)
-        resp = sqladmin.instances().list(project=project_id).execute()
-        instances = resp.get("items", [])
+        instances = _gcp_cloud_sql_instances(project_id)
 
         failing: list[str] = []
         for inst in instances:
@@ -2243,7 +2362,7 @@ def _check_6_2(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed. Install with: pip install google-api-python-client"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check Cloud SQL public IPs: {exc}"
+        result.evidence = f"Could not check Cloud SQL public IPs: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -2251,18 +2370,14 @@ def _check_6_3(project_id: str) -> CISCheckResult:
     """CIS 6.3 — Ensure Cloud SQL database instances have automated backups enabled."""
     result = CISCheckResult(
         check_id="6.3",
-        title="Ensure that Cloud SQL database instances have automated backups enabled",
+        title="Cloud SQL automated backups enabled",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Enable automated backups on all Cloud SQL instances.",
         cis_section=_SQL_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        sqladmin = googleapiclient.discovery.build("sqladmin", "v1beta4", cache_discovery=False)
-        resp = sqladmin.instances().list(project=project_id).execute()
-        instances = resp.get("items", [])
+        instances = _gcp_cloud_sql_instances(project_id)
 
         failing: list[str] = []
         for inst in instances:
@@ -2284,7 +2399,7 @@ def _check_6_3(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed. Install with: pip install google-api-python-client"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check Cloud SQL backup configuration: {exc}"
+        result.evidence = f"Could not check Cloud SQL backup configuration: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -2292,18 +2407,14 @@ def _check_6_4(project_id: str) -> CISCheckResult:
     """CIS 6.4 — Ensure Cloud SQL PostgreSQL instances have log_error_verbosity set to DEFAULT or stricter."""
     result = CISCheckResult(
         check_id="6.4",
-        title="Ensure Cloud SQL for PostgreSQL instances have log_error_verbosity set to DEFAULT or stricter",
+        title="Cloud SQL PostgreSQL log_error_verbosity DEFAULT or stricter",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Set the log_error_verbosity database flag to DEFAULT or TERSE on PostgreSQL instances.",
         cis_section=_SQL_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        sqladmin = googleapiclient.discovery.build("sqladmin", "v1beta4", cache_discovery=False)
-        resp = sqladmin.instances().list(project=project_id).execute()
-        instances = resp.get("items", [])
+        instances = _gcp_cloud_sql_instances(project_id)
 
         failing: list[str] = []
         acceptable_values = {"default", "terse"}
@@ -2334,7 +2445,7 @@ def _check_6_4(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check PostgreSQL log_error_verbosity: {exc}"
+        result.evidence = f"Could not check PostgreSQL log_error_verbosity: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -2342,18 +2453,14 @@ def _check_6_5(project_id: str) -> CISCheckResult:
     """CIS 6.5 — Ensure Cloud SQL PostgreSQL instances have log_connections enabled."""
     result = CISCheckResult(
         check_id="6.5",
-        title="Ensure that Cloud SQL for PostgreSQL instances have log_connections database flag set to on",
+        title="Cloud SQL PostgreSQL log_connections flag on",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Set the log_connections database flag to 'on' on all PostgreSQL instances.",
         cis_section=_SQL_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        sqladmin = googleapiclient.discovery.build("sqladmin", "v1beta4", cache_discovery=False)
-        resp = sqladmin.instances().list(project=project_id).execute()
-        instances = resp.get("items", [])
+        instances = _gcp_cloud_sql_instances(project_id)
 
         failing: list[str] = []
         for inst in instances:
@@ -2383,7 +2490,7 @@ def _check_6_5(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check PostgreSQL log_connections: {exc}"
+        result.evidence = f"Could not check PostgreSQL log_connections: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -2391,18 +2498,14 @@ def _check_6_6(project_id: str) -> CISCheckResult:
     """CIS 6.6 — Ensure Cloud SQL PostgreSQL instances have log_disconnections enabled."""
     result = CISCheckResult(
         check_id="6.6",
-        title="Ensure that Cloud SQL for PostgreSQL instances have log_disconnections database flag set to on",
+        title="Cloud SQL PostgreSQL log_disconnections flag on",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Set the log_disconnections database flag to 'on' on all PostgreSQL instances.",
         cis_section=_SQL_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        sqladmin = googleapiclient.discovery.build("sqladmin", "v1beta4", cache_discovery=False)
-        resp = sqladmin.instances().list(project=project_id).execute()
-        instances = resp.get("items", [])
+        instances = _gcp_cloud_sql_instances(project_id)
 
         failing: list[str] = []
         for inst in instances:
@@ -2432,7 +2535,7 @@ def _check_6_6(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check PostgreSQL log_disconnections: {exc}"
+        result.evidence = f"Could not check PostgreSQL log_disconnections: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -2440,18 +2543,14 @@ def _check_6_7(project_id: str) -> CISCheckResult:
     """CIS 6.7 — Ensure Cloud SQL PostgreSQL instances have log_min_duration_statement set to -1."""
     result = CISCheckResult(
         check_id="6.7",
-        title="Ensure that Cloud SQL for PostgreSQL instances have log_min_duration_statement set to -1",
+        title="Cloud SQL PostgreSQL log_min_duration_statement set to -1",
         status=CheckStatus.ERROR,
         severity="medium",
-        recommendation="Set the log_min_duration_statement database flag to '-1' to disable logging of statement durations (prevents sensitive data leakage).",
+        recommendation="Set the log_min_duration_statement database flag to '-1' to disable logging of statement durations (prevents sensitive data leakage).",  # noqa: E501 (CIS remediation/log-filter string — kept verbatim for copy-paste)
         cis_section=_SQL_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        sqladmin = googleapiclient.discovery.build("sqladmin", "v1beta4", cache_discovery=False)
-        resp = sqladmin.instances().list(project=project_id).execute()
-        instances = resp.get("items", [])
+        instances = _gcp_cloud_sql_instances(project_id)
 
         failing: list[str] = []
         for inst in instances:
@@ -2481,7 +2580,7 @@ def _check_6_7(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed."
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check PostgreSQL log_min_duration_statement: {exc}"
+        result.evidence = f"Could not check PostgreSQL log_min_duration_statement: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -2494,18 +2593,15 @@ def _check_7_1(project_id: str) -> CISCheckResult:
     """CIS 7.1 — Ensure BigQuery datasets are not anonymously or publicly accessible."""
     result = CISCheckResult(
         check_id="7.1",
-        title="Ensure that BigQuery datasets are not anonymously or publicly accessible",
+        title="BigQuery datasets not publicly accessible",
         status=CheckStatus.ERROR,
         severity="high",
         recommendation="Remove allUsers and allAuthenticatedUsers from BigQuery dataset IAM policies.",
         cis_section=_BIGQUERY_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        bq = googleapiclient.discovery.build("bigquery", "v2", cache_discovery=False)
-        datasets_resp = bq.datasets().list(projectId=project_id).execute()
-        datasets = datasets_resp.get("datasets", [])
+        bq = _discovery_client("bigquery", "v2")
+        datasets = _gcp_bigquery_datasets(bq, project_id)
 
         public_datasets: list[str] = []
         for ds in datasets:
@@ -2532,7 +2628,7 @@ def _check_7_1(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed. Install with: pip install google-api-python-client"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check BigQuery dataset access: {exc}"
+        result.evidence = f"Could not check BigQuery dataset access: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -2540,18 +2636,15 @@ def _check_7_2(project_id: str) -> CISCheckResult:
     """CIS 7.2 — Ensure BigQuery datasets have default table expiration configured."""
     result = CISCheckResult(
         check_id="7.2",
-        title="Ensure that a default Customer-managed encryption key (CMEK) is specified for all BigQuery Data Sets",
+        title="Default CMEK specified for BigQuery datasets",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Set a default table expiration on all BigQuery datasets to automatically clean up unused tables.",
         cis_section=_BIGQUERY_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        bq = googleapiclient.discovery.build("bigquery", "v2", cache_discovery=False)
-        datasets_resp = bq.datasets().list(projectId=project_id).execute()
-        datasets = datasets_resp.get("datasets", [])
+        bq = _discovery_client("bigquery", "v2")
+        datasets = _gcp_bigquery_datasets(bq, project_id)
 
         failing: list[str] = []
         for ds in datasets:
@@ -2576,7 +2669,7 @@ def _check_7_2(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed. Install with: pip install google-api-python-client"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check BigQuery dataset expiration: {exc}"
+        result.evidence = f"Could not check BigQuery dataset expiration: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -2584,18 +2677,15 @@ def _check_7_3(project_id: str) -> CISCheckResult:
     """CIS 7.3 — Ensure BigQuery datasets are encrypted with Customer-Managed Keys (CMK)."""
     result = CISCheckResult(
         check_id="7.3",
-        title="Ensure that all BigQuery Tables are encrypted with Customer-managed encryption key (CMEK)",
+        title="BigQuery tables encrypted with CMEK",
         status=CheckStatus.ERROR,
         severity="medium",
         recommendation="Set a default KMS key on all BigQuery datasets so that new tables are automatically encrypted with CMEK.",
         cis_section=_BIGQUERY_SECTION,
     )
     try:
-        import googleapiclient.discovery
-
-        bq = googleapiclient.discovery.build("bigquery", "v2", cache_discovery=False)
-        datasets_resp = bq.datasets().list(projectId=project_id).execute()
-        datasets = datasets_resp.get("datasets", [])
+        bq = _discovery_client("bigquery", "v2")
+        datasets = _gcp_bigquery_datasets(bq, project_id)
 
         failing: list[str] = []
         for ds in datasets:
@@ -2618,7 +2708,7 @@ def _check_7_3(project_id: str) -> CISCheckResult:
         result.evidence = "google-api-python-client not installed. Install with: pip install google-api-python-client"
     except Exception as exc:
         result.status = CheckStatus.ERROR
-        result.evidence = f"Could not check BigQuery dataset encryption: {exc}"
+        result.evidence = f"Could not check BigQuery dataset encryption: {sanitize_discovery_warning(exc)}"
     return result
 
 
@@ -2629,12 +2719,18 @@ def _check_7_3(project_id: str) -> CISCheckResult:
 
 def run_benchmark(
     project_id: str | None = None,
+    credentials: Any = None,
     checks: list[str] | None = None,
 ) -> GCPCISReport:
     """Run CIS GCP Foundation Benchmark v3.0 checks.
 
     Args:
         project_id: GCP project ID. Falls back to GOOGLE_CLOUD_PROJECT env var.
+        credentials: Optional google-auth credential threaded into every check's
+            service client. When ``None`` the SDK falls back to Application
+            Default Credentials (the prior behaviour). Pass an explicit
+            credential (e.g. ``google.oauth2.credentials.Credentials``) to run
+            against a project without ambient ADC.
         checks: Optional list of check IDs to run (e.g. ['1.5', '3.6']).
             Runs all checks if omitted.
 
@@ -2662,6 +2758,11 @@ def run_benchmark(
         raise CloudDiscoveryError("At least one GCP SDK is required. Install with: pip install 'agent-bom[gcp]'")
 
     report = GCPCISReport(project_id=resolved_project)
+
+    # Thread the resolved credential to every check's client factory for the
+    # duration of this (sequential) run. Cleared in the finally block below so a
+    # subsequent ADC-only run is not contaminated by a prior explicit credential.
+    _set_credentials(credentials)
 
     all_checks: list[tuple[str, Any]] = [
         ("1.1", lambda: _check_1_1(resolved_project)),
@@ -2725,21 +2826,112 @@ def run_benchmark(
         ("7.3", lambda: _check_7_3(resolved_project)),
     ]
 
-    for check_id, check_fn in all_checks:
-        if checks and check_id not in checks:
-            continue
-        try:
-            report.checks.append(check_fn())
-        except Exception as exc:
-            logger.warning("GCP CIS check %s failed with exception: %s", check_id, exc)
-            report.checks.append(
-                CISCheckResult(
-                    check_id=check_id,
-                    title=f"Check {check_id}",
-                    status=CheckStatus.ERROR,
-                    severity="unknown",
-                    evidence=str(exc),
+    try:
+        for check_id, check_fn in all_checks:
+            if checks and check_id not in checks:
+                continue
+            try:
+                report.checks.append(check_fn())
+            except Exception as exc:
+                logger.warning("GCP CIS check %s failed with exception: %s", check_id, exc)
+                report.checks.append(
+                    CISCheckResult(
+                        check_id=check_id,
+                        title=f"Check {check_id}",
+                        status=CheckStatus.ERROR,
+                        severity="unknown",
+                        evidence=sanitize_discovery_warning(exc),
+                    )
                 )
-            )
+    finally:
+        _clear_credentials()
+
+    # Structured remediation per #665.
+    from agent_bom.cloud.cis_remediation import attach_all
+
+    attach_all(report, cloud="gcp")
 
     return report
+
+
+# Bounded concurrency for the multi-project fan-out — mirrors the GCP inventory
+# fan-out's thread pool. Each thread sets its own credential context (the context
+# is thread-local), so concurrent per-project runs do not contaminate one another.
+_MAX_CIS_FANOUT_WORKERS = 8
+
+
+def run_all_project_benchmarks(
+    credentials: Any = None,
+    checks: list[str] | None = None,
+) -> GCPCISReport:
+    """Run the CIS GCP benchmark for EVERY project in the org/folder tree.
+
+    The CIS counterpart of :func:`agent_bom.cloud.gcp_inventory.discover_all_project_inventories`:
+    it reuses the same project enumeration
+    (:func:`agent_bom.cloud.gcp_organizations.list_project_ids`) and the same
+    read-only impersonation resolution
+    (:func:`agent_bom.cloud.gcp_inventory._resolve_impersonation`) so the
+    benchmark covers the identical estate the inventory fan-out does. Each
+    project is benchmarked concurrently (bounded thread pool) and the
+    per-project results are aggregated into one :class:`GCPCISReport` with every
+    check tagged by its ``project_id``.
+
+    Read-only and partial-permission tolerant: a project the credential cannot
+    read is skipped with a warning rather than failing the whole run.
+
+    Raises:
+        CloudDiscoveryError: if no GCP SDK packages are installed and a project
+            set cannot be resolved.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from agent_bom.cloud import gcp_inventory, gcp_organizations
+
+    warnings: list[str] = []
+    resolved = gcp_inventory._resolve_impersonation(credentials, warnings)
+
+    try:
+        project_ids = gcp_organizations.list_project_ids(resolved, force=True)
+    except Exception as exc:  # noqa: BLE001 — org enumeration failure must degrade, not crash
+        logger.warning("GCP org project enumeration failed: %s", sanitize_discovery_warning(exc))
+        warnings.append(sanitize_discovery_warning(exc))
+        project_ids = []
+
+    if not project_ids:
+        single = os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
+        project_ids = [single] if single else []
+    if not project_ids:
+        raise CloudDiscoveryError(
+            "No GCP projects resolved for the multi-project CIS benchmark. Grant org/folder browse access or set GOOGLE_CLOUD_PROJECT."
+        )
+
+    aggregate = GCPCISReport(project_id=", ".join(project_ids))
+    aggregate.warnings.extend(warnings)
+
+    def _run_one(project_id: str) -> tuple[str, GCPCISReport]:
+        return project_id, run_benchmark(project_id=project_id, credentials=resolved, checks=checks)
+
+    # Deterministic aggregation: collect per-project reports keyed by id, then
+    # merge in enumeration order so output is stable across runs.
+    reports: dict[str, GCPCISReport] = {}
+    with ThreadPoolExecutor(max_workers=min(_MAX_CIS_FANOUT_WORKERS, len(project_ids))) as executor:
+        future_to_project = {executor.submit(_run_one, pid): pid for pid in project_ids}
+        for future in as_completed(future_to_project):
+            pid = future_to_project[future]
+            try:
+                _pid, project_report = future.result()
+                reports[pid] = project_report
+            except Exception as exc:  # noqa: BLE001 — one unreadable project must not sink the rest
+                aggregate.warnings.append(f"Project {pid} skipped: {sanitize_discovery_warning(exc)}")
+
+    for pid in project_ids:
+        merged = reports.get(pid)
+        if merged is None:
+            continue
+        aggregate.projects_scanned.append(pid)
+        for check in merged.checks:
+            check.account_id = pid
+            aggregate.checks.append(check)
+        aggregate.warnings.extend(merged.warnings)
+
+    return aggregate

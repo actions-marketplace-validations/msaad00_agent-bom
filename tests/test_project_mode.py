@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from agent_bom.parsers import scan_project_directory
+from agent_bom.parsers import scan_project_directory, summarize_project_inventory
 from agent_bom.sbom import detect_sbom_resource_name, load_sbom
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 # ── scan_project_directory ────────────────────────────────────────────────────
 
@@ -58,6 +62,39 @@ class TestScanProjectDirectory:
         assert subdir in result
         names = {p.name for p in result[subdir]}
         assert "flask" in names
+
+    def test_skips_symlinked_directory_by_default(self, tmp_path):
+        outside = tmp_path.parent / f"{tmp_path.name}-outside"
+        outside.mkdir()
+        (outside / "requirements.txt").write_text("flask==3.0.0\n")
+        link = tmp_path / "linked-outside"
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+
+        warnings: list[str] = []
+        result = scan_project_directory(tmp_path, warnings=warnings)
+
+        assert not result
+        assert any("skipping symlinked directory" in warning for warning in warnings)
+
+    def test_follow_symlinks_stays_inside_project_root(self, tmp_path):
+        skipped_target = tmp_path / "node_modules"
+        skipped_target.mkdir()
+        (skipped_target / "requirements.txt").write_text("flask==3.0.0\n")
+        link = tmp_path / "linked-inside"
+        try:
+            link.symlink_to(skipped_target, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+
+        warnings: list[str] = []
+        result = scan_project_directory(tmp_path, follow_symlinks=True, warnings=warnings)
+
+        assert link in result
+        assert any(pkg.name == "flask" for pkg in result[link])
+        assert warnings == []
 
     def test_skips_node_modules(self, tmp_path):
         node_modules = tmp_path / "node_modules"
@@ -123,6 +160,74 @@ class TestScanProjectDirectory:
         (nested / "requirements.txt").write_text("flask==3.0.0\n")
         result = scan_project_directory(tmp_path, max_depth=2)
         assert nested in result
+
+    def test_summarize_project_inventory_tracks_lockfiles_and_transitive(self, tmp_path):
+        (tmp_path / "package.json").write_text(json.dumps({"name": "myapp", "version": "1.0.0", "dependencies": {"lodash": "4.17.21"}}))
+        (tmp_path / "package-lock.json").write_text(
+            json.dumps(
+                {
+                    "name": "myapp",
+                    "lockfileVersion": 3,
+                    "packages": {
+                        "": {"name": "myapp", "version": "1.0.0"},
+                        "node_modules/lodash": {"version": "4.17.21"},
+                        "node_modules/lodash.merge": {"version": "4.6.2"},
+                    },
+                }
+            )
+        )
+        result = scan_project_directory(tmp_path)
+        summary = summarize_project_inventory(tmp_path, result)
+        assert summary["manifest_directories"] == 1
+        assert summary["manifest_files"] == 2
+        assert summary["lockfiles"] == 1
+        assert summary["package_count"] == 2
+        assert summary["direct_packages"] == 1
+        assert summary["transitive_packages"] == 1
+        assert summary["lockfile_directories"] == 1
+        assert summary["declaration_only_directories"] == 0
+        assert summary["lockfile_backed_packages"] == 2
+        assert summary["declaration_only_packages"] == 0
+        assert summary["advisory_depth_pct"] == 100
+        assert summary["ecosystems"] == {"npm": 2}
+        assert summary["directories"][0]["lockfile_files"] == ["package-lock.json"]
+        assert summary["directories"][0]["advisory_evidence"] == "lockfile_backed"
+
+    def test_workspace_package_lock_fixture_keeps_nested_manifest_context(self):
+        fixture_root = FIXTURES / "npm-workspace-package-lock"
+        web_dir = fixture_root / "apps" / "web"
+
+        result = scan_project_directory(fixture_root)
+        assert web_dir in result
+
+        packages = {package.name: package for package in result[web_dir]}
+        assert packages["react"].version == "18.2.0"
+        assert packages["react"].is_direct is True
+        assert packages["@sample/ui"].version == "1.0.0"
+        assert packages["@sample/ui"].is_direct is True
+        assert packages["vite"].version == "8.0.16"
+        assert packages["vite"].is_direct is True
+        assert packages["rollup"].version == "4.59.0"
+        assert packages["rollup"].is_direct is False
+
+        summary = summarize_project_inventory(fixture_root, result)
+        directory = next(item for item in summary["directories"] if item["path"] == "apps/web")
+        assert set(directory["manifest_files"]) == {"package.json", "package-lock.json"}
+        assert directory["lockfile_files"] == ["package-lock.json"]
+        assert directory["advisory_evidence"] == "lockfile_backed"
+        assert summary["ecosystems"] == {"npm": 4}
+
+    def test_summarize_project_inventory_marks_manifest_only_depth(self, tmp_path):
+        (tmp_path / "requirements.txt").write_text("requests==2.31.0\nflask==3.0.0\n")
+        result = scan_project_directory(tmp_path)
+        summary = summarize_project_inventory(tmp_path, result)
+        assert summary["manifest_directories"] == 1
+        assert summary["lockfile_directories"] == 0
+        assert summary["declaration_only_directories"] == 1
+        assert summary["lockfile_backed_packages"] == 0
+        assert summary["declaration_only_packages"] == 2
+        assert summary["advisory_depth_pct"] == 0
+        assert summary["directories"][0]["advisory_evidence"] == "declaration_only"
 
 
 # ── detect_sbom_resource_name ─────────────────────────────────────────────────
@@ -221,7 +326,8 @@ def test_cli_has_sbom_name_flag():
     runner = CliRunner()
     result = runner.invoke(main, ["scan", "--help"])
     assert "--project" in result.output
-    assert "--sbom-name" in result.output
+    full = runner.invoke(main, ["scan", "--help-all"])
+    assert "--sbom-name" in full.output
 
 
 def test_project_scan_via_cli_no_agents(tmp_path):
@@ -235,12 +341,121 @@ def test_project_scan_via_cli_no_agents(tmp_path):
     (tmp_path / "requirements.txt").write_text("requests==2.31.0\n")
     runner = CliRunner()
     # Patch discover_all at the cli module level (imported at top of cli.py)
-    with patch("agent_bom.cli.scan.discover_all", return_value=[]):
+    with patch("agent_bom.cli.agents.discover_all", return_value=[]):
         result = runner.invoke(main, ["scan", "--project", str(tmp_path), "--no-scan"])
     assert result.exit_code == 0
     assert "No MCP configurations" not in result.output
     # Should find the package manifest and show it
     assert "project" in result.output.lower() or "package" in result.output.lower()
+
+
+def test_project_scan_via_cli_with_discovered_project_agents(tmp_path):
+    """--project DIR should still scan local manifests even when project MCP configs exist."""
+    from click.testing import CliRunner
+
+    from agent_bom.cli import main
+    from agent_bom.models import Agent, AgentType, MCPServer, Package
+
+    runner = CliRunner()
+    project_agent = Agent(
+        name="project-configured",
+        agent_type=AgentType.CUSTOM,
+        config_path=str(tmp_path / "mcp.json"),
+        source="project",
+        mcp_servers=[MCPServer(name="configured", command="npx", args=["server"], packages=[])],
+    )
+    project_pkgs = {
+        tmp_path: [Package(name="requests", version="2.31.0", ecosystem="pypi")],
+    }
+    with (
+        patch("agent_bom.cli.agents.discover_all", return_value=[project_agent]),
+        patch("agent_bom.parsers.scan_project_directory", return_value=project_pkgs),
+    ):
+        result = runner.invoke(main, ["scan", "--project", str(tmp_path), "--no-scan"])
+    assert result.exit_code == 0
+    assert "Scanning project directory for package manifests" in result.output
+    assert "lockfile" in result.output
+    assert "1 package(s)" in result.output
+
+
+def test_project_scan_via_cli_scopes_auto_iac_to_project(tmp_path):
+    """--project DIR should not auto-detect IaC from the caller's current directory."""
+    from click.testing import CliRunner
+
+    from agent_bom.cli import main
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    (project_dir / "requirements.txt").write_text("requests==2.31.0\n")
+
+    ambient_dir = tmp_path / "ambient"
+    ambient_dir.mkdir()
+    (ambient_dir / "Dockerfile").write_text("FROM python:3.13-alpine\n")
+
+    runner = CliRunner()
+    with (
+        patch("agent_bom.cli.agents.discover_all", return_value=[]),
+        patch("agent_bom.cli.agents._discovery.Path.cwd", return_value=ambient_dir),
+    ):
+        result = runner.invoke(main, ["scan", "--project", str(project_dir), "--no-scan"])
+    assert result.exit_code == 0
+    assert "Auto-detected 1 IaC file" not in result.output
+
+
+def test_discover_all_project_dir_scopes_to_project_only(tmp_path):
+    """discover_all(project_dir=...) should not pull in ambient host discovery."""
+    from agent_bom.discovery import discover_all
+    from agent_bom.models import Agent, AgentType, MCPServer
+
+    project_agent = Agent(
+        name="project-only",
+        agent_type=AgentType.CUSTOM,
+        config_path=str(tmp_path / "mcp.json"),
+        source="project",
+        mcp_servers=[MCPServer(name="proj", command="npx", args=["proj"], packages=[])],
+    )
+    global_agent = Agent(
+        name="global-agent",
+        agent_type=AgentType.CLAUDE_DESKTOP,
+        config_path="/Users/example/.config/global.json",
+        source="global",
+        mcp_servers=[MCPServer(name="global", command="npx", args=["global"], packages=[])],
+    )
+    with (
+        patch("agent_bom.discovery.discover_global_configs", return_value=[global_agent]),
+        patch("agent_bom.discovery.discover_project_configs", return_value=[project_agent]),
+        patch("agent_bom.discovery.discover_compose_mcp_servers", return_value=None),
+        patch("agent_bom.discovery.discover_docker_mcp", return_value=global_agent),
+    ):
+        agents = discover_all(project_dir=str(tmp_path))
+    assert [a.name for a in agents] == ["project-only"]
+
+
+def test_discover_all_accepts_project_config_file_scope(tmp_path):
+    """Project-scoped discovery accepts a direct MCP config file path."""
+    from agent_bom.discovery import discover_all
+
+    config_dir = tmp_path / ".cursor"
+    config_dir.mkdir()
+    config_file = config_dir / "mcp.json"
+    config_file.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "filesystem": {
+                        "command": "npx",
+                        "args": ["@modelcontextprotocol/server-filesystem", str(tmp_path)],
+                    }
+                }
+            }
+        )
+    )
+
+    agents = discover_all(project_dir=str(config_file))
+
+    assert len(agents) == 1
+    assert agents[0].config_path == str(config_file)
+    assert [server.name for server in agents[0].mcp_servers] == ["filesystem"]
 
 
 def test_sbom_name_overrides_metadata(tmp_path):
@@ -282,3 +497,56 @@ def test_sbom_auto_detects_name(tmp_path):
         result = runner.invoke(main, ["scan", "--sbom", str(sbom), "--no-scan"])
     assert result.exit_code == 0
     assert "nginx:1.25" in result.output
+
+
+def test_cargo_toml_manifest_fallback_when_no_lockfile(tmp_path):
+    """A Rust project with only Cargo.toml (no lockfile) must not silently yield 0 packages."""
+    from agent_bom.parsers.compiled_parsers import parse_cargo_packages
+
+    (tmp_path / "Cargo.toml").write_text(
+        '[package]\nname = "app"\n'
+        "[dependencies]\n"
+        'time = "0.1.42"\n'
+        'smallvec = { version = "1.6.0", features = ["serde"] }\n'
+        'local-dep = { path = "../local" }\n'
+        "[dev-dependencies]\n"
+        'criterion = "0.3"\n'
+    )
+    pkgs = parse_cargo_packages(tmp_path)
+    names = {p.name for p in pkgs}
+    assert names == {"time", "smallvec", "criterion"}, names
+    assert "local-dep" not in names  # path dep has no version
+    assert all(p.version_source == "manifest" for p in pkgs)
+
+
+def test_cargo_toml_manifest_fallback_handles_target_and_workspace_deps(tmp_path):
+    from agent_bom.parsers.compiled_parsers import parse_cargo_packages
+
+    (tmp_path / "Cargo.toml").write_text(
+        '[package]\nname = "app"\n'
+        "[workspace.dependencies]\n"
+        'serde = "1.0.193"\n'
+        "[dependencies]\n"
+        "serde = { workspace = true }\n"
+        'git-dep = { git = "https://example.invalid/repo", version = "1.0" }\n'
+        "[target.'cfg(unix)'.dependencies]\n"
+        'nix = "0.27"\n'
+        "[target.'cfg(windows)'.dev-dependencies]\n"
+        'winapi = "0.3"\n'
+    )
+
+    pkgs = parse_cargo_packages(tmp_path)
+    versions = {p.name: p.version for p in pkgs}
+
+    assert versions == {"serde": "1.0.193", "nix": "0.27", "winapi": "0.3"}
+    assert {p.name: p.is_direct for p in pkgs} == {"serde": True, "nix": True, "winapi": False}
+    assert "git-dep" not in versions
+
+
+def test_cargo_lockfile_preferred_over_manifest(tmp_path):
+    from agent_bom.parsers.compiled_parsers import parse_cargo_packages
+
+    (tmp_path / "Cargo.toml").write_text('[dependencies]\ntime = "0.1.42"\n')
+    (tmp_path / "Cargo.lock").write_text('[[package]]\nname = "time"\nversion = "0.1.45"\n')
+    pkgs = parse_cargo_packages(tmp_path)
+    assert len(pkgs) == 1 and pkgs[0].version == "0.1.45"  # exact lockfile pin wins

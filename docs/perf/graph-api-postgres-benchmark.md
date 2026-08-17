@@ -1,0 +1,388 @@
+# Graph API and Postgres Benchmark Evidence
+
+Evidence status: measured local API + Postgres EXPLAIN + repeated Postgres latency artifacts
+Owner issue: #3353
+Related evidence-lake issue: #2929
+Raw result artifacts:
+
+- `docs/perf/results/graph-benchmark-estate-sample.json`
+- `docs/perf/results/graph-benchmark-estate-sample-report.json`
+- `docs/perf/results/graph-api-benchmark-sample.json`
+- `docs/perf/results/postgres-graph-explain-sample.json`
+- `docs/perf/results/postgres-graph-explain-sample/*.sql`
+- `docs/perf/results/postgres-graph-latency-sample.json`
+- `docs/perf/results/postgres-graph-latency-sample/*.sql`
+- `docs/perf/results/graph-benchmark-estate-live-2026-05-13.json`
+- `docs/perf/results/graph-benchmark-estate-live-2026-05-13-report.json`
+- `docs/perf/results/graph-benchmark-store-load-live-2026-05-13.json`
+- `docs/perf/results/graph-benchmark-postgres-load-live-2026-05-13.json`
+- `docs/perf/results/graph-api-benchmark-live-2026-05-13.json`
+- `docs/perf/results/postgres-graph-explain-live-2026-05-13.json`
+- `docs/perf/results/postgres-graph-explain-live-2026-05-13/*.sql`
+- `docs/perf/results/postgres-graph-explain-live-2026-05-13/plans/*.txt`
+- `docs/perf/results/graph-benchmark-postgres-load-live-2026-07-01.json`
+- `docs/perf/results/postgres-graph-latency-live-2026-07-01.json`
+- `docs/perf/results/postgres-graph-latency-live-2026-07-01/*.sql`
+
+## Claim
+
+This page documents benchmark commands plus checked-in measured artifacts for a
+local graph API run, a Docker Postgres `EXPLAIN ANALYZE` run, and repeated
+Docker Postgres client wall-clock probes. The measured artifacts support local
+evidence for graph API p50/p95/p99 client timings, database-local Postgres query
+plans, and Postgres p50/p95/p99 query-family timings on a deterministic
+synthetic estate.
+
+These artifacts do not claim Snowflake behavior, browser timing, managed
+operator deployment timing, managed graph-backend timing, or production SLOs.
+The current measured ceiling is the checked-in Docker Postgres estate with
+10,479 nodes, 11,242 edges, and 291 materialized attack paths. 100k+ and
+1M-node Postgres claims are not yet measured; they remain follow-on scale work.
+Store-backed live graph builds on the persist path still use a **private
+SQLite staging workspace by default**; shared-Postgres producer wiring is
+implemented but not the default auto-enable path (see
+`src/agent_bom/graph/store_backed.py`).
+Measured local CPU graph timings remain in
+[`p95-p99-graph-query.md`](p95-p99-graph-query.md).
+
+## Scope
+
+Covered by the checked-in evidence:
+
+- skewed synthetic estate generation with local, CI, fleet, cloud, and
+  operator-pushed source labels
+- SQLite graph-store load for old/current snapshots with 11,242 current edges,
+  10,479 current nodes, and 291 materialized attack paths
+- API request plan for `/v1/graph/search`, `/v1/graph/node/{id}`,
+  `/v1/graph/paths`, `/v1/graph/diff`, and `/v1/graph/query`
+- local loopback API p50/p95/p99 client timings for each request above
+- Docker Postgres graph-store load for the same old/current snapshots
+- Postgres `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` plan artifacts for node
+  search, node detail, attack-path drilldown, graph diff, and bounded traversal
+- repeated Postgres client wall-clock latency artifacts for node search, node
+  detail, attack-path drilldown, graph diff, graph history, evidence-manifest
+  digest, and bounded traversal
+- retained graph history and redaction-aware evidence-manifest API/CLI surfaces
+  backed by the same tenant-scoped snapshot store
+- fail-closed backend selection for experimental Neptune so unmeasured managed
+  graph paths cannot be selected accidentally
+
+Excluded from these local artifacts:
+
+- authenticated remote API latency
+- Snowflake or managed-operator deployment timings
+- browser/UI interaction timing
+- 50k / 100k / 1M edge Postgres runs
+- Amazon Neptune or other managed graph backend latency
+- six-month hosted lake retention jobs, audit-chain bundle persistence,
+  compliance bundle persistence, and legal-hold/deletion workflows
+
+## Environment
+
+The first live artifacts were produced on 2026-05-13 with:
+
+- API: `agent-bom api` loopback on `127.0.0.1:8429`, local unauthenticated
+  mode, SQLite job store, SQLite graph store
+- OS: Darwin 25.4.0 arm64
+- Python: `uv run python --version` -> Python 3.13.5
+- uv: 0.10.9
+- Docker: 29.2.1
+- Postgres: `postgres:16-alpine`, PostgreSQL 16.13
+- Tenant: `default`
+- Scan IDs: `graph-benchmark-estate-old` and
+  `graph-benchmark-estate-current`
+
+The 2026-07-01 repeated Postgres latency artifact was produced with the same
+deterministic estate shape on Docker `postgres:16-alpine`, using a local Docker
+`psql` wrapper with 30 samples per query family. These are client wall-clock
+timings and include process/client overhead; pair them with the
+`EXPLAIN ANALYZE` artifacts before making deployment SLO claims.
+
+## Commands
+
+Generate the checked-in sample estate report:
+
+```bash
+uv run python scripts/generate_graph_benchmark_estate.py \
+  --agents 25 \
+  --report-output docs/perf/results/graph-benchmark-estate-sample-report.json \
+  --summary-output docs/perf/results/graph-benchmark-estate-sample.json
+```
+
+Generate the 2026-05-13 live estate shape:
+
+```bash
+uv run python scripts/generate_graph_benchmark_estate.py \
+  --agents 250 \
+  --report-output docs/perf/results/graph-benchmark-estate-live-2026-05-13-report.json \
+  --summary-output docs/perf/results/graph-benchmark-estate-live-2026-05-13.json
+```
+
+Load old/current snapshots into a local SQLite graph store:
+
+```bash
+uv run python scripts/seed_graph_benchmark_store.py \
+  --backend sqlite \
+  --sqlite-db /tmp/agent-bom-graph-benchmark.db \
+  --report docs/perf/results/graph-benchmark-estate-live-2026-05-13-report.json \
+  --summary-output docs/perf/results/graph-benchmark-store-load-live-2026-05-13.json
+```
+
+Validate the API benchmark plan without measuring:
+
+```bash
+uv run python scripts/run_graph_api_benchmark.py \
+  --dry-run \
+  --output docs/perf/results/graph-api-benchmark-sample.json
+```
+
+Run the API benchmark against the loaded local control plane:
+
+```bash
+AGENT_BOM_GRAPH_DB=/tmp/agent-bom-graph-benchmark.db \
+AGENT_BOM_DB=/tmp/agent-bom-api-benchmark.db \
+uv run --extra api agent-bom api --host 127.0.0.1 --port 8429
+
+uv run python scripts/run_graph_api_benchmark.py \
+  --base-url http://127.0.0.1:8429 \
+  --tenant-id default \
+  --scan-id graph-benchmark-estate-current \
+  --old-scan-id graph-benchmark-estate-old \
+  --new-scan-id graph-benchmark-estate-current \
+  --source-node agent:agent-00000 \
+  --detail-node pkg:go:langchain@1.0.0 \
+  --repeat 10 \
+  --output docs/perf/results/graph-api-benchmark-live-2026-05-13.json
+```
+
+Export retained graph evidence from the local graph store without a running API:
+
+```bash
+agent-bom graph-evidence --mode history \
+  --graph-db /tmp/agent-bom-graph-benchmark.db \
+  --tenant default \
+  --limit 50
+
+agent-bom graph-evidence --mode manifest \
+  --graph-db /tmp/agent-bom-graph-benchmark.db \
+  --tenant default \
+  --scan-id graph-benchmark-estate-current \
+  --baseline-scan-id graph-benchmark-estate-old \
+  --output docs/perf/results/graph-evidence-manifest-local.json
+```
+
+Query the same evidence through the API:
+
+```bash
+curl -H 'X-Agent-Bom-Tenant-ID: default' \
+  'http://127.0.0.1:8429/v1/graph/history?limit=50'
+
+curl -H 'X-Agent-Bom-Tenant-ID: default' \
+  'http://127.0.0.1:8429/v1/graph/evidence-manifest?scan_id=graph-benchmark-estate-current&baseline_scan_id=graph-benchmark-estate-old'
+```
+
+Generate Postgres EXPLAIN SQL artifacts without measuring:
+
+```bash
+uv run python scripts/run_graph_postgres_explain.py \
+  --dry-run \
+  --output-dir docs/perf/results/postgres-graph-explain-sample \
+  --summary-output docs/perf/results/postgres-graph-explain-sample.json
+```
+
+Generate Postgres repeated-latency SQL artifacts without measuring:
+
+```bash
+uv run python scripts/run_graph_postgres_latency.py \
+  --dry-run \
+  --output-dir docs/perf/results/postgres-graph-latency-sample \
+  --summary-output docs/perf/results/postgres-graph-latency-sample.json
+```
+
+Run Postgres EXPLAIN ANALYZE against a loaded graph store:
+
+```bash
+docker run --rm --name agent-bom-graph-bench-pg \
+  -e POSTGRES_PASSWORD=agentbom \
+  -e POSTGRES_DB=agentbom \
+  -p 55432:5432 \
+  -d postgres:16-alpine
+
+AGENT_BOM_POSTGRES_URL=postgresql://postgres:agentbom@127.0.0.1:55432/agentbom \
+uv run --extra postgres python scripts/seed_graph_benchmark_store.py \
+  --backend postgres \
+  --report docs/perf/results/graph-benchmark-estate-live-2026-05-13-report.json \
+  --summary-output docs/perf/results/graph-benchmark-postgres-load-live-2026-05-13.json
+
+cat >/tmp/psql <<'SH'
+#!/bin/sh
+file=""
+args=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --file) shift; file="$1" ;;
+    --file=*) file="${1#--file=}" ;;
+    *) args="$args '$(printf '%s' "$1" | sed "s/'/'\\\\''/g")'" ;;
+  esac
+  shift
+done
+if [ -n "$file" ]; then
+  eval "docker exec -i agent-bom-graph-bench-pg psql $args" < "$file"
+else
+  eval "docker exec -i agent-bom-graph-bench-pg psql $args"
+fi
+SH
+chmod +x /tmp/psql
+
+AGENT_BOM_POSTGRES_DSN=postgresql://postgres:agentbom@127.0.0.1:5432/agentbom \
+uv run python scripts/run_graph_postgres_explain.py \
+  --run \
+  --psql-bin /tmp/psql \
+  --scan-id graph-benchmark-estate-current \
+  --old-scan-id graph-benchmark-estate-old \
+  --source-node agent:agent-00000 \
+  --detail-node pkg:go:langchain@1.0.0 \
+  --output-dir docs/perf/results/postgres-graph-explain-live-2026-05-13 \
+  --summary-output docs/perf/results/postgres-graph-explain-live-2026-05-13.json
+```
+
+Run repeated Postgres latency probes against the same loaded graph store:
+
+```bash
+AGENT_BOM_POSTGRES_DSN=postgresql://postgres:agentbom@127.0.0.1:5432/agentbom \
+uv run python scripts/run_graph_postgres_latency.py \
+  --run \
+  --psql-bin /tmp/psql \
+  --scan-id graph-benchmark-estate-current \
+  --old-scan-id graph-benchmark-estate-old \
+  --source-node agent:agent-00000 \
+  --detail-node pkg:go:langchain@1.0.0 \
+  --repeat 30 \
+  --output-dir docs/perf/results/postgres-graph-latency-live-YYYY-MM-DD \
+  --summary-output docs/perf/results/postgres-graph-latency-live-YYYY-MM-DD.json
+```
+
+## Results
+
+### Supported size from checked-in evidence
+
+The current supported-size statement is intentionally bounded:
+
+| Store | Current measured ceiling | Query families | Success criteria | Raw artifact |
+|---|---:|---|---|---|
+| Docker Postgres 16 | 10,479 nodes / 11,242 edges / 291 attack paths | search, detail, drilldown, diff, history, evidence digest, bounded traversal | 30 successful samples per query family; p95 <= 750 ms on the local Docker harness | `docs/perf/results/postgres-graph-latency-live-2026-07-01.json` |
+
+The release gate in `scripts/check_graph_scale_evidence.py` enforces the raw
+artifact shape, query-family coverage, sample count, p95 ceiling, and this
+document's explicit current-measured-ceiling language. Larger-estate numbers
+must be added as new checked-in artifacts before product copy can claim them.
+
+| Artifact | Status | What it supports |
+|---|---|---|
+| `graph-benchmark-estate-sample.json` | scaffold | deterministic skewed estate shape and source mix |
+| `graph-api-benchmark-sample.json` | dry-run | API benchmark request coverage, including graph history and evidence manifest |
+| `postgres-graph-explain-sample.json` | dry-run | Postgres EXPLAIN artifact paths only |
+| `postgres-graph-latency-sample.json` | dry-run | Postgres repeated-latency SQL paths, including graph history and evidence-manifest digest queries |
+| `graph-benchmark-estate-live-2026-05-13.json` | generated | 250-agent estate with 604 servers, 3,475 tools, and 5,958 package instances |
+| `graph-benchmark-store-load-live-2026-05-13.json` | measured load | SQLite graph store loaded old/current snapshots; current has 10,479 nodes, 11,242 edges, 291 attack paths |
+| `graph-api-benchmark-live-2026-05-13.json` | measured API | loopback API p50/p95/p99 client timings across five graph hot paths |
+| `graph-benchmark-postgres-load-live-2026-05-13.json` | measured load | Docker Postgres graph store loaded the same old/current snapshots |
+| `postgres-graph-explain-live-2026-05-13.json` | measured plan | five Postgres `EXPLAIN ANALYZE` runs returned successfully with plan files |
+| `graph-benchmark-postgres-load-live-2026-07-01.json` | measured load | Docker Postgres graph store loaded the same old/current snapshots after schema bootstrap hardening |
+| `postgres-graph-latency-live-2026-07-01.json` | measured latency | 30 repeated Postgres client wall-clock samples for seven graph hot paths |
+
+API client timings from `graph-api-benchmark-live-2026-05-13.json`:
+
+| Operation | Samples | p50 ms | p95 ms | p99 ms |
+|---|---:|---:|---:|---:|
+| graph search | 10 | 21.141 | 64.061 | 64.061 |
+| node detail | 10 | 97.760 | 109.534 | 109.534 |
+| attack-path drilldown | 10 | 1625.596 | 2146.839 | 2146.839 |
+| graph diff | 10 | 208.873 | 338.559 | 338.559 |
+| bounded traversal | 10 | 828.342 | 1179.635 | 1179.635 |
+
+Top-level Postgres plan times from
+`postgres-graph-explain-live-2026-05-13/plans/*.txt`:
+
+| Query | Actual total time |
+|---|---:|
+| node search | 47.970 ms |
+| node detail | 0.124 ms |
+| attack-path drilldown | 0.177 ms |
+| graph diff nodes | 38.421 ms |
+| bounded traversal edges | 8.903 ms |
+
+Postgres client wall-clock timings from
+`postgres-graph-latency-live-2026-07-01.json`:
+
+| Query | Samples | p50 ms | p95 ms | p99 ms |
+|---|---:|---:|---:|---:|
+| node search | 30 | 77.941 | 182.647 | 502.350 |
+| node detail | 30 | 73.804 | 128.536 | 129.372 |
+| attack-path drilldown | 30 | 75.949 | 89.377 | 99.619 |
+| graph diff nodes | 30 | 73.383 | 103.289 | 104.114 |
+| graph history | 30 | 77.961 | 128.294 | 138.774 |
+| evidence-manifest digest | 30 | 106.545 | 180.376 | 210.068 |
+| bounded traversal edges | 30 | 80.181 | 101.969 | 152.170 |
+
+## Retained Graph Evidence Slice
+
+The retained-history slice for #2929 is limited to the graph snapshot store.
+Every response is scoped by the request tenant or the
+`agent-bom graph-evidence --tenant` value.
+
+Shipped in this slice:
+
+- `GET /v1/graph/history` lists retained snapshots and adjacent diff summaries
+  from `graph_snapshots`, `graph_nodes`, and `graph_edges`.
+- `GET /v1/graph/evidence-manifest` returns `tenant_id`, `scan_id`,
+  `scan_created_at`, `graph_digest`, `findings_digest`,
+  `diff_baseline_scan_id`, counts, included tables, excluded private fields,
+  and retention policy metadata.
+- `agent-bom graph-evidence` exports the same history or manifest JSON from the
+  local SQLite graph store for demos and CI evidence capture.
+- API and Postgres benchmark scaffolds include graph history and
+  evidence-manifest digest paths.
+
+Not shipped by this slice:
+
+- Hosted ClickHouse/Snowflake lake retention jobs.
+- Durable audit-chain and compliance bundle tables outside the graph store.
+- Legal-hold/deletion state transitions beyond the explicit manifest fields.
+- Six-month remote hosted evidence proving tenant history across operational
+  lake backends.
+
+## Plan-Driven Hardening
+
+The first follow-up hardening pass targets only query plans supported by the
+checked-in artifacts above:
+
+- node search now queries the already-normalized `graph_node_search.search_text`
+  value directly instead of wrapping it in `LOWER(...)`, so the trigram index is
+  eligible for `%term%` search.
+- the Postgres bootstrap, runtime DDL, and Alembic path include trigram search,
+  source-scoped attack-path ordering, traversable source-edge traversal, and
+  scan/id node-covering indexes.
+- graph schema bootstrap suppresses the signed RLS-bypass audit write during
+  the legacy tenant backfill only, avoiding recursive audit-store bootstrap
+  while the graph DDL transaction is active. Runtime RLS bypasses still audit by
+  default.
+- the slowest API timings above are not explained by the database plans alone:
+  attack-path drilldown and bounded traversal show fast single-query plans but
+  much slower API timings. Treat app-side graph hydration/serialization as a
+  separate optimization lane before making production SLO claims.
+
+## SLOs
+
+No production API/Postgres SLO is declared from this local run. A future SLO
+page should repeat these measurements under the intended authenticated
+deployment topology and attach resource sizing before making an operator or
+enterprise-pilot latency claim.
+
+## Gaps
+
+- Run the API benchmark under the intended authenticated remote topology.
+- Add 50k / 100k / 1M edge Postgres artifacts before claiming larger estates.
+- Add browser interaction timing separately if UI scale claims are needed.
+- Add hosted evidence-lake retention jobs and measured six-month history
+  evidence before closing #2929.

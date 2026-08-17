@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
@@ -49,7 +50,7 @@ class ScanConfig:
     """Configuration for inline proxy scanning."""
 
     enabled: bool = False
-    mode: str = "audit"  # "audit" | "enforce"
+    mode: str = "enforce"  # "audit" | "enforce"
     scanners: list[str] = field(default_factory=lambda: ["injection", "pii", "secrets", "payload_vuln"])
     pii_action: str = "redact"  # "redact" | "block"
 
@@ -83,6 +84,78 @@ _PII_PATTERNS: list[tuple[re.Pattern, str, str]] = [
         re.compile(r"\b(?:10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.\d{1,3}\.\d{1,3}\b"),
         "internal_ip",
         "medium",
+    ),
+]
+
+# ---------------------------------------------------------------------------
+# Modern secret token formats (new — gateway-DLP specific)
+#
+# The shared ``_SECRET_PATTERNS`` ruleset (imported from prompt_scanner) misses
+# several token formats that a live gateway forwards upstream in cleartext and
+# echoes to clients. These patterns are kept LOCAL to the proxy scanner so the
+# prompt-file scanner's false-positive profile is unchanged. Every rule requires
+# a distinctive prefix, an explicit label, or a high length/charset constraint
+# to keep false positives low on ordinary prose.
+# ---------------------------------------------------------------------------
+
+_GATEWAY_SECRET_PATTERNS: list[tuple[re.Pattern, str, str]] = [
+    (
+        # OpenAI project-scoped keys: sk-proj-<body>. The dash after the prefix
+        # defeats the legacy ``sk-[A-Za-z0-9]{20,}`` rule, so it is missed today.
+        re.compile(r"sk-proj-[A-Za-z0-9_\-]{20,}"),
+        "openai_project_key",
+        "critical",
+    ),
+    (
+        # Anthropic keys: sk-ant-<body>.
+        re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"),
+        "anthropic_api_key",
+        "critical",
+    ),
+    (
+        # GitHub fine-grained PAT: github_pat_<22+ char body>.
+        re.compile(r"github_pat_[A-Za-z0-9_]{22,}"),
+        "github_fine_grained_pat",
+        "critical",
+    ),
+    (
+        # JWT (and bearer JWTs): three base64url segments, header begins ``eyJ``
+        # (base64 of ``{"``). The triple-segment shape keeps FPs negligible.
+        re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),
+        "jwt",
+        "critical",
+    ),
+    (
+        # Opaque bearer token behind an explicit Authorization header. The
+        # explicit ``Authorization: Bearer`` label plus a 20+ char value keeps
+        # this from firing on ordinary words.
+        re.compile(r"(?i)authorization\s*:\s*bearer\s+[A-Za-z0-9._\-]{20,}"),
+        "bearer_token",
+        "critical",
+    ),
+    (
+        # AWS secret access key value (40-char base64) — REQUIRE the label. A
+        # bare 40-char base64 string collides with git SHAs, hashes, etc., so it
+        # is only flagged when explicitly named ``aws_secret_access_key``.
+        re.compile(
+            r"(?i)(?P<aws_label_quote>['\"]?)aws_secret_access_key(?P=aws_label_quote)\s*[:=]\s*"
+            r"(?P<aws_value_quote>['\"]?)[A-Za-z0-9/+=]{40}(?P=aws_value_quote)(?![A-Za-z0-9/+=])"
+        ),
+        "aws_secret_access_key",
+        "critical",
+    ),
+    (
+        # Generic labeled secret where the keyword is EMBEDDED in a longer
+        # identifier (e.g. client_secret, secret_key, access_token) that the
+        # legacy adjacent-keyword rules miss. Requires ``=``/``:`` plus a 16+
+        # char value to avoid flagging prose that merely mentions the word.
+        re.compile(
+            r"(?i)\b[\w.\-]*"
+            r"(?:secret|api[_-]?key|access[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|credential)"
+            r"[\w.\-]*\s*[:=]\s*['\"]?([A-Za-z0-9/+=_\-\.]{16,})",
+        ),
+        "labeled_secret",
+        "high",
     ),
 ]
 
@@ -123,12 +196,66 @@ _PAYLOAD_VULN_PATTERNS: list[tuple[re.Pattern, str, str]] = [
 # Helpers
 # ---------------------------------------------------------------------------
 
+_UNICODE_CONTROL_CHARS = {
+    "\u200b",  # zero-width space
+    "\u200c",  # zero-width non-joiner
+    "\u200d",  # zero-width joiner
+    "\u2060",  # word joiner
+    "\ufeff",  # zero-width no-break space / BOM
+    "\u202a",  # left-to-right embedding
+    "\u202b",  # right-to-left embedding
+    "\u202c",  # pop directional formatting
+    "\u202d",  # left-to-right override
+    "\u202e",  # right-to-left override
+    "\u2066",  # left-to-right isolate
+    "\u2067",  # right-to-left isolate
+    "\u2068",  # first strong isolate
+    "\u2069",  # pop directional isolate
+}
 
-def _redact_excerpt(match_text: str, max_len: int = 12) -> str:
-    """Return a safely redacted preview of a match."""
-    if len(match_text) <= 4:
+
+def _normalize_detector_text(text: str) -> str:
+    """Normalize detector input so invisible Unicode controls cannot split patterns."""
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = "".join(ch for ch in normalized if ch not in _UNICODE_CONTROL_CHARS)
+    # Tool responses are commonly JSON-serialized before DLP inspection, so
+    # quoted keys/values arrive as \"key\": \"value\". Normalize quote escapes
+    # for detection only; the original response is never rewritten or logged.
+    return normalized.replace('\\"', '"').replace("\\'", "'")
+
+
+# How much of a matched value an excerpt may reveal. Four is the PCI DSS 3.4
+# allowance for a PAN and is the most any rule here needs; it exists so an
+# operator can correlate one alert with another, never so the value can be read.
+_EXCERPT_TAIL = 4
+# Fixed-width mask: a mask that mirrored the input would leak its length, which
+# is itself identifying for many credential formats.
+_EXCERPT_MASK = "*" * 8
+
+
+def _redact_excerpt(match_text: str, max_len: int = _EXCERPT_TAIL) -> str:
+    """Return a masked preview of a match, never the match itself.
+
+    This used to be ``match_text[:12] + "***"`` — a *truncation*. Every pattern
+    shorter than the cut therefore survived in full: an SSN redacted to
+    ``123-45-6789***``, a phone number to ``415-555-1234***``, a private address
+    to ``10.1.2.3***``, and 12 of a card's 16 digits. The excerpt *was* the
+    finding.
+
+    That matters well beyond the log line: redaction is applied at the durable
+    storage boundary, but the same alert object also reaches the alert webhook,
+    the control-plane push, disk spillover, and the ``/ws/proxy/alerts`` stream.
+
+    An excerpt exists so a human can tell *which* rule fired and correlate
+    repeats — so it keeps a short tail and masks the rest. A value too short for
+    a tail to be non-identifying is masked outright.
+    """
+    tail = max(0, min(max_len, _EXCERPT_TAIL))
+    # Below ~3x the tail, the revealed characters are a large fraction of a
+    # short secret, so reveal nothing at all.
+    if not match_text or len(match_text) < tail * 3:
         return "***"
-    return match_text[:max_len] + "***"
+    return _EXCERPT_MASK + match_text[-tail:]
 
 
 def _scan_patterns(
@@ -196,6 +323,7 @@ def scan_content(text: str, config: ScanConfig) -> list[ScanResult]:
     if not config.enabled or not text:
         return []
 
+    text = _normalize_detector_text(text)
     is_enforce = config.mode == "enforce"
     results: list[ScanResult] = []
 
@@ -237,6 +365,8 @@ def scan_content(text: str, config: ScanConfig) -> list[ScanResult]:
                 is_enforce,
             )
         )
+        # Modern token formats missed by the shared ruleset above.
+        results.extend(_scan_patterns(text, _GATEWAY_SECRET_PATTERNS, "secrets", is_enforce))
 
     # Payload vulnerability scanning
     if "payload_vuln" in config.scanners:
@@ -306,7 +436,7 @@ def load_scan_config(policy: dict) -> ScanConfig:
 
     return ScanConfig(
         enabled=bool(section.get("enabled", False)),
-        mode=str(section.get("mode", "audit")),
+        mode=str(section.get("mode", "enforce")),
         scanners=list(section.get("scanners", ["injection", "pii", "secrets", "payload_vuln"])),
         pii_action=str(section.get("pii_action", "redact")),
     )

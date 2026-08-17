@@ -15,13 +15,14 @@ from unittest.mock import MagicMock, patch
 
 
 def test_create_client_default_redirects():
-    """create_client sets max_redirects=5 by default."""
+    """create_client disables redirect following by default."""
     import asyncio
 
     from agent_bom.http_client import create_client
 
     client = create_client()
-    assert client.max_redirects == 5
+    assert client.max_redirects == 0
+    assert client.follow_redirects is False
     asyncio.run(client.aclose())
 
 
@@ -36,14 +37,14 @@ def test_create_client_custom_redirects():
     asyncio.run(client.aclose())
 
 
-def test_create_client_follows_redirects():
-    """create_client enables follow_redirects."""
+def test_create_client_does_not_follow_redirects():
+    """Redirect following must be opt-in so SSRF validation cannot be bypassed."""
     import asyncio
 
     from agent_bom.http_client import create_client
 
     client = create_client()
-    assert client.follow_redirects is True
+    assert client.follow_redirects is False
     asyncio.run(client.aclose())
 
 
@@ -100,7 +101,7 @@ def test_cvss_valid_score_accepted():
         "database_specific": {"severity": "HIGH"},
     }
 
-    severity, score = parse_osv_severity(vuln_data)
+    severity, score, _sev_src = parse_osv_severity(vuln_data)
     # Should accept the score — exact value depends on CVSS parsing
     assert severity is not None
 
@@ -115,7 +116,7 @@ def test_cvss_out_of_range_rejected():
         "database_specific": {"severity": "CRITICAL"},
     }
 
-    severity, score = parse_osv_severity(vuln_data)
+    severity, score, _sev_src = parse_osv_severity(vuln_data)
     # Should reject the out-of-range score and fall back to label
     assert score is None or (score is not None and 0.0 <= score <= 10.0)
 
@@ -129,7 +130,7 @@ def test_cvss_negative_rejected():
         "database_specific": {"severity": "LOW"},
     }
 
-    severity, score = parse_osv_severity(vuln_data)
+    severity, score, _sev_src = parse_osv_severity(vuln_data)
     assert score is None or (score is not None and 0.0 <= score <= 10.0)
 
 
@@ -216,6 +217,92 @@ glibc-2.34-83.el9.x86_64
     # Check version parsing
     bash = next(p for p in rpm_pkgs if p.name == "bash")
     assert "5.2.26" in bash.version
+
+
+def test_flattened_legacy_bdb_rpmdb_is_decoded_natively():
+    """The docker-export fallback decodes legacy RPM headers without warnings."""
+    import struct
+
+    from agent_bom.image import _packages_from_tar
+    from agent_bom.oci_parser import (
+        _RPM_HDR_MAGIC,
+        _RPM_TYPE_STRING,
+        _RPMTAG_NAME,
+        _RPMTAG_RELEASE,
+        _RPMTAG_VERSION,
+    )
+
+    strings = {
+        _RPMTAG_NAME: b"bash\x00",
+        _RPMTAG_VERSION: b"4.4.20\x00",
+        _RPMTAG_RELEASE: b"5.el8\x00",
+    }
+    data = b""
+    offsets: dict[int, int] = {}
+    for tag, value in strings.items():
+        offsets[tag] = len(data)
+        data += value
+    header = _RPM_HDR_MAGIC + struct.pack(">II", len(strings), len(data))
+    for tag in strings:
+        header += struct.pack(">IIII", tag, _RPM_TYPE_STRING, offsets[tag], 1)
+    database = b"berkeley-page\x00" + header + data
+
+    buf = BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name="var/lib/rpm/Packages")
+        info.size = len(database)
+        tf.addfile(info, BytesIO(database))
+
+    with tempfile.NamedTemporaryFile(suffix=".tar") as tmp:
+        tmp.write(buf.getvalue())
+        tmp.flush()
+        packages = _packages_from_tar(tmp.name)
+
+    assert [(p.name, p.version) for p in packages if p.ecosystem == "rpm"] == [("bash", "4.4.20-5.el8")]
+
+
+def _make_tar_with_files(files: dict[str, str]) -> bytes:
+    """Create an in-memory tar archive from a {path: content} mapping."""
+    buf = BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for path, content in files.items():
+            data = content.encode("utf-8")
+            info = tarfile.TarInfo(name=path)
+            info.size = len(data)
+            tf.addfile(info, BytesIO(data))
+    return buf.getvalue()
+
+
+def test_egg_info_python_extraction():
+    """Legacy ``*.egg-info/PKG-INFO`` is parsed from container tar as pypi."""
+    from agent_bom.image import _packages_from_tar
+
+    pkg_info = "Metadata-Version: 1.0\nName: setuptools\nVersion: 50.0.0\n"
+    tar_bytes = _make_tar_with_files({"usr/lib/python3.9/dist-packages/setuptools-50.0.egg-info/PKG-INFO": pkg_info})
+    with tempfile.NamedTemporaryFile(suffix=".tar") as tmp:
+        tmp.write(tar_bytes)
+        tmp.flush()
+        packages = _packages_from_tar(tmp.name)
+
+    pypi = [p for p in packages if p.ecosystem == "pypi"]
+    assert any(p.name == "setuptools" and p.version == "50.0.0" for p in pypi)
+
+
+def test_packages_from_tar_tags_distro_from_usr_lib_os_release():
+    """OS packages are tagged with the distro detected from usr/lib/os-release."""
+    from agent_bom.image import _packages_from_tar
+
+    dpkg = "Package: bash\nVersion: 5.0-4\nStatus: install ok installed\n\n"
+    os_release = 'ID=debian\nVERSION_ID="10"\n'
+    tar_bytes = _make_tar_with_files({"var/lib/dpkg/status": dpkg, "usr/lib/os-release": os_release})
+    with tempfile.NamedTemporaryFile(suffix=".tar") as tmp:
+        tmp.write(tar_bytes)
+        tmp.flush()
+        packages = _packages_from_tar(tmp.name)
+
+    bash = next(p for p in packages if p.name == "bash")
+    assert bash.distro_name == "debian"
+    assert bash.distro_version == "10"
 
 
 # ── M5: Pre-release version filtering ────────────────────────────────────────
@@ -363,8 +450,8 @@ def test_fixed_version_skips_prerelease():
     assert result == "3.0.0"
 
 
-def test_fixed_version_fallback_to_prerelease():
-    """parse_fixed_version falls back to pre-release if no stable fix exists."""
+def test_fixed_version_suppresses_prerelease_only_fix_by_default():
+    """parse_fixed_version suppresses prerelease-only fixes by default."""
     from agent_bom.scanners import parse_fixed_version
 
     vuln_data = {
@@ -385,6 +472,31 @@ def test_fixed_version_fallback_to_prerelease():
     }
 
     result = parse_fixed_version(vuln_data, "mylib")
+    assert result is None
+
+
+def test_fixed_version_can_return_prerelease_when_explicitly_allowed():
+    """Callers can still opt in to prerelease-only fixes when needed."""
+    from agent_bom.scanners import parse_fixed_version
+
+    vuln_data = {
+        "affected": [
+            {
+                "package": {"name": "mylib", "ecosystem": "PyPI"},
+                "ranges": [
+                    {
+                        "type": "ECOSYSTEM",
+                        "events": [
+                            {"introduced": "0"},
+                            {"fixed": "2.0.0a1"},
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+
+    result = parse_fixed_version(vuln_data, "mylib", allow_prerelease=True)
     assert result == "2.0.0a1"
 
 
@@ -422,6 +534,7 @@ def test_sync_uses_batch_put():
     mock_store.batch_put.assert_called_once()
     call_args = mock_store.batch_put.call_args[0][0]
     assert len(call_args) == 3
+    assert all(isinstance(agent.canonical_id, str) for agent in call_args)
 
 
 def test_sync_batch_put_with_existing():
@@ -463,6 +576,7 @@ def test_sync_batch_put_with_existing():
     mock_store.batch_put.assert_called_once()
     call_args = mock_store.batch_put.call_args[0][0]
     assert len(call_args) == 2
+    assert all(isinstance(agent.canonical_id, str) for agent in call_args)
     # No individual put calls
     mock_store.put.assert_not_called()
 

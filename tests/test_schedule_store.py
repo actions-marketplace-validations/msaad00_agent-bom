@@ -2,13 +2,14 @@
 
 import asyncio
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from agent_bom.api.schedule_store import (
     InMemoryScheduleStore,
     ScanSchedule,
     SQLiteScheduleStore,
 )
-from agent_bom.api.scheduler import parse_cron_next
+from agent_bom.api.scheduler import parse_cron_next, validate_cron_expression
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -146,6 +147,44 @@ class TestSQLiteScheduleStore:
         store2.put(_make_schedule())
         assert store2.get("sched-1") is not None
 
+    def test_uses_scan_schedules_table_name(self, tmp_path):
+        import sqlite3
+
+        db = tmp_path / "sched.db"
+        store = SQLiteScheduleStore(str(db))
+        store.put(_make_schedule())
+
+        with sqlite3.connect(db) as conn:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert "scan_schedules" in tables
+        assert "schedules" not in tables
+
+    def test_migrates_legacy_schedules_table(self, tmp_path):
+        import sqlite3
+
+        db = tmp_path / "sched.db"
+        schedule = _make_schedule("legacy-sched", tenant_id="tenant-alpha")
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                """
+                CREATE TABLE schedules (
+                    schedule_id TEXT PRIMARY KEY,
+                    enabled INTEGER DEFAULT 1,
+                    next_run TEXT,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    data TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO schedules (schedule_id, enabled, next_run, tenant_id, data) VALUES (?, ?, ?, ?, ?)",
+                (schedule.schedule_id, int(schedule.enabled), schedule.next_run, schedule.tenant_id, schedule.model_dump_json()),
+            )
+
+        store = SQLiteScheduleStore(str(db))
+
+        assert store.get("legacy-sched", tenant_id="tenant-alpha") is not None
+
 
 # ─── parse_cron_next ──────────────────────────────────────────────────────────
 
@@ -193,6 +232,25 @@ class TestParseCronNext:
         result = parse_cron_next("*/0 * * * *", after)
         assert result is None
 
+    def test_validation_rejects_invalid_ignored_fields(self):
+        assert validate_cron_expression("0 0 bad * *") is False
+        assert parse_cron_next("0 0 bad * *", datetime(2025, 1, 1, tzinfo=timezone.utc)) is None
+
+    def test_validation_accepts_basic_five_field_cron(self):
+        assert validate_cron_expression("0 0 * * *") is True
+
+    def test_validation_accepts_lists_ranges_and_steps(self):
+        assert validate_cron_expression("5,35 1-6/2 * * 1-5") is True
+
+    def test_list_and_range_expression_finds_next_run(self):
+        after = datetime(2025, 1, 6, 0, 0, 0, tzinfo=timezone.utc)
+        result = parse_cron_next("5,35 1-6/2 * * 1-5", after)
+
+        assert result == datetime(2025, 1, 6, 1, 5, tzinfo=timezone.utc)
+
+    def test_validation_rejects_descending_ranges(self):
+        assert validate_cron_expression("0 5-1 * * *") is False
+
 
 # ─── scheduler_loop ───────────────────────────────────────────────────────────
 
@@ -207,8 +265,69 @@ class TestSchedulerLoop:
 
         triggered = []
 
-        def mock_scan(config):
-            triggered.append(config)
+        def mock_scan(config, **metadata):
+            triggered.append({"config": config, "metadata": metadata})
+            return "job-123"
+
+        async def _run():
+            task = asyncio.create_task(scheduler_loop(store, mock_scan, interval_seconds=0))
+            await asyncio.sleep(0.1)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(_run())
+        assert len(triggered) >= 1
+
+    def test_in_memory_store_ignores_postgres_env(self, monkeypatch):
+        """Global Postgres env should not block non-Postgres schedule stores."""
+        from agent_bom.api.scheduler import scheduler_loop
+
+        store = InMemoryScheduleStore()
+        store.put(_make_schedule("s1", next_run="2020-01-01T00:00:00+00:00", enabled=True))
+        monkeypatch.setenv("AGENT_BOM_POSTGRES_URL", "postgresql://example.invalid/agent_bom")
+
+        triggered = []
+
+        def mock_scan(config, **metadata):
+            triggered.append({"config": config, "metadata": metadata})
+            return "job-123"
+
+        async def _run():
+            task = asyncio.create_task(scheduler_loop(store, mock_scan, interval_seconds=0))
+            await asyncio.sleep(0.1)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(_run())
+        assert len(triggered) >= 1
+
+    def test_in_memory_store_does_not_enter_postgres_rls_bypass(self, monkeypatch):
+        """SQLite/in-memory scheduling must not log Postgres RLS bypass activation."""
+        import contextlib
+
+        from agent_bom.api import postgres_store
+        from agent_bom.api.scheduler import scheduler_loop
+
+        @contextlib.contextmanager
+        def fail_if_called():
+            raise AssertionError("in-memory scheduler should not enter Postgres RLS bypass")
+            yield
+
+        store = InMemoryScheduleStore()
+        store.put(_make_schedule("s1", next_run="2020-01-01T00:00:00+00:00", enabled=True))
+        monkeypatch.setenv("AGENT_BOM_POSTGRES_URL", "postgresql://example.invalid/agent_bom")
+        monkeypatch.setattr(postgres_store, "bypass_tenant_rls", fail_if_called)
+
+        triggered = []
+
+        def mock_scan(config, **metadata):
+            triggered.append({"config": config, "metadata": metadata})
             return "job-123"
 
         async def _run():
@@ -232,8 +351,8 @@ class TestSchedulerLoop:
 
         triggered = []
 
-        def mock_scan(config):
-            triggered.append(config)
+        def mock_scan(config, **metadata):
+            triggered.append({"config": config, "metadata": metadata})
             return "job-123"
 
         async def _run():
@@ -254,8 +373,10 @@ class TestSchedulerLoop:
 
         store = InMemoryScheduleStore()
         store.put(_make_schedule("s1", next_run="2020-01-01T00:00:00+00:00", enabled=True))
+        triggered = []
 
-        def mock_scan(config):
+        def mock_scan(config, **metadata):
+            triggered.append({"config": config, "metadata": metadata})
             return "job-456"
 
         async def _run():
@@ -271,3 +392,51 @@ class TestSchedulerLoop:
         updated = store.get("s1")
         assert updated.last_run is not None
         assert updated.last_job_id == "job-456"
+        assert triggered[0]["metadata"]["schedule_id"] == "s1"
+        assert triggered[0]["metadata"]["tenant_id"] == "default"
+
+    def test_skips_due_scans_without_postgres_leader_lock(self, monkeypatch):
+        """Only the replica holding the advisory lock should trigger schedules."""
+        from agent_bom.api.scheduler import scheduler_loop
+
+        class PostgresScheduleStore(InMemoryScheduleStore):
+            pass
+
+        store = PostgresScheduleStore()
+        store.put(_make_schedule("s1", next_run="2020-01-01T00:00:00+00:00", enabled=True))
+        monkeypatch.setenv("AGENT_BOM_POSTGRES_URL", "postgresql://example.invalid/agent_bom")
+
+        triggered = []
+
+        class _FakeCursor:
+            def fetchone(self):
+                return (False,)
+
+        class _FakeConn:
+            def execute(self, sql, params):
+                return _FakeCursor()
+
+        class _FakePool:
+            def getconn(self):
+                return _FakeConn()
+
+            def putconn(self, conn):
+                return None
+
+        def mock_scan(config, **metadata):
+            triggered.append({"config": config, "metadata": metadata})
+            return "job-123"
+
+        async def _run():
+            task = asyncio.create_task(scheduler_loop(store, mock_scan, interval_seconds=0))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        with patch("agent_bom.api.postgres_store._get_pool", return_value=_FakePool()):
+            asyncio.run(_run())
+
+        assert triggered == []

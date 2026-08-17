@@ -1,0 +1,117 @@
+# ADR-009: Python-Primary Runtime; Optional Go Sidecar Later
+
+**Status:** Accepted
+**Date:** 2026-07-23
+
+## Context
+
+Dogfood deployments and scale discussions keep surfacing the same tension:
+Go’s concurrency model is attractive for long-lived network daemons (high
+connection fanout, cheap goroutines, predictable memory under load), while
+shipping two full product stacks (Python edition vs Go edition) would double
+maintenance across scanners, cloud connectors, API contracts, CLI, MCP tools,
+docs, and release artifacts.
+
+We already have a Go tree under `sdks/go`, and operators sometimes assume that
+implies a second runtime engine. We need a clear product boundary so
+contributors do not fork the architecture prematurely, and so scale work stays
+evidence-driven rather than language-fashion-driven.
+
+ADR-004 already chose a Python stdio/HTTP proxy path for runtime enforcement.
+That choice stands until measurement shows a hot path that Python cannot meet
+under a stable control-plane contract.
+
+## Decision
+
+**One product. Python-primary today. Optional Go worker/sidecar later — only
+for proven hot paths.**
+
+1. **Primary runtime** remains Python for scanners, cloud connectors, FastAPI
+   control plane, MCP server, CLI, and proxy/gateway as shipped today.
+2. **Optional Go sidecar/worker** may be introduced later only where profilers
+   and production load prove a hot path — for example high-concurrency gateway
+   relay or long-lived collectors — behind a **stable HTTP/gRPC contract** owned
+   by the Python control plane.
+3. **`sdks/go` remains a CLIENT SDK** for calling the control-plane API. It is
+   not a second product runtime and must not grow into a parallel scanner/API
+   engine without a new ADR.
+
+**Non-goals**
+
+- No “Python edition” vs “Go edition” of agent-bom.
+- No wholesale rewrite of cloud connectors (or the scan path) into Go without
+  profiler evidence and an explicit ADR update.
+- No requirement that scan, CLI, or MCP paths depend on a Go binary today.
+
+**Relates to:** [ADR-004](004-proxy-runtime-enforcement.md) — proxy/runtime
+enforcement stays Python until measured need justifies an optional sidecar for
+a specific hot path under the same policy/audit contract.
+
+## Consequences
+
+- **Orchestration stays Python.** Job scheduling, auth, RBAC, tenant scope,
+  graph writes, and policy remain in the control plane; any future Go process is
+  a worker the control plane starts and supervises.
+- **Release shape unchanged for now.** Primary artifacts remain the Python
+  wheel (and Docker images built from it) plus the Next.js UI. A future Go
+  sidecar would be an *additional* optional artifact, not a replacement edition.
+- **Contract-first if/when Go lands.** Sidecar I/O must be covered by contract
+  tests (HTTP/gRPC schemas, fail-open/fail-closed behavior, audit relay) so the
+  Python plane can swap or roll back without dual product semantics.
+- **Positive:** Contributors have a clear default — extend Python — and a
+  narrow, evidence-gated path for Go where concurrency truly matters.
+- **Negative:** Some network-daemon workloads may hit Python concurrency limits
+  before a sidecar exists; mitigate with horizontal workers and measurement
+  rather than speculative rewrites.
+
+### Phase 3 Go spike (2026-07-24) — **defer**
+
+Measured `runtime/gateway-relay` behind `AGENT_BOM_GATEWAY_RELAY_BACKEND=go`
+against the default Python in-process relay
+(`docs/perf/results/gateway-relay-go-spike-2026-07-24.json` and the c=500 soak
+decision in `docs/perf/results/gateway-relay-decision-2026-07-23.json`).
+
+| Backend | p95 @ 50 | p95 @ 500 |
+|---------|---------:|----------:|
+| python  | 1319.6 ms | 1447.6 ms |
+| go      | 1172.8 ms | 1326.6 ms |
+
+Go improved p95 by roughly 8% in the scrubbed 100-req soak and by ~6% vs the
+tuned Python full-ladder artifact at c=500 (Python p95 2572.27 ms → Go p95
+2426.12 ms; ratio ~0.94). Neither run met promote thresholds (Go p95 < 50%
+of Python p95, or Go p95 < 50 ms). **Defer promotion:** Python stays the
+default pure-relay implementation; the Go sidecar remains an optional
+experimental flag + Helm values stub. Revisit only with stronger evidence
+(pool tuning, multi-replica EKS soak, or a clear SLO miss that Python cannot
+close).
+
+### Retired (2026-07-25) — Go runtime tier removed
+
+Both Go runtime workloads are deleted; `sdks/go` (a client SDK with no runtime
+role) is unaffected.
+
+**`runtime/gateway-relay` — removed.** The measured 8% p95 gain never came
+close to the promote gate above, and carrying the sidecar had a real cost: the
+Python gateway set `allow_private = True` whenever the Go backend was selected,
+so choosing it bypassed the pinned transport's metadata/link-local block while
+the Go forwarder ignored `private_network_approved` entirely and served
+`/v1/forward` with no inbound auth. An 8% p95 improvement does not buy a
+weaker egress boundary. Private-network egress is once again gated solely by
+the operator-authored `private_network_approved` bit.
+
+**`runtime/event-collector` — removed.** Its `sqs` mode was never wired (the
+binary logged that it was a stub and served the same forward endpoints), no
+image was ever published, and no CI job ran its Go tests, while
+`agent_bom.cloud.event_ingest` already performs bounded polling, account-bound
+validation, dispatch, and poison-message handling in Python.
+
+**What stays.** `gateway_relay_contract.py` keeps the dataclasses and the
+`GatewayRelayTransport` Protocol — that boundary is precisely what made this
+removal a one-line transport swap rather than a rewrite, and it remains the
+seam for any future out-of-process relay. The HTTP ingest contract
+`POST /v1/cloud/connections/events/ingest` also stays: it is
+implementation-agnostic, so any collector may post to it.
+
+**Standing guidance.** Python remains the default for all runtime workloads.
+A future Go component must clear the promote gate above *and* carry its own
+CI build/test job before it merges.

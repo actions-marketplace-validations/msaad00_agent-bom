@@ -8,41 +8,56 @@ on:
       - 'mkdocs.yml'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      deploy:
+        description: 'Deploy built docs to GitHub Pages'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: pages
-  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup-python
         with:
-          python-version: '3.12'
-
-      - name: Install MkDocs
-        run: uv pip install --system mkdocs-material==9.7.4  # mkdocs-material ships no CLI; install into system env
+          python-version: '3.11'
 
       - name: Build site
-        run: mkdocs build --strict
+        run: >-
+          uv tool run
+          --from mkdocs==1.6.1
+          --with mkdocs-material==9.7.5
+          --with mkdocstrings==1.0.3
+          --with mkdocstrings-python==2.0.3
+          mkdocs build --strict
 
-      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4.0.0
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: site
 
   deploy:
+    if: ${{ github.ref == 'refs/heads/main' && (github.event_name != 'workflow_call' || inputs.deploy == true) }}
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Serialize only real Pages deployments. Keeping this at job level (not the
+    # whole workflow) means build-only validation runs — e.g. the release
+    # workflow calling this with deploy:false — never join the pages group and
+    # so can't cancel an in-progress deploy. cancel-in-progress:false lets a
+    # running production deploy finish instead of being cancelled mid-flight.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     permissions:
       pages: write
       id-token: write
@@ -51,4 +66,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

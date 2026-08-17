@@ -1,0 +1,111 @@
+import {
+  LARGE_GRAPH_OVERVIEW_EDGE_THRESHOLD,
+  LARGE_GRAPH_OVERVIEW_NODE_THRESHOLD,
+} from "@/lib/large-graph-overview";
+
+export type GraphRendererKind = "react-flow" | "webgl";
+
+export interface GraphRendererDecisionInput {
+  nodeCount: number;
+  edgeCount: number;
+  captureMode?: boolean | undefined;
+  selectedAttackPath?: boolean | undefined;
+  reachabilityActive?: boolean | undefined;
+  rollupActive?: boolean | undefined;
+  graphOnlyFindings?: boolean | undefined;
+  /**
+   * Retired opt-in for the WebGL overview. WebGL is now the default renderer
+   * for broad graphs, so this flag is accepted for backward compatibility but
+   * no longer affects the decision.
+   */
+  webglEnabled?: boolean | undefined;
+}
+
+export interface GraphRendererDecision {
+  kind: GraphRendererKind;
+  reason: string;
+  interactive: boolean;
+  supportsInvestigation: boolean;
+}
+
+/**
+ * Roll-up navigation already bounds the React Flow node set to the current
+ * hierarchy level. Virtualizing that tiny set before the first fitView
+ * measurement can leave every card outside the initial viewport, so render
+ * roll-up cards eagerly and retain virtualization for ordinary topology.
+ */
+export function shouldVirtualizeReactFlowNodes({
+  rollupActive = false,
+}: Pick<GraphRendererDecisionInput, "rollupActive">): boolean {
+  return !rollupActive;
+}
+
+export function decideGraphRenderer({
+  nodeCount,
+  edgeCount,
+  captureMode = false,
+  selectedAttackPath = false,
+  reachabilityActive = false,
+  rollupActive = false,
+  graphOnlyFindings = false,
+}: GraphRendererDecisionInput): GraphRendererDecision {
+  if (captureMode) {
+    return {
+      kind: "react-flow",
+      reason: "capture-mode",
+      interactive: true,
+      supportsInvestigation: true,
+    };
+  }
+  if (selectedAttackPath) {
+    return {
+      kind: "react-flow",
+      reason: "attack-path-focus",
+      interactive: true,
+      supportsInvestigation: true,
+    };
+  }
+  if (reachabilityActive) {
+    return {
+      kind: "react-flow",
+      reason: "reachability-drill-in",
+      interactive: true,
+      supportsInvestigation: true,
+    };
+  }
+  if (rollupActive) {
+    return {
+      kind: "react-flow",
+      reason: "estate-rollup-navigation",
+      interactive: true,
+      supportsInvestigation: true,
+    };
+  }
+  if (graphOnlyFindings) {
+    return {
+      kind: "react-flow",
+      reason: "findings-only-fallback",
+      interactive: true,
+      supportsInvestigation: true,
+    };
+  }
+
+  const broadGraph =
+    nodeCount >= LARGE_GRAPH_OVERVIEW_NODE_THRESHOLD ||
+    edgeCount >= LARGE_GRAPH_OVERVIEW_EDGE_THRESHOLD;
+  if (broadGraph) {
+    return {
+      kind: "webgl",
+      reason: "large-graph-webgl-overview",
+      interactive: true,
+      supportsInvestigation: false,
+    };
+  }
+
+  return {
+    kind: "react-flow",
+    reason: "focused-interactive-graph",
+    interactive: true,
+    supportsInvestigation: true,
+  };
+}

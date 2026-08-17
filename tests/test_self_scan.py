@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+from unittest.mock import patch
 
 from click.testing import CliRunner
 
 from agent_bom.cli import main
+from agent_bom.cli.agents import _build_self_scan_inventory
 
 
 class TestSelfScanInventory:
@@ -52,6 +54,58 @@ class TestSelfScanInventory:
                 pass
         assert resolved >= 5, f"Expected >=5 resolved deps, got {resolved}"
 
+    def test_self_scan_inventory_walks_installed_distributions(self):
+        """Per #2197 audit: self-scan walks every installed distribution
+        in the venv (not just declared deps), excludes agent-bom itself,
+        and dedups duplicate (name, version, ecosystem) tuples."""
+
+        class _FakeDist:
+            def __init__(self, name: str, version: str) -> None:
+                self.metadata = {"Name": name}
+                self.version = version
+
+        fake_dists = [
+            _FakeDist("agent-bom", "0.75.9"),  # excluded -- this IS the tool
+            _FakeDist("requests", "2.33.0"),
+            _FakeDist("Requests", "2.33.0"),  # case-only duplicate, dropped
+            _FakeDist("urllib3", "2.0.0"),  # transitive dep, must appear
+            _FakeDist("", "1.0.0"),  # empty name, dropped
+            _FakeDist("foo", ""),  # empty version, dropped
+        ]
+
+        with patch("importlib.metadata.distributions", return_value=fake_dists):
+            inventory = _build_self_scan_inventory()
+
+        agent = inventory["agents"][0]
+        packages = agent["mcp_servers"][0]["packages"]
+        assert agent["config_path"] == "self-scan://agent-bom"
+        # Sorted by lowercased name; agent-bom self excluded; the first
+        # case-variant ("requests") wins the dedup key, so capitalised
+        # "Requests" is dropped; empty name/version entries dropped.
+        assert packages == [
+            {"name": "requests", "version": "2.33.0", "ecosystem": "pypi"},
+            {"name": "urllib3", "version": "2.0.0", "ecosystem": "pypi"},
+        ]
+
+    def test_self_scan_skips_malformed_distributions(self):
+        """Malformed local dist-info metadata should not crash self-scan."""
+
+        class _FakeDist:
+            def __init__(self, metadata: dict[str, str], version: str) -> None:
+                self.metadata = metadata
+                self.version = version
+
+        fake_dists = [
+            _FakeDist({}, "1.0.0"),
+            _FakeDist({"Name": "requests"}, "2.33.0"),
+        ]
+
+        with patch("importlib.metadata.distributions", return_value=fake_dists):
+            inventory = _build_self_scan_inventory()
+
+        packages = inventory["agents"][0]["mcp_servers"][0]["packages"]
+        assert packages == [{"name": "requests", "version": "2.33.0", "ecosystem": "pypi"}]
+
 
 class TestSelfScanCLI:
     """Integration tests for --self-scan via CLI runner."""
@@ -68,14 +122,36 @@ class TestSelfScanCLI:
         runner = CliRunner()
         result = runner.invoke(
             main,
-            ["scan", "--self-scan", "--output", str(out_file), "--format", "json", "--quiet"],
+            ["scan", "--self-scan", "--no-scan", "--output", str(out_file), "--format", "json", "--quiet"],
         )
         assert result.exit_code == 0, f"Exit {result.exit_code}: {result.output}"
         data = json.loads(out_file.read_text())
         assert "agents" in data or "inventory" in data or "vulnerabilities" in data
+        agents = data.get("agents", [])
+        assert agents, "expected self-scan to produce at least one agent"
+        packages = agents[0]["mcp_servers"][0]["packages"]
+        assert len(packages) >= 5, f"expected self-scan to retain multiple dependencies, got {len(packages)}"
+        assert all(pkg.get("ecosystem") != "mcp-registry" for pkg in packages), "self-scan should not collapse to MCP registry fallback"
 
     def test_self_scan_shows_packages(self):
         """--self-scan discovers agent-bom dependencies."""
         runner = CliRunner()
         result = runner.invoke(main, ["scan", "--self-scan", "--dry-run"])
         assert result.exit_code == 0, f"Exit {result.exit_code}: {result.output}"
+
+    def test_self_scan_graph_export_is_not_empty(self, tmp_path):
+        """self-scan JSON should remain compatible with graph export."""
+        report = tmp_path / "self-scan.json"
+        runner = CliRunner()
+
+        scan_result = runner.invoke(
+            main,
+            ["scan", "--self-scan", "--no-scan", "--output", str(report), "--format", "json", "--quiet"],
+        )
+        assert scan_result.exit_code == 0, f"Exit {scan_result.exit_code}: {scan_result.output}"
+
+        graph_result = runner.invoke(main, ["graph", str(report), "--format", "json"])
+        assert graph_result.exit_code == 0, f"Exit {graph_result.exit_code}: {graph_result.output}"
+        data = json.loads(graph_result.output)
+        assert data["stats"]["node_count"] > 0
+        assert data["stats"]["edge_count"] > 0

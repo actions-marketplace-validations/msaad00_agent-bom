@@ -1,11 +1,8 @@
-"""Nebius cloud discovery — GPU cloud AI workloads, AI Studio, and compute instances.
-
-Requires ``requests``.  Install with::
-
-    pip install 'agent-bom[nebius]'
+"""Nebius cloud discovery — GPU cloud AI workloads, AI Studio, compute instances, and InfiniBand training.
 
 Authentication uses Nebius credentials (NEBIUS_API_KEY + NEBIUS_PROJECT_ID env vars).
-Nebius does not have an official Python SDK, so all API calls use REST via requests.
+Nebius does not have an official Python SDK, so all API calls use REST via the shared
+``http_client`` (retry, timeout, SSRF guards).
 """
 
 from __future__ import annotations
@@ -16,9 +13,12 @@ import os
 import shutil
 import subprocess
 
+from agent_bom import http_client
+from agent_bom.discovery_envelope import RedactionStatus, ScanMode, attach_envelope_to_agents
 from agent_bom.models import Agent, AgentType, MCPServer, MCPTool, Package, TransportType
 
 from .base import CloudDiscoveryError
+from .normalization import build_cloud_origin, build_package_purl, parse_container_image_package
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +30,14 @@ _API_TIMEOUT = 15
 
 def _nebius_get(url: str, api_key: str, params: dict | None = None) -> dict:
     """Make an authenticated GET request to a Nebius REST API endpoint."""
-    import requests
-
-    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
-    resp = requests.get(url, headers=headers, params=params, timeout=_API_TIMEOUT)
+    resp = http_client.sync_get(
+        url,
+        timeout=_API_TIMEOUT,
+        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+        params=params,
+    )
+    if resp is None:
+        raise CloudDiscoveryError("Nebius: request failed after retries")
     resp.raise_for_status()
     return resp.json()
 
@@ -50,26 +54,33 @@ def _nebius_get_all(url: str, api_key: str, items_key: str, params: dict | None 
         items_key: Top-level key containing the list (e.g. ``"models"``, ``"instances"``).
         params: Additional query parameters.
     """
-    import requests
-
-    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
     all_items: list = []
     page_params = dict(params or {})
     _max_pages = 50  # safety cap — prevents infinite loops on malformed responses
 
-    for _ in range(_max_pages):
-        resp = requests.get(url, headers=headers, params=page_params, timeout=_API_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
+    with http_client.create_sync_client(timeout=_API_TIMEOUT) as client:
+        headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+        for _ in range(_max_pages):
+            resp = http_client.sync_request_with_retry(
+                client,
+                "GET",
+                url,
+                headers=headers,
+                params=page_params,
+            )
+            if resp is None:
+                raise CloudDiscoveryError("Nebius: request failed after retries")
+            resp.raise_for_status()
+            data = resp.json()
 
-        # Nebius API uses both "models"/"instances" keys and a generic "data" fallback
-        items = data.get(items_key, data.get("data", []))
-        all_items.extend(items if isinstance(items, list) else [])
+            # Nebius API uses both "models"/"instances" keys and a generic "data" fallback
+            items = data.get(items_key, data.get("data", []))
+            all_items.extend(items if isinstance(items, list) else [])
 
-        next_token = data.get("nextPageToken") or data.get("next_page_token", "")
-        if not next_token:
-            break
-        page_params["pageToken"] = next_token
+            next_token = data.get("nextPageToken") or data.get("next_page_token", "")
+            if not next_token:
+                break
+            page_params["pageToken"] = next_token
 
     return all_items
 
@@ -81,19 +92,14 @@ def discover(
     """Discover AI workloads from Nebius GPU cloud.
 
     Discovers AI Studio inference endpoints, GPU compute instances,
-    Managed K8s GPU pods, and container services.
+    Managed K8s GPU pods, container services, and InfiniBand training jobs.
 
     Returns:
         (agents, warnings) — discovered agents and non-fatal warnings.
 
     Raises:
-        CloudDiscoveryError: if ``requests`` is not installed.
+        CloudDiscoveryError: on unrecoverable API errors.
     """
-    try:
-        import requests  # noqa: F401
-    except ImportError:
-        raise CloudDiscoveryError("requests is required for Nebius discovery. Install with: pip install 'agent-bom[nebius]'")
-
     agents: list[Agent] = []
     warnings: list[str] = []
 
@@ -140,6 +146,32 @@ def discover(
     except Exception as exc:
         warnings.append(f"Nebius container service discovery error: {exc}")
 
+    # ── InfiniBand training jobs ──────────────────────────────────────────
+    try:
+        ib_agents, ib_warns = _discover_infiniband_jobs(resolved_key, resolved_project)
+        agents.extend(ib_agents)
+        warnings.extend(ib_warns)
+    except Exception as exc:
+        warnings.append(f"Nebius InfiniBand discovery error: {exc}")
+
+    # Per-run discovery envelope (#2083 PR B).
+    scope: list[str] = []
+    if resolved_project:
+        scope.append(f"nebius:project/{resolved_project}")
+    attach_envelope_to_agents(
+        agents,
+        scan_mode=ScanMode.CLOUD_READ_ONLY,
+        discovery_scope=tuple(scope),
+        permissions_used=(
+            "ai-studio:endpoints:list",
+            "ai-studio:endpoints:get",
+            "compute:instances:list",
+            "compute:instances:get",
+            "k8s:pods:list",
+            "container-service:list",
+        ),
+        redaction_status=RedactionStatus.CENTRAL_SANITIZER_APPLIED,
+    )
     return agents, warnings
 
 
@@ -184,6 +216,7 @@ def _discover_ai_studio(
                     name=model_name,
                     version=str(model_version),
                     ecosystem="nebius-ai-studio",
+                    purl=build_package_purl(ecosystem="nebius-ai-studio", name=model_name, version=str(model_version)),
                 )
             ]
 
@@ -203,6 +236,17 @@ def _discover_ai_studio(
                 source="nebius-ai-studio",
                 version=f"{status} (v{model_version})",
                 mcp_servers=[server],
+                metadata={
+                    "cloud_origin": build_cloud_origin(
+                        provider="nebius",
+                        service="ai-studio",
+                        resource_type="model",
+                        resource_id=model_id,
+                        resource_name=model_name,
+                        project_id=project_id,
+                        raw_identity={"id": model_id, "name": model_name, "status": status, "version": model_version},
+                    )
+                },
             )
             agents.append(agent)
 
@@ -275,6 +319,11 @@ def _discover_gpu_instances(
                         name=boot_disk.get("image_name", image_id),
                         version="detected",
                         ecosystem="nebius-compute-image",
+                        purl=build_package_purl(
+                            ecosystem="nebius-compute-image",
+                            name=boot_disk.get("image_name", image_id),
+                            version="detected",
+                        ),
                     )
                 )
 
@@ -293,7 +342,20 @@ def _discover_gpu_instances(
                 source="nebius-gpu",
                 version=status,
                 mcp_servers=[server],
-                metadata={"gpu_count": gpu_count, "gpu_type": gpu_type, "ai_workload": is_ai_workload},
+                metadata={
+                    "gpu_count": gpu_count,
+                    "gpu_type": gpu_type,
+                    "ai_workload": is_ai_workload,
+                    "cloud_origin": build_cloud_origin(
+                        provider="nebius",
+                        service="compute",
+                        resource_type="gpu-instance",
+                        resource_id=inst_id,
+                        resource_name=inst_name,
+                        project_id=project_id,
+                        raw_identity={"id": inst_id, "name": inst_name, "platform_id": platform_id, "status": status},
+                    ),
+                },
             )
             agents.append(agent)
 
@@ -367,13 +429,19 @@ def _discover_k8s_gpu_pods(
                         continue
                     seen_images.add(image_ref)
 
-                    packages = [
-                        Package(
-                            name=image_ref.split("/")[-1].split(":")[0],
-                            version=image_ref.split(":")[-1] if ":" in image_ref else "latest",
-                            ecosystem="container-image",
-                        )
-                    ]
+                    image_parts = parse_container_image_package(image_ref)
+                    packages = (
+                        [
+                            Package(
+                                name=image_parts[0],
+                                version=image_parts[1],
+                                ecosystem="container-image",
+                                purl=build_package_purl(ecosystem="container-image", name=image_parts[0], version=image_parts[1]),
+                            )
+                        ]
+                        if image_parts
+                        else []
+                    )
 
                     server = MCPServer(
                         name=f"nebius-k8s-gpu:{pod_ns}/{pod_name}/{container_name}",
@@ -390,7 +458,19 @@ def _discover_k8s_gpu_pods(
                         source="nebius-k8s-gpu",
                         version=f"gpu-request:{gpu_request or gpu_limit}",
                         mcp_servers=[server],
-                        metadata={"image": image_ref, "container": container_name},
+                        metadata={
+                            "image": image_ref,
+                            "container": container_name,
+                            "cloud_origin": build_cloud_origin(
+                                provider="nebius",
+                                service="kubernetes",
+                                resource_type="gpu-pod",
+                                resource_id=f"{pod_ns}/{pod_name}",
+                                resource_name=pod_name,
+                                project_id=project_id,
+                                raw_identity={"namespace": pod_ns, "pod": pod_name, "container": container_name, "image": image_ref},
+                            ),
+                        },
                     )
                     agents.append(agent)
 
@@ -447,10 +527,140 @@ def _discover_container_services(
                 config_path=f"nebius://{project_id}/containers/{svc_id}",
                 source="nebius-container",
                 mcp_servers=[server],
+                metadata={
+                    "cloud_origin": build_cloud_origin(
+                        provider="nebius",
+                        service="containers",
+                        resource_type="container",
+                        resource_id=svc_id,
+                        resource_name=svc_name,
+                        project_id=project_id,
+                        raw_identity={"id": svc_id, "name": svc_name, "image": image},
+                    )
+                },
             )
             agents.append(agent)
 
     except Exception as exc:
         warnings.append(f"Could not list Nebius container services: {exc}")
+
+    return agents, warnings
+
+
+# ── InfiniBand Training Jobs ──────────────────────────────────────────────
+
+
+def _discover_infiniband_jobs(
+    api_key: str,
+    project_id: str,
+) -> tuple[list[Agent], list[str]]:
+    """Discover multi-node training pods using Nebius InfiniBand (rdma/ib resources).
+
+    Scans all namespaces via kubectl for pods requesting ``rdma/ib`` resources,
+    which indicates multi-node NCCL training over InfiniBand fabric.  Mirrors the
+    CoreWeave InfiniBand discovery pattern.  Requires kubectl configured with
+    Nebius cluster credentials.
+    """
+    agents: list[Agent] = []
+    warnings: list[str] = []
+
+    if not shutil.which("kubectl"):
+        logger.debug("kubectl not found — skipping Nebius InfiniBand job discovery")
+        return agents, warnings
+
+    try:
+        result = subprocess.run(
+            ["kubectl", "get", "pods", "-A", "-o", "json"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        if result.returncode != 0:
+            warnings.append(f"kubectl failed for Nebius InfiniBand jobs: {result.stderr.strip()[:200]}")
+            return agents, warnings
+
+        data = json.loads(result.stdout)
+        seen_jobs: set[str] = set()
+
+        for pod in data.get("items", []):
+            meta = pod.get("metadata", {})
+            pod_name = meta.get("name", "unknown")
+            pod_ns = meta.get("namespace", "default")
+
+            for container in pod.get("spec", {}).get("containers", []):
+                resources = container.get("resources", {})
+                limits = resources.get("limits", {})
+                requests_res = resources.get("requests", {})
+
+                ib_limit = str(limits.get("rdma/ib", "0"))
+                ib_request = str(requests_res.get("rdma/ib", "0"))
+
+                if ib_limit == "0" and ib_request == "0":
+                    continue
+
+                job_key = f"{pod_ns}/{pod_name}"
+                if job_key in seen_jobs:
+                    continue
+                seen_jobs.add(job_key)
+
+                image_ref = container.get("image", "").strip()
+                gpu_limits = str(limits.get("nvidia.com/gpu", "0"))
+
+                packages: list[Package] = []
+                if image_ref:
+                    image_parts = parse_container_image_package(image_ref)
+                    if image_parts:
+                        packages.append(
+                            Package(
+                                name=image_parts[0],
+                                version=image_parts[1],
+                                ecosystem="container-image",
+                                purl=build_package_purl(
+                                    ecosystem="container-image",
+                                    name=image_parts[0],
+                                    version=image_parts[1],
+                                ),
+                            )
+                        )
+
+                server = MCPServer(
+                    name=f"nebius-training:{pod_ns}/{pod_name}",
+                    transport=TransportType.UNKNOWN,
+                    packages=packages,
+                )
+
+                agent = Agent(
+                    name=f"nebius-training:{pod_ns}/{pod_name}",
+                    agent_type=AgentType.CUSTOM,
+                    config_path=f"nebius://{project_id}/training/{pod_ns}/{pod_name}",
+                    source="nebius-training",
+                    version=f"infiniband+gpu:{gpu_limits}" if gpu_limits != "0" else "infiniband",
+                    mcp_servers=[server],
+                    metadata={
+                        "training_job": True,
+                        "infiniband": True,
+                        "gpu_count": int(gpu_limits) if gpu_limits != "0" else 0,
+                        "image": image_ref,
+                        "kind": "Pod",
+                        "cloud_origin": build_cloud_origin(
+                            provider="nebius",
+                            service="kubernetes",
+                            resource_type="training-pod",
+                            resource_id=f"{pod_ns}/{pod_name}",
+                            resource_name=pod_name,
+                            project_id=project_id,
+                            raw_identity={"namespace": pod_ns, "pod": pod_name, "image": image_ref},
+                        ),
+                    },
+                )
+                agents.append(agent)
+
+    except json.JSONDecodeError as exc:
+        warnings.append(f"kubectl produced invalid JSON for InfiniBand jobs: {exc}")
+    except subprocess.TimeoutExpired:
+        warnings.append("kubectl timed out during Nebius InfiniBand job discovery")
+    except Exception as exc:
+        warnings.append(f"Nebius InfiniBand job discovery failed: {exc}")
 
     return agents, warnings

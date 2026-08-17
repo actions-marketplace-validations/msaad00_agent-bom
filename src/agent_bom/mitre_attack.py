@@ -4,8 +4,8 @@ Maps three finding types to MITRE ATT&CK Enterprise techniques.  All technique
 IDs, names, and CWE mappings are loaded from MITRE's published data — nothing
 is hardcoded in this module.
 
-Data source: :mod:`agent_bom.mitre_fetch` (fetches from MITRE GitHub STIX,
-cached 30 days).
+Data source: :mod:`agent_bom.mitre_fetch` (bundled normalized ATT&CK/CAPEC
+catalog by default, with optional explicit refresh from upstream STIX).
 
 Finding types:
 
@@ -35,18 +35,25 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ─── Public catalog accessors — always from fetched/cached MITRE data ─────────
+# ─── Public catalog accessors — always from the active MITRE catalog ──────────
 
 
 def get_attack_techniques() -> dict[str, str]:
-    """Return ``{technique_id: name}`` from the cached ATT&CK catalog.
-
-    Fetches from MITRE GitHub on first call; cached for 30 days.  Returns
-    empty dict on network failure so callers degrade gracefully.
-    """
+    """Return ``{technique_id: name}`` from the active ATT&CK catalog."""
     from agent_bom.mitre_fetch import get_techniques
 
     return {tid: meta["name"] for tid, meta in get_techniques().items()}
+
+
+def get_bundled_attack_techniques() -> dict[str, str]:
+    """Return ``{technique_id: name}`` from the bundled ATT&CK catalog only.
+
+    Deterministic and offline (ignores any synced catalog). Used for disclosing
+    the bundled technique count in compliance coverage metadata and docs.
+    """
+    from agent_bom.mitre_fetch import get_bundled_techniques
+
+    return {tid: meta["name"] for tid, meta in get_bundled_techniques().items()}
 
 
 # Legacy alias kept for callers that import ATTACK_TECHNIQUES directly from
@@ -132,16 +139,38 @@ _CHECK_KEYWORD_TACTICS: list[tuple[tuple[str, ...], list[str]]] = [
     (("encryption", "kms", "tls", "ssl", "crypto"), ["credential-access"]),
 ]
 
+_BROAD_TACTIC_FALLBACK_LIMIT = 3
+_PREFERRED_TACTIC_TECHNIQUES: dict[str, tuple[str, ...]] = {
+    "initial-access": ("T1190", "T1195", "T1078"),
+    "credential-access": ("T1552", "T1556", "T1110"),
+    "execution": ("T1059", "T1204", "T1129"),
+    "command-and-control": ("T1090", "T1105", "T1071"),
+    "collection": ("T1005", "T1530", "T1119"),
+    "exfiltration": ("T1041", "T1048", "T1537"),
+    "defense-evasion": ("T1562", "T1027", "T1036"),
+    "privilege-escalation": ("T1548", "T1068", "T1134"),
+    "impact": ("T1499", "T1485", "T1565"),
+}
 
-def _techniques_for_tactics(tactic_phases: list[str]) -> list[str]:
-    """Return technique IDs from the catalog that belong to any of the given tactic phases."""
+
+def _bounded_techniques_for_tactics(tactic_phases: list[str]) -> list[str]:
+    """Return a small representative set for broad context-only tactic signals."""
     from agent_bom.mitre_fetch import get_techniques
 
     all_techniques = get_techniques()
     result: list[str] = []
-    for tid, meta in all_techniques.items():
-        if any(t in tactic_phases for t in meta.get("tactics", [])):
-            result.append(tid)
+    seen: set[str] = set()
+    for tactic in sorted(set(tactic_phases)):
+        preferred = [
+            tid
+            for tid in _PREFERRED_TACTIC_TECHNIQUES.get(tactic, ())
+            if tid in all_techniques and tactic in all_techniques[tid].get("tactics", [])
+        ]
+        fallback = sorted(tid for tid, meta in all_techniques.items() if tid not in preferred and tactic in meta.get("tactics", []))
+        for tid in [*preferred, *fallback][:_BROAD_TACTIC_FALLBACK_LIMIT]:
+            if tid not in seen:
+                seen.add(tid)
+                result.append(tid)
     return result
 
 
@@ -151,9 +180,9 @@ def _techniques_for_tactics(tactic_phases: list[str]) -> list[str]:
 def tag_cis_check(check: object) -> list[str]:
     """Return MITRE ATT&CK Enterprise technique IDs for a failed CIS check.
 
-    Resolves techniques from the live ATT&CK catalog (fetched from MITRE) by
+    Resolves techniques from the active ATT&CK catalog by
     mapping the check's section keywords and title keywords to tactic phases,
-    then returning all techniques in those tactics.
+    then returning a bounded representative set from those tactics.
 
     Only FAILED checks are tagged.  Passing/error checks produce no output.
 
@@ -190,7 +219,7 @@ def tag_cis_check(check: object) -> list[str]:
         # Default: any failed check is at minimum an initial-access signal
         tactic_phases.add("initial-access")
 
-    return sorted(set(_techniques_for_tactics(list(tactic_phases))))
+    return sorted(set(_bounded_techniques_for_tactics(list(tactic_phases))))
 
 
 def tag_provenance_finding(finding: dict) -> list[str]:
@@ -222,23 +251,30 @@ def tag_provenance_finding(finding: dict) -> list[str]:
         if "public_large" in flag:
             tactic_phases.update(["collection", "exfiltration"])
 
-    return sorted(set(_techniques_for_tactics(list(tactic_phases))))
+    return sorted(set(_bounded_techniques_for_tactics(list(tactic_phases))))
 
 
 def tag_blast_radius(br: BlastRadius) -> list[str]:
-    """Return MITRE ATT&CK Enterprise technique IDs for a CVE blast radius.
+    """Return MITRE ATT&CK Enterprise technique IDs a CVE blast radius makes
+    APPLICABLE — an overlay, never a set of failing controls.
 
-    Combines two signal sources — all resolved against the live MITRE catalog:
+    The only signal used is MITRE's own data: each CWE weakness ID on the
+    vulnerability resolved through the official CAPEC bridge
+    (CWE → CAPEC → ATT&CK, derived from MITRE's STIX data). A technique appears
+    here because MITRE associates it with a weakness actually present in the
+    estate.
 
-    1. **CWE-based**: maps each CWE weakness ID on the vulnerability to
-       ATT&CK techniques via the official CAPEC bridge
-       (CWE → CAPEC → ATT&CK, derived from MITRE's STIX data).
-    2. **Context-based**: maps blast-radius characteristics (exposed credentials,
-       reachable exec tools, CISA KEV status, severity) to tactic phases, then
-       resolves those phases to catalog techniques.
+    Broad *context* signals — "credentials are exposed", "high severity with no
+    CWE" — used to be expanded into a representative technique set via
+    :func:`_bounded_techniques_for_tactics`. That synthesized concrete technique
+    assertions (``T1110 Brute Force`` from the mere presence of a credential,
+    ``T1195 Supply Chain Compromise`` from an unclassified high-severity CVE)
+    off no evidencing signal, so it is gone. Those tactic expansions remain for
+    :func:`tag_cis_check` and :func:`tag_provenance_finding`, where a specific
+    failed check or risk flag is the evidence.
 
-    No technique IDs are hardcoded here — every mapping resolves through the
-    fetched MITRE data.
+    The scan path does not fetch framework catalogs at runtime. Catalog refreshes
+    happen out of band so scans remain deterministic and offline-friendly.
 
     Only MITRE ATT&CK Enterprise techniques (T-codes) are returned here.
     MITRE ATLAS techniques (AML.T-codes) are handled by :func:`atlas.tag_blast_radius`.
@@ -247,54 +283,21 @@ def tag_blast_radius(br: BlastRadius) -> list[str]:
         br: A :class:`~agent_bom.models.BlastRadius` instance.
 
     Returns:
-        Sorted list of ATT&CK technique IDs from the live catalog.
-        Empty list when the catalog could not be fetched and no context
-        signals apply.
+        Sorted list of ATT&CK technique IDs from the pinned local catalog.
+        Empty list when the vulnerability carries no CAPEC-mapped CWE.
     """
-    from agent_bom.constants import high_risk_severities
     from agent_bom.mitre_fetch import get_cwe_to_attack
-    from agent_bom.risk_analyzer import ToolCapability, classify_tool
 
     cwe_map = get_cwe_to_attack()
     techniques: set[str] = set()
 
-    # 1. CWE → ATT&CK via CAPEC official data
+    # CWE → ATT&CK via CAPEC official data
     for cwe in br.vulnerability.cwe_ids:
         # Normalise: accept "CWE-78", "78", "cwe-78"
         cwe_norm = cwe.strip().upper()
         if not cwe_norm.startswith("CWE-"):
             cwe_norm = f"CWE-{cwe_norm}"
-        for tech in cwe_map.get(cwe_norm, []):
-            techniques.add(tech)
-
-    # 2. Context-based signals → tactic phases → catalog techniques
-    high_risk = high_risk_severities()
-    is_high = br.vulnerability.severity in high_risk
-
-    tactic_phases: set[str] = set()
-
-    # Exposed credentials → credential-access tactic
-    if br.exposed_credentials:
-        tactic_phases.add("credential-access")
-
-    # CISA KEV or CRITICAL severity → direct exploitation (initial-access)
-    if br.vulnerability.is_kev or br.vulnerability.severity.value == "critical":
-        tactic_phases.add("initial-access")
-
-    # Reachable exec tools → execution tactic
-    for tool in br.exposed_tools:
-        caps = classify_tool(tool.name, tool.description)
-        if ToolCapability.EXECUTE in caps:
-            tactic_phases.add("execution")
-            break
-
-    # HIGH+ with no CWE IDs → initial-access is the baseline tactic
-    if is_high and not br.vulnerability.cwe_ids:
-        tactic_phases.add("initial-access")
-
-    # Resolve tactic phases to catalog techniques
-    for tech in _techniques_for_tactics(list(tactic_phases)):
-        techniques.add(tech)
+        techniques.update(cwe_map.get(cwe_norm, []))
 
     return sorted(techniques)
 

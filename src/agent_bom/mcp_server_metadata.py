@@ -1,0 +1,683 @@
+"""Metadata and route helpers for the agent-bom MCP server."""
+
+from __future__ import annotations
+
+import ast
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+_SERVER_CARD_TOOLS = [
+    {"name": "scan", "description": "Full discovery → scan → output pipeline", "annotations": {"readOnlyHint": True}},
+    {"name": "check", "description": "Check a specific package for CVEs before installing", "annotations": {"readOnlyHint": True}},
+    {
+        "name": "intel_lookup",
+        "description": "Look up a CVE, GHSA, or OSV advisory from local threat intel",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "intel_match",
+        "description": "Match package inventory coordinates to local advisory intel",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "intel_sources",
+        "description": "Return canonical intel sources and local feed-run freshness",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "intel_daily_brief",
+        "description": "Return a local analyst threat brief from governed intel sources",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "youcom_search",
+        "description": "Search You.com for current web/news context when YDC_API_KEY is configured",
+        "annotations": {"readOnlyHint": True},
+    },
+    {"name": "blast_radius", "description": "Look up blast radius for a specific CVE", "annotations": {"readOnlyHint": True}},
+    {
+        "name": "exposure_paths",
+        "description": "Return ranked ExposurePath JSON for headless security agents and MCP clients",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "should_i_deploy",
+        "description": (
+            "Pre-deployment gate: resolves a candidate (package, CVE, resource, or graph node) against the"
+            " latest security-graph snapshot and returns an allow/warn/block decision from its top ExposurePath risk score"
+        ),
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "policy_check",
+        "description": (
+            "Evaluate security policy rules against scan findings — supports 17 conditions"
+            " including severity, KEV, EPSS, credential exposure, and custom expressions"
+        ),
+        "annotations": {"readOnlyHint": True},
+    },
+    {"name": "registry_lookup", "description": "Query MCP server threat intelligence registry", "annotations": {"readOnlyHint": True}},
+    {"name": "generate_sbom", "description": "Generate CycloneDX or SPDX SBOM", "annotations": {"readOnlyHint": True}},
+    {
+        "name": "compliance",
+        "description": (
+            "Map scan findings to framework-aware controls:"
+            " OWASP LLM/MCP/Agentic, MITRE ATLAS, NIST AI RMF/CSF/800-53, FedRAMP, EU AI Act, ISO 27001, SOC 2, CIS Controls"
+        ),
+        "annotations": {"readOnlyHint": True},
+    },
+    {"name": "remediate", "description": "Generate actionable remediation plan", "annotations": {"readOnlyHint": True}},
+    {
+        "name": "skill_scan",
+        "description": "Scan instruction files for packages, MCP servers, trust verdicts, and findings",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "skill_verify",
+        "description": "Verify Sigstore provenance for instruction and skill files",
+        "annotations": {"readOnlyHint": True},
+    },
+    {"name": "skill_trust", "description": "ClawHub-style trust assessment for SKILL.md files", "annotations": {"readOnlyHint": True}},
+    {
+        "name": "verify",
+        "description": "Verify package integrity via Sigstore cosign signatures and SLSA provenance attestation",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "inventory_summary",
+        "description": (
+            "Unified asset-inventory counts by OCSF entity type and source group (ai/cloud/identity/secrets/code)"
+            " across the one tenant-scoped graph snapshot; findings excluded"
+        ),
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "inventory_list",
+        "description": (
+            "Faceted, paginated asset rows across AI, cloud, Snowflake, and identity in the unified graph —"
+            " filter by type/search/severity/environment/provider/source with keyset paging; findings excluded"
+        ),
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "inventory_asset",
+        "description": "One asset's attributes, inbound/outbound relationships, neighbors, sources, and blast-radius impact",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "where",
+        "description": "List supported MCP client discovery paths and coverage telemetry — useful for debugging discovery issues",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "tool_risk_assessment",
+        "description": (
+            "Live-introspect configured MCP servers via tools/list and score each exposed tool by capability"
+            " (filesystem, network, code execution, credential access) to rate per-tool and per-server blast radius"
+        ),
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "inventory",
+        "description": "Quick agent and server discovery without vulnerability scanning — shows what's configured, not what's vulnerable",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "diff",
+        "description": "Compare scan against baseline; persists scan to history and prunes old reports (destructive write)",
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False},
+    },
+    {
+        "name": "marketplace_check",
+        "description": "Pre-install marketplace trust check with registry cross-reference",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "code_scan",
+        "description": (
+            "Execute Semgrep SAST with CWE-based compliance mapping and return a typed findings, clean, skipped, or failed execution status"
+        ),
+        "annotations": {"readOnlyHint": True},
+    },
+    {"name": "context_graph", "description": "Agent context graph with lateral movement analysis", "annotations": {"readOnlyHint": True}},
+    {
+        "name": "graph_export",
+        "description": "Export dependency graph in graph-native formats (GraphML, Neo4j Cypher, DOT, Mermaid)",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "analytics_query",
+        "description": "Query vulnerability trends, posture history, and runtime events from ClickHouse",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "cis_benchmark",
+        "description": "Run CIS benchmark checks against AWS, Snowflake, Azure, or GCP accounts; Databricks security best practices",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "kspm_cluster_posture",
+        "description": "Evaluate live Kubernetes cluster posture (KSPM) vs the CIS Kubernetes Benchmark, with honest per-collector state",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "fleet_scan",
+        "description": "Batch registry lookup for multiple MCP servers — returns risk levels, tool counts, and trust signals for each",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "runtime_correlate",
+        "description": "Cross-reference scan results with proxy audit logs to find actually-called vulnerable tools",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "runtime_production_index",
+        "description": "Return metadata-only runtime production posture for agent/tool traffic",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "runtime_blueprints",
+        "description": "Return canonical runtime role/profile blueprints for agent and MCP governance",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "runtime_blueprint_drift",
+        "description": "Evaluate live runtime posture against a role/profile blueprint",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "cost_report",
+        "description": "Return LLM spend attribution per agent/model/provider with budget posture, from OTel GenAI token usage",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "anomaly_scan",
+        "description": "Detect cost and behavior anomalies (per-agent spend + per-session call-rate z-score outliers)",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "drift_incidents",
+        "description": "List open blueprint-drift incidents where observed runtime traffic left the approved role blueprint",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "proxy_status",
+        "description": "Return current MCP proxy metrics and runtime alert posture",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "proxy_alerts",
+        "description": "Return recent tenant-scoped runtime proxy alerts with severity and detector filters",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "gateway_status",
+        "description": "Return gateway policy and inter-agent firewall runtime statistics",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "shield_status",
+        "description": "Return Shield session status and threat assessment without changing enforcement state",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "shield_start",
+        "description": "Start Shield enforcement for a session; requires admin role, shield:write scope, and an audit reason",
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False},
+    },
+    {
+        "name": "shield_unblock",
+        "description": "Unblock Shield enforcement for a session; requires admin role, shield:write scope, and an audit reason",
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False},
+    },
+    {
+        "name": "shield_break_glass",
+        "description": "Emergency Shield override; requires admin role, shield:write scope, and an audit reason",
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False},
+    },
+    {
+        "name": "identity_issue",
+        "description": "Issue a managed agent identity; requires admin role, identity:write scope, and an audit reason",
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
+    },
+    {
+        "name": "identity_rotate",
+        "description": "Rotate a managed agent identity with an overlap window; requires admin role, identity:write scope, audit reason",
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
+    },
+    {
+        "name": "identity_revoke",
+        "description": "Revoke a managed agent identity immediately; requires admin role, identity:write scope, and an audit reason",
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    },
+    {
+        "name": "identity_grant_jit",
+        "description": "Grant an identity time-bound JIT access to one tool; requires admin role, identity:write scope, audit reason",
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
+    },
+    {
+        "name": "identity_revoke_jit",
+        "description": "Revoke an active JIT access grant immediately; requires admin role, identity:write scope, and an audit reason",
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    },
+    {
+        "name": "firewall_check",
+        "description": "Dry-run an inter-agent firewall decision without recording control-plane state",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "audit_query",
+        "description": (
+            "Read the immutable hash-chained control-plane audit log for one tenant — filter identity/shield/firewall/policy"
+            " actions by action, resource, and time with pagination; read-only and never mutates enforcement state"
+        ),
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "audit_integrity",
+        "description": "Verify control-plane and runtime audit-chain integrity without mutating enforcement state",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "vector_db_scan",
+        "description": "Discover running vector databases (Qdrant, Weaviate, Chroma, Milvus) and assess auth + exposure (MAESTRO KC4)",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "aisvs_benchmark",
+        "description": "OWASP AISVS v1.0 compliance checks — model safety, vector store auth, inference exposure, supply chain",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "gpu_infra_scan",
+        "description": "Discover GPU containers, K8s GPU nodes, CUDA versions, and unauthenticated DCGM endpoints (MAESTRO KC6)",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "registry_sweep_scan",
+        "description": "Sweep a cloud registry (ECR/ACR/GAR): enumerate repos+tags, dedupe by digest, cap, scan each (read-only)",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "dataset_card_scan",
+        "description": "Scan dataset cards (HuggingFace, DVC) for licensing, provenance, and compliance tags (LLM03, ART-10)",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "training_pipeline_scan",
+        "description": "Scan MLflow/Kubeflow/W&B training artifacts for lineage, serialization risks, and compliance tags",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "browser_extension_scan",
+        "description": "Scan installed browser extensions for dangerous permissions and AI assistant domain access",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "model_provenance_scan",
+        "description": "Check ML model provenance from HuggingFace Hub or Ollama for supply chain risk signals",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "prompt_scan",
+        "description": (
+            "Statically scan prompt template files (.prompt, system_prompt.*, prompts/) for prompt-injection patterns"
+            " and unsafe variable interpolation; returns per-file findings with rule id, severity, and line"
+        ),
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "model_file_scan",
+        "description": "Scan model files (.gguf, .safetensors, .pkl, .pt) for serialization risks and format metadata",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "ai_inventory_scan",
+        "description": "Scan source code for AI SDK imports, model refs, API keys, shadow AI, deprecated models (7 languages)",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "license_compliance_scan",
+        "description": (
+            "Classify each package license as allowed/warn/blocked against an SPDX policy"
+            " — 2,500+ licenses, network-copyleft detection, deprecated ID normalization; takes a prior scan"
+            " result or an explicit package array and returns per-package verdicts with counts"
+        ),
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "ingest_external_scan",
+        "description": (
+            "Ingest tool-agnostic SARIF, CycloneDX, SPDX, Trivy, Grype, or Syft evidence and return "
+            "packages with blast radius analysis;"
+            " parse_only stays local, while pushing to the control plane requires the findings:write scope"
+        ),
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False},
+    },
+    {
+        "name": "runtime_evidence_ingest",
+        "description": (
+            "Ingest CWPP runtime/EDR workload signals into the durable evidence store "
+            "(authenticated source; metadata only; never writes to a customer cloud target)"
+        ),
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True},
+    },
+    {
+        "name": "cost_forecast",
+        "description": "Project LLM spend burn rate and budget runway (reference-only forecast)",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "cost_allocation",
+        "description": "Chargeback / showback LLM spend rollups by cost-center and allocation tag",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "credential_expiry",
+        "description": "Expiring / overdue credential and rotation posture for control-plane secrets (no secret values)",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "nhi_discover",
+        "description": "Discover non-human identities (Okta / Entra) — reference-only metadata, gated per provider",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "cloud_inventory",
+        "description": "Estate-wide cloud asset inventory summary (resource + identity counts), opt-in per provider",
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "access_review",
+        "description": "List/get NHI access-review campaigns; recomputes and persists overdue status (idempotent write)",
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True},
+    },
+    {
+        "name": "create_ticket",
+        "description": "File an ITSM ticket for a finding through a stored connect-once connection; no per-action credential",
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False},
+    },
+    {
+        "name": "sync_ticket_status",
+        "description": "Refresh a filed ITSM ticket's status through the stored ticketing connection",
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False},
+    },
+    {
+        "name": "findings_triage",
+        "description": "Record a tenant-scoped finding triage decision (queue state, VEX decision + justification) to the exception store",
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False},
+    },
+    {
+        "name": "risk_campaign_workflow",
+        "description": "List, assign, ticket, and verify tenant-scoped remediation campaigns through the shared persisted workflow",
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    },
+    {
+        "name": "cloud_side_scan",
+        "description": "Trigger one agentless Azure/GCP disk side-scan — metadata-only SBOM/CVE/secret evidence; admin-gated write",
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False},
+    },
+]
+
+_TOOL_CAPABILITY_CLASSES = {
+    "scan": ["READ", "NETWORK", "LOCAL_FILE_READ"],
+    "check": ["READ", "NETWORK"],
+    "intel_lookup": ["READ", "THREAT_INTEL"],
+    "intel_match": ["READ", "THREAT_INTEL", "INVENTORY"],
+    "intel_sources": ["READ", "THREAT_INTEL"],
+    "intel_daily_brief": ["READ", "THREAT_INTEL", "INVENTORY"],
+    "blast_radius": ["READ", "ANALYZE"],
+    "exposure_paths": ["READ", "GRAPH", "ANALYZE"],
+    "should_i_deploy": ["READ", "GRAPH", "POLICY"],
+    "policy_check": ["READ", "POLICY"],
+    "registry_lookup": ["READ", "REGISTRY"],
+    "generate_sbom": ["READ", "EXPORT"],
+    "compliance": ["READ", "COMPLIANCE"],
+    "remediate": ["READ", "PLAN"],
+    "skill_scan": ["READ", "LOCAL_FILE_READ"],
+    "skill_verify": ["READ", "LOCAL_FILE_READ", "PROVENANCE"],
+    "skill_trust": ["READ", "LOCAL_FILE_READ"],
+    "verify": ["READ", "NETWORK", "PROVENANCE"],
+    "where": ["READ", "LOCAL_FILE_READ"],
+    "inventory_summary": ["READ", "GRAPH", "INVENTORY"],
+    "inventory_list": ["READ", "GRAPH", "INVENTORY"],
+    "inventory_asset": ["READ", "GRAPH", "INVENTORY", "ANALYZE"],
+    "tool_risk_assessment": ["READ", "ANALYZE"],
+    "inventory": ["READ", "LOCAL_FILE_READ"],
+    "diff": ["WRITE", "READ", "LOCAL_FILE_READ", "ANALYZE", "HISTORY"],
+    "marketplace_check": ["READ", "REGISTRY"],
+    "code_scan": ["READ", "LOCAL_FILE_READ", "SAST"],
+    "context_graph": ["READ", "GRAPH", "ANALYZE"],
+    "graph_export": ["READ", "GRAPH", "EXPORT"],
+    "analytics_query": ["READ", "ANALYTICS"],
+    "cis_benchmark": ["READ", "NETWORK", "CLOUD"],
+    "kspm_cluster_posture": ["READ", "NETWORK", "CLOUD"],
+    "fleet_scan": ["READ", "REGISTRY", "ANALYZE"],
+    "runtime_correlate": ["READ", "LOCAL_FILE_READ", "RUNTIME"],
+    "runtime_production_index": ["READ", "RUNTIME", "OBSERVABILITY"],
+    "runtime_blueprints": ["READ", "RUNTIME", "POLICY"],
+    "runtime_blueprint_drift": ["READ", "RUNTIME", "POLICY", "ANALYZE"],
+    "cost_report": ["READ", "RUNTIME", "OBSERVABILITY"],
+    "anomaly_scan": ["READ", "RUNTIME", "OBSERVABILITY", "ANALYZE"],
+    "drift_incidents": ["READ", "RUNTIME", "POLICY", "ANALYZE"],
+    "proxy_status": ["READ", "RUNTIME", "OBSERVABILITY"],
+    "proxy_alerts": ["READ", "RUNTIME", "OBSERVABILITY"],
+    "gateway_status": ["READ", "RUNTIME", "POLICY"],
+    "shield_status": ["READ", "RUNTIME", "SECURITY"],
+    "shield_start": ["WRITE", "RUNTIME", "SECURITY", "AUDIT"],
+    "shield_unblock": ["WRITE", "RUNTIME", "SECURITY", "AUDIT"],
+    "shield_break_glass": ["WRITE", "RUNTIME", "SECURITY", "AUDIT"],
+    "identity_issue": ["WRITE", "IDENTITY", "AUDIT"],
+    "identity_rotate": ["WRITE", "IDENTITY", "AUDIT"],
+    "identity_revoke": ["WRITE", "IDENTITY", "AUDIT"],
+    "identity_grant_jit": ["WRITE", "IDENTITY", "AUDIT"],
+    "identity_revoke_jit": ["WRITE", "IDENTITY", "AUDIT"],
+    "firewall_check": ["READ", "RUNTIME", "POLICY"],
+    "audit_query": ["READ", "AUDIT"],
+    "audit_integrity": ["READ", "AUDIT", "PROVENANCE"],
+    "vector_db_scan": ["READ", "NETWORK", "RUNTIME"],
+    "aisvs_benchmark": ["READ", "COMPLIANCE"],
+    "gpu_infra_scan": ["READ", "NETWORK", "INFRA"],
+    "registry_sweep_scan": ["READ", "NETWORK", "INFRA"],
+    "dataset_card_scan": ["READ", "LOCAL_FILE_READ", "COMPLIANCE"],
+    "training_pipeline_scan": ["READ", "LOCAL_FILE_READ", "LINEAGE"],
+    "browser_extension_scan": ["READ", "LOCAL_FILE_READ"],
+    "model_provenance_scan": ["READ", "NETWORK", "PROVENANCE"],
+    "prompt_scan": ["READ", "LOCAL_FILE_READ", "SAST"],
+    "model_file_scan": ["READ", "LOCAL_FILE_READ"],
+    "ai_inventory_scan": ["READ", "LOCAL_FILE_READ"],
+    "license_compliance_scan": ["READ", "LOCAL_FILE_READ", "COMPLIANCE"],
+    "ingest_external_scan": ["WRITE", "LOCAL_FILE_READ", "INGEST"],
+    "runtime_evidence_ingest": ["WRITE", "INGEST"],
+    # access_review recomputes and persists campaign status as a side effect of
+    # a read-shaped call → WRITE (idempotent, non-destructive).
+    "access_review": ["WRITE", "READ", "IDENTITY", "GOVERNANCE", "AUDIT"],
+    "nhi_discover": ["READ", "NETWORK", "IDENTITY"],
+    "cloud_inventory": ["READ", "NETWORK", "CLOUD", "INVENTORY"],
+    "credential_expiry": ["READ", "SECURITY", "AUDIT"],
+    "cost_forecast": ["READ", "RUNTIME", "OBSERVABILITY"],
+    "cost_allocation": ["READ", "RUNTIME", "OBSERVABILITY"],
+    "create_ticket": ["WRITE", "NETWORK", "INTEGRATION"],
+    "sync_ticket_status": ["WRITE", "NETWORK", "INTEGRATION"],
+    "findings_triage": ["WRITE", "GOVERNANCE", "AUDIT"],
+    "risk_campaign_workflow": ["WRITE", "GOVERNANCE", "AUDIT"],
+    "cloud_side_scan": ["WRITE", "NETWORK", "CLOUD", "CWPP", "AUDIT"],
+}
+
+for _tool in _SERVER_CARD_TOOLS:
+    _tool["capability_classes"] = _TOOL_CAPABILITY_CLASSES.get(str(_tool["name"]), ["READ"])
+
+
+def server_card_tool_names() -> frozenset[str]:
+    """Return the MCP server-card tool names advertised to clients."""
+    return frozenset(str(tool["name"]) for tool in _SERVER_CARD_TOOLS)
+
+
+def _is_mcp_tool_decorator(node: ast.expr) -> bool:
+    target = node.func if isinstance(node, ast.Call) else node
+    return isinstance(target, ast.Attribute) and target.attr == "tool" and isinstance(target.value, ast.Name) and target.value.id == "mcp"
+
+
+def registered_mcp_tool_decorator_names() -> frozenset[str]:
+    """Return MCP tool function names across server registration modules."""
+    package_root = Path(__file__).resolve().parent
+    names: set[str] = set()
+    for path in sorted(package_root.glob("mcp_server*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if any(_is_mcp_tool_decorator(decorator) for decorator in node.decorator_list):
+                names.add(node.name)
+    return frozenset(names)
+
+
+_SERVER_CARD_PROMPTS = [
+    {"name": "quick-audit", "description": "Run a complete security audit of your AI agent setup"},
+    {"name": "pre-install-check", "description": "Check an MCP server package for vulnerabilities before installing"},
+    {"name": "compliance-report", "description": "Generate OWASP LLM + OWASP MCP + ATLAS + NIST compliance posture for your AI stack"},
+    {"name": "fleet-audit", "description": "Audit an endpoint or cloud inventory file and return graph-ready findings"},
+    {"name": "incident-triage", "description": "Prioritize a CVE or suspicious MCP finding using blast radius and runtime evidence"},
+    {"name": "remediation-plan", "description": "Draft a human-reviewed remediation plan without modifying files"},
+    {"name": "cloud-connection-review", "description": "Review a read-only cloud or Snowflake connection before the first scan"},
+    {"name": "gateway-fleet-live-demo", "description": "Run the gateway and fleet enforcement story as a guided demo"},
+]
+
+_SERVER_CARD_RESOURCES = [
+    {"uri": "registry://servers", "description": "MCP server security metadata registry"},
+    {"uri": "policy://template", "description": "Default security policy-as-code template"},
+    {"uri": "metrics://tools", "description": "Bounded MCP tool execution metrics"},
+    {"uri": "schema://inventory-v1", "description": "Canonical pushed-inventory schema contract"},
+    {"uri": "bestpractices://mcp-hardening", "description": "NSA-informed MCP hardening control mapping"},
+    {"uri": "compliance://framework-controls", "description": "Framework coverage and evidence mapping"},
+]
+
+
+def build_server_card(*, auth_required: bool = False) -> dict[str, Any]:
+    from agent_bom import __version__
+    from agent_bom.mcp_server_helpers import get_registry_data
+
+    try:
+        registry_servers = int(get_registry_data().get("_total_servers") or 0)
+    except Exception:
+        registry_servers = 0
+    if registry_servers <= 0:
+        # Fall back to counting the bundled map when the header is missing.
+        try:
+            servers = get_registry_data().get("servers") or {}
+            registry_servers = len(servers) if isinstance(servers, dict) else 0
+        except Exception:
+            registry_servers = 0
+
+    card = {
+        "name": "agent-bom",
+        "version": __version__,
+        "description": ("Security scanner and graph for AI supply chain and infrastructure — agents, MCP, runtime, and blast radius."),
+        "repository": "https://github.com/msaad00/agent-bom",
+        "transport": ["stdio", "sse", "streamable-http"],
+        "tools": _SERVER_CARD_TOOLS,
+        "resources": _SERVER_CARD_RESOURCES,
+        "prompts": _SERVER_CARD_PROMPTS,
+        "capabilities": {
+            "frameworks": ["OWASP LLM Top 10", "OWASP MCP Top 10", "MITRE ATLAS", "NIST AI RMF"],
+            "sbom_formats": ["CycloneDX 1.7", "SPDX 3.0", "SARIF 2.1.0"],
+            "data_sources": ["OSV.dev", "NVD", "EPSS", "CISA KEV", "Snyk", "MCP Registry", "Smithery"],
+            "discovery_sources": [
+                "Local MCP configs",
+                "AWS Bedrock",
+                "Azure AI Foundry",
+                "GCP Vertex AI",
+                "Databricks",
+                "Snowflake",
+                "Docker images",
+                "Kubernetes",
+                "SBOMs",
+            ],
+            "registry_servers": registry_servers,
+            # Scanner/graph tools are read-only; Shield / identity / ticket tools
+            # are write-gated. Do not claim a fully read-only server.
+            "read_only": False,
+        },
+        "license": "Apache-2.0",
+        "pypi": "agent-bom",
+        "install": "pip install agent-bom[mcp-server]",
+    }
+    # SEP-1649 shape consumed by Smithery and other MCP marketplaces. Retain
+    # the established top-level fields above for existing agent-bom clients.
+    card["serverInfo"] = {"name": card["name"], "version": card["version"]}
+    card["authentication"] = {
+        "required": auth_required,
+        "schemes": ["bearer"] if auth_required else [],
+    }
+    return card
+
+
+def build_root_metadata(*, auth_required: bool) -> dict[str, Any]:
+    from agent_bom import __version__
+
+    return {
+        "name": "agent-bom",
+        "version": __version__,
+        "description": ("Security scanner and graph for AI supply chain and infrastructure — agents, MCP, runtime, and blast radius."),
+        "homepage": "https://github.com/msaad00/agent-bom",
+        "source": "https://github.com/msaad00/agent-bom",
+        "license": "Apache-2.0",
+        "pypi": "https://pypi.org/project/agent-bom/",
+        "documentation": "https://github.com/msaad00/agent-bom#readme",
+        "server_card": "/.well-known/mcp/server-card.json",
+        "auth_required": auth_required,
+    }
+
+
+def build_health_payload(*, auth_required: bool, tool_metrics_summary: dict[str, Any]) -> dict[str, Any]:
+    from agent_bom import __version__
+
+    return {
+        "status": "healthy",
+        "name": "agent-bom",
+        "version": __version__,
+        "auth_required": auth_required,
+        "tool_count": tool_metrics_summary["tool_count"],
+        "mcp_metrics": tool_metrics_summary,
+    }
+
+
+def attach_metadata_routes(
+    mcp: Any,
+    *,
+    auth_required: bool,
+    tool_metrics_snapshot: Callable[[], dict[str, Any]],
+) -> None:
+    @mcp.custom_route("/.well-known/mcp/server-card.json", methods=["GET"])
+    async def server_card_route(request):
+        from starlette.responses import JSONResponse
+
+        card = build_server_card(auth_required=auth_required)
+        # The static metadata catalog owns descriptions and capability classes;
+        # the live FastMCP registry owns exact JSON input/output schemas. Serve
+        # the latter here so marketplaces never index a hand-maintained schema.
+        live_tools = await mcp.list_tools()
+        metadata_by_name = {str(tool["name"]): tool for tool in card["tools"]}
+        rendered_tools: list[dict[str, Any]] = []
+        for tool in live_tools:
+            payload = tool.model_dump(by_alias=True, exclude_none=True)
+            metadata = metadata_by_name.get(str(payload.get("name")), {})
+            if metadata.get("capability_classes"):
+                payload["capability_classes"] = list(metadata["capability_classes"])
+            rendered_tools.append(payload)
+        card["tools"] = rendered_tools
+        return JSONResponse(card)
+
+    @mcp.custom_route("/", methods=["GET"])
+    async def root_metadata_route(request):
+        from starlette.responses import JSONResponse
+
+        return JSONResponse(build_root_metadata(auth_required=auth_required))
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health_route(request):
+        from starlette.responses import JSONResponse
+
+        metrics = tool_metrics_snapshot()["summary"]
+        return JSONResponse(build_health_payload(auth_required=auth_required, tool_metrics_summary=metrics))

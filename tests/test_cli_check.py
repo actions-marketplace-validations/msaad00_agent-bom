@@ -1,0 +1,725 @@
+from __future__ import annotations
+
+import json
+import os
+from urllib.parse import urlparse
+
+import pytest
+from click.testing import CliRunner
+
+from agent_bom.cli import main
+from agent_bom.models import Severity, Vulnerability
+from agent_bom.scanners import IncompleteScanError
+
+
+def _patch_check_scan(monkeypatch, vulns):
+    async def _scan_packages(pkgs, **_kwargs):
+        for pkg in pkgs:
+            pkg.vulnerabilities = list(vulns)
+
+    monkeypatch.setattr("agent_bom.scanners.scan_packages", _scan_packages)
+    monkeypatch.setattr("agent_bom.parsers.os_parsers.enrich_os_package_context", lambda pkg: True)
+
+
+def test_check_clean_exits_zero(monkeypatch):
+    _patch_check_scan(monkeypatch, [])
+
+    result = CliRunner().invoke(main, ["check", "django@4.1.0", "--ecosystem", "pypi"])
+
+    assert result.exit_code == 0
+    assert "No known vulnerabilities" in result.output
+
+
+def test_check_vulns_exit_one_by_default(monkeypatch):
+    _patch_check_scan(
+        monkeypatch,
+        [
+            Vulnerability(
+                id="CVE-2023-30861",
+                summary="Session cookie disclosure",
+                severity=Severity.HIGH,
+                fixed_version="2.3.2",
+            )
+        ],
+    )
+
+    result = CliRunner().invoke(main, ["check", "flask@2.2.0", "--ecosystem", "pypi"])
+
+    assert result.exit_code == 1
+    assert "do not install without review" in result.output
+
+
+def test_check_enriches_matched_vulnerabilities(monkeypatch):
+    vuln = Vulnerability(
+        id="CVE-2023-30861",
+        summary="Session cookie disclosure",
+        severity=Severity.HIGH,
+        fixed_version="2.3.2",
+    )
+    _patch_check_scan(monkeypatch, [vuln])
+    calls = []
+
+    async def _enrich_vulnerabilities(vulns, **kwargs):
+        calls.append((vulns, kwargs))
+        vulns[0].epss_score = 0.91
+        vulns[0].epss_percentile = 99.0
+        vulns[0].is_kev = True
+        vulns[0].cwe_ids.append("CWE-200")
+        vulns[0].advisory_sources.append("epss")
+        return 1
+
+    monkeypatch.setattr("agent_bom.enrichment.enrich_vulnerabilities", _enrich_vulnerabilities)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "check",
+            "flask@2.2.0",
+            "--ecosystem",
+            "pypi",
+            "--enrich",
+            "--nvd-api-key",
+            "test-key",
+            "--format",
+            "json",
+            "--quiet",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert calls
+    assert calls[0][1]["nvd_api_key"] == "test-key"
+    payload = json.loads(result.output)
+    finding = payload["vulnerabilities"][0]
+    assert finding["epss_score"] == 0.91
+    assert finding["epss_percentile"] == 99.0
+    assert finding["is_kev"] is True
+    assert finding["cwe_ids"] == ["CWE-200"]
+    assert finding["advisory_sources"] == ["epss"]
+
+
+def test_check_does_not_enrich_without_flag(monkeypatch):
+    _patch_check_scan(
+        monkeypatch,
+        [
+            Vulnerability(
+                id="CVE-2023-30861",
+                summary="Session cookie disclosure",
+                severity=Severity.HIGH,
+                fixed_version="2.3.2",
+            )
+        ],
+    )
+
+    async def _enrich_vulnerabilities(_vulns, **_kwargs):
+        raise AssertionError("check should not enrich unless --enrich is set")
+
+    monkeypatch.setattr("agent_bom.enrichment.enrich_vulnerabilities", _enrich_vulnerabilities)
+
+    result = CliRunner().invoke(main, ["check", "flask@2.2.0", "--ecosystem", "pypi", "--quiet"])
+
+    assert result.exit_code == 1
+    assert "1 vulnerability found" in result.output
+
+
+def test_check_exit_zero_reports_without_failing(monkeypatch):
+    _patch_check_scan(
+        monkeypatch,
+        [
+            Vulnerability(
+                id="CVE-2023-30861",
+                summary="Session cookie disclosure",
+                severity=Severity.HIGH,
+                fixed_version="2.3.2",
+            )
+        ],
+    )
+
+    result = CliRunner().invoke(main, ["check", "flask@2.2.0", "--ecosystem", "pypi", "--exit-zero"])
+
+    assert result.exit_code == 0
+    assert "reported without failing due to --exit-zero" in result.output
+
+
+def test_check_fail_on_severity_exits_zero_when_findings_below_threshold(monkeypatch):
+    _patch_check_scan(
+        monkeypatch,
+        [
+            Vulnerability(
+                id="CVE-2026-0001",
+                summary="Moderate issue",
+                severity=Severity.MEDIUM,
+                fixed_version="2.0.0",
+            )
+        ],
+    )
+
+    result = CliRunner().invoke(
+        main,
+        ["check", "demo@1.0.0", "--ecosystem", "pypi", "--fail-on-severity", "high", "--format", "json", "--quiet"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["fail_on_severity"] == "high"
+    assert payload["fail_on_severity_count"] == 0
+
+
+def test_check_fail_on_severity_exits_one_when_threshold_matches(monkeypatch):
+    _patch_check_scan(
+        monkeypatch,
+        [
+            Vulnerability(
+                id="CVE-2026-0002",
+                summary="Critical issue",
+                severity=Severity.CRITICAL,
+                fixed_version="2.0.0",
+            )
+        ],
+    )
+
+    result = CliRunner().invoke(
+        main,
+        ["check", "demo@1.0.0", "--ecosystem", "pypi", "--fail-on-severity", "high", "--format", "json", "--quiet"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["fail_on_severity"] == "high"
+    assert payload["fail_on_severity_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("severities", "threshold", "expected_exit", "expected_count"),
+    [
+        ([Severity.HIGH], "high", 1, 1),
+        ([Severity.HIGH], "critical", 0, 0),
+        ([Severity.HIGH, Severity.LOW], "medium", 1, 1),
+        ([Severity.HIGH, Severity.LOW], "low", 1, 2),
+        ([Severity.MEDIUM], "medium", 1, 1),
+        ([Severity.MEDIUM], "low", 1, 1),
+    ],
+)
+def test_check_fail_on_severity_uses_at_or_above_threshold(
+    monkeypatch,
+    severities,
+    threshold,
+    expected_exit,
+    expected_count,
+):
+    _patch_check_scan(
+        monkeypatch,
+        [
+            Vulnerability(
+                id=f"CVE-2026-{idx:04d}",
+                summary=f"{severity.value.title()} issue",
+                severity=severity,
+                fixed_version="2.0.0",
+            )
+            for idx, severity in enumerate(severities, start=10)
+        ],
+    )
+
+    result = CliRunner().invoke(
+        main,
+        ["check", "demo@1.0.0", "--ecosystem", "pypi", "--fail-on-severity", threshold, "--format", "json", "--quiet"],
+    )
+
+    assert result.exit_code == expected_exit
+    payload = json.loads(result.output)
+    assert payload["fail_on_severity"] == threshold
+    assert payload["fail_on_severity_count"] == expected_count
+
+
+def test_check_incomplete_offline_scan_exits_two(monkeypatch):
+    async def _scan_packages(_pkgs, **_kwargs):
+        raise IncompleteScanError("Offline mode requires a populated local vulnerability DB.")
+
+    monkeypatch.setattr("agent_bom.scanners.scan_packages", _scan_packages)
+    monkeypatch.setattr("agent_bom.parsers.os_parsers.enrich_os_package_context", lambda pkg: True)
+
+    result = CliRunner().invoke(main, ["check", "django@4.1.0", "--ecosystem", "pypi"])
+
+    assert result.exit_code == 2
+    assert "populated local vulnerability DB" in result.output
+
+
+def test_check_accepts_offline_flag(monkeypatch):
+    seen = {}
+
+    async def _scan_packages(_pkgs, *, options=None, **_kwargs):
+        seen["offline"] = options.offline
+
+    monkeypatch.setattr("agent_bom.scanners.scan_packages", _scan_packages)
+
+    result = CliRunner().invoke(main, ["check", "django@4.1.0", "--ecosystem", "pypi", "--offline", "--quiet"])
+
+    assert result.exit_code == 0
+    assert seen == {"offline": True}
+
+
+def test_check_discards_stale_coverage_warnings_before_scan(monkeypatch):
+    from agent_bom.scanners import record_coverage_warning
+
+    record_coverage_warning(
+        {
+            "kind": "offline_ecosystem_gap",
+            "release": "stale-package@0.1.0",
+            "ecosystem": "pypi",
+            "reason": "state left by an earlier scan",
+        }
+    )
+
+    async def _scan_packages(_pkgs, **_kwargs):
+        return None
+
+    monkeypatch.setattr("agent_bom.scanners.scan_packages", _scan_packages)
+
+    result = CliRunner().invoke(main, ["check", "django@4.1.0", "--ecosystem", "pypi", "--offline", "--quiet"])
+
+    assert result.exit_code == 0
+    assert "CLEAN" in result.output
+
+
+class _DummyResponse:
+    def __init__(self, status_code: int, payload: dict):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def test_check_uses_version_aware_ecosystem_resolution(monkeypatch):
+    seen_ecosystems = []
+
+    def _fake_sync_get(url, timeout=3):  # noqa: ARG001
+        host = urlparse(url).hostname or ""
+        if host == "pypi.org":
+            return _DummyResponse(200, {"releases": {"2.33.0": [{}]}})
+        if host == "registry.npmjs.org":
+            return _DummyResponse(200, {"versions": {"0.0.1": {}}})
+        return None
+
+    async def _scan_packages(pkgs, **_kwargs):
+        for pkg in pkgs:
+            seen_ecosystems.append(pkg.ecosystem)
+            pkg.vulnerabilities = []
+
+    monkeypatch.setattr("agent_bom.http_client.sync_get", _fake_sync_get)
+    monkeypatch.setattr("agent_bom.scanners.scan_packages", _scan_packages)
+    monkeypatch.setattr("agent_bom.parsers.os_parsers.enrich_os_package_context", lambda pkg: True)
+
+    result = CliRunner().invoke(main, ["check", "requests@2.33.0"])
+
+    assert result.exit_code == 0
+    assert seen_ecosystems == ["pypi"]
+
+
+def test_check_requires_explicit_ecosystem_when_name_stays_ambiguous(monkeypatch):
+    def _fake_sync_get(url, timeout=3):  # noqa: ARG001
+        host = urlparse(url).hostname or ""
+        if host == "pypi.org":
+            return _DummyResponse(200, {"releases": {"1.0.0": [{}]}})
+        if host == "registry.npmjs.org":
+            return _DummyResponse(200, {"versions": {"1.0.0": {}}})
+        return None
+
+    monkeypatch.setattr("agent_bom.http_client.sync_get", _fake_sync_get)
+
+    result = CliRunner().invoke(main, ["check", "sharedpkg@1.0.0"])
+
+    assert result.exit_code == 2
+    assert "Specify --ecosystem pypi or --ecosystem npm" in result.output
+
+
+def test_mcp_scan_delegates_to_package_check(monkeypatch):
+    _patch_check_scan(monkeypatch, [])
+
+    result = CliRunner().invoke(main, ["mcp", "scan", "requests@2.33.0", "--ecosystem", "pypi"])
+
+    assert result.exit_code == 0
+    assert "No known vulnerabilities" in result.output
+
+
+def test_mcp_scan_empty_spec_is_usage_error():
+    result = CliRunner().invoke(main, ["mcp", "scan", ""])
+
+    assert result.exit_code == 2
+    assert "cannot be empty" in result.output
+
+
+def test_sbom_missing_file_is_usage_error():
+    result = CliRunner().invoke(main, ["sbom", "/missing.json"])
+
+    assert result.exit_code == 2
+    assert "does not exist" in result.output
+
+
+def test_check_quiet_suppresses_scan_chatter(monkeypatch):
+    async def _scan_packages(pkgs, **_kwargs):
+        import agent_bom.scanners as scanners
+
+        scanners.console.print("scanner noise that should stay hidden")
+        for pkg in pkgs:
+            pkg.vulnerabilities = [
+                Vulnerability(
+                    id="CVE-2023-30861",
+                    summary="Session cookie disclosure",
+                    severity=Severity.HIGH,
+                    fixed_version="2.3.2",
+                )
+            ]
+
+    monkeypatch.setattr("agent_bom.scanners.scan_packages", _scan_packages)
+    monkeypatch.setattr("agent_bom.parsers.os_parsers.enrich_os_package_context", lambda pkg: True)
+
+    result = CliRunner().invoke(main, ["check", "flask@2.2.0", "--ecosystem", "pypi", "--quiet"])
+
+    assert result.exit_code == 1
+    assert "scanner noise" not in result.output
+    assert "Checking flask@2.2.0" not in result.output
+    assert "1 vulnerability found" in result.output
+
+
+def test_check_pluralizes_vulnerability_count(monkeypatch):
+    _patch_check_scan(
+        monkeypatch,
+        [
+            Vulnerability(
+                id="CVE-2023-30861",
+                summary="Session cookie disclosure",
+                severity=Severity.HIGH,
+                fixed_version="2.3.2",
+            ),
+            Vulnerability(
+                id="CVE-2024-00002",
+                summary="Second issue",
+                severity=Severity.MEDIUM,
+                fixed_version="2.3.3",
+            ),
+        ],
+    )
+
+    result = CliRunner().invoke(main, ["check", "flask@2.2.0", "--ecosystem", "pypi", "--quiet"])
+
+    assert result.exit_code == 1
+    assert "2 vulnerabilities found" in result.output
+
+
+def test_check_json_output_is_machine_readable(monkeypatch):
+    _patch_check_scan(
+        monkeypatch,
+        [
+            Vulnerability(
+                id="CVE-2023-30861",
+                summary="Session cookie disclosure",
+                severity=Severity.HIGH,
+                fixed_version="2.3.2",
+            )
+        ],
+    )
+
+    result = CliRunner().invoke(
+        main,
+        ["check", "flask@2.2.0", "--ecosystem", "pypi", "--format", "json", "--quiet"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["package"] == "flask"
+    assert payload["version"] == "2.2.0"
+    assert payload["verdict"] == "unsafe"
+    assert payload["vulnerability_count"] == 1
+    assert payload["vulnerabilities"][0]["id"] == "CVE-2023-30861"
+
+
+def test_check_sarif_output_is_machine_readable(monkeypatch):
+    _patch_check_scan(
+        monkeypatch,
+        [
+            Vulnerability(
+                id="CVE-2023-30861",
+                summary="Session cookie disclosure",
+                severity=Severity.HIGH,
+                fixed_version="2.3.2",
+                cvss_score=7.5,
+                epss_score=0.42,
+                epss_percentile=93.0,
+                is_kev=True,
+                cwe_ids=["CWE-200"],
+            )
+        ],
+    )
+
+    result = CliRunner().invoke(
+        main,
+        ["check", "flask@2.2.0", "--ecosystem", "pypi", "--format", "sarif", "--quiet"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    run = payload["runs"][0]
+    rule = run["tool"]["driver"]["rules"][0]
+    finding = run["results"][0]
+    assert payload["version"] == "2.1.0"
+    assert rule["id"] == "CVE-2023-30861"
+    assert rule["properties"]["security-severity"] == "7.5"
+    assert rule["properties"]["epss_score"] == 0.42
+    assert rule["properties"]["is_kev"] is True
+    assert rule["properties"]["cwe_ids"] == ["CWE-200"]
+    assert finding["ruleId"] == "CVE-2023-30861"
+    assert finding["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == "pkg:pypi/flask@2.2.0"
+
+
+def test_check_agent_mode_rejects_sarif_format(monkeypatch):
+    _patch_check_scan(monkeypatch, [])
+
+    result = CliRunner().invoke(
+        main,
+        ["--agent-mode", "check", "django@4.1.0", "--ecosystem", "pypi", "--format", "sarif"],
+    )
+
+    assert result.exit_code == 1
+    assert "--agent-mode requires" in result.output
+
+
+def test_check_agent_mode_emits_machine_envelope_without_rich_table(monkeypatch):
+    monkeypatch.delenv("AGENT_BOM_AGENT_MODE", raising=False)
+    _patch_check_scan(
+        monkeypatch,
+        [
+            Vulnerability(
+                id="CVE-2023-30861",
+                summary="Session cookie disclosure",
+                severity=Severity.HIGH,
+                fixed_version="2.3.2",
+            )
+        ],
+    )
+
+    result = CliRunner().invoke(main, ["--agent-mode", "check", "flask@2.2.0", "--ecosystem", "pypi"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "1"
+    assert payload["mode"] == "agent"
+    assert payload["ok"] is False
+    assert payload["command"] == "check"
+    assert payload["exit_code"] == 1
+    assert payload["error"]["type"] == "unsafe_package"
+    assert payload["summary"]["packages"] == 1
+    assert payload["summary"]["vulnerabilities"] == 1
+    assert payload["summary"]["severity_counts"]["high"] == 1
+    assert payload["data"]["document_type"] == "PACKAGE-CHECK"
+    assert payload["data"]["vulnerabilities"][0]["id"] == "CVE-2023-30861"
+    assert "flask@2.2.0 — 1 vulnerability found" not in result.output
+    assert "┏" not in result.output
+    assert "AGENT_BOM_AGENT_MODE" not in os.environ
+
+
+def test_check_agent_mode_env_emits_clean_envelope_for_clean_package(monkeypatch):
+    _patch_check_scan(monkeypatch, [])
+
+    result = CliRunner().invoke(
+        main,
+        ["check", "django@4.1.0", "--ecosystem", "pypi"],
+        env={"AGENT_BOM_AGENT_MODE": "1"},
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["mode"] == "agent"
+    assert payload["ok"] is True
+    assert payload["data"]["verdict"] == "clean"
+    assert payload["summary"]["vulnerabilities"] == 0
+
+
+def test_check_output_requires_json_format(monkeypatch):
+    _patch_check_scan(monkeypatch, [])
+
+    result = CliRunner().invoke(
+        main,
+        ["check", "django@4.1.0", "--ecosystem", "pypi", "--output", "report.json"],
+    )
+
+    assert result.exit_code == 1
+    assert "--format json" in result.output
+
+
+def test_check_without_version_exits_nonzero(monkeypatch):
+    """`check <pkg>` with no @version scans nothing, so it must not exit 0 —
+    a CI pre-install gate must never treat an unscanned package as clean."""
+    _patch_check_scan(monkeypatch, [])
+
+    result = CliRunner().invoke(main, ["check", "somepkg", "--ecosystem", "pypi"])
+
+    assert result.exit_code != 0
+    assert result.exit_code == 2
+    assert "not a clean result" in result.output
+
+
+def test_check_without_version_json_reports_nonzero(monkeypatch):
+    """Structured output for the no-version skip must also carry exit_code=2."""
+    _patch_check_scan(monkeypatch, [])
+
+    result = CliRunner().invoke(main, ["check", "somepkg", "--ecosystem", "pypi", "--format", "json"])
+
+    assert result.exit_code == 2
+    payload = json.loads(result.output)
+    assert payload["verdict"] == "skipped"
+    assert payload["exit_code"] == 2
+
+
+def test_check_maven_bare_artifact_fails_closed(monkeypatch):
+    """A Maven artifact without group context must not appear clean."""
+
+    async def _unexpected_scan(*_args, **_kwargs):
+        raise AssertionError("ambiguous Maven input must be rejected before scanning")
+
+    monkeypatch.setattr("agent_bom.scanners.scan_packages", _unexpected_scan)
+
+    result = CliRunner().invoke(main, ["check", "log4j-core@2.14.1", "--ecosystem", "maven"])
+
+    assert result.exit_code == 2
+    assert "group:artifact" in result.output
+    assert "No known vulnerabilities" not in result.output
+
+
+def test_check_maven_coordinate_remains_supported(monkeypatch):
+    """Fully qualified Maven coordinates continue through the scanner."""
+    _patch_check_scan(monkeypatch, [])
+
+    result = CliRunner().invoke(
+        main,
+        ["check", "org.apache.logging.log4j:log4j-core@2.14.1", "--ecosystem", "maven"],
+    )
+
+    assert result.exit_code == 0
+    assert "No known vulnerabilities" in result.output
+
+
+def test_check_maven_bare_artifact_json_is_incomplete(monkeypatch):
+    """Machine-readable Maven ambiguity must carry the incomplete contract."""
+
+    async def _unexpected_scan(*_args, **_kwargs):
+        raise AssertionError("ambiguous Maven input must be rejected before scanning")
+
+    monkeypatch.setattr("agent_bom.scanners.scan_packages", _unexpected_scan)
+
+    result = CliRunner().invoke(
+        main,
+        ["check", "log4j-core@2.14.1", "--ecosystem", "maven", "--format", "json"],
+    )
+
+    assert result.exit_code == 2
+    payload = json.loads(result.output)
+    assert payload["verdict"] == "incomplete"
+    assert payload["exit_code"] == 2
+    assert "group:artifact" in payload["message"]
+
+
+def test_check_malformed_requirement_fails_closed(monkeypatch):
+    """Malformed requirement syntax must not be coerced into a clean scan."""
+
+    async def _unexpected_scan(*_args, **_kwargs):
+        raise AssertionError("malformed package input must be rejected before scanning")
+
+    monkeypatch.setattr("agent_bom.scanners.scan_packages", _unexpected_scan)
+
+    result = CliRunner().invoke(main, ["check", "flask==@@@bad", "--ecosystem", "pypi"])
+
+    assert result.exit_code == 2
+    assert "Invalid pypi package name" in result.output
+    assert "No known vulnerabilities" not in result.output
+
+
+def _patch_check_scan_malicious(monkeypatch, reason="Possible typosquat of 'requests'"):
+    async def _scan_packages(pkgs, **_kwargs):
+        for pkg in pkgs:
+            pkg.vulnerabilities = []
+            pkg.is_malicious = True
+            pkg.malicious_reason = reason
+
+    monkeypatch.setattr("agent_bom.scanners.scan_packages", _scan_packages)
+    monkeypatch.setattr("agent_bom.parsers.os_parsers.enrich_os_package_context", lambda pkg: True)
+
+
+def test_check_malicious_package_blocks_without_cve(monkeypatch):
+    """A typosquat / dependency-confusion package with no CVE rows must BLOCK.
+
+    Reading only vuln rows let a malicious package report "No known
+    vulnerabilities" and exit 0 — a pre-install gate must fail closed."""
+    _patch_check_scan_malicious(monkeypatch)
+
+    result = CliRunner().invoke(main, ["check", "reqeusts@1.0.0", "--ecosystem", "pypi"])
+
+    assert result.exit_code == 1
+    assert "No known vulnerabilities" not in result.output
+    assert "malicious" in result.output.lower() or "typosquat" in result.output.lower()
+
+
+def test_check_malicious_package_json_verdict(monkeypatch):
+    _patch_check_scan_malicious(monkeypatch, reason="Dependency confusion risk")
+
+    result = CliRunner().invoke(main, ["check", "internal-lib@1.0.0", "--ecosystem", "pypi", "--format", "json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["verdict"] == "malicious"
+    assert payload["exit_code"] == 1
+    assert "Dependency confusion risk" in payload["message"]
+
+
+def test_check_malicious_beats_exit_zero(monkeypatch):
+    """--exit-zero is for vulnerability triage; it must not let a malicious
+    package through the pre-install gate."""
+    _patch_check_scan_malicious(monkeypatch)
+
+    result = CliRunner().invoke(main, ["check", "reqeusts@1.0.0", "--ecosystem", "pypi", "--exit-zero"])
+
+    assert result.exit_code == 1
+
+
+def _patch_check_scan_offline_gap(monkeypatch):
+    async def _scan_packages(pkgs, **_kwargs):
+        from agent_bom.scanners import record_coverage_warning
+
+        for pkg in pkgs:
+            pkg.vulnerabilities = []
+        record_coverage_warning(
+            {
+                "kind": "offline_ecosystem_gap",
+                "release": "offline:pypi",
+                "ecosystems": ["pypi"],
+                "package_count": len(pkgs),
+            }
+        )
+
+    monkeypatch.setattr("agent_bom.scanners.scan_packages", _scan_packages)
+    monkeypatch.setattr("agent_bom.parsers.os_parsers.enrich_os_package_context", lambda pkg: True)
+
+
+def test_check_offline_coverage_gap_exits_incomplete(monkeypatch):
+    """Offline scan of an ecosystem the local DB has no advisories for is NOT a
+    clean pass — it must exit 2 (incomplete), symmetric with deb/apk/rpm."""
+    _patch_check_scan_offline_gap(monkeypatch)
+
+    result = CliRunner().invoke(main, ["check", "somepypipkg@1.0.0", "--ecosystem", "pypi", "--offline"])
+
+    assert result.exit_code == 2
+    assert "No known vulnerabilities" not in result.output
+
+
+def test_check_offline_coverage_gap_json_incomplete(monkeypatch):
+    _patch_check_scan_offline_gap(monkeypatch)
+
+    result = CliRunner().invoke(
+        main,
+        ["check", "somepypipkg@1.0.0", "--ecosystem", "pypi", "--offline", "--format", "json"],
+    )
+
+    assert result.exit_code == 2
+    payload = json.loads(result.output)
+    assert payload["verdict"] == "incomplete"
+    assert payload["exit_code"] == 2

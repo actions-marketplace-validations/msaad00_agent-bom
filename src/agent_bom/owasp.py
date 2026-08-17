@@ -21,7 +21,7 @@ from agent_bom.constants import (
 from agent_bom.constants import (
     high_risk_severities,
 )
-from agent_bom.risk_analyzer import ToolCapability, classify_tool
+from agent_bom.risk_analyzer import ToolCapability, classify_mcp_tool
 
 if TYPE_CHECKING:
     from agent_bom.models import BlastRadius
@@ -61,9 +61,14 @@ def tag_blast_radius(br: BlastRadius) -> list[str]:
     """
     tags: set[str] = set()
 
-    # LLM05 — supply chain vulnerability: only when package is AI-related
-    if br.package.name.lower() in _AI_PACKAGES or br.package.name.lower() in _TRAINING_DATA_PACKAGES:
-        tags.add("LLM05")
+    # LLM05 — "Supply Chain Vulnerabilities" per OWASP LLM Top 10.
+    # Every CVE in a third-party package an agent depends on is a supply-chain
+    # finding by OWASP's definition; the prior narrow allowlist (AI/training
+    # packages only) under-fired LLM05 on generic transport/HTTP/template
+    # packages (starlette, requests, jinja2, etc.) that ARE reachable from
+    # the agent via an MCP server and therefore ARE supply-chain risk.
+    # A vulnerable package is always at least LLM05.
+    tags.add("LLM05")
 
     # LLM06 — sensitive information disclosure via credential exposure
     if br.exposed_credentials:
@@ -71,7 +76,7 @@ def tag_blast_radius(br: BlastRadius) -> list[str]:
 
     # LLM02 / LLM07 — tool-level risks via semantic capability analysis
     for tool in br.exposed_tools:
-        caps = classify_tool(tool.name, tool.description)
+        caps = classify_mcp_tool(tool)
         if ToolCapability.EXECUTE in caps:
             tags.add("LLM02")
         if ToolCapability.READ in caps:
@@ -91,11 +96,9 @@ def tag_blast_radius(br: BlastRadius) -> list[str]:
 
     # CWE-based compliance tagging (applies to all vulns with CWE data)
     if br.vulnerability.cwe_ids:
-        from agent_bom.constants import CWE_COMPLIANCE_MAP
+        from agent_bom.framework_mapping import controls_for_cwes
 
-        for cwe in br.vulnerability.cwe_ids:
-            for tag in CWE_COMPLIANCE_MAP.get(cwe.upper(), {}).get("owasp_llm", []):
-                tags.add(tag)
+        tags.update(controls_for_cwes(br.vulnerability.cwe_ids, "owasp_llm"))
 
     return sorted(tags)
 

@@ -25,55 +25,166 @@ VERSION_LOCATIONS: list[tuple[str, re.Pattern, str]] = [
     # Dockerfiles
     ("deploy/docker/Dockerfile.runtime", re.compile(r"^(ARG VERSION=)\S+", re.M), r"\g<1>{v}"),
     ("deploy/docker/Dockerfile.sse", re.compile(r"^(ARG VERSION=)\S+", re.M), r"\g<1>{v}"),
-    ("integrations/toolhive/Dockerfile.mcp", re.compile(r"^(ARG VERSION=)\S+", re.M), r"\g<1>{v}"),
+    ("deploy/docker/Dockerfile.mcp", re.compile(r"^(ARG VERSION=)\S+", re.M), r"\g<1>{v}"),
+    ("deploy/docker/Dockerfile.collector", re.compile(r"^(ARG VERSION=)\S+", re.M), r"\g<1>{v}"),
     # MCP Registry server.json (version field + pypi identifier version)
     ("integrations/mcp-registry/server.json", re.compile(r'("version":\s*")[^"]+(")', re.M), r"\g<1>{v}\g<2>"),
-    # ToolHive server.json (version field + OCI image tags)
-    ("integrations/toolhive/server.json", re.compile(r'("version":\s*")[^"]+(")', re.M), r"\g<1>{v}\g<2>"),
-    ("integrations/toolhive/server.json", re.compile(r"(ghcr\.io/msaad00/agent-bom:v)[^\s\"]+"), r"\g<1>{v}"),
+    ("integrations/glama/server.json", re.compile(r'("version":\s*")[^"]+(")', re.M), r"\g<1>{v}\g<2>"),
     # Snowpark Dockerfile
     ("deploy/docker/Dockerfile.snowpark", re.compile(r"^(ARG VERSION=)\S+", re.M), r"\g<1>{v}"),
-    # Helm chart
+    ("Dockerfile", re.compile(r"^(ARG VERSION=)\S+", re.M), r"\g<1>{v}"),
+    # Compose + packaged manifests
+    ("deploy/docker-compose.pilot.yml", re.compile(r"(agentbom/agent-bom(?:-ui)?:)\d+\.\d+\.\d+"), r"\g<1>{v}"),
+    ("deploy/docker-compose.runtime-example.yml", re.compile(r"(agentbom/agent-bom(?:-ui)?:)\d+\.\d+\.\d+"), r"\g<1>{v}"),
+    ("deploy/docker-compose.fullstack.yml", re.compile(r"(agentbom/agent-bom(?:-ui)?:)\d+\.\d+\.\d+"), r"\g<1>{v}"),
+    ("deploy/docker-compose.platform.yml", re.compile(r"(agentbom/agent-bom(?:-ui)?:)\d+\.\d+\.\d+"), r"\g<1>{v}"),
+    ("deploy/k8s/daemonset.yaml", re.compile(r"(agentbom/agent-bom:)\d+\.\d+\.\d+"), r"\g<1>{v}"),
+    # Helm chart — both chart `version:` and `appVersion:` track the platform release
+    ("deploy/helm/agent-bom/Chart.yaml", re.compile(r"^(version:\s*)\S+", re.M), r"\g<1>{v}"),
     ("deploy/helm/agent-bom/Chart.yaml", re.compile(r'^(appVersion:\s*")[^"]+(")', re.M), r"\g<1>{v}\g<2>"),
     ("deploy/helm/agent-bom/values.yaml", re.compile(r'^(\s*tag:\s*")[^"]+(")', re.M), r"\g<1>{v}\g<2>"),
-    # OpenClaw SKILL.md files (version + docker tag + sigstore verify)
-    ("integrations/openclaw/scan/SKILL.md", re.compile(r"^(version:\s*)\S+", re.M), r"\g<1>{v}"),
-    ("integrations/openclaw/scan/SKILL.md", re.compile(r"(ghcr\.io/msaad00/agent-bom:)\S+"), r"\g<1>{v}"),
-    ("integrations/openclaw/scan/SKILL.md", re.compile(r"(agent-bom verify agent-bom@)\S+"), r"\g<1>{v}"),
-    ("integrations/openclaw/compliance/SKILL.md", re.compile(r"^(version:\s*)\S+", re.M), r"\g<1>{v}"),
-    ("integrations/openclaw/registry/SKILL.md", re.compile(r"^(version:\s*)\S+", re.M), r"\g<1>{v}"),
-    ("integrations/openclaw/runtime/SKILL.md", re.compile(r"^(version:\s*)\S+", re.M), r"\g<1>{v}"),
+    # Frontend package — UI version tracks the platform release so the docker image and
+    # the Next.js build manifest agree on what version is shipping
+    ("ui/package.json", re.compile(r'^(\s*"version":\s*")[^"]+(",?)', re.M), r"\g<1>{v}\g<2>"),
+    (
+        "ui/package-lock.json",
+        re.compile(r'(\A\{\n  "name": "ui",\n  "version": ")[^"]+(")', re.M),
+        r"\g<1>{v}\g<2>",
+    ),
+    (
+        "ui/package-lock.json",
+        re.compile(r'(\n    "": \{\n      "name": "ui",\n      "version": ")[^"]+(")', re.M),
+        r"\g<1>{v}\g<2>",
+    ),
+    ("uv.lock", re.compile(r'(\[\[package\]\]\nname = "agent-bom"\nversion = ")[^"]+(")', re.M), r"\g<1>{v}\g<2>"),
+    # `agent-bom-sdk` is a thin alias that re-exports the packaged control-plane
+    # client, so it ships the platform's version. It was bumped by hand once and
+    # then forgotten, drifting to 0.92.0 while the platform reached 0.100.0.
+    # scripts/check_release_consistency.py now sweeps for this structurally; this
+    # entry is the writer half, so the sweep has nothing to catch.
+    ("sdks/python/pyproject.toml", re.compile(r'^(version\s*=\s*")[^"]+(")', re.M), r"\g<1>{v}\g<2>"),
+]
+
+OPENCLAW_SKILL_PATTERNS: list[tuple[str, re.Pattern, str]] = [
+    ("integrations/openclaw/**/SKILL.md", re.compile(r"^(version:\s*)\S+", re.M), r"\g<1>{v}"),
+    ("integrations/openclaw/**/SKILL.md", re.compile(r"(ghcr\.io/msaad00/agent-bom:)\S+"), r"\g<1>{v}"),
+    ("integrations/openclaw/**/SKILL.md", re.compile(r"(agent-bom verify agent-bom@)[^`\s]+(`)"), r"\g<1>{v}\g<2>"),
 ]
 
 # Patterns that reference the version in docs/tests (updated separately)
 DOC_TEST_LOCATIONS: list[tuple[str, re.Pattern, str]] = [
     # README.md + docs — GitHub Action version references
-    ("README.md", re.compile(r"(msaad00/agent-bom@v)[^\s\"]+"), r"\g<1>{v}"),
-    ("docs/AI_INFRASTRUCTURE_SCANNING.md", re.compile(r"(msaad00/agent-bom@v)[^\s\"]+"), r"\g<1>{v}"),
+    ("README.md", re.compile(r"(msaad00/agent-bom@v)\d+(?:\.\d+){0,2}"), r"\g<1>{v}"),
+    (
+        "README.md",
+        re.compile(r"(CLI walkthrough</b> — )\d+\.\d+\.\d+( console demo</summary>)"),
+        r"\g<1>{v}\g<2>",
+    ),
+    (
+        "README.md",
+        re.compile(r"(oci://ghcr\.io/msaad00/charts/agent-bom --version )\d+\.\d+\.\d+"),
+        r"\g<1>{v}",
+    ),
+    ("docs/AI_INFRASTRUCTURE_SCANNING.md", re.compile(r"(msaad00/agent-bom@v)\d+(?:\.\d+){0,2}"), r"\g<1>{v}"),
+    ("docs/ENTERPRISE_DEPLOYMENT.md", re.compile(r"(msaad00/agent-bom@v)\d+(?:\.\d+){0,2}"), r"\g<1>{v}"),
+    ("docs/archive/WINDOWS_CONTAINERS.md", re.compile(r"(msaad00/agent-bom@v)\d+(?:\.\d+){0,2}"), r"\g<1>{v}"),
+    ("docs/MCP_SECURITY_MODEL.md", re.compile(r"(msaad00/agent-bom@v)\d+(?:\.\d+){0,2}"), r"\g<1>{v}"),
+    ("site-docs/index.md", re.compile(r"(msaad00/agent-bom@v)\d+(?:\.\d+){0,2}"), r"\g<1>{v}"),
+    ("site-docs/features/policy.md", re.compile(r"(msaad00/agent-bom@v)\d+(?:\.\d+){0,2}"), r"\g<1>{v}"),
+    ("docs/ENTERPRISE_DEPLOYMENT.md", re.compile(r"(agentbom/agent-bom:)(?:v)?\d+\.\d+\.\d+"), r"\g<1>{v}"),
+    ("site-docs/deployment/control-plane-helm.md", re.compile(r"(--version\s+)\d+\.\d+\.\d+"), r"\g<1>{v}"),
+    ("deploy/k8s/sidecar-example.yaml", re.compile(r"(agentbom/agent-bom:)\d+\.\d+\.\d+"), r"\g<1>{v}"),
+    ("deploy/k8s/proxy-sidecar-pilot.yaml", re.compile(r"(agentbom/agent-bom:)\d+\.\d+\.\d+"), r"\g<1>{v}"),
+    ("deploy/k8s/cronjob.yaml", re.compile(r"(agentbom/agent-bom:)\d+\.\d+\.\d+"), r"\g<1>{v}"),
+    (
+        "deploy/snowflake/native-app/manifest.yml",
+        re.compile(r"(:v)\d+_\d+_\d+"),
+        r"\g<1>{v_underscore}",
+    ),
+    (
+        "deploy/snowflake/native-app/manifest.yml",
+        re.compile(r"^(  name: v)\d+_\d+_\d+$", re.M),
+        r"\g<1>{v_underscore}",
+    ),
+    (
+        "deploy/snowflake/native-app/manifest.yml",
+        re.compile(r'^(  label: "agent-bom )\d+\.\d+\.\d+("$)', re.M),
+        r"\g<1>{v}\g<2>",
+    ),
+    (
+        "deploy/snowflake/native-app/service-spec.yaml",
+        re.compile(r"(:v)\d+_\d+_\d+"),
+        r"\g<1>{v_underscore}",
+    ),
+    (
+        "deploy/snowflake/native-app/service-specs/scanner-service.yaml",
+        re.compile(r"(:v)\d+_\d+_\d+"),
+        r"\g<1>{v_underscore}",
+    ),
+    (
+        "deploy/snowflake/native-app/service-specs/mcp-runtime-service.yaml",
+        re.compile(r"(:v)\d+_\d+_\d+"),
+        r"\g<1>{v_underscore}",
+    ),
+    ("docs/PRODUCT_METRICS.md", re.compile(r"(- Version: `)\d+\.\d+\.\d+(`)"), r"\g<1>{v}\g<2>"),
+    ("docs/PRODUCT_METRICS.json", re.compile(r'("version":\s*")\d+\.\d+\.\d+(")'), r"\g<1>{v}\g<2>"),
+    ("docs/RELEASE_VERIFICATION.md", re.compile(r"^(TAG=v)\d+\.\d+\.\d+$", re.M), r"\g<1>{v}"),
+    # The storefront row carries one of TWO phrasings depending on where the
+    # release is: lifecycle-neutral before the image is published, "Current
+    # stable version (pinned)" after. Matching only the published phrasing meant
+    # a pre-release bump silently skipped this file, and the drift surfaced as a
+    # `check_release_consistency` failure at tag time instead of being fixed by
+    # the bump that was supposed to own it.
+    ("DOCKER_HUB_README.md", re.compile(r"(\| `)\d+\.\d+\.\d+(` \| Current stable version \(pinned\) \|)"), r"\g<1>{v}\g<2>"),
+    (
+        "DOCKER_HUB_README.md",
+        re.compile(r"(\| `)\d+\.\d+\.\d+(` \| Version used by the examples below; verify registry availability before pinning \|)"),
+        r"\g<1>{v}\g<2>",
+    ),
     # PUBLISHING.md — version examples
     ("docs/PUBLISHING.md", re.compile(r'(--version\s+")[^"]+(")', re.M), r"\g<1>{v}\g<2>"),
     ("docs/PUBLISHING.md", re.compile(r"(git tag v)\S+", re.M), r"\g<1>{v}"),
     ("docs/PUBLISHING.md", re.compile(r"(git push origin v)\S+", re.M), r"\g<1>{v}"),
-    # tests/test_core.py — version assertions
-    ("tests/test_core.py", re.compile(r'(assert\s+__version__\s*==\s*")[^"]+(")', re.M), r"\g<1>{v}\g<2>"),
-    # Only match version assertions that currently contain a semver pattern (avoids clobbering SARIF "2.1.0")
-    ("tests/test_core.py", re.compile(r'(assert\s+data\["version"\]\s*==\s*")0\.\d+\.\d+(")', re.M), r"\g<1>{v}\g<2>"),
-    # cve-freshness.yml — SARIF fallback template version
-    (".github/workflows/cve-freshness.yml", re.compile(r'("version":")\d+\.\d+\.\d+(")'), r"\g<1>{v}\g<2>"),
-    # mcp-change-scan.yml — pinned agent-bom install version
-    (".github/workflows/mcp-change-scan.yml", re.compile(r"(agent-bom==)\d+\.\d+\.\d+"), r"\g<1>{v}"),
-    # README.md — Sigstore verify line
-    ("README.md", re.compile(r"(agent-bom verify agent-bom@)\S+"), r"\g<1>{v}"),
+    ("ui/tests/nav.test.tsx", re.compile(r"(version:\s*')\d+\.\d+\.\d+(')"), r"\g<1>{v}\g<2>"),
+    ("site-docs/deployment/docker.md", re.compile(r"(agentbom/agent-bom:)\d+\.\d+\.\d+"), r"\g<1>{v}"),
+    (
+        "site-docs/deployment/airgapped-image-bundle.md",
+        re.compile(
+            r"(?:"
+            r"(--version\s+)|"
+            r"(agent-bom-airgap-)|"
+            r"(VERSION=)|"
+            r"(tag:\s*\")|"
+            r"(agent-bom-ui:\")"
+            r")\d+\.\d+\.\d+"
+        ),
+        r"\g<1>\g<2>\g<3>\g<4>\g<5>{v}",
+    ),
+    (
+        "site-docs/deployment/aws-company-rollout.md",
+        re.compile(r"((?:--version\s+|refs/tags/v))\d+\.\d+\.\d+"),
+        r"\g<1>{v}",
+    ),
+    ("site-docs/reference/remediate-output.md", re.compile(r'("version":\s*")\d+\.\d+\.\d+(")'), r"\g<1>{v}\g<2>"),
+    ("docs/RUNTIME_MONITORING.md", re.compile(r"(agentbom/agent-bom:)\d+\.\d+\.\d+"), r"\g<1>{v}"),
+    # docs/demo.tape — version header
+    ("docs/demo.tape", re.compile(r"^(# agent-bom v)\d+\.\d+\.\d+(\s+.*demo.*)$", re.M), r"\g<1>{v}\g<2>"),
 ]
 
 
-def bump(new_version: str, *, dry_run: bool = False) -> int:
+def bump(new_version: str, *, dry_run: bool = False, check: bool = False) -> int:
     """Replace version strings across all tracked files."""
     if not re.match(r"^\d+\.\d+\.\d+$", new_version):
         print(f"ERROR: Invalid semver: {new_version}", file=sys.stderr)
         return 1
+    underscore_version = new_version.replace(".", "_")
 
     all_locations = VERSION_LOCATIONS + DOC_TEST_LOCATIONS
+    for glob_pattern, pattern, template in OPENCLAW_SKILL_PATTERNS:
+        for path in sorted(ROOT.glob(glob_pattern)):
+            text = path.read_text()
+            if pattern.search(text):
+                all_locations.append((str(path.relative_to(ROOT)), pattern, template))
     changed = 0
 
     for rel_path, pattern, template in all_locations:
@@ -83,7 +194,7 @@ def bump(new_version: str, *, dry_run: bool = False) -> int:
             continue
 
         text = path.read_text()
-        replacement = template.format(v=new_version)
+        replacement = template.format(v=new_version, v_underscore=underscore_version)
         new_text, count = pattern.subn(replacement, text)
 
         if count == 0:
@@ -92,13 +203,43 @@ def bump(new_version: str, *, dry_run: bool = False) -> int:
             print(f"  OK (already {new_version}): {rel_path}")
         else:
             changed += count
-            if dry_run:
-                print(f"  DRY-RUN ({count} hit): {rel_path}")
+            if dry_run or check:
+                print(f"  {'DRIFT' if check else 'DRY-RUN'} ({count} hit): {rel_path}")
             else:
                 path.write_text(new_text)
                 print(f"  UPDATED ({count} hit): {rel_path}")
 
-    print(f"\n{'Would update' if dry_run else 'Updated'} {changed} occurrence(s)")
+    # Structural sweep: align every managed image pin / GitHub Action ref across
+    # the whole shipping-surface tree (deploy + docs + site-docs + integrations),
+    # so files not enumerated above — or added in a future release — can never
+    # silently drift. This is the same scan the CI version-alignment gate runs.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import check_version_alignment as cva
+
+    if dry_run or check:
+        sweep_drift = cva.find_drift(new_version)
+        for line in sweep_drift:
+            print(f"  {'DRIFT' if check else 'DRY-RUN'} (align sweep): {line}")
+        changed += len(sweep_drift)
+    else:
+        sweep_count, sweep_files = cva.rewrite(new_version)
+        for path in sweep_files:
+            print(f"  UPDATED (align sweep): {path.relative_to(ROOT)}")
+        changed += sweep_count
+
+    # ``--check`` writes nothing, so reporting "Updated N" for it described work
+    # that did not happen — during a release that reads as "the bump is done."
+    verb = "Would update" if (dry_run or check) else "Updated"
+    print(f"\n{verb} {changed} occurrence(s)")
+
+    if check:
+        if changed > 0:
+            print(
+                f"\nERROR: release-managed files drift from {new_version}. Run: python scripts/bump-version.py {new_version}",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
 
     if not dry_run and changed > 0:
         print("\nNext steps:")
@@ -113,8 +254,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Bump agent-bom version everywhere")
     parser.add_argument("version", help="New version (e.g. 0.29.0)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing")
+    parser.add_argument("--check", action="store_true", help="Fail if managed files are not already aligned")
     args = parser.parse_args()
-    sys.exit(bump(args.version, dry_run=args.dry_run))
+    sys.exit(bump(args.version, dry_run=args.dry_run, check=args.check))
 
 
 if __name__ == "__main__":

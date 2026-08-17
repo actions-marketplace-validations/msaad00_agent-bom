@@ -17,16 +17,34 @@ from typing import Optional
 import toml  # type: ignore[import-untyped]
 import yaml  # type: ignore[import-untyped]
 from rich.console import Console
+from rich.markup import escape
 
 from agent_bom.models import MCPServer, TransportType
 from agent_bom.security import (
     SecurityError,
     sanitize_env_vars,
+    sanitize_log_label,
     validate_mcp_server_config,
 )
 
 console = Console(stderr=True)
 logger = logging.getLogger(__name__)
+
+
+def _display_label(value: object, max_len: int = 500) -> str:
+    return escape(sanitize_log_label(value, max_len=max_len))
+
+
+def _string_field(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _args_field(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, str)]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -79,13 +97,13 @@ def parse_mcp_config(config_data: dict, config_path: str) -> list[MCPServer]:
         try:
             validate_mcp_server_config(server_def)
         except SecurityError as e:
-            warning_msg = f"Blocked insecure server '{name}': {e}"
+            warning_msg = f"Blocked insecure server '{sanitize_log_label(name)}': {sanitize_log_label(e)}"
             logger.warning(warning_msg)
-            console.print(f"[yellow]⚠️  {warning_msg}[/yellow]")
+            console.print(f"[yellow]⚠️  {_display_label(warning_msg)}[/yellow]")
             # Include blocked server in report for visibility — no silent skips
             blocked_server = MCPServer(
                 name=name,
-                command=server_def.get("command", ""),
+                command=_string_field(server_def.get("command", "")),
                 config_path=config_path,
                 security_blocked=True,
                 security_warnings=[str(e)],
@@ -100,19 +118,19 @@ def parse_mcp_config(config_data: dict, config_path: str) -> list[MCPServer]:
         vscode_type = server_def.get("type", "")
         if vscode_type == "sse":
             transport = TransportType.SSE
-            url = server_def.get("uri") or server_def.get("url")
+            url = _string_field(server_def.get("uri") or server_def.get("url"))
         elif vscode_type == "http":
             transport = TransportType.STREAMABLE_HTTP
-            url = server_def.get("uri") or server_def.get("url")
+            url = _string_field(server_def.get("uri") or server_def.get("url"))
         elif "url" in server_def or "uri" in server_def:
-            url = server_def.get("url") or server_def.get("uri")
+            url = _string_field(server_def.get("url") or server_def.get("uri"))
             if url and "sse" in url.lower():
                 transport = TransportType.SSE
             else:
                 transport = TransportType.STREAMABLE_HTTP
 
-        command = server_def.get("command", "")
-        args = server_def.get("args", [])
+        command = _string_field(server_def.get("command", ""))
+        args = _args_field(server_def.get("args", []))
         raw_env = server_def.get("env", {})
 
         # ✅ Security: redact credential values before storing in MCPServer
@@ -122,7 +140,7 @@ def parse_mcp_config(config_data: dict, config_path: str) -> list[MCPServer]:
         server = MCPServer(
             name=name,
             command=command,
-            args=args if isinstance(args, list) else [args],
+            args=args,
             env=env,
             transport=transport,
             url=url,
@@ -173,34 +191,6 @@ def parse_claude_json_projects(config_data: dict, config_path: str) -> list[MCPS
     return servers
 
 
-def _parse_toolhive_servers(data) -> list[MCPServer]:
-    """Parse ToolHive ``thv list --output json`` into MCPServer objects."""
-    servers: list[MCPServer] = []
-    items = data if isinstance(data, list) else data.get("servers", [])
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("name", "")
-        if not name:
-            continue
-
-        url = item.get("url") or item.get("endpoint")
-        transport = TransportType.STDIO
-        if url:
-            transport = TransportType.SSE if "sse" in url.lower() else TransportType.STREAMABLE_HTTP
-
-        server = MCPServer(
-            name=name,
-            command=item.get("image", "thv"),
-            args=[],
-            transport=transport,
-            url=url,
-            config_path="thv",
-        )
-        servers.append(server)
-    return servers
-
-
 # ---------------------------------------------------------------------------
 # TOML / YAML config parsers
 # ---------------------------------------------------------------------------
@@ -229,9 +219,9 @@ def parse_codex_config(config_path: str) -> list[MCPServer]:
 
         # Determine transport
         transport = TransportType.STDIO
-        url = server_def.get("url")
-        command = server_def.get("command", "")
-        args = server_def.get("args", [])
+        url = _string_field(server_def.get("url"))
+        command = _string_field(server_def.get("command", ""))
+        args = _args_field(server_def.get("args", []))
 
         if url:
             transport = TransportType.SSE if "sse" in url.lower() else TransportType.STREAMABLE_HTTP
@@ -240,14 +230,14 @@ def parse_codex_config(config_path: str) -> list[MCPServer]:
         env = sanitize_env_vars(raw_env) if isinstance(raw_env, dict) else {}
 
         # Bearer token env var → track as credential
-        bearer_var = server_def.get("bearer_token_env_var")
+        bearer_var = _string_field(server_def.get("bearer_token_env_var"))
         if bearer_var:
             env[bearer_var] = "***REDACTED***"
 
         server = MCPServer(
             name=name,
             command=command,
-            args=args if isinstance(args, list) else [args],
+            args=args,
             env=env,
             transport=transport,
             url=url,
@@ -462,6 +452,30 @@ _DANGEROUS_HOOK_PATTERNS = re.compile(
 )
 
 
+def audit_claude_desktop_settings(config_data: dict, config_path: str) -> list[dict]:
+    """Extract and flag risky Claude Desktop automation settings."""
+    findings = []
+    risky_settings = {
+        "scheduledTasksEnabled": ("Autonomous scheduled task execution", "high"),
+        "ccdScheduledTasksEnabled": ("Code Desktop scheduled tasks", "high"),
+        "keepAwakeEnabled": ("Keep-awake prevents idle timeout", "medium"),
+        "webSearchEnabled": ("Autonomous internet access", "high"),
+    }
+    for key, (desc, risk) in risky_settings.items():
+        val = config_data.get(key)
+        if val is True:
+            findings.append(
+                {
+                    "setting": key,
+                    "value": val,
+                    "description": desc,
+                    "risk_level": risk,
+                    "config_path": config_path,
+                }
+            )
+    return findings
+
+
 def audit_cortex_hooks(hooks: dict) -> list[dict]:
     """Audit Cortex Code hook configuration for security risks.
 
@@ -536,6 +550,7 @@ def _parse_docker_mcp_catalog(
     server definitions with image refs, tool lists, secrets, and metadata.
     We only parse entries that the user has enabled in ``registry.yaml``.
     """
+    from agent_bom.floating_refs import classify_image_reference
     from agent_bom.models import MCPTool, Package
 
     try:
@@ -578,12 +593,15 @@ def _parse_docker_mcp_catalog(
             pkg_version = image_ref.split(":")[-1]
 
         pkg_name = image_ref.split("@")[0] if "@" in image_ref else image_ref
+        floating = classify_image_reference(image_ref)
         packages = [
             Package(
                 name=pkg_name,
                 version=pkg_version,
                 ecosystem="docker",
                 is_direct=True,
+                floating_reference=floating is not None,
+                floating_reference_reason=floating.reason if floating else None,
             )
         ]
 
@@ -596,6 +614,7 @@ def _parse_docker_mcp_catalog(
             tools=tools,
             packages=packages,
             config_path=str(catalog_path),
+            security_warnings=[floating.to_security_warning()] if floating else [],
         )
         servers.append(server)
 

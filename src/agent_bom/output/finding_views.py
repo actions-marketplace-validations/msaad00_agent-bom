@@ -1,0 +1,333 @@
+"""Compatibility views over the unified Finding stream for output formatters."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from agent_bom.compliance_coverage import COMPLIANCE_TAG_FIELDS
+from agent_bom.finding import Finding, FindingType, blast_radius_to_finding
+from agent_bom.graph.severity import normalize_severity
+from agent_bom.models import AIBOMReport, BlastRadius, Severity
+
+_MACHINE_EXPORT_TYPES = (FindingType.CVE, FindingType.MALICIOUS_PACKAGE)
+
+
+def cve_findings(report: AIBOMReport, blast_radii: list[BlastRadius] | None = None) -> list[Finding]:
+    """Return CVE findings, accepting non-empty legacy BlastRadius overrides."""
+    source_blast_radii = blast_radii if blast_radii is not None else report.blast_radii
+    if source_blast_radii:
+        # The CLI/API dual-write path already materializes this exact projection
+        # on ``report.findings``. Reusing it avoids rebuilding and re-sanitizing
+        # every BlastRadius once per output format (JSON, CSV, SARIF, HTML,
+        # Markdown, JUnit, and graph exports). Fall back to the legacy conversion
+        # when the caller supplies a different or incomplete BlastRadius stream.
+        materialized = [finding for finding in report.findings if finding.finding_type == FindingType.CVE]
+        expected_ids = sorted(str(getattr(br.vulnerability, "id", "")) for br in source_blast_radii)
+        materialized_ids = sorted(str(finding.cve_id or finding.id or "") for finding in materialized)
+        if materialized and expected_ids == materialized_ids:
+            return materialized
+        return [blast_radius_to_finding(br) for br in source_blast_radii]
+
+    return [finding for finding in report.to_findings() if finding.finding_type in _MACHINE_EXPORT_TYPES]
+
+
+def apply_workload_runtime_evidence_for_export(findings: list[Finding]) -> list[Finding]:
+    """Annotate findings with CWPP runtime evidence when a tenant index is present.
+
+    Additive only: findings without a resolvable workload identity are unchanged.
+    An empty store leaves findings untouched (no fabricated no-signal rows).
+    Findings that already carry ``workload_runtime_evidence`` keep it.
+    """
+    from agent_bom.cloud.runtime_workload_evidence import (
+        enrich_findings_workload_runtime_evidence,
+        optional_runtime_workload_evidence_index,
+    )
+
+    pending = [finding for finding in findings if not getattr(finding, "workload_runtime_evidence", None)]
+    if pending:
+        enrich_findings_workload_runtime_evidence(pending, optional_runtime_workload_evidence_index())
+    return findings
+
+
+def machine_export_findings(report: AIBOMReport, blast_radii: list[BlastRadius] | None = None) -> list[Finding]:
+    """Rows for flat machine exports (CSV/Parquet): CVE findings plus synthesized
+    malicious-package findings.
+
+    ``cve_findings`` only includes synthesized malicious (vuln-less typosquat /
+    dep-confusion) findings when there are no BlastRadius rows to override with;
+    once any CVE BlastRadius exists it returns the BlastRadius list alone, so a
+    malicious-only package would silently vanish from CSV/Parquet even though
+    JSON/SARIF (which read ``report.to_findings()``) still surface it. Append the
+    malicious findings that the BlastRadius list doesn't already carry, deduped by
+    finding id, so every export sees the same rows.
+    """
+    findings = cve_findings(report, blast_radii)
+    seen = {getattr(finding, "id", None) for finding in findings}
+    findings.extend(
+        finding
+        for finding in report.to_findings()
+        if finding.finding_type in _MACHINE_EXPORT_TYPES and getattr(finding, "id", None) not in seen
+    )
+    return findings
+
+
+def unified_export_findings(report: AIBOMReport, blast_radii: list[BlastRadius] | None = None) -> list[Finding]:
+    """Every unified finding for flat exports — no type silently dropped.
+
+    ``machine_export_findings`` covers only CVE + malicious-package rows, so
+    exports built on it lost COMBINATION / PROMPT_SECURITY / CIS / SAST /
+    secret findings with no indicator while the console stream showed them.
+    Keep the CVE half on ``machine_export_findings`` (it honors legacy
+    BlastRadius overrides and dedups synthesized malicious rows) and append
+    every other finding type from the unified stream.
+    """
+    findings = machine_export_findings(report, blast_radii)
+    findings.extend(finding for finding in report.to_findings() if finding.finding_type not in _MACHINE_EXPORT_TYPES)
+    return findings
+
+
+def unified_findings(report: AIBOMReport, blast_radii: list[BlastRadius] | None = None) -> list[Finding]:
+    """Return the complete finding stream for human and machine summaries.
+
+    Keep this name separate from ``unified_export_findings`` so callers that
+    only need a posture/severity summary do not imply a flat-file export
+    contract.  Both paths intentionally share the same deduplicated stream.
+    """
+    return unified_export_findings(report, blast_radii)
+
+
+def active_cve_findings(report: AIBOMReport, blast_radii: list[BlastRadius] | None = None) -> list[Finding]:
+    """Return CVE findings that remain active after VEX suppression."""
+    from agent_bom.vex import active_blast_radii
+
+    source = blast_radii if blast_radii is not None else report.blast_radii
+    if source:
+        return cve_findings(report, active_blast_radii(source))
+    return [finding for finding in cve_findings(report) if not finding.suppressed]
+
+
+def nested_vulnerabilities(report: AIBOMReport) -> list[Any]:
+    """Return package vulnerabilities from the legacy inventory tree."""
+    vulns: list[Any] = []
+    for agent in report.agents:
+        for server in agent.mcp_servers:
+            for package in server.packages:
+                vulns.extend(package.vulnerabilities)
+    return vulns
+
+
+def evidence(finding: Finding, key: str, default: Any = "") -> Any:
+    value = finding.evidence.get(key, default)
+    return default if value is None else value
+
+
+def workflow_status(finding: Finding) -> str:
+    """Return the persisted finding workflow/lifecycle state, if available."""
+    value = getattr(finding, "lifecycle_status", None)
+    if value is None:
+        value = evidence(finding, "lifecycle_status", None) or evidence(finding, "status", None)
+    return str(value or "").strip()
+
+
+# Human-facing labels for the code-level reachability signal. Ordered
+# most-specific first. ``state`` drives filtering/styling; ``label`` is the cell.
+_REACHABILITY_LABELS: dict[str, tuple[str, str]] = {
+    "function_reachable": ("Function", "reachable"),
+    "package_reachable": ("Package", "reachable"),
+    "unreachable": ("Unreachable", "unreachable"),
+}
+
+
+def reachability_label(finding: Finding) -> tuple[str, str]:
+    """Human-facing code-reachability signal for a CVE finding.
+
+    Returns ``(label, state)`` where ``state`` is ``"reachable"``,
+    ``"unreachable"``, or ``"unknown"``. This surfaces the symbol/graph
+    reachability moat — *not* the coarse blast-radius ``reachability``
+    classification (which is always populated). §11 honesty: when neither the
+    symbol nor graph engine produced a verdict we report ``"Unknown"`` and
+    never imply the finding is reachable.
+    """
+    symbol = evidence(finding, "symbol_reachability", None)
+    if isinstance(symbol, str) and symbol in _REACHABILITY_LABELS:
+        return _REACHABILITY_LABELS[symbol]
+    graph = finding.evidence.get("graph_reachable", None)
+    if graph is True:
+        return "Reachable", "reachable"
+    if graph is False:
+        return "Unreachable", "unreachable"
+    return "Unknown", "unknown"
+
+
+def package_name(finding: Finding) -> str:
+    value = evidence(finding, "package_name", "")
+    if value:
+        return str(value)
+    identifier = finding.asset.identifier or ""
+    if "/" in identifier:
+        tail = identifier.rsplit("/", 1)[-1]
+        return tail.rsplit("@", 1)[0]
+    return finding.asset.name
+
+
+def package_version(finding: Finding) -> str:
+    value = evidence(finding, "package_version", "")
+    if value:
+        return str(value)
+    identifier = finding.asset.identifier or ""
+    if "@" in identifier:
+        return identifier.rsplit("@", 1)[-1]
+    return ""
+
+
+def package_ecosystem(finding: Finding) -> str:
+    value = evidence(finding, "ecosystem", "")
+    if value:
+        return str(value)
+    identifier = finding.asset.identifier or ""
+    if identifier.startswith("pkg:") and "/" in identifier:
+        return identifier.removeprefix("pkg:").split("/", 1)[0]
+    return ""
+
+
+def severity_value(finding: Finding) -> str:
+    return str(finding.effective_severity() or finding.severity or "unknown").lower()
+
+
+def finding_severity(finding: Finding) -> Severity:
+    """Map a unified finding to the legacy Severity enum for console badges."""
+    raw = severity_value(finding)
+    if raw == "none":
+        return Severity.NONE
+    try:
+        return Severity(raw)
+    except ValueError:
+        return Severity.UNKNOWN
+
+
+def is_package_direct(finding: Finding) -> bool:
+    return bool(evidence(finding, "package_is_direct", False))
+
+
+def is_package_malicious(finding: Finding) -> bool:
+    return bool(evidence(finding, "package_is_malicious", False))
+
+
+def is_actionable_finding(finding: Finding) -> bool:
+    """Return whether a CVE finding should surface in default actionable views."""
+    if finding.is_actionable is not None:
+        return bool(finding.is_actionable)
+    if finding.suppressed:
+        return False
+    if finding.is_kev:
+        return True
+    if severity_value(finding) in {"critical", "high"}:
+        return True
+    if finding.exposed_credentials or finding.exposed_tools:
+        return True
+    if is_package_direct(finding) or is_package_malicious(finding):
+        return True
+    return False
+
+
+def exploit_likelihood_value(finding: Finding) -> str:
+    """Graded exploit-likelihood signal derived from unified finding enrichment.
+
+    Returns ``"unassessed"`` (never ``"theoretical"``) when there is no basis —
+    no KEV, no EPSS score, no EPSS percentile — so an assessed-sounding label is
+    never fabricated from absent signal.
+    """
+    from agent_bom.config import EPSS_ACTIVE_EXPLOITATION_THRESHOLD
+
+    if finding.is_kev:
+        return "actively_exploited"
+    epss = finding.epss_score
+    percentile = evidence(finding, "epss_percentile", None)
+    if epss is None and percentile is None:
+        return "unassessed"  # no signal → no fabricated assessment
+    if epss is not None and epss >= EPSS_ACTIVE_EXPLOITATION_THRESHOLD:
+        return "likely_exploited"
+    if percentile is not None and percentile >= 95:
+        return "likely_exploited"
+    if percentile is not None and percentile >= 80:
+        return "public_exploit"
+    return "theoretical"
+
+
+def finding_references(finding: Finding) -> list[str]:
+    refs = evidence(finding, "references", [])
+    if isinstance(refs, list):
+        return [str(ref) for ref in refs if ref]
+    return []
+
+
+SEVERITY_COUNT_KEYS: tuple[str, ...] = (
+    "critical",
+    "high",
+    "medium",
+    "low",
+    "info",
+    "none",
+    "unknown",
+)
+
+
+def severity_counts(findings: list[Finding]) -> dict[str, int]:
+    """Bucket every finding by severity, losing none of them.
+
+    ``sum(severity_counts(f).values()) == len(f)`` always holds: a severity the
+    scanners never resolved lands in ``unknown`` rather than falling out of the
+    histogram. A total printed beside a breakdown that silently dropped its
+    unrated rows reads as "all of these are benign" when the truth is "we never
+    rated them".
+    """
+    counts = {key: 0 for key in SEVERITY_COUNT_KEYS}
+    for finding in findings:
+        counts[normalize_severity(severity_value(finding))] += 1
+    return counts
+
+
+def has_high_or_critical(finding: Finding) -> bool:
+    return severity_value(finding) in {"critical", "high"}
+
+
+def is_medium(finding: Finding) -> bool:
+    return severity_value(finding) == "medium"
+
+
+def ranked_cve_findings(
+    report: AIBOMReport,
+    blast_radii: list[BlastRadius] | None = None,
+    *,
+    limit: int = 10,
+) -> list[Finding]:
+    """Return top CVE findings by unified risk score for exposure-path views."""
+    findings = cve_findings(report, blast_radii)
+    return sorted(findings, key=lambda finding: float(finding.risk_score or 0.0), reverse=True)[:limit]
+
+
+def topology_package_key(finding: Finding) -> tuple[str, str]:
+    """Return ``(name, ecosystem)`` for graph/mermaid package nodes."""
+    return package_name(finding), package_ecosystem(finding)
+
+
+def compliance_row_dict(finding: Finding) -> dict[str, Any]:
+    """Framework table row payload from a unified CVE finding."""
+    return {
+        "severity": severity_value(finding),
+        **{field: list(getattr(finding, field, []) or []) for field in COMPLIANCE_TAG_FIELDS},
+    }
+
+
+def topology_vuln_dict(finding: Finding) -> dict[str, Any]:
+    """Project a unified CVE finding into the graph builder vuln payload shape."""
+    summary = finding.description or finding.title or ""
+    return {
+        "id": finding.cve_id or finding.title,
+        "severity": severity_value(finding),
+        "summary": summary[:100] if summary else "",
+        "risk_score": finding.risk_score,
+        "cvss_score": finding.cvss_score or 0,
+        "fix_version": finding.fixed_version or "",
+        **{field: list(getattr(finding, field, []) or []) for field in COMPLIANCE_TAG_FIELDS},
+    }

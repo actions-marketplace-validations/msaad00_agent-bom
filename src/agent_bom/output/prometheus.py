@@ -18,16 +18,46 @@ Usage from cli.py::
 
 from __future__ import annotations
 
-import urllib.error
-import urllib.request
+import logging
 from pathlib import Path
 from typing import Optional
 
+from agent_bom.evidence.scan_run import ScanOutcome, effective_scan_run
 from agent_bom.models import AIBOMReport, BlastRadius, Severity
+from agent_bom.output.finding_views import (
+    cve_findings,
+    package_ecosystem,
+    package_name,
+    package_version,
+    severity_counts,
+    severity_value,
+)
+
+logger = logging.getLogger(__name__)
 
 # ─── Metric name constants ─────────────────────────────────────────────────
 
 _PREFIX = "agent_bom"
+
+# Each finding emits up to three high-cardinality time series (blast radius,
+# EPSS, CVSS) keyed by vuln_id/package/version. A large report would otherwise
+# explode a Prometheus server's scrape cardinality, so cap the number of
+# per-finding series and expose the truncation as its own metric. Callers can
+# override via ``max_per_finding_series``; ``0`` disables per-finding series
+# entirely (aggregate metrics are always emitted).
+_DEFAULT_MAX_PER_FINDING_SERIES = 500
+
+
+def _cap_findings(findings: list, limit: int) -> tuple[list, int]:
+    """Return the highest-risk ``limit`` findings and the dropped count.
+
+    Findings are ranked by risk score (descending) so the retained per-finding
+    series are the ones an operator most wants on a dashboard.
+    """
+    if limit < 0 or len(findings) <= limit:
+        return findings, 0
+    ranked = sorted(findings, key=lambda f: getattr(f, "risk_score", 0.0) or 0.0, reverse=True)
+    return ranked[:limit], len(findings) - limit
 
 
 def _label(key: str, value: str) -> str:
@@ -52,6 +82,7 @@ def _metric(name: str, value: float | int, *label_pairs: tuple[str, str]) -> str
 def to_prometheus(
     report: AIBOMReport,
     blast_radii: Optional[list[BlastRadius]] = None,
+    max_per_finding_series: int = _DEFAULT_MAX_PER_FINDING_SERIES,
 ) -> str:
     """Convert an AIBOMReport to Prometheus text exposition format.
 
@@ -74,7 +105,8 @@ def to_prometheus(
     agent_bom_credentials_exposed_total    Gauge  Creds exposed, per agent
     agent_bom_agent_vulnerabilities_total  Gauge  Per-agent, per-severity counts
     """
-    brs = blast_radii or []
+    findings = cve_findings(report, blast_radii)
+    scan_run = effective_scan_run(report)
     lines: list[str] = []
 
     def header(name: str, help_text: str, metric_type: str = "gauge") -> None:
@@ -84,6 +116,14 @@ def to_prometheus(
     # ── agent_bom_info ────────────────────────────────────────────────────
     header("info", "agent-bom tool metadata (always 1)")
     lines.append(_metric("info", 1, ("version", report.tool_version), ("scan_at", report.generated_at.strftime("%Y-%m-%dT%H:%M:%SZ"))))
+    lines.append("")
+
+    # An empty/partial scan must never look healthy to an alerting system.
+    header("scan_outcome", "Scan execution quality (1 for the current outcome)")
+    for outcome in ScanOutcome:
+        lines.append(_metric("scan_outcome", 1 if scan_run.outcome is outcome else 0, ("outcome", outcome.value)))
+    header("scan_issues_total", "Number of bounded scan execution issues")
+    lines.append(_metric("scan_issues_total", len(scan_run.issues)))
     lines.append("")
 
     # ── agent_bom_scan_timestamp_seconds ─────────────────────────────────
@@ -107,77 +147,86 @@ def to_prometheus(
 
     # ── Vulnerability counts by severity ─────────────────────────────────
     header("vulnerabilities_total", "Total vulnerabilities found, broken down by severity")
-    sev_counts: dict[str, int] = {s.value: 0 for s in Severity if s != Severity.NONE}
-    for br in brs:
-        sev = br.vulnerability.severity.value
-        if sev in sev_counts:
-            sev_counts[sev] += 1
+    sev_counts = severity_counts(findings)
     for sev, count in sev_counts.items():
         lines.append(_metric("vulnerabilities_total", count, ("severity", sev)))
     lines.append("")
 
     # ── CISA KEV count ────────────────────────────────────────────────────
     header("kev_findings_total", "Number of findings in the CISA Known Exploited Vulnerabilities catalog")
-    kev_count = sum(1 for br in brs if br.vulnerability.is_kev)
+    kev_count = sum(1 for finding in findings if finding.is_kev)
     lines.append(_metric("kev_findings_total", kev_count))
     lines.append("")
 
     # ── Fixable vulns ─────────────────────────────────────────────────────
     header("fixable_vulnerabilities_total", "Number of vulnerabilities that have a known fixed version available")
-    fixable = sum(1 for br in brs if br.vulnerability.fixed_version)
+    fixable = sum(1 for finding in findings if finding.fixed_version)
     lines.append(_metric("fixable_vulnerabilities_total", fixable))
     lines.append("")
 
     # ── Per-vulnerability blast radius scores ─────────────────────────────
-    if brs:
+    # Cap per-finding series so a large report cannot blow up scrape cardinality.
+    per_finding, dropped = _cap_findings(findings, max_per_finding_series)
+    if dropped:
+        logger.warning(
+            "Prometheus export truncated per-finding series: emitting top %d of %d findings (cap=%d) to bound scrape cardinality",
+            len(per_finding),
+            len(findings),
+            max_per_finding_series,
+        )
+        header(
+            "per_finding_series_truncated",
+            "Number of findings whose per-finding series were dropped to bound cardinality",
+        )
+        lines.append(_metric("per_finding_series_truncated", dropped))
+        lines.append("")
+
+    if per_finding:
         header("blast_radius_score", "Blast radius risk score per vulnerability (0-10 scale)")
-        for br in brs:
-            v = br.vulnerability
+        for finding in per_finding:
             lines.append(
                 _metric(
                     "blast_radius_score",
-                    round(br.risk_score, 3),
-                    ("vuln_id", v.id),
-                    ("package", br.package.name),
-                    ("version", br.package.version),
-                    ("severity", v.severity.value),
-                    ("ecosystem", br.package.ecosystem),
-                    ("fixable", "1" if v.fixed_version else "0"),
-                    ("kev", "1" if v.is_kev else "0"),
+                    round(finding.risk_score, 3),
+                    ("vuln_id", finding.cve_id or finding.id),
+                    ("package", package_name(finding)),
+                    ("version", package_version(finding)),
+                    ("severity", severity_value(finding)),
+                    ("ecosystem", package_ecosystem(finding)),
+                    ("fixable", "1" if finding.fixed_version else "0"),
+                    ("kev", "1" if finding.is_kev else "0"),
                 )
             )
         lines.append("")
 
         # ── EPSS scores ───────────────────────────────────────────────────
-        epss_brs = [br for br in brs if br.vulnerability.epss_score is not None]
-        if epss_brs:
+        epss_findings = [finding for finding in per_finding if finding.epss_score is not None]
+        if epss_findings:
             header("vulnerability_epss_score", "EPSS exploit probability score (0.0-1.0) per vulnerability")
-            for br in epss_brs:
-                v = br.vulnerability
+            for finding in epss_findings:
                 lines.append(
                     _metric(
                         "vulnerability_epss_score",
-                        round(v.epss_score, 5),  # type: ignore[arg-type]
-                        ("vuln_id", v.id),
-                        ("package", br.package.name),
-                        ("severity", v.severity.value),
+                        round(finding.epss_score, 5),  # type: ignore[arg-type]
+                        ("vuln_id", finding.cve_id or finding.id),
+                        ("package", package_name(finding)),
+                        ("severity", severity_value(finding)),
                     )
                 )
             lines.append("")
 
         # ── CVSS scores ───────────────────────────────────────────────────
-        cvss_brs = [br for br in brs if br.vulnerability.cvss_score is not None]
-        if cvss_brs:
+        cvss_findings = [finding for finding in per_finding if finding.cvss_score is not None]
+        if cvss_findings:
             header("vulnerability_cvss_score", "CVSS base score (0.0-10.0) per vulnerability")
-            for br in cvss_brs:
-                v = br.vulnerability
+            for finding in cvss_findings:
                 lines.append(
                     _metric(
                         "vulnerability_cvss_score",
-                        round(v.cvss_score, 2),  # type: ignore[arg-type]
-                        ("vuln_id", v.id),
-                        ("package", br.package.name),
-                        ("severity", v.severity.value),
+                        round(finding.cvss_score, 2),  # type: ignore[arg-type]
+                        ("vuln_id", finding.cve_id or finding.id),
+                        ("package", package_name(finding)),
+                        ("severity", severity_value(finding)),
                     )
                 )
             lines.append("")
@@ -186,13 +235,13 @@ def to_prometheus(
     header("agent_vulnerabilities_total", "Number of vulnerabilities per agent, broken down by severity")
     # Build agent→severity→count
     agent_sev: dict[str, dict[str, int]] = {}
-    for br in brs:
-        for agent in br.affected_agents:
-            if agent.name not in agent_sev:
-                agent_sev[agent.name] = {s.value: 0 for s in Severity if s != Severity.NONE}
-            sev = br.vulnerability.severity.value
-            if sev in agent_sev[agent.name]:
-                agent_sev[agent.name][sev] += 1
+    for finding in findings:
+        for agent_name in finding.affected_agents:
+            if agent_name not in agent_sev:
+                agent_sev[agent_name] = {s.value: 0 for s in Severity if s != Severity.NONE}
+            sev = severity_value(finding)
+            if sev in agent_sev[agent_name]:
+                agent_sev[agent_name][sev] += 1
     # Also emit 0-counts for agents with no vulns
     for agent in report.agents:
         if agent.name not in agent_sev:
@@ -252,10 +301,12 @@ def push_to_gateway(
     Raises:
         PushgatewayError: If the HTTP push fails
     """
-    # Enforce http/https only — reject file://, ftp://, etc.
-    parsed_scheme = gateway_url.split("://", 1)[0].lower()
-    if parsed_scheme not in ("http", "https"):
-        raise PushgatewayError(f"Pushgateway URL must use http:// or https://, got: {gateway_url!r}")
+    from agent_bom.security import SecurityError, validate_url
+
+    try:
+        validate_url(gateway_url, allowed_schemes=("http", "https"))
+    except SecurityError as exc:
+        raise PushgatewayError(f"Pushgateway URL rejected by outbound URL policy: {exc}") from exc
 
     text = to_prometheus(report, blast_radii)
 
@@ -264,22 +315,26 @@ def push_to_gateway(
         url += f"/instance/{instance}"
 
     data = text.encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
-    )
 
     try:
-        # nosec B310 — URL scheme restricted to http/https above
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
-            if resp.status not in (200, 202):
-                raise PushgatewayError(f"Pushgateway returned HTTP {resp.status}")
-    except urllib.error.HTTPError as e:
-        raise PushgatewayError(f"Pushgateway HTTP {e.code}: {e.reason}") from e
-    except urllib.error.URLError as e:
-        raise PushgatewayError(f"Cannot reach Pushgateway at {gateway_url}: {e.reason}") from e
+        from agent_bom.http_client import create_sync_client, sync_request_with_retry
+
+        with create_sync_client(timeout=timeout) as client:
+            resp = sync_request_with_retry(
+                client,
+                "POST",
+                url,
+                content=data,
+                headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
+            )
+        if resp is None:
+            raise PushgatewayError(f"Cannot reach Pushgateway at {gateway_url} after retries")
+        if resp.status_code not in (200, 202):
+            raise PushgatewayError(f"Pushgateway returned HTTP {resp.status_code}")
+    except PushgatewayError:
+        raise
+    except Exception as e:
+        raise PushgatewayError(f"Cannot reach Pushgateway at {gateway_url}: {e}") from e
 
 
 # ─── OpenTelemetry OTLP export (optional dep) ─────────────────────────────
@@ -324,7 +379,7 @@ def push_otlp(
             "opentelemetry-exporter-otlp-proto-http)"
         ) from exc
 
-    brs = blast_radii or []
+    findings = cve_findings(report, blast_radii)
 
     resource = Resource(
         attributes={
@@ -332,6 +387,13 @@ def push_otlp(
             "agent_bom.version": report.tool_version,
         }
     )
+
+    from agent_bom.security import SecurityError, validate_url
+
+    try:
+        validate_url(endpoint, allowed_schemes=("http", "https"))
+    except SecurityError as exc:
+        raise RuntimeError(f"OTLP endpoint rejected by outbound URL policy: {exc}") from exc
 
     otlp_url = endpoint.rstrip("/") + "/v1/metrics"
     exporter = OTLPMetricExporter(endpoint=otlp_url, timeout=timeout)
@@ -352,7 +414,7 @@ def push_otlp(
         yield otel_metrics.Observation(report.total_packages)
 
     def _kev_cb(options):
-        yield otel_metrics.Observation(sum(1 for br in brs if br.vulnerability.is_kev))
+        yield otel_metrics.Observation(sum(1 for finding in findings if finding.is_kev))
 
     meter.create_observable_gauge("agent_bom.agents_total", callbacks=[_agents_cb], description="Total AI agents discovered")
     meter.create_observable_gauge("agent_bom.mcp_servers_total", callbacks=[_servers_cb], description="Total MCP servers")
@@ -360,11 +422,7 @@ def push_otlp(
     meter.create_observable_gauge("agent_bom.kev_findings_total", callbacks=[_kev_cb], description="CISA KEV findings")
 
     # Severity breakdown via ObservableGauge per severity
-    sev_counts: dict[str, int] = {s.value: 0 for s in Severity if s != Severity.NONE}
-    for br in brs:
-        sev = br.vulnerability.severity.value
-        if sev in sev_counts:
-            sev_counts[sev] += 1
+    sev_counts = severity_counts(findings)
 
     for sev_value, count in sev_counts.items():
         _count = count  # capture
@@ -382,3 +440,101 @@ def push_otlp(
     # Force flush
     provider.force_flush(timeout_millis=timeout * 1000)
     provider.shutdown()
+
+
+# ─── OpenTelemetry OTLP traces export (optional dep) ──────────────────────
+
+
+def push_otlp_traces(
+    endpoint: str,
+    report: AIBOMReport,
+    blast_radii: Optional[list[BlastRadius]] = None,
+    timeout: int = 15,
+) -> bool:
+    """Export the scan as an OTLP **trace** (spans) over OTLP/HTTP.
+
+    Complements ``push_otlp`` (metrics). The platform already *ingests* traces
+    (``api/tracing.py``); this closes the loop by *emitting* a trace for each
+    scan so observability interop works both ways. A root ``agent_bom.scan``
+    span carries scan-level attributes; a child span is emitted per severity
+    bucket so a finding distribution is visible in any OTLP trace backend.
+
+    Opt-in and no-op-friendly:
+      * ``endpoint`` empty  → returns ``False`` (no-op), never raises.
+      * OTel packages absent → returns ``False`` (no-op), never raises.
+    Both branches let callers gate behind the existing OTLP endpoint config
+    without import-guarding at the call site.
+
+    Args:
+        endpoint: OTLP collector base URL, e.g. ``http://localhost:4318``
+                  (``/v1/traces`` is appended automatically).
+        report: The AI-BOM report to emit as a trace.
+        blast_radii: Blast radius analysis results.
+        timeout: Per-export timeout in seconds.
+
+    Returns:
+        ``True`` when a trace was emitted and flushed; ``False`` on no-op.
+
+    Raises:
+        RuntimeError: Only if the endpoint is rejected by the outbound URL
+            policy (an actionable misconfiguration, not a transient failure).
+    """
+    if not (endpoint or "").strip():
+        return False
+
+    try:
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+            OTLPSpanExporter,
+        )
+        from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.trace import SpanKind
+    except ImportError:
+        # Graceful no-op: traces are optional. The metrics path raises ImportError
+        # for the explicit `push_otlp` request; traces are an additive emit, so we
+        # degrade silently rather than failing a scan.
+        return False
+
+    from agent_bom.security import SecurityError, validate_url
+
+    try:
+        validate_url(endpoint, allowed_schemes=("http", "https"))
+    except SecurityError as exc:
+        raise RuntimeError(f"OTLP traces endpoint rejected by outbound URL policy: {exc}") from exc
+
+    findings = cve_findings(report, blast_radii)
+    sev_counts = severity_counts(findings)
+
+    resource = Resource(
+        attributes={
+            SERVICE_NAME: "agent-bom",
+            "agent_bom.version": report.tool_version,
+        }
+    )
+
+    otlp_url = endpoint.rstrip("/") + "/v1/traces"
+    exporter = OTLPSpanExporter(endpoint=otlp_url, timeout=timeout)
+    provider = TracerProvider(resource=resource)
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+    tracer = provider.get_tracer("agent_bom", report.tool_version)
+
+    kev_count = sum(1 for finding in findings if finding.is_kev)
+    fixable = sum(1 for finding in findings if finding.fixed_version)
+
+    with tracer.start_as_current_span("agent_bom.scan", kind=SpanKind.INTERNAL) as scan_span:
+        scan_span.set_attribute("agent_bom.version", report.tool_version)
+        scan_span.set_attribute("agent_bom.agents_total", report.total_agents)
+        scan_span.set_attribute("agent_bom.mcp_servers_total", report.total_servers)
+        scan_span.set_attribute("agent_bom.packages_total", report.total_packages)
+        scan_span.set_attribute("agent_bom.vulnerabilities_total", len(findings))
+        scan_span.set_attribute("agent_bom.kev_findings_total", kev_count)
+        scan_span.set_attribute("agent_bom.fixable_vulnerabilities_total", fixable)
+        for sev_value, count in sev_counts.items():
+            with tracer.start_as_current_span(f"agent_bom.severity.{sev_value}", kind=SpanKind.INTERNAL) as sev_span:
+                sev_span.set_attribute("agent_bom.severity", sev_value)
+                sev_span.set_attribute("agent_bom.count", count)
+
+    provider.force_flush(timeout_millis=timeout * 1000)
+    provider.shutdown()
+    return True

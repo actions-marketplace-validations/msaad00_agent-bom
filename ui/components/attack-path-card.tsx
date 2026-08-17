@@ -1,0 +1,154 @@
+"use client";
+
+import Link from "next/link";
+import type { LucideIcon } from "lucide-react";
+import { ArrowRight, Bot, Bug, ChevronRight, Database, Fingerprint, KeyRound, Package, Server, ShieldAlert, Wrench } from "lucide-react";
+
+interface AttackPathNode {
+  type: "cve" | "package" | "server" | "agent" | "credential" | "tool" | "data" | "identity" | "entity";
+  label: string;
+  severity?: string | undefined;
+}
+
+interface AttackPathCardProps {
+  nodes: AttackPathNode[];
+  riskScore: number;
+  onClick?: () => void;
+  href?: string | undefined;
+  captureMode?: boolean | undefined;
+  compact?: boolean | undefined;
+  showRiskBadge?: boolean | undefined;
+}
+
+const NODE_META: Record<AttackPathNode["type"], { icon: LucideIcon; tint: string; ring: string }> = {
+  cve: { icon: Bug, tint: "text-red-700 dark:text-red-300 bg-red-500/12", ring: "border-red-500/25" },
+  package: { icon: Package, tint: "text-amber-700 dark:text-amber-300 bg-amber-500/12", ring: "border-amber-500/25" },
+  server: { icon: Server, tint: "text-sky-700 dark:text-sky-300 bg-sky-500/12", ring: "border-sky-500/25" },
+  agent: { icon: Bot, tint: "text-emerald-700 dark:text-emerald-300 bg-emerald-500/12", ring: "border-emerald-500/25" },
+  credential: { icon: KeyRound, tint: "text-fuchsia-700 dark:text-fuchsia-300 bg-fuchsia-500/12", ring: "border-fuchsia-500/25" },
+  tool: { icon: Wrench, tint: "text-purple-700 dark:text-purple-300 bg-purple-500/12", ring: "border-purple-500/25" },
+  data: { icon: Database, tint: "text-cyan-700 dark:text-cyan-300 bg-cyan-500/12", ring: "border-cyan-500/25" },
+  identity: { icon: Fingerprint, tint: "text-indigo-700 dark:text-indigo-300 bg-indigo-500/12", ring: "border-indigo-500/25" },
+  entity: {
+    icon: ShieldAlert,
+    tint: "text-[color:var(--text-secondary)] bg-[color:var(--surface-elevated)]",
+    ring: "border-[color:var(--border-subtle)]",
+  },
+};
+
+export function AttackPathCard({
+  nodes,
+  riskScore,
+  onClick,
+  href,
+  captureMode = false,
+  compact = false,
+  showRiskBadge = true,
+}: AttackPathCardProps) {
+  const riskTone =
+    riskScore >= 8
+      ? "border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-200"
+      : riskScore >= 5
+        ? "border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-200"
+        : "border-[color:var(--border-subtle)] bg-[color:var(--surface-elevated)] text-[color:var(--text-secondary)]";
+
+  const cardBody = (
+    <>
+      {!compact && (
+        <div className="mb-3 flex items-start justify-between gap-3">
+          <div>
+            <p className="text-[11px] uppercase tracking-[0.2em] text-[color:var(--text-tertiary)]">Attack path</p>
+            <p className="mt-1 text-sm font-semibold text-[color:var(--foreground)]">Credential-aware blast radius</p>
+          </div>
+          <div className={`rounded-xl border px-2.5 py-1 font-mono text-xs font-semibold ${riskTone}`}>
+            <span className="text-[11px] uppercase tracking-[0.14em]">Risk</span>{" "}
+            <span>{riskScore.toFixed(1)}</span>
+          </div>
+        </div>
+      )}
+
+      <div className={`flex flex-wrap items-center gap-1.5 ${compact ? "justify-between" : ""}`}>
+        {compact && showRiskBadge && (
+          <div className={`rounded-lg border px-2 py-0.5 font-mono text-[11px] font-semibold ${riskTone}`}>
+            {riskScore.toFixed(1)}
+          </div>
+        )}
+        {nodes.map((node, i) => {
+          const meta = NODE_META[node.type];
+          const Icon = meta.icon;
+          const severityRing =
+            node.severity === "critical"
+              ? "border-red-500/30"
+              : node.severity === "high"
+                ? "border-orange-500/30"
+                : meta.ring;
+          return (
+            <div key={`${node.type}-${node.label}-${i}`} className="flex items-center gap-1.5">
+              {i > 0 && (
+                <div className="flex h-5 w-5 items-center justify-center text-[color:var(--text-tertiary)]">
+                  <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+                  <span className="sr-only">→</span>
+                </div>
+              )}
+              <div className={`flex items-center gap-2 rounded-xl border px-2.5 py-1.5 ${severityRing} ${meta.tint}`}>
+                <Icon className="h-3.5 w-3.5 shrink-0" />
+                <div className="min-w-0">
+                  <p
+                    title={node.label}
+                    className={`text-[11px] font-medium text-[color:var(--foreground)] ${
+                      captureMode
+                        ? "max-w-[13rem] whitespace-normal break-words leading-4"
+                        : "max-w-[16rem] whitespace-normal break-words leading-4 [overflow-wrap:anywhere]"
+                    }`}
+                  >
+                    {node.label}
+                  </p>
+                  <p className="text-[11px] uppercase tracking-[0.14em] text-[color:var(--text-tertiary)]">{node.type}</p>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {href && (
+        <div className="mt-4 flex items-center justify-between border-t border-[color:var(--border-subtle)] pt-3">
+          <div>
+            <p className="text-[11px] uppercase tracking-[0.16em] text-[color:var(--text-tertiary)]">Drilldown</p>
+            <p className="mt-1 text-xs font-medium text-emerald-500 transition-colors group-hover:text-emerald-400">
+              Open focused security graph
+            </p>
+          </div>
+          <div className="flex items-center gap-1 text-xs font-medium text-[color:var(--text-secondary)] transition-colors group-hover:text-[color:var(--foreground)]">
+            Inspect path
+            <ArrowRight className="h-3.5 w-3.5" />
+          </div>
+        </div>
+      )}
+    </>
+  );
+
+  const className =
+    `group block w-full rounded-2xl border border-[color:var(--border-subtle)] bg-[linear-gradient(135deg,var(--surface),var(--surface-elevated))] text-left shadow-lg transition-all hover:border-[color:var(--border-strong)] hover:shadow-xl hover:shadow-emerald-500/5 ${
+      compact ? "px-3 py-2" : "px-4 py-3"
+    } ${
+      captureMode ? "" : "hover:-translate-y-0.5"
+    }`;
+
+  if (href && !onClick) {
+    return (
+      <Link href={href} className={className}>
+        {cardBody}
+      </Link>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={className}
+    >
+      {cardBody}
+    </button>
+  );
+}

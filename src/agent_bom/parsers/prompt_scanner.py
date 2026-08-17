@@ -16,13 +16,58 @@ Supported file types:
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+from agent_bom.runtime.text_normalize import HOMOGLYPHS
+from agent_bom.traversal import iter_discovery_files
 
 logger = logging.getLogger(__name__)
+
+# ── Obfuscation normalization ──────────────────────────────────────────────
+# Adversarial prompt injections evade naive keyword matching via Unicode
+# homoglyphs, zero-width separators, leetspeak, and base64 encoding. We match
+# every pattern against BOTH the raw text and a normalized projection so these
+# bypasses are caught. Detection only — the projection is never persisted.
+
+# Zero-width / invisible separators an attacker inserts between letters.
+_ZERO_WIDTH = dict.fromkeys(map(ord, "​‌‍⁠⁡⁢⁣⁤﻿­͏᠎"), None)
+# Common Cyrillic/Greek homoglyphs → Latin (NFKC misses these script
+# confusables). Shared with the policy engine so detection and enforcement
+# cannot drift apart on what counts as a look-alike.
+_HOMOGLYPHS = HOMOGLYPHS
+# Leetspeak substitutions (applied to a separate projection to limit false positives).
+_LEET = str.maketrans({"4": "a", "3": "e", "1": "i", "0": "o", "5": "s", "7": "t", "@": "a", "$": "s"})
+_B64_RUN = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
+
+
+def normalize_for_matching(text: str) -> str:
+    """Return a normalized projection of ``text`` for obfuscation-resistant matching.
+
+    Folds Unicode (NFKC + homoglyphs), strips zero-width separators, de-leets, and
+    appends any decoded base64 payloads — so injections hidden via homoglyph,
+    zero-width, leetspeak, or base64 still match the keyword patterns. Newline
+    structure is not preserved (this projection is for presence detection only;
+    line numbers come from the raw pass).
+    """
+    folded = unicodedata.normalize("NFKC", text).translate(_ZERO_WIDTH).translate(_HOMOGLYPHS)
+    decoded: list[str] = []
+    for m in _B64_RUN.finditer(text):
+        chunk = m.group(0)
+        try:
+            raw = base64.b64decode(chunk + "===", validate=False).decode("utf-8", "ignore")
+        except Exception:  # noqa: BLE001
+            continue
+        if len(raw) > 6 and sum(c.isprintable() for c in raw) / len(raw) > 0.8:
+            decoded.append(raw)
+    return "\n".join([folded, folded.translate(_LEET), *decoded])
+
 
 # ── File discovery patterns ──────────────────────────────────────────────────
 
@@ -151,10 +196,52 @@ _SECRET_PATTERNS = [
 _INJECTION_PATTERNS = [
     (
         re.compile(
-            r"""ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|rules?|constraints?)""",
+            r"""(?:ignore|disregard|forget|override|bypass|skip)\s+"""
+            r"""(?:all\s+|the\s+|any\s+|your\s+)*"""
+            r"""(?:previous|prior|above|earlier|preceding|former|original|system|these)\s+"""
+            r"""(?:instructions?|rules?|constraints?|prompts?|guidelines?|directions?|commands?|context)""",
             re.IGNORECASE,
         ),
         "Prompt injection: ignore previous instructions",
+    ),
+    (
+        # Same intent with the qualifier AFTER the noun ("the rules above").
+        re.compile(
+            r"""(?:ignore|disregard|forget|override|bypass|skip)\s+"""
+            r"""(?:all\s+|the\s+|any\s+|your\s+)*"""
+            r"""(?:instructions?|rules?|constraints?|guidelines?|directions?|prompts?)\s+"""
+            r"""(?:above|below|earlier|here|given|provided|stated)""",
+            re.IGNORECASE,
+        ),
+        "Prompt injection: ignore previous instructions",
+    ),
+    (
+        # Indirect injection: embedded SYSTEM/ASSISTANT directives or HTML-comment
+        # smuggling — the #1 vector for poisoned documents and MCP tool descriptions.
+        re.compile(
+            r"""(?:\[\[?\s*|<!--\s*|\{\{\s*)?\b(?:system|assistant|ai|agent)\s*[:>]\s*"""
+            r"""(?:ignore|exfiltrat|send|call|execute|run|reveal|leak|transfer|delete|disregard)""",
+            re.IGNORECASE,
+        ),
+        "Indirect prompt injection: embedded system directive",
+    ),
+    (
+        # System-prompt / configuration disclosure attempts.
+        re.compile(
+            r"""(?:repeat|reveal|print|show|output|disclose|leak)\s+(?:me\s+)?(?:your\s+|the\s+|all\s+)*"""
+            r"""(?:initial\s+|system\s+|original\s+|hidden\s+|above\s+)*"""
+            r"""(?:prompt|instructions?|configuration|config|rules?|guidelines?|directives?)""",
+            re.IGNORECASE,
+        ),
+        "Prompt injection: system-prompt disclosure attempt",
+    ),
+    (
+        re.compile(
+            r"""(?:developer|debug|god|admin|root|dan|jailbreak)\s+mode\s+"""
+            r"""(?:enabled?|activated?|on\b|is\s+now)""",
+            re.IGNORECASE,
+        ),
+        "Jailbreak pattern: mode-override persona",
     ),
     (
         re.compile(
@@ -204,7 +291,10 @@ _UNSAFE_INSTRUCTION_PATTERNS = [
     ),
     (
         re.compile(
-            r"""(?:send|post|upload|exfiltrate)\s+(?:data|results?|output)\s+to\s+(?:https?://|webhook)""",
+            r"""(?:send|post|upload|exfiltrate|email|forward|leak|transmit|copy|deliver)\s+"""
+            r"""(?:me\s+|the\s+|all\s+|your\s+|any\s+|this\s+)*"""
+            r"""(?:data|results?|output|conversation|history|context|secrets?|credentials?|keys?|tokens?|files?|contents?)\s+"""
+            r"""(?:to|over\s+to|via)\s+(?:https?://|webhook|[\w.+-]+@|attacker|evil|ngrok)""",
             re.IGNORECASE,
         ),
         "Data exfiltration instruction",
@@ -294,48 +384,32 @@ def discover_prompt_files(
     if not root.is_dir():
         return found
 
-    def _walk(directory: Path, depth: int) -> None:
-        if depth > max_depth:
-            return
-        try:
-            entries = sorted(directory.iterdir())
-        except PermissionError:
-            return
+    prompt_dir_extensions = {
+        ".txt",
+        ".md",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".j2",
+        ".jinja2",
+        ".hbs",
+        ".mustache",
+        ".prompt",
+        ".promptfile",
+    }
+    for path in iter_discovery_files(root, extra_skip_dirs=frozenset(_SKIP_DIRS)):
+        relative_parts = path.relative_to(root).parts
+        parent_parts = relative_parts[:-1]
+        prompt_dir_depths = [index for index, part in enumerate(parent_parts) if part.lower() in PROMPT_DIR_NAMES]
+        in_reachable_prompt_dir = bool(prompt_dir_depths) and min(prompt_dir_depths) <= max_depth
+        within_normal_depth = len(parent_parts) <= max_depth
 
-        for entry in entries:
-            if entry.is_dir():
-                if entry.name in _SKIP_DIRS:
-                    continue
-                # Check if it's a prompt directory
-                if entry.name.lower() in PROMPT_DIR_NAMES:
-                    # Scan all files inside prompt directories
-                    for f in sorted(entry.rglob("*")):
-                        if f.is_file() and f.suffix in {
-                            ".txt",
-                            ".md",
-                            ".yaml",
-                            ".yml",
-                            ".json",
-                            ".j2",
-                            ".jinja2",
-                            ".hbs",
-                            ".mustache",
-                            ".prompt",
-                            ".promptfile",
-                        }:
-                            found.append(f)
-                else:
-                    _walk(entry, depth + 1)
-            elif entry.is_file():
-                # Match by extension
-                if entry.suffix.lower() in PROMPT_FILE_EXTENSIONS:
-                    found.append(entry)
-                # Match by exact name
-                elif entry.name.lower() in PROMPT_FILE_NAMES:
-                    found.append(entry)
+        if in_reachable_prompt_dir and path.suffix.lower() in prompt_dir_extensions:
+            found.append(path)
+        elif within_normal_depth and (path.suffix.lower() in PROMPT_FILE_EXTENSIONS or path.name.lower() in PROMPT_FILE_NAMES):
+            found.append(path)
 
-    _walk(root, 0)
-    return found
+    return sorted(found)
 
 
 # ── Analysis ─────────────────────────────────────────────────────────────────
@@ -433,6 +507,30 @@ def _analyze_content(
                 )
             )
 
+    # Obfuscation-resistant pass: re-run the injection + unsafe-instruction
+    # patterns against a normalized projection (homoglyph/zero-width/leet/base64
+    # decoded) so an attack hidden by encoding is still caught. Findings whose
+    # title was already raised in the raw pass are skipped.
+    seen_titles = {f.title for f in findings}
+    normalized = normalize_for_matching(content)
+    if normalized != content:
+        for pattern, title in (*_INJECTION_PATTERNS, *_UNSAFE_INSTRUCTION_PATTERNS):
+            nmatch = pattern.search(normalized)
+            if nmatch and title not in seen_titles:
+                seen_titles.add(title)
+                findings.append(
+                    PromptFinding(
+                        severity="high",
+                        category="prompt_injection",
+                        title=f"{title} (obfuscated)",
+                        detail="Detected only after de-obfuscation (homoglyph/zero-width/leetspeak/base64).",
+                        source_file=source_file,
+                        line_number=1,
+                        matched_text=nmatch.group(0)[:100],
+                        recommendation="An injection was hidden via text obfuscation — treat the source as hostile.",
+                    )
+                )
+
     return findings
 
 
@@ -441,6 +539,69 @@ def _redact(text: str) -> str:
     if len(text) <= 8:
         return text[:2] + "***"
     return text[:4] + "***" + text[-4:]
+
+
+def _risk_score(severity: str) -> float:
+    return {
+        "critical": 9.0,
+        "high": 7.5,
+        "medium": 5.0,
+        "low": 2.5,
+    }.get(severity.lower(), 1.0)
+
+
+def _finding_type_for_category(category: str):
+    from agent_bom.finding import FindingType
+
+    normalized = category.lower()
+    if "secret" in normalized or "sensitive" in normalized:
+        return FindingType.CREDENTIAL_EXPOSURE
+    if "exfil" in normalized:
+        return FindingType.EXFILTRATION
+    if "injection" in normalized or "jailbreak" in normalized:
+        return FindingType.INJECTION
+    return FindingType.PROMPT_SECURITY
+
+
+def prompt_scan_data_to_findings(prompt_scan: dict[str, Any]):
+    """Convert serialized prompt scan data into the unified Finding stream."""
+    from agent_bom.finding import Asset, Finding, FindingSource
+
+    unified = []
+    for item in prompt_scan.get("findings") or []:
+        if not isinstance(item, dict):
+            continue
+        source_file = str(item.get("source_file") or "")
+        category = str(item.get("category") or "prompt_security")
+        severity = str(item.get("severity") or "unknown").lower()
+        title = str(item.get("title") or "Prompt security finding")
+        asset_name = Path(source_file).name if source_file else "prompt"
+        unified.append(
+            Finding(
+                finding_type=_finding_type_for_category(category),
+                source=FindingSource.PROMPT_SCAN,
+                asset=Asset(
+                    name=asset_name,
+                    asset_type="prompt_template",
+                    identifier=source_file or None,
+                    location=source_file or None,
+                ),
+                severity=severity,
+                title=title,
+                description=str(item.get("detail") or title),
+                remediation_guidance=str(item.get("recommendation") or "") or None,
+                owasp_tags=["LLM01"] if "injection" in category else [],
+                nist_ai_rmf_tags=["MAP-4.1", "MEASURE-2.6"],
+                evidence={
+                    "category": category,
+                    "line_number": item.get("line_number"),
+                    "matched_text": item.get("matched_text"),
+                    "scanner": "prompt_scan",
+                },
+                risk_score=_risk_score(severity),
+            )
+        )
+    return unified
 
 
 # ── JSON prompt file parsing ────────────────────────────────────────────────

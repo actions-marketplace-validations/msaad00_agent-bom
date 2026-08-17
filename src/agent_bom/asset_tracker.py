@@ -1,9 +1,13 @@
 """Persistent asset tracker — first_seen / last_seen / resolved per vulnerability.
 
 Stores a lightweight SQLite database at ``~/.agent-bom/assets.db`` that tracks
-every vulnerability across scans.  Each scan call to ``record_scan()`` updates
+every vulnerability across scans. Each scan call to ``record_scan()`` updates
 the tracker: new findings get ``first_seen``, existing findings get ``last_seen``
 bumped, and findings no longer present are marked ``resolved``.
+
+The tracker is tenant-aware. API/control-plane scans record and query assets
+within the authenticated tenant partition, while local CLI usage defaults to the
+single-tenant ``"default"`` namespace.
 
 Usage::
 
@@ -18,6 +22,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -26,6 +31,7 @@ DEFAULT_DB_PATH = Path.home() / ".agent-bom" / "assets.db"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
+    tenant_id   TEXT NOT NULL DEFAULT 'default',
     vuln_id     TEXT NOT NULL,
     package     TEXT NOT NULL,
     ecosystem   TEXT NOT NULL DEFAULT '',
@@ -36,23 +42,96 @@ CREATE TABLE IF NOT EXISTS assets (
     resolved_at TEXT,
     scan_count  INTEGER NOT NULL DEFAULT 1,
     metadata    TEXT NOT NULL DEFAULT '{}',
-    PRIMARY KEY (vuln_id, package, ecosystem)
+    PRIMARY KEY (tenant_id, vuln_id, package, ecosystem)
 );
 
-CREATE INDEX IF NOT EXISTS idx_assets_status ON assets(status);
-CREATE INDEX IF NOT EXISTS idx_assets_severity ON assets(severity);
+CREATE INDEX IF NOT EXISTS idx_assets_tenant_status ON assets(tenant_id, status);
+CREATE INDEX IF NOT EXISTS idx_assets_tenant_severity ON assets(tenant_id, severity);
 """
+
+_CREATE_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_assets_tenant_status ON assets(tenant_id, status);
+CREATE INDEX IF NOT EXISTS idx_assets_tenant_severity ON assets(tenant_id, severity);
+"""
+
+_SCHEMA_LOCK = threading.RLock()
 
 
 class AssetTracker:
     """SQLite-backed vulnerability asset tracker."""
 
-    def __init__(self, db_path: Optional[Path] = None) -> None:
+    def __init__(self, db_path: Optional[Path] = None, *, tenant_id: str = "default") -> None:
         self._db_path = db_path or DEFAULT_DB_PATH
+        self._tenant_id = tenant_id or "default"
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self._db_path))
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(_SCHEMA)
+        self._configure_connection()
+        self._ensure_schema()
+
+    def _configure_connection(self) -> None:
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.DatabaseError:
+            # Some non-file SQLite targets cannot enable WAL; schema locking
+            # still prevents same-process migration races.
+            pass
+
+    def _ensure_schema(self) -> None:
+        with _SCHEMA_LOCK:
+            columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(assets)")}
+            if not columns:
+                self._conn.executescript(_SCHEMA)
+                self._conn.commit()
+                return
+
+            if "tenant_id" in columns:
+                self._conn.executescript(_CREATE_INDEXES)
+                self._conn.commit()
+                return
+
+            # Legacy single-tenant databases were created with a primary key on
+            # (vuln_id, package, ecosystem). Rebuild the table so tenant_id becomes
+            # part of the key; ALTER TABLE cannot change a SQLite primary key.
+            legacy_columns = columns
+            required = {
+                "vuln_id",
+                "package",
+                "ecosystem",
+                "severity",
+                "status",
+                "first_seen",
+                "last_seen",
+                "resolved_at",
+                "scan_count",
+                "metadata",
+            }
+            missing = required - legacy_columns
+            if missing:
+                raise RuntimeError(f"Legacy asset tracker schema missing required columns: {', '.join(sorted(missing))}")
+
+            self._conn.execute("ALTER TABLE assets RENAME TO assets_legacy")
+            self._conn.executescript(_SCHEMA)
+            self._conn.execute(
+                """
+                INSERT INTO assets (
+                    tenant_id, vuln_id, package, ecosystem, severity, status,
+                    first_seen, last_seen, resolved_at, scan_count, metadata
+                )
+                SELECT
+                    'default', vuln_id, package, ecosystem, severity, status,
+                    first_seen, last_seen, resolved_at, scan_count, metadata
+                FROM assets_legacy
+                """
+            )
+            self._conn.execute("DROP TABLE assets_legacy")
+            self._conn.commit()
+
+    def __enter__(self) -> "AssetTracker":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
 
     def close(self) -> None:
         self._conn.close()
@@ -83,13 +162,23 @@ class AssetTracker:
                 current[key] = br
 
         # Load existing open/reopened assets
-        cursor = self._conn.execute("SELECT vuln_id, package, ecosystem, status FROM assets WHERE status IN ('open', 'reopened')")
+        cursor = self._conn.execute(
+            """
+            SELECT vuln_id, package, ecosystem, status
+            FROM assets
+            WHERE tenant_id = ? AND status IN ('open', 'reopened')
+            """,
+            (self._tenant_id,),
+        )
         existing_open: set[tuple[str, str, str]] = set()
         for row in cursor:
             existing_open.add((row["vuln_id"], row["package"], row["ecosystem"]))
 
         # Load all known assets (including resolved) for reopening detection
-        cursor = self._conn.execute("SELECT vuln_id, package, ecosystem, status FROM assets")
+        cursor = self._conn.execute(
+            "SELECT vuln_id, package, ecosystem, status FROM assets WHERE tenant_id = ?",
+            (self._tenant_id,),
+        )
         all_known: dict[tuple[str, str, str], str] = {}
         for row in cursor:
             all_known[(row["vuln_id"], row["package"], row["ecosystem"])] = row["status"]
@@ -115,9 +204,11 @@ class AssetTracker:
             if key not in all_known:
                 # Brand new finding
                 self._conn.execute(
-                    """INSERT INTO assets (vuln_id, package, ecosystem, severity, status, first_seen, last_seen, scan_count, metadata)
-                       VALUES (?, ?, ?, ?, 'open', ?, ?, 1, ?)""",
-                    (vuln_id, package, ecosystem, severity, now, now, meta),
+                    """INSERT INTO assets (
+                           tenant_id, vuln_id, package, ecosystem, severity, status, first_seen, last_seen, scan_count, metadata
+                       )
+                       VALUES (?, ?, ?, ?, ?, 'open', ?, ?, 1, ?)""",
+                    (self._tenant_id, vuln_id, package, ecosystem, severity, now, now, meta),
                 )
                 new_findings.append(vuln_id)
             elif all_known[key] == "resolved":
@@ -125,16 +216,16 @@ class AssetTracker:
                 self._conn.execute(
                     """UPDATE assets SET status='reopened', last_seen=?, resolved_at=NULL,
                        scan_count=scan_count+1, severity=?, metadata=?
-                       WHERE vuln_id=? AND package=? AND ecosystem=?""",
-                    (now, severity, meta, vuln_id, package, ecosystem),
+                       WHERE tenant_id=? AND vuln_id=? AND package=? AND ecosystem=?""",
+                    (now, severity, meta, self._tenant_id, vuln_id, package, ecosystem),
                 )
                 reopened_findings.append(vuln_id)
             else:
                 # Still open — bump last_seen
                 self._conn.execute(
                     """UPDATE assets SET last_seen=?, scan_count=scan_count+1, severity=?, metadata=?
-                       WHERE vuln_id=? AND package=? AND ecosystem=?""",
-                    (now, severity, meta, vuln_id, package, ecosystem),
+                       WHERE tenant_id=? AND vuln_id=? AND package=? AND ecosystem=?""",
+                    (now, severity, meta, self._tenant_id, vuln_id, package, ecosystem),
                 )
                 unchanged_count += 1
 
@@ -146,8 +237,8 @@ class AssetTracker:
                 vuln_id, package, ecosystem = key
                 self._conn.execute(
                     """UPDATE assets SET status='resolved', resolved_at=?
-                       WHERE vuln_id=? AND package=? AND ecosystem=?""",
-                    (now, vuln_id, package, ecosystem),
+                       WHERE tenant_id=? AND vuln_id=? AND package=? AND ecosystem=?""",
+                    (now, self._tenant_id, vuln_id, package, ecosystem),
                 )
                 resolved_findings.append(vuln_id)
 
@@ -185,8 +276,8 @@ class AssetTracker:
         Returns:
             List of asset dicts with first_seen, last_seen, status, etc.
         """
-        query = "SELECT * FROM assets WHERE 1=1"
-        params: list = []
+        query = "SELECT * FROM assets WHERE tenant_id = ?"
+        params: list = [self._tenant_id]
         if status:
             query += " AND status = ?"
             params.append(status)
@@ -208,8 +299,8 @@ class AssetTracker:
     def get_asset(self, vuln_id: str, package: str, ecosystem: str = "") -> Optional[dict]:
         """Get a single asset by primary key."""
         cursor = self._conn.execute(
-            "SELECT * FROM assets WHERE vuln_id=? AND package=? AND ecosystem=?",
-            (vuln_id, package, ecosystem),
+            "SELECT * FROM assets WHERE tenant_id=? AND vuln_id=? AND package=? AND ecosystem=?",
+            (self._tenant_id, vuln_id, package, ecosystem),
         )
         row = cursor.fetchone()
         if row:
@@ -229,7 +320,9 @@ class AssetTracker:
                 SUM(CASE WHEN severity = 'critical' AND status IN ('open','reopened') THEN 1 ELSE 0 END) as critical_open,
                 SUM(CASE WHEN severity = 'high' AND status IN ('open','reopened') THEN 1 ELSE 0 END) as high_open,
                 AVG(scan_count) as avg_scan_count
-            FROM assets"""
+            FROM assets
+            WHERE tenant_id = ?""",
+            (self._tenant_id,),
         )
         row = cursor.fetchone()
         return dict(row) if row else {}
@@ -244,7 +337,9 @@ class AssetTracker:
             """SELECT AVG(
                 (julianday(resolved_at) - julianday(first_seen))
             ) as avg_days
-            FROM assets WHERE status = 'resolved' AND resolved_at IS NOT NULL"""
+            FROM assets
+            WHERE tenant_id = ? AND status = 'resolved' AND resolved_at IS NOT NULL""",
+            (self._tenant_id,),
         )
         row = cursor.fetchone()
         val = row["avg_days"] if row else None

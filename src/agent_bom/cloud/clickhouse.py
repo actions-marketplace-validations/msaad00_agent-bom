@@ -10,8 +10,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import urllib.error
-import urllib.request
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -40,15 +38,18 @@ class ClickHouseClient:
         self,
         url: str | None = None,
         user: str | None = None,
-        password: str | None = None,
+        access_token: str | None = None,
         database: str = "agent_bom",
         timeout: int = _DEFAULT_TIMEOUT,
     ) -> None:
-        self.url = (url or os.environ.get("AGENT_BOM_CLICKHOUSE_URL", "")).rstrip("/")
+        self.url: str = ((url or os.environ.get("AGENT_BOM_CLICKHOUSE_URL")) or "").rstrip("/")
         if not self.url:
             raise ClickHouseError("ClickHouse URL required. Set AGENT_BOM_CLICKHOUSE_URL or pass url=.")
-        self.user = user or os.environ.get("AGENT_BOM_CLICKHOUSE_USER", "default")
-        self.password = password or os.environ.get("AGENT_BOM_CLICKHOUSE_PASSWORD", "")
+        self.user: str = (user or os.environ.get("AGENT_BOM_CLICKHOUSE_USER")) or "default"
+        # Policy: no passwords. The auth secret is a short-lived access token /
+        # API key, referenced from the OS environment only and never stored or
+        # logged. ClickHouse accepts a token in the X-ClickHouse-Key slot.
+        self.access_token: str = (access_token or os.environ.get("AGENT_BOM_CLICKHOUSE_ACCESS_TOKEN")) or ""
         self.database = database
         self.timeout = timeout
 
@@ -60,19 +61,22 @@ class ClickHouseClient:
         """Execute a query, return raw response text."""
         headers = {
             "X-ClickHouse-User": self.user,
-            "X-ClickHouse-Key": self.password,
+            "X-ClickHouse-Key": self.access_token,
             "X-ClickHouse-Database": self.database,
         }
         data = query.encode("utf-8")
-        req = urllib.request.Request(self.url, data=data, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # nosec B310 — URL scheme is user-configured
-                return resp.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise ClickHouseError(f"ClickHouse HTTP {exc.code}: {body[:500]}") from exc
-        except urllib.error.URLError as exc:
-            raise ClickHouseError(f"ClickHouse connection error: {exc.reason}") from exc
+            from agent_bom.http_client import create_sync_client, sync_request_with_retry
+
+            with create_sync_client(timeout=self.timeout) as client:
+                resp = sync_request_with_retry(client, "POST", self.url, headers=headers, content=data)
+            if resp is None:
+                raise ClickHouseError("ClickHouse connection timed out after retries")
+            if resp.status_code >= 400:
+                raise ClickHouseError(f"ClickHouse HTTP {resp.status_code}: {resp.text[:500]}")
+            return resp.text
+        except ClickHouseError:
+            raise
         except TimeoutError as exc:
             raise ClickHouseError(f"ClickHouse request timed out after {self.timeout}s") from exc
 
@@ -98,11 +102,27 @@ class ClickHouseClient:
     # ------------------------------------------------------------------
 
     def ensure_tables(self) -> None:
-        """Create analytics tables if they don't exist (idempotent)."""
+        """Create analytics tables if they don't exist (idempotent).
+
+        Also applies forward-compatible column migrations via
+        ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` so deployments that
+        pre-date the multi-tenant schema pick up the ``tenant_id`` column
+        on the next process start without an operator intervention.
+        """
         _validate_identifier(self.database, "database")
         self.execute(f"CREATE DATABASE IF NOT EXISTS {self.database}")
         for ddl in _TABLE_DDL:
             self.execute(ddl)
+        for migration in _TABLE_MIGRATIONS:
+            try:
+                self.execute(migration)
+            except ClickHouseError as exc:
+                # ALTER TABLE ADD COLUMN IF NOT EXISTS is idempotent on
+                # modern ClickHouse. Older clusters may return a transient
+                # error on repeat runs; log and continue so ensure_tables
+                # stays safe to call on every process start.
+                logger.debug("ClickHouse migration skipped (%s): %s", exc, migration.split("\n", 1)[0])
+        self.execute("INSERT INTO control_plane_schema_versions (component, version) VALUES ('analytics', 1)")
         logger.info("ClickHouse analytics tables ensured in database '%s'", self.database)
 
 
@@ -111,11 +131,22 @@ class ClickHouseClient:
 # ------------------------------------------------------------------
 
 _TABLE_DDL: list[str] = [
-    # 1. Vulnerability scan results (append-only)
+    # 0. Control-plane schema inventory for release/upgrade readiness checks.
+    """\
+CREATE TABLE IF NOT EXISTS control_plane_schema_versions (
+    component String,
+    version UInt16,
+    updated_at DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY component""",
+    # 1. Vulnerability scan results (idempotent via finding_key)
     """\
 CREATE TABLE IF NOT EXISTS vulnerability_scans (
     scan_id String,
     scan_timestamp DateTime DEFAULT now(),
+    tenant_id String DEFAULT 'default',
+    finding_key String DEFAULT '',
+    updated_at DateTime DEFAULT now(),
     package_name String,
     package_version String,
     ecosystem LowCardinality(String),
@@ -125,28 +156,36 @@ CREATE TABLE IF NOT EXISTS vulnerability_scans (
     severity LowCardinality(String),
     source LowCardinality(String),
     agent_name String,
-    environment LowCardinality(String)
-) ENGINE = MergeTree()
-ORDER BY (scan_timestamp, severity, agent_name)
+    environment LowCardinality(String),
+    cmmc_tags Array(String)
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (tenant_id, scan_id, finding_key)
 PARTITION BY toYYYYMM(scan_timestamp)""",
     # 2. Runtime protection events (append-only)
     """\
 CREATE TABLE IF NOT EXISTS runtime_events (
     event_id String,
     event_timestamp DateTime DEFAULT now(),
+    updated_at DateTime DEFAULT now(),
+    tenant_id String DEFAULT 'default',
     event_type LowCardinality(String),
     detector LowCardinality(String),
     severity LowCardinality(String),
     tool_name String,
     message String,
-    agent_name String
-) ENGINE = MergeTree()
-ORDER BY (event_timestamp, event_type, agent_name)
+    agent_name String,
+    session_id String DEFAULT '',
+    trace_id String DEFAULT '',
+    request_id String DEFAULT '',
+    source_id String DEFAULT ''
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (tenant_id, event_id)
 PARTITION BY toYYYYMM(event_timestamp)""",
     # 3. Posture scores (periodic snapshots)
     """\
 CREATE TABLE IF NOT EXISTS posture_scores (
     measured_at DateTime DEFAULT now(),
+    tenant_id String DEFAULT 'default',
     agent_name String,
     total_packages UInt32,
     critical_vulns UInt32,
@@ -159,11 +198,13 @@ CREATE TABLE IF NOT EXISTS posture_scores (
 ORDER BY (measured_at, agent_name)
 PARTITION BY toYYYYMM(measured_at)
 TTL measured_at + INTERVAL 2 YEAR""",
-    # 4. Scan metadata (one row per scan run)
+    # 4. Scan metadata (one row per scan run; idempotent on scan_id)
     """\
 CREATE TABLE IF NOT EXISTS scan_metadata (
     scan_id String,
     scan_timestamp DateTime DEFAULT now(),
+    tenant_id String DEFAULT 'default',
+    updated_at DateTime DEFAULT now(),
     agent_count UInt32,
     package_count UInt32,
     vuln_count UInt32,
@@ -171,9 +212,181 @@ CREATE TABLE IF NOT EXISTS scan_metadata (
     high_count UInt32,
     posture_grade LowCardinality(String),
     scan_duration_ms UInt32,
-    source LowCardinality(String)
-) ENGINE = MergeTree()
-ORDER BY (scan_timestamp, scan_id)
+    source LowCardinality(String),
+    aisvs_score Float32 DEFAULT 0.0,
+    has_runtime_correlation UInt8 DEFAULT 0
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (tenant_id, scan_id)
 PARTITION BY toYYYYMM(scan_timestamp)
 TTL scan_timestamp + INTERVAL 2 YEAR""",
+    # 5. Fleet agent snapshots (trust/lifecycle over time)
+    """\
+CREATE TABLE IF NOT EXISTS fleet_agents (
+    measured_at DateTime DEFAULT now(),
+    agent_name String,
+    agent_type LowCardinality(String),
+    lifecycle_state LowCardinality(String),
+    trust_score Float32,
+    server_count UInt32,
+    package_count UInt32,
+    credential_count UInt32,
+    vuln_count UInt32,
+    tenant_id String
+) ENGINE = MergeTree()
+ORDER BY (measured_at, tenant_id, agent_name)
+PARTITION BY toYYYYMM(measured_at)
+TTL measured_at + INTERVAL 2 YEAR""",
+    # 6. Compliance control observations
+    """\
+CREATE TABLE IF NOT EXISTS compliance_controls (
+    measured_at DateTime DEFAULT now(),
+    scan_id String,
+    tenant_id String DEFAULT 'default',
+    control_key String DEFAULT '',
+    updated_at DateTime DEFAULT now(),
+    framework LowCardinality(String),
+    control_id String,
+    control_name String,
+    status LowCardinality(String),
+    finding_count UInt32,
+    score Float32
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (tenant_id, scan_id, control_key)
+PARTITION BY toYYYYMM(measured_at)
+TTL measured_at + INTERVAL 2 YEAR""",
+    # 7. Audit events for trend/forensics dashboards
+    """\
+CREATE TABLE IF NOT EXISTS audit_events (
+    event_timestamp DateTime DEFAULT now(),
+    entry_id String,
+    updated_at DateTime DEFAULT now(),
+    action LowCardinality(String),
+    actor String,
+    resource String,
+    tenant_id String,
+    session_id String DEFAULT '',
+    trace_id String DEFAULT '',
+    request_id String DEFAULT ''
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (tenant_id, entry_id)
+PARTITION BY toYYYYMM(event_timestamp)
+TTL event_timestamp + INTERVAL 2 YEAR""",
+    # 9. Legacy direct findings-feed table plus attempt-scoped staging and the
+    #    atomic publication manifest used by scheduled warehouse exports.
+    """\
+CREATE TABLE IF NOT EXISTS findings_feed (
+    tenant_id String,
+    run_id String,
+    exported_at DateTime DEFAULT now(),
+    updated_at DateTime DEFAULT now(),
+    finding_id String,
+    canonical_id String,
+    severity LowCardinality(String),
+    cvss_score Float32,
+    epss_score Float32,
+    package_name String,
+    package_version String,
+    ecosystem LowCardinality(String),
+    cve_id String,
+    source LowCardinality(String),
+    status LowCardinality(String),
+    effective_reach String,
+    first_seen String,
+    last_seen String
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (tenant_id, finding_id)
+PARTITION BY toYYYYMM(exported_at)""",
+    """\
+CREATE TABLE IF NOT EXISTS findings_feed_staged (
+    tenant_id String,
+    run_id String,
+    publication_attempt_id String,
+    exported_at DateTime DEFAULT now(),
+    finding_id String,
+    canonical_id String,
+    severity LowCardinality(String),
+    cvss_score Float32,
+    epss_score Float32,
+    package_name String,
+    package_version String,
+    ecosystem LowCardinality(String),
+    cve_id String,
+    source LowCardinality(String),
+    status LowCardinality(String),
+    effective_reach String,
+    first_seen String,
+    last_seen String
+) ENGINE = MergeTree()
+ORDER BY (tenant_id, run_id, publication_attempt_id, finding_id)
+PARTITION BY toYYYYMM(exported_at)""",
+    """\
+CREATE TABLE IF NOT EXISTS findings_feed_runs (
+    tenant_id String,
+    run_id String,
+    publication_attempt_id String,
+    row_count UInt64,
+    commit_version UInt64 DEFAULT toUnixTimestamp64Nano(now64(9)),
+    committed_at DateTime64(6) DEFAULT now64(6)
+) ENGINE = ReplacingMergeTree(commit_version)
+ORDER BY (tenant_id, run_id)""",
+    # 8. CIS benchmark check observations with remediation fields indexed
+    """\
+CREATE TABLE IF NOT EXISTS cis_benchmark_checks (
+    measured_at DateTime DEFAULT now(),
+    scan_id String,
+    tenant_id String DEFAULT 'default',
+    check_key String DEFAULT '',
+    updated_at DateTime DEFAULT now(),
+    cloud LowCardinality(String),
+    check_id String,
+    title String,
+    status LowCardinality(String),
+    severity LowCardinality(String),
+    cis_section String,
+    evidence String,
+    resource_ids Array(String),
+    remediation String,
+    fix_cli String,
+    fix_console String,
+    effort LowCardinality(String),
+    priority UInt8,
+    guardrails Array(String),
+    requires_human_review UInt8
+) ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (tenant_id, scan_id, check_key)
+PARTITION BY toYYYYMM(measured_at)
+TTL measured_at + INTERVAL 2 YEAR""",
+]
+
+
+# Forward-compatible column additions for pre-tenant deployments. Each ALTER
+# uses ``ADD COLUMN IF NOT EXISTS`` so it is safe to run on every startup.
+# Existing rows get the ``default`` tenant; new rows carry the caller-supplied
+# tenant_id. Reads enforce the filter when a tenant scope is provided.
+_TABLE_MIGRATIONS: list[str] = [
+    "ALTER TABLE vulnerability_scans ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default'",
+    "ALTER TABLE runtime_events ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default'",
+    "ALTER TABLE runtime_events ADD COLUMN IF NOT EXISTS session_id String DEFAULT ''",
+    "ALTER TABLE runtime_events ADD COLUMN IF NOT EXISTS trace_id String DEFAULT ''",
+    "ALTER TABLE runtime_events ADD COLUMN IF NOT EXISTS request_id String DEFAULT ''",
+    "ALTER TABLE runtime_events ADD COLUMN IF NOT EXISTS source_id String DEFAULT ''",
+    "ALTER TABLE posture_scores ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default'",
+    "ALTER TABLE scan_metadata ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default'",
+    "ALTER TABLE compliance_controls ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default'",
+    "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS session_id String DEFAULT ''",
+    "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS trace_id String DEFAULT ''",
+    "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS request_id String DEFAULT ''",
+    "ALTER TABLE cis_benchmark_checks ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'default'",
+    "ALTER TABLE cis_benchmark_checks ADD COLUMN IF NOT EXISTS remediation String DEFAULT '{}'",
+    # #3484 — idempotent sink keys for canonical analytics rows (new columns only;
+    # engine/ORDER BY changes apply on fresh CREATE TABLE above).
+    "ALTER TABLE vulnerability_scans ADD COLUMN IF NOT EXISTS finding_key String DEFAULT ''",
+    "ALTER TABLE vulnerability_scans ADD COLUMN IF NOT EXISTS updated_at DateTime DEFAULT now()",
+    "ALTER TABLE runtime_events ADD COLUMN IF NOT EXISTS updated_at DateTime DEFAULT now()",
+    "ALTER TABLE scan_metadata ADD COLUMN IF NOT EXISTS updated_at DateTime DEFAULT now()",
+    "ALTER TABLE compliance_controls ADD COLUMN IF NOT EXISTS control_key String DEFAULT ''",
+    "ALTER TABLE compliance_controls ADD COLUMN IF NOT EXISTS updated_at DateTime DEFAULT now()",
+    "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS updated_at DateTime DEFAULT now()",
+    "ALTER TABLE cis_benchmark_checks ADD COLUMN IF NOT EXISTS check_key String DEFAULT ''",
+    "ALTER TABLE cis_benchmark_checks ADD COLUMN IF NOT EXISTS updated_at DateTime DEFAULT now()",
 ]

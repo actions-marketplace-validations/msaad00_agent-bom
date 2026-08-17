@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
 
-from agent_bom.cli._history import diff_cmd, history_cmd, rescan_command
+from agent_bom.cli._history import compliance_narrative_cmd, diff_cmd, history_cmd, rescan_command
 
 # ---------------------------------------------------------------------------
 # history_cmd
@@ -56,6 +56,57 @@ def test_history_with_corrupt_report(tmp_path):
     ):
         result = runner.invoke(history_cmd, [])
         assert result.exit_code == 0
+
+
+def test_history_json_output(tmp_path):
+    runner = CliRunner()
+    report_path = tmp_path / "scan_20250101.json"
+    report_data = {
+        "generated_at": "2025-01-01T00:00:00Z",
+        "summary": {
+            "total_agents": 2,
+            "total_packages": 10,
+            "total_vulnerabilities": 3,
+            "critical_findings": 1,
+        },
+    }
+    report_path.write_text(json.dumps(report_data))
+
+    with (
+        patch("agent_bom.history.list_reports", return_value=[report_path]),
+        patch("agent_bom.history.load_report", return_value=report_data),
+    ):
+        result = runner.invoke(history_cmd, ["--format", "json"])
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["total_reports"] == 1
+        assert payload["reports"][0]["file"] == "scan_20250101.json"
+        assert payload["reports"][0]["total_vulnerabilities"] == 3
+
+
+def test_history_quiet_suppresses_heading_and_footer(tmp_path):
+    runner = CliRunner()
+    report_path = tmp_path / "scan_20250101.json"
+    report_data = {
+        "generated_at": "2025-01-01T00:00:00Z",
+        "summary": {
+            "total_agents": 2,
+            "total_packages": 10,
+            "total_vulnerabilities": 3,
+            "critical_findings": 1,
+        },
+    }
+    report_path.write_text(json.dumps(report_data))
+
+    with (
+        patch("agent_bom.history.list_reports", return_value=[report_path]),
+        patch("agent_bom.history.load_report", return_value=report_data),
+    ):
+        result = runner.invoke(history_cmd, ["--quiet"])
+        assert result.exit_code == 0
+        assert "Scan History" not in result.output
+        assert "History directory" not in result.output
+        assert "scan_20250101.json" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +174,149 @@ def test_diff_baseline_with_latest(tmp_path):
     ):
         result = runner.invoke(diff_cmd, [str(base)])
         assert result.exit_code == 0
+
+
+def test_diff_accepts_sbom_baseline_and_latest_report(tmp_path):
+    runner = CliRunner()
+    baseline = tmp_path / "baseline.cdx.json"
+    latest = tmp_path / "latest.json"
+    baseline.write_text(
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "metadata": {"component": {"name": "vendor-api"}},
+                "components": [{"type": "library", "name": "requests", "version": "2.31.0", "purl": "pkg:pypi/requests@2.31.0"}],
+            }
+        )
+    )
+    latest.write_text(
+        json.dumps(
+            {
+                "generated_at": "2025-01-02T00:00:00Z",
+                "summary": {"total_agents": 1, "total_packages": 1},
+                "agents": [
+                    {
+                        "name": "scan",
+                        "mcp_servers": [
+                            {
+                                "name": "scan",
+                                "packages": [{"name": "requests", "version": "2.31.0", "ecosystem": "pypi"}],
+                            }
+                        ],
+                    }
+                ],
+                "blast_radius": [],
+            }
+        )
+    )
+
+    with patch("agent_bom.history.latest_report", return_value=latest), patch("agent_bom.cli._history.print_diff") as mock_print:
+        result = runner.invoke(diff_cmd, [str(baseline)])
+        assert result.exit_code == 0
+        mock_print.assert_called_once()
+
+
+def test_diff_accepts_two_sboms(tmp_path):
+    runner = CliRunner()
+    baseline = tmp_path / "baseline.cdx.json"
+    current = tmp_path / "current.spdx.json"
+    baseline.write_text(
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "components": [{"type": "library", "name": "requests", "version": "2.31.0", "purl": "pkg:pypi/requests@2.31.0"}],
+            }
+        )
+    )
+    current.write_text(
+        json.dumps(
+            {
+                "spdxVersion": "SPDX-2.3",
+                "packages": [
+                    {
+                        "name": "requests",
+                        "versionInfo": "2.31.0",
+                        "externalRefs": [
+                            {
+                                "referenceCategory": "PACKAGE-MANAGER",
+                                "referenceType": "purl",
+                                "referenceLocator": "pkg:pypi/requests@2.31.0",
+                            }
+                        ],
+                    },
+                    {
+                        "name": "urllib3",
+                        "versionInfo": "2.2.0",
+                        "externalRefs": [
+                            {
+                                "referenceCategory": "PACKAGE-MANAGER",
+                                "referenceType": "purl",
+                                "referenceLocator": "pkg:pypi/urllib3@2.2.0",
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+    )
+
+    with patch("agent_bom.cli._history.print_diff") as mock_print:
+        result = runner.invoke(diff_cmd, [str(baseline), str(current)])
+        assert result.exit_code == 0
+        diff_payload = mock_print.call_args.args[0]
+        assert diff_payload["summary"]["new_packages"] == 1
+
+
+def test_diff_json_output(tmp_path):
+    runner = CliRunner()
+    base = tmp_path / "base.json"
+    curr = tmp_path / "curr.json"
+    base.write_text(json.dumps(_make_report_data()))
+    curr.write_text(json.dumps(_make_report_data()))
+
+    diff_result = {
+        "baseline_generated_at": "2025-01-01T00:00:00Z",
+        "current_generated_at": "2025-01-02T00:00:00Z",
+        "new": [],
+        "resolved": [],
+        "unchanged": [],
+        "new_packages": [],
+        "removed_packages": [],
+        "inventory_diff": {},
+        "summary": {"new_findings": 0, "resolved_findings": 0, "unchanged_findings": 0, "new_packages": 0, "removed_packages": 0},
+    }
+    with patch("agent_bom.history.diff_reports", return_value=diff_result):
+        result = runner.invoke(diff_cmd, [str(base), str(curr), "--format", "json"])
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["baseline_path"].endswith("base.json")
+        assert payload["current_path"].endswith("curr.json")
+        assert payload["summary"]["new_findings"] == 0
+
+
+def test_diff_quiet_prints_compact_summary(tmp_path):
+    runner = CliRunner()
+    base = tmp_path / "base.json"
+    curr = tmp_path / "curr.json"
+    base.write_text(json.dumps(_make_report_data()))
+    curr.write_text(json.dumps(_make_report_data()))
+
+    diff_result = {
+        "baseline_generated_at": "2025-01-01T00:00:00Z",
+        "current_generated_at": "2025-01-02T00:00:00Z",
+        "new": [],
+        "resolved": [],
+        "unchanged": [],
+        "new_packages": [],
+        "removed_packages": [],
+        "inventory_diff": {},
+        "summary": {"new_findings": 0, "resolved_findings": 0, "unchanged_findings": 0, "new_packages": 0, "removed_packages": 0},
+    }
+    with patch("agent_bom.history.diff_reports", return_value=diff_result):
+        result = runner.invoke(diff_cmd, [str(base), str(curr), "--quiet"])
+        assert result.exit_code == 0
+        assert "Scan Diff" not in result.output
+        assert "No changes since baseline." in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -249,3 +443,247 @@ def test_rescan_osv_failure(tmp_path):
         mock_cache_cls.return_value = mock_cache
         result = runner.invoke(rescan_command, [str(base)])
         assert result.exit_code == 2
+
+
+def test_compliance_narrative_command_json(tmp_path):
+    runner = CliRunner()
+    report = tmp_path / "report.json"
+    report.write_text(
+        json.dumps(
+            {
+                "summary": {"total_packages": 1, "total_vulnerabilities": 1},
+                "blast_radius": [
+                    {
+                        "vulnerability_id": "CVE-2025-1234",
+                        "severity": "high",
+                        "package": "requests@1.0.0",
+                        "ecosystem": "pypi",
+                        "affected_agents": ["claude"],
+                        "affected_servers": ["filesystem"],
+                        "owasp_tags": ["LLM05"],
+                    }
+                ],
+            }
+        )
+    )
+
+    result = runner.invoke(compliance_narrative_cmd, [str(report), "--format", "json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert "executive_summary" in payload
+    assert payload["framework_narratives"]
+
+
+def _nist_report(tmp_path):
+    report = tmp_path / "report.json"
+    report.write_text(
+        json.dumps(
+            {
+                "summary": {"total_agents": 1, "total_packages": 1, "total_vulnerabilities": 1},
+                "blast_radius": [
+                    {
+                        "vulnerability_id": "CVE-2025-9000",
+                        "severity": "high",
+                        "package": "flask@1.0.0",
+                        "ecosystem": "pypi",
+                        "affected_agents": ["claude"],
+                        "affected_servers": ["filesystem"],
+                        "owasp_tags": [],
+                        "nist_800_53_tags": ["SI-10"],
+                    }
+                ],
+            }
+        )
+    )
+    return report
+
+
+def test_compliance_narrative_json_carries_nist_catalog(tmp_path):
+    runner = CliRunner()
+    report = _nist_report(tmp_path)
+    result = runner.invoke(compliance_narrative_cmd, [str(report), "--format", "json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    catalog = payload["nist_800_53_catalog"]
+    assert catalog["framework_key"] == "nist_800_53_catalog"
+    assert catalog["vendor_asserted"] is True
+    assert catalog["status"] == "fail"
+    assert any(c["control_id"] == "SI-10" and c["status"] == "fail" for c in catalog["controls"])
+
+
+def test_compliance_narrative_markdown_renders_nist_catalog_drill(tmp_path):
+    runner = CliRunner()
+    report = _nist_report(tmp_path)
+    result = runner.invoke(compliance_narrative_cmd, [str(report), "--format", "markdown"])
+    assert result.exit_code == 0, result.output
+    out = result.output
+    # Exec line: label + vendor-asserted provenance + honest buckets.
+    assert "NIST SP 800-53 Rev 5" in out
+    assert "vendor-asserted" in out.lower()
+    assert "Evaluated" in out and "Not evaluated" in out
+    # Engineer drill: the failing control id surfaces.
+    assert "SI-10" in out
+
+
+def test_compliance_narrative_uses_saved_summary_totals(tmp_path):
+    runner = CliRunner()
+    report = tmp_path / "report.json"
+    report.write_text(
+        json.dumps(
+            {
+                "summary": {"total_agents": 4, "total_packages": 12, "total_vulnerabilities": 1},
+                "blast_radius": [
+                    {
+                        "vulnerability_id": "CVE-2025-1234",
+                        "severity": "high",
+                        "package": "requests@1.0.0",
+                        "ecosystem": "pypi",
+                        "affected_agents": ["claude"],
+                        "affected_servers": ["filesystem"],
+                        "owasp_tags": ["LLM05"],
+                    }
+                ],
+            }
+        )
+    )
+
+    result = runner.invoke(compliance_narrative_cmd, [str(report), "--format", "json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert "covers 4 AI agents and 12 packages" in payload["executive_summary"]
+
+
+def _detective_report(tmp_path, generated_at):
+    """A saved artifact with one corrective finding, stamped at ``generated_at``."""
+    report = tmp_path / "report.json"
+    payload = {
+        "summary": {"total_agents": 1, "total_packages": 1, "total_vulnerabilities": 1},
+        "blast_radius": [
+            {
+                "vulnerability_id": "CVE-2025-9000",
+                "severity": "high",
+                "package": "flask@1.0.0",
+                "ecosystem": "pypi",
+                "affected_agents": ["claude"],
+                "affected_servers": ["filesystem"],
+                "owasp_tags": [],
+                "nist_800_53_tags": ["SI-10"],
+            }
+        ],
+    }
+    if generated_at is not None:
+        payload["generated_at"] = generated_at
+    report.write_text(json.dumps(payload))
+    return report
+
+
+def _nist_narrative(report):
+    result = CliRunner().invoke(compliance_narrative_cmd, [str(report), "--format", "json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    return next(fn for fn in payload["framework_narratives"] if fn["slug"] == "nist-800-53")
+
+
+def test_narrative_from_a_stale_artifact_fails_detective_controls(tmp_path):
+    """A narrative rebuilt from an old scan must not inherit today's freshness.
+
+    The saved report carries its own ``generated_at``; regenerating the
+    narrative a year later means continuous monitoring has lapsed, and RA-5 /
+    CM-8 have to say so.
+    """
+    fw = _nist_narrative(_detective_report(tmp_path, "2020-01-01T00:00:00+00:00"))
+
+    stale = {c["control_id"] for c in fw["failing_controls"] if c["status"] == "fail"}
+    assert {"RA-5", "CM-8"} <= stale, fw["failing_controls"]
+
+
+def test_narrative_from_a_fresh_artifact_passes_detective_controls(tmp_path):
+    from datetime import datetime, timezone
+
+    fw = _nist_narrative(_detective_report(tmp_path, datetime.now(timezone.utc).isoformat()))
+
+    failing = {c["control_id"] for c in fw["failing_controls"]}
+    assert failing == {"SI-10"}, fw["failing_controls"]
+
+
+def test_narrative_from_an_undated_artifact_still_renders(tmp_path):
+    """A saved report with no ``generated_at`` must not crash the narrative."""
+    fw = _nist_narrative(_detective_report(tmp_path, None))
+
+    assert fw["slug"] == "nist-800-53"
+    # Age unknown is reported as a pass with an explicit unknown-age reason,
+    # never a fabricated stale-evidence failure.
+    assert {c["control_id"] for c in fw["failing_controls"]} == {"SI-10"}
+
+
+def test_report_from_json_preserves_every_compliance_tag_field():
+    """Reloading a saved scan must carry every framework's tags, not a hand-listed subset.
+
+    ``agent-bom report compliance-narrative scan.json`` rebuilds BlastRadius rows
+    from the saved JSON. The constructor call enumerated the tag fields by hand
+    and missed two, so ATT&CK and PCI DSS evidence that is present in the
+    artifact was silently dropped: the narrative reported those frameworks as
+    unevaluated while the API, reading the same evidence, reported mapped
+    controls.
+    """
+    from agent_bom.cli._history import _report_from_json
+    from agent_bom.compliance_coverage import COMPLIANCE_TAG_FIELDS
+
+    row = {
+        "vulnerability_id": "CVE-2025-4242",
+        "severity": "high",
+        "package": "requests@1.0.0",
+        "ecosystem": "pypi",
+        "affected_agents": ["claude"],
+        "affected_servers": ["filesystem"],
+    }
+    # One distinctive tag per framework so a dropped field is unambiguous.
+    expected = {field: [f"TAG-{field}"] for field in COMPLIANCE_TAG_FIELDS}
+    row.update(expected)
+
+    report = _report_from_json({"summary": {}, "blast_radius": [row]})
+
+    assert len(report.blast_radii) == 1
+    rebuilt = report.blast_radii[0]
+    dropped = [field for field, tags in expected.items() if list(getattr(rebuilt, field, []) or []) != tags]
+    assert not dropped, f"compliance tag fields dropped on reload: {dropped}"
+
+
+def test_narrative_markdown_renders_the_failing_control_drill(tmp_path):
+    """The default markdown narrative must carry the auditor's engineer-level drill.
+
+    It rendered only the per-framework exec paragraph, status, score and
+    recommendations — no control ids, no packages, no finding ids. An auditor
+    reading the shipped default could not tie any control assertion back to the
+    evidence behind it: `grep -c "CVE-" narrative.md` returned 0.
+    """
+    runner = CliRunner()
+    report = tmp_path / "report.json"
+    report.write_text(
+        json.dumps(
+            {
+                "summary": {"total_agents": 1, "total_packages": 1, "total_vulnerabilities": 1},
+                "blast_radius": [
+                    {
+                        "vulnerability_id": "CVE-2025-7788",
+                        "severity": "critical",
+                        "package": "langchain@0.0.150",
+                        "ecosystem": "pypi",
+                        "affected_agents": ["claude"],
+                        "affected_servers": ["filesystem"],
+                        "owasp_tags": ["LLM05"],
+                    }
+                ],
+            }
+        )
+    )
+
+    result = runner.invoke(compliance_narrative_cmd, [str(report), "--framework", "owasp-llm", "--format", "markdown"])
+
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "LLM05" in out, out
+    assert "CVE-2025-7788" in out, out
+    assert "langchain@0.0.150" in out, out

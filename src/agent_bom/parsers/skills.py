@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agent_bom.models import MCPServer, Package, TransportType
+from agent_bom.traversal import iter_discovery_files
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ SKILL_FILE_NAMES: list[str] = [
     ".claude/CLAUDE.md",
     ".cursorrules",
     ".cursor/rules",
+    "SKILL.md",
     "skill.md",
     "skills",
     ".github/copilot-instructions.md",
@@ -57,7 +59,7 @@ _NPM_INSTALL_RE = re.compile(
 )
 _ENV_VAR_RE = re.compile(r"\b([A-Z][A-Z0-9_]{2,})\b")
 _MCP_JSON_RE = re.compile(
-    r"```(?:json|jsonc)?\s*\n(\{[\s\S]*?\"mcpServers\"[\s\S]*?\})\s*\n```",
+    r"```(?:json|jsonc)?\s*\n(?P<body>\{[\s\S]*?\"mcpServers\"[\s\S]*?\})\s*\n```",
     re.MULTILINE,
 )
 _CODE_BLOCK_RE = re.compile(r"```[\w]*\n([\s\S]*?)```", re.MULTILINE)
@@ -220,7 +222,7 @@ class SkillScanResult:
     servers: list[MCPServer] = field(default_factory=list)
     credential_env_vars: list[str] = field(default_factory=list)
     source_files: list[str] = field(default_factory=list)
-    raw_content: dict[str, str] = field(default_factory=dict)  # source_file -> raw text (truncated)
+    raw_content: dict[str, str] = field(default_factory=dict)  # source_file -> raw text for audit analysis
     metadata: SkillMetadata | None = None  # Parsed frontmatter (SKILL.md format)
 
 
@@ -235,13 +237,12 @@ def parse_skill_file(path: Path) -> SkillScanResult:
     """
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
-        truncated_content = content[:8000] if len(content) > 8000 else content
     except OSError:
         logger.warning("Could not read skill file: %s", path)
         return SkillScanResult()
 
     if not content.strip():
-        return SkillScanResult(source_files=[str(path)], raw_content={str(path): truncated_content})
+        return SkillScanResult(source_files=[str(path)], raw_content={str(path): content})
 
     packages: list[Package] = []
     servers: list[MCPServer] = []
@@ -311,12 +312,22 @@ def parse_skill_file(path: Path) -> SkillScanResult:
     # MCP server JSON blocks
     for match in _MCP_JSON_RE.finditer(content):
         try:
-            config = json.loads(match.group(1))
+            config = json.loads(_strip_jsonc(match.group("body")))
             mcp_servers = config.get("mcpServers", {})
             for name, srv_config in mcp_servers.items():
-                command = srv_config.get("command", "")
+                if not isinstance(srv_config, dict):
+                    continue
+                command = str(srv_config.get("command") or "")
                 args = srv_config.get("args", [])
+                if isinstance(args, str):
+                    args = [args]
+                if not isinstance(args, list):
+                    args = []
                 env = srv_config.get("env", {})
+                if not isinstance(env, dict):
+                    env = {}
+                url = _server_url(srv_config)
+                transport = _server_transport(srv_config, url=url)
                 # Redact values — only keep keys for credential detection
                 redacted_env = {k: "***REDACTED***" for k in env}
                 servers.append(
@@ -325,7 +336,9 @@ def parse_skill_file(path: Path) -> SkillScanResult:
                         command=command,
                         args=args,
                         env=redacted_env,
-                        transport=TransportType.STDIO,
+                        transport=transport,
+                        url=url,
+                        config_path=str(path),
                     )
                 )
         except (json.JSONDecodeError, AttributeError):
@@ -343,9 +356,72 @@ def parse_skill_file(path: Path) -> SkillScanResult:
         servers=servers,
         credential_env_vars=credential_vars,
         source_files=[str(path)],
-        raw_content={str(path): truncated_content},
+        raw_content={str(path): content},
         metadata=metadata,
     )
+
+
+def _strip_jsonc(raw: str) -> str:
+    """Strip JSONC comments and trailing commas from an MCP config block."""
+    out: list[str] = []
+    i = 0
+    in_string = False
+    quote = ""
+    while i < len(raw):
+        char = raw[i]
+        nxt = raw[i + 1] if i + 1 < len(raw) else ""
+        if in_string:
+            out.append(char)
+            if char == "\\" and i + 1 < len(raw):
+                out.append(raw[i + 1])
+                i += 2
+                continue
+            if char == quote:
+                in_string = False
+                quote = ""
+            i += 1
+            continue
+        if char in {"'", '"'}:
+            in_string = True
+            quote = char
+            out.append(char)
+            i += 1
+            continue
+        if char == "/" and nxt == "/":
+            i += 2
+            while i < len(raw) and raw[i] != "\n":
+                i += 1
+            continue
+        if char == "/" and nxt == "*":
+            i += 2
+            while i + 1 < len(raw) and not (raw[i] == "*" and raw[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        out.append(char)
+        i += 1
+    return re.sub(r",\s*([}\]])", r"\1", "".join(out))
+
+
+def _server_url(config: dict) -> str | None:
+    for key in ("url", "serverUrl", "server_url", "endpoint"):
+        value = config.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _server_transport(config: dict, *, url: str | None) -> TransportType:
+    raw = str(config.get("transport") or config.get("type") or "").lower()
+    if raw in {"sse", "eventsource"}:
+        return TransportType.SSE
+    if raw in {"streamable-http", "http", "https", "remote"}:
+        return TransportType.STREAMABLE_HTTP
+    if raw == "stdio":
+        return TransportType.STDIO
+    if url:
+        return TransportType.SSE if "/sse" in url.lower() else TransportType.STREAMABLE_HTTP
+    return TransportType.STDIO
 
 
 def _parse_pkg_spec(spec: str, version_sep: str) -> tuple[str, str]:
@@ -387,25 +463,191 @@ def _is_credential_name(name: str) -> bool:
 
 # ─── Discovery ───────────────────────────────────────────────────────────────
 
+# Vendored / generated directories are never treated as first-party instruction
+# surfaces, so discovery stays bounded instead of walking an entire monorepo.
+SKILL_DISCOVERY_SKIP_DIRS: frozenset[str] = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        "site-packages",
+        ".next",
+    }
+)
+
+# Test trees intentionally contain malicious / high-risk skill samples: fixture
+# corpora, and also plain `tests/SKILL.md`-style documents tabulating the inputs
+# a detector must flag. Auto-discovery must not treat any of them as first-party
+# surfaces (self-scan / project scan would otherwise fail the severity gate on
+# its own test material — and a test-input table would outrank a real attack).
+_TEST_FIXTURE_ROOT_NAMES: frozenset[str] = frozenset({"tests", "test", "__tests__"})
+
+
+def _is_test_material_path(path: Path) -> bool:
+    """Return True for paths under a ``tests`` / ``test`` / ``__tests__`` directory.
+
+    ``path`` must be relative to the scan root, so that pointing a scan *at* a
+    test tree (``agent-bom skills scan tests/fixtures/skills/…``) still works:
+    the test-root component is then part of the root, not of the relative path.
+    """
+    return any(part in _TEST_FIXTURE_ROOT_NAMES for part in path.parts[:-1])
+
+
+# Well-known instruction filenames recognised anywhere in the tree.
+_INSTRUCTION_FILE_NAMES: frozenset[str] = frozenset(
+    {
+        "CLAUDE.md",
+        "AGENTS.md",
+        "GEMINI.md",
+        "SKILL.md",
+        "skill.md",
+        ".cursorrules",
+        ".windsurfrules",
+        ".clinerules",
+    }
+)
+
+# Index / catalog markdown often lives inside skills trees but is not an
+# executable skill surface (e.g. `.agents/skills/README.md`, `skills/index.md`).
+_INSTRUCTION_INDEX_FILE_NAMES: frozenset[str] = frozenset(
+    {
+        "readme.md",
+        "index.md",
+        "summary.md",
+        "overview.md",
+    }
+)
+
+# Published / generated docs trees that mention skills but are not estate skills.
+_DOCS_SKILL_ROOT_NAMES: frozenset[str] = frozenset({"docs", "site-docs"})
+
+# Directory names whose ``*.md`` / ``*.mdc`` descendants are instruction surfaces.
+# Keep this list narrow: bare ``agents/`` / ``commands/`` dirs are common in
+# application code and would flood discovery with false positives.
+_INSTRUCTION_DIR_NAMES: frozenset[str] = frozenset({"skills", "prompts"})
+_INSTRUCTION_SUFFIXES: frozenset[str] = frozenset({".md", ".mdc"})
+
+# IDE / agent-tooling roots: (grandparent.name, parent.name) → instruction tree.
+# Covers Cursor/Claude/Codex/AGENTS.md-adjacent layouts without treating every
+# repo ``agents/`` package directory as a skill surface.
+_INSTRUCTION_NESTED_ROOTS: frozenset[tuple[str, str]] = frozenset(
+    {
+        (".cursor", "rules"),
+        (".cursor", "agents"),
+        (".cursor", "skills"),
+        (".cursor", "commands"),
+        (".claude", "skills"),
+        (".claude", "agents"),
+        (".claude", "commands"),
+        (".claude", "rules"),
+        (".agents", "skills"),
+        (".agents", "agents"),
+        (".codex", "skills"),
+        (".github", "instructions"),
+    }
+)
+
+
+def looks_like_instruction_surface(
+    path: Path,
+    *,
+    allow_docs_skills: bool = False,
+    skip_test_fixtures: bool = True,
+    scan_root: Path | None = None,
+) -> bool:
+    """Return True when a file path looks like a real skill/instruction surface.
+
+    The heuristic is intentionally bounded: it recognises well-known instruction
+    filenames anywhere, plus ``*.md`` / ``*.mdc`` files nested under recognised
+    instruction directories (``skills/``, ``prompts/``, ``.cursor/{rules,agents,skills}``,
+    ``.claude/{skills,agents,commands,rules}``, ``.codex/skills``,
+    ``.github/instructions``). Generic repository markdown (READMEs, PR
+    templates, changelogs) and vendored trees are excluded so discovery does not
+    scan an entire monorepo blindly.
+
+    ``skip_test_fixtures`` defaults on: self-scan must not treat intentional
+    malicious samples under a ``tests`` tree as estate skills. The check runs
+    against ``path`` relative to ``scan_root``, so release fixtures remain
+    scannable when an operator points a scan directly at them.
+    """
+    if any(part in SKILL_DISCOVERY_SKIP_DIRS for part in path.parts):
+        return False
+    if skip_test_fixtures:
+        relative = path
+        if scan_root is not None:
+            try:
+                relative = path.relative_to(scan_root)
+            except ValueError:
+                relative = path
+        if _is_test_material_path(relative):
+            return False
+    if not allow_docs_skills and any(root in path.parts for root in _DOCS_SKILL_ROOT_NAMES) and "skills" in path.parts:
+        return False
+
+    name = path.name
+
+    if name in _INSTRUCTION_FILE_NAMES:
+        return True
+
+    if name == "copilot-instructions.md" and any(parent.name == ".github" for parent in path.parents):
+        return True
+
+    if path.suffix.lower() not in _INSTRUCTION_SUFFIXES:
+        return False
+
+    # Catalog/index files under skills trees are documentation, not skills.
+    if name.lower() in _INSTRUCTION_INDEX_FILE_NAMES:
+        return False
+
+    parents = list(path.parents)
+
+    if any(parent.name in _INSTRUCTION_DIR_NAMES for parent in parents):
+        return True
+
+    # IDE / agent-tooling nested roots (Cursor, Claude Code, Codex, Copilot).
+    for parent in parents:
+        grandparent = parent.parent
+        if grandparent == parent:
+            continue
+        if (grandparent.name, parent.name) in _INSTRUCTION_NESTED_ROOTS:
+            return True
+
+    return False
+
 
 def discover_skill_files(project_dir: Path) -> list[Path]:
-    """Auto-discover common skill/instruction files in a project directory.
+    """Auto-discover skill/instruction files under a project directory.
 
-    Searches for CLAUDE.md, .cursorrules, skill.md, skills/*.md, etc.
+    Performs a single bounded walk (skipping vendored/generated directories) and
+    keeps only paths that :func:`looks_like_instruction_surface` recognises:
+    named instruction files (``CLAUDE.md``, ``AGENTS.md``, ``.cursorrules`` …)
+    plus ``*.md`` / ``*.mdc`` files nested under ``skills/``, ``prompts/``,
+    IDE agent/skill/rules trees, and ``.github/instructions`` at any depth.
     """
+    if not project_dir.is_dir():
+        return []
+
+    allow_docs_skills = any(root in project_dir.parts for root in _DOCS_SKILL_ROOT_NAMES) and "skills" in project_dir.parts
     found: list[Path] = []
+    seen: set[Path] = set()
 
-    for name in SKILL_FILE_NAMES:
-        candidate = project_dir / name
-        if candidate.is_file():
-            found.append(candidate)
-        elif candidate.is_dir():
-            # Scan .md files inside the directory
-            for md_file in sorted(candidate.glob("*.md")):
-                if md_file.is_file():
-                    found.append(md_file)
+    for path in iter_discovery_files(project_dir, extra_skip_dirs=SKILL_DISCOVERY_SKIP_DIRS):
+        if not looks_like_instruction_surface(path, allow_docs_skills=allow_docs_skills, scan_root=project_dir):
+            continue
+        resolved = path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            found.append(path)
 
-    return found
+    return sorted(found)
 
 
 # ─── Batch scanning ──────────────────────────────────────────────────────────

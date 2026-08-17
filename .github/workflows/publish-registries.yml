@@ -4,63 +4,229 @@ name: Publish to Registries
 # Secrets needed (add via Settings → Secrets):
 #   SMITHERY_API_TOKEN  — Smithery service token (smithery.ai → API tokens)
 #   CLAWHUB_TOKEN       — ClawHub auth token (clawhub.ai → Settings)
+#
+# NOT wired, deliberately: a `SMITHERY_UPSTREAM_TOKEN` was once documented here
+# as the way to let Smithery's scanner authenticate against our MCP endpoint.
+# No such secret exists and nothing in this file ever read one, so the note
+# described a fix that was never implemented. The consequence is real: Smithery
+# cannot enumerate our tools, the release settles as AUTH_REQUIRED, and the
+# public catalog lists fewer tools than the server serves (36 of 77 as of
+# 0.99.0 — see the supply-chain-drift tracker).
+#
+# The AS-not-mounted half of this was FIXED in #4730 (shipped in 0.100.0) and
+# the note below is kept only because the conclusion changed. Measured against
+# the live endpoint on 2026-08-12, after 0.100.0 deployed:
+#
+#   /.well-known/oauth-protected-resource   -> 200
+#   /.well-known/oauth-authorization-server -> 200   (was 404)
+#   POST /oauth/register                    -> 201   (DCR works)
+#   POST /mcp  (no token)                   -> 401
+#
+# So discovery and dynamic client registration both work now. Smithery still
+# reports AUTH_REQUIRED, and the reason is one level further in: DCR issues a
+# PUBLIC client (`token_endpoint_auth_method: none`) with an empty scope, and
+# the only machine-usable grant, `client_credentials`, needs a client secret.
+# `authorization_code` needs a human at `/authorize`. An unattended scanner can
+# therefore register but can never obtain a token.
+#
+# That makes AUTH_REQUIRED the correct terminal state for an endpoint that
+# authenticates every request by design — not a bug awaiting a CI fix. Closing
+# it means deciding to issue scanners a scoped credential (a product decision),
+# so no step here may treat the resulting stale catalog as a release blocker.
 # Optional vars:
-#   RAILWAY_MCP_URL     — Override Railway MCP endpoint URL
+#   SMITHERY_MCP_URL    — Public Streamable HTTP MCP endpoint for Smithery
+# Optional secret:
+#   GLAMA_WEBHOOK_URL   — Glama rebuild webhook (POST JSON: ref, commit, version, dockerfile)
 
 on:
   workflow_run:
     workflows: ["Release"]
     types: [completed]
   workflow_dispatch:
+    inputs:
+      glama_repair:
+        description: >-
+          Fail the run if the Glama rebuild cannot be triggered. Opt in only when
+          repairing the Glama listing is the point of this run; an ordinary
+          re-publish should leave this off so an unconfigured third-party
+          webhook cannot block the other registries.
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  release:
+    name: Resolve published release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      release_ref: ${{ steps.release.outputs.release_ref }}
+      release_sha: ${{ steps.release.outputs.release_sha }}
+      tool_count: ${{ steps.release.outputs.tool_count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve published release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          RUN_REPOSITORY: ${{ github.event.workflow_run.repository.full_name }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            # Manual repair always targets the latest published release. This
+            # workflow fans out to multiple registries, so accepting an older
+            # tag here could downgrade Smithery or ClawHub as a side effect.
+            RELEASE_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest")
+            RELEASE_TAG=$(echo "$RELEASE_JSON" | jq -er '.tag_name')
+            if [ "$(echo "$RELEASE_JSON" | jq -r '.draft != false')" = "true" ]; then
+              echo "::error::Registry repair requires a published, non-draft GitHub release"
+              exit 1
+            fi
+          else
+            if [ "$RUN_EVENT" != "push" ] || [ "$RUN_REPOSITORY" != "$GITHUB_REPOSITORY" ]; then
+              echo "::error::Release workflow must be a same-repository tag push"
+              exit 1
+            fi
+            RELEASE_TAG="${HEAD_BRANCH:-}"
+            if ! echo "$RELEASE_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+              echo "::error::Successful Release workflow did not report a release tag"
+              exit 1
+            fi
+            if [ -z "${HEAD_SHA:-}" ]; then
+              echo "::error::Successful Release workflow did not report a release commit"
+              exit 1
+            fi
+          fi
+
+          git fetch --force --no-tags origin \
+            "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          RELEASE_SHA=$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")
+          if [ "$EVENT_NAME" != "workflow_dispatch" ] && [ "$RELEASE_SHA" != "$HEAD_SHA" ]; then
+            echo "::error::Release tag and successful workflow commit do not match"
+            exit 1
+          fi
+          git fetch --no-tags origin \
+            "refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          if ! git merge-base --is-ancestor "$RELEASE_SHA" "origin/$DEFAULT_BRANCH"; then
+            echo "::error::Published release commit is not reachable from the trusted default branch"
+            exit 1
+          fi
+
+          VERSION="${RELEASE_TAG#v}"
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            echo "::error::Resolved release tag is not semantic versioned"
+            exit 1
+          fi
+          METRICS_JSON=$(git show "${RELEASE_SHA}:docs/PRODUCT_METRICS.json")
+          METRICS_VERSION=$(echo "$METRICS_JSON" | jq -er '.version')
+          TOOL_COUNT=$(echo "$METRICS_JSON" | jq -er 'first(.metrics[] | select(.name == "MCP tools") | .value)')
+          if [ "$METRICS_VERSION" != "$VERSION" ]; then
+            echo "::error::Published release metrics version ${METRICS_VERSION} does not match ${VERSION}"
+            exit 1
+          fi
+          if ! echo "$TOOL_COUNT" | grep -qE '^[1-9][0-9]*$'; then
+            echo "::error::Published release metrics do not declare a positive MCP tool count"
+            exit 1
+          fi
+          {
+            echo "version=$VERSION"
+            echo "release_ref=refs/tags/${RELEASE_TAG}"
+            echo "release_sha=$RELEASE_SHA"
+            echo "tool_count=$TOOL_COUNT"
+          } >> "$GITHUB_OUTPUT"
+
   smithery:
     name: Publish to Smithery
+    needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
 
-      - name: Extract version
-        id: meta
-        env:
-          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            # workflow_dispatch may run from main or a tag — prefer tag, fall back to pyproject.toml
-            REF="${GITHUB_REF_NAME#v}"
-            if echo "$REF" | grep -qE '^[0-9]+\.[0-9]+'; then
-              VERSION="$REF"
-            else
-              VERSION=$(grep '^version' pyproject.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-            fi
-          else
-            VERSION="${HEAD_BRANCH#v}"
-            if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
-              VERSION=$(grep '^version' pyproject.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-            fi
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Publish to Smithery
+      - name: Check Smithery configuration
+        id: smithery_config
         env:
           SMITHERY_API_TOKEN: ${{ secrets.SMITHERY_API_TOKEN }}
-          RAILWAY_MCP_URL: ${{ vars.RAILWAY_MCP_URL }}
-          VERSION: ${{ steps.meta.outputs.version }}
+          SMITHERY_MCP_URL: ${{ vars.SMITHERY_MCP_URL }}
         run: |
-          if [ -z "$SMITHERY_API_TOKEN" ]; then
-            echo "::error::SMITHERY_API_TOKEN not set — cannot publish to Smithery"
-            exit 1
+          if [ -z "${SMITHERY_MCP_URL:-}" ]; then
+            echo "::notice::SMITHERY_MCP_URL not configured — skipping Smithery publish"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          case "$SMITHERY_MCP_URL" in
+            https://server.smithery.ai/*|http://server.smithery.ai/*)
+              echo "::warning::SMITHERY_MCP_URL points at Smithery's hosted proxy, not agent-bom's upstream MCP origin. Skipping Smithery publish to avoid publishing the proxy back to itself."
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          if [ -z "${SMITHERY_API_TOKEN:-}" ]; then
+            echo "::notice::SMITHERY_API_TOKEN not configured — skipping Smithery publish"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
 
+      - name: Validate Smithery public server card
+        if: steps.smithery_config.outputs.enabled == 'true'
+        env:
+          SMITHERY_MCP_URL: ${{ vars.SMITHERY_MCP_URL }}
+          EXPECTED_TOOL_COUNT: ${{ needs.release.outputs.tool_count }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          SERVER_CARD_URL=$(python3 -c 'import sys; from urllib.parse import urlsplit, urlunsplit; p=urlsplit(sys.argv[1]); print(urlunsplit((p.scheme, p.netloc, "/.well-known/mcp/server-card.json", "", "")))' "$SMITHERY_MCP_URL")
+          for ATTEMPT in $(seq 1 12); do
+            if curl -fsS --connect-timeout 10 --max-time 30 "$SERVER_CARD_URL" -o /tmp/smithery-server-card.json && \
+              jq -e \
+                --arg version "$VERSION" \
+                --argjson tool_count "$EXPECTED_TOOL_COUNT" \
+                '.serverInfo.version == $version and (.tools | length) == $tool_count and all(.tools[]; (.name | type == "string") and (.inputSchema | type == "object"))' \
+                /tmp/smithery-server-card.json >/dev/null; then
+              echo "Smithery server card matches v${VERSION} with ${EXPECTED_TOOL_COUNT} live tool schemas"
+              exit 0
+            fi
+            echo "Smithery server card attempt ${ATTEMPT}/12 has not reached the released contract"
+            sleep 10
+          done
+          echo "::error::Smithery server card does not match the released version/tool/schema contract"
+          exit 1
+
+      - name: Publish to Smithery
+        id: smithery_publish
+        if: steps.smithery_config.outputs.enabled == 'true'
+        env:
+          SMITHERY_API_TOKEN: ${{ secrets.SMITHERY_API_TOKEN }}
+          SMITHERY_MCP_URL: ${{ vars.SMITHERY_MCP_URL }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
           QUALIFIED_NAME="agent-bom%2Fagent-bom"
-          MCP_URL="${RAILWAY_MCP_URL:-https://agent-bom-mcp.up.railway.app/mcp}"
+          MCP_URL="${SMITHERY_MCP_URL}"
 
           echo "Publishing agent-bom v${VERSION} to Smithery..."
 
@@ -76,12 +242,17 @@ jobs:
                 \"configSchema\": {
                   \"type\": \"object\",
                   \"properties\": {
+                    \"bearerToken\": {
+                      \"type\": \"string\",
+                      \"title\": \"Access token\",
+                      \"description\": \"Bearer token for the agent-bom MCP endpoint. Required — the endpoint authenticates every request and will not enumerate tools without it.\"
+                    },
                     \"NVD_API_KEY\": {
                       \"type\": \"string\",
                       \"description\": \"NVD API key for higher rate limits on CVSS enrichment (optional)\"
                     }
                   },
-                  \"required\": []
+                  \"required\": [\"bearerToken\"]
                 }
               }")
 
@@ -89,136 +260,331 @@ jobs:
 
             if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
               echo "Smithery publish succeeded"
+              RELEASE_ID=$(jq -er '.deploymentId' /tmp/smithery-response.json)
+              echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
               break
+            elif [ "$HTTP_STATUS" -eq 429 ] && [ "$ATTEMPT" -lt 3 ]; then
+              DELAY=$((ATTEMPT * 15))
+              echo "Rate limited — retrying in ${DELAY}s..."
+              sleep "$DELAY"
             elif [ "$HTTP_STATUS" -ge 500 ] && [ "$ATTEMPT" -lt 3 ]; then
               DELAY=$((ATTEMPT * 10))
               echo "Server error — retrying in ${DELAY}s..."
               sleep "$DELAY"
             else
               echo "::error::Smithery publish failed with HTTP ${HTTP_STATUS}"
-              cat /tmp/smithery-response.json
+              # Log only error message, not full response (may contain auth context)
+              jq -r '.error // .message // "unknown error"' /tmp/smithery-response.json 2>/dev/null || echo "(non-JSON response)"
               exit 1
             fi
           done
 
+      - name: Wait for Smithery release
+        id: smithery_release
+        if: steps.smithery_config.outputs.enabled == 'true'
+        env:
+          SMITHERY_API_TOKEN: ${{ secrets.SMITHERY_API_TOKEN }}
+          RELEASE_ID: ${{ steps.smithery_publish.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          for ATTEMPT in $(seq 1 18); do
+            STATUS=$(curl -fsS --connect-timeout 10 --max-time 30 \
+              "https://api.smithery.ai/servers/agent-bom%2Fagent-bom/releases/${RELEASE_ID}" \
+              -H "Authorization: Bearer ${SMITHERY_API_TOKEN}" | jq -er '.status')
+            echo "Smithery release attempt ${ATTEMPT}/18 — ${STATUS}"
+            case "$STATUS" in
+              SUCCESS)
+                echo "scan_status=SUCCESS" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+              # The agent-bom MCP endpoint authenticates every request — that is
+              # the point of it, and the published configSchema marks
+              # `bearerToken` as required so a Smithery user supplies their own.
+              # Smithery's scanner therefore cannot enumerate our tools, and
+              # reports AUTH_REQUIRED / AUTH_TIMEOUT. The RELEASE ITSELF
+              # succeeded; only the optional post-publish scan did not.
+              #
+              # Failing here failed the whole Publish to Registries job on every
+              # release and opened a release-blocker issue for a server that had
+              # in fact published. The alternative — handing a third-party
+              # scanner our production bearer token so it can pass — is not a
+              # trade worth making for a green check.
+              AUTH_REQUIRED|AUTH_TIMEOUT)
+                echo "::warning::Smithery published the release but could not scan it (${STATUS}); the endpoint requires a caller-supplied bearerToken by design"
+                echo "scan_status=${STATUS}" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+              FAILURE|FAILURE_SCAN|CANCELLED|INTERNAL_ERROR)
+                echo "::error::Smithery release did not complete successfully (${STATUS})"
+                exit 1
+                ;;
+            esac
+            sleep 10
+          done
+          echo "::error::Smithery release did not finish before the verification timeout"
+          exit 1
+
+      # The step above deliberately accepts AUTH_REQUIRED/AUTH_TIMEOUT as a
+      # terminal state, because our MCP endpoint authenticates every request and
+      # Smithery's scanner has no credential. This step then asserted a tool
+      # count that only a SUCCESSFUL scan can produce — so it re-created, one
+      # step later, exactly the failure the step above documents having fixed:
+      # a release-blocker issue on every release for a server that published
+      # correctly. The catalog cannot converge while the scan cannot run.
+      #
+      # So the assertion is now conditional on the scan having actually run. It
+      # stays a hard failure when Smithery reports SUCCESS — that is a real
+      # regression signal — and degrades to a warning when the scan was refused,
+      # where the stale count is already reported by the supply-chain-drift
+      # tracker. A gate that cannot pass is as dishonest as one that cannot fail.
+      - name: Verify Smithery catalog inventory
+        if: steps.smithery_config.outputs.enabled == 'true'
+        env:
+          EXPECTED_TOOL_COUNT: ${{ needs.release.outputs.tool_count }}
+          VERSION: ${{ needs.release.outputs.version }}
+          SCAN_STATUS: ${{ steps.smithery_release.outputs.scan_status }}
+        run: |
+          set -euo pipefail
+          if [ "${SCAN_STATUS}" != "SUCCESS" ]; then
+            ACTUAL=$(curl -fsS --connect-timeout 10 --max-time 30 \
+              "https://api.smithery.ai/servers/agent-bom/agent-bom" | jq -er '.tools | length')
+            echo "::warning::Smithery scan was refused (${SCAN_STATUS:-unknown}); its catalog still advertises ${ACTUAL}/${EXPECTED_TOOL_COUNT} tools for v${VERSION}. Not failing the release — a scan that cannot run cannot converge. Tracked by the supply-chain-drift issue."
+            exit 0
+          fi
+          for ATTEMPT in $(seq 1 12); do
+            ACTUAL=$(curl -fsS --connect-timeout 10 --max-time 30 \
+              "https://api.smithery.ai/servers/agent-bom/agent-bom" | jq -er '.tools | length')
+            if [ "$ACTUAL" = "$EXPECTED_TOOL_COUNT" ]; then
+              echo "Smithery catalog exposes all ${ACTUAL} tools for v${VERSION}"
+              exit 0
+            fi
+            echo "Smithery catalog attempt ${ATTEMPT}/12 exposes ${ACTUAL}/${EXPECTED_TOOL_COUNT} tools"
+            sleep 10
+          done
+          echo "::error::Smithery catalog did not converge to ${EXPECTED_TOOL_COUNT} tools"
+          exit 1
+
   glama:
     name: Trigger Glama Rebuild
+    needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
+      actions: read
       contents: read
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
-      - name: Trigger Glama rebuild
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Fetch release commit for manifest verification
         env:
-          GLAMA_WEBHOOK_URL: ${{ vars.GLAMA_WEBHOOK_URL }}
+          RELEASE_SHA: ${{ needs.release.outputs.release_sha }}
+        run: git fetch --no-tags --depth=1 origin "$RELEASE_SHA"
+
+      - name: Verify Glama build manifest
+        run: python scripts/check_glama_listing.py --verify-manifest --git-ref "${{ needs.release.outputs.release_sha }}"
+
+      - name: Trigger Glama rebuild
+        id: glama_trigger
+        env:
+          GLAMA_WEBHOOK_URL: ${{ secrets.GLAMA_WEBHOOK_URL }}
+          GLAMA_REPAIR: ${{ inputs.glama_repair }}
+          RELEASE_REF: ${{ needs.release.outputs.release_ref }}
+          RELEASE_SHA: ${{ needs.release.outputs.release_sha }}
+          VERSION: ${{ needs.release.outputs.version }}
+          GLAMA_DOCKERFILE: integrations/glama/Dockerfile
         run: |
+          set -u
+
+          fail_or_warn() {
+            local message="$1"
+            echo "rebuild_triggered=false" >> "$GITHUB_OUTPUT"
+            if [ "$GLAMA_REPAIR" = "true" ]; then
+              echo "::error::Requested Glama repair ${message}"
+              return 1
+            fi
+            echo "::warning::Automatic Glama rebuild ${message}; the freshness issue will remain open"
+            return 0
+          }
+
           if [ -z "$GLAMA_WEBHOOK_URL" ]; then
-            echo "::notice::GLAMA_WEBHOOK_URL not configured — Glama will rebuild on next auto-sync from PyPI"
-            echo "To enable instant rebuild, set GLAMA_WEBHOOK_URL in repo variables"
-            exit 0
+            echo "Release pin for Glama: ${RELEASE_REF} (${RELEASE_SHA:0:7}) dockerfile=${GLAMA_DOCKERFILE}"
+            echo "To enable instant rebuild, set GLAMA_WEBHOOK_URL as a repository Actions secret"
+            fail_or_warn "failed because GLAMA_WEBHOOK_URL is not configured. No Glama rebuild was triggered"
+            exit $?
           fi
-          HTTP_STATUS=$(curl -s --connect-timeout 10 --max-time 30 \
-            -o /dev/null -w "%{http_code}" \
-            -X POST "$GLAMA_WEBHOOK_URL")
-          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 400 ]; then
+          PAYLOAD=$(jq -n \
+            --arg ref "$RELEASE_REF" \
+            --arg commit "$RELEASE_SHA" \
+            --arg version "$VERSION" \
+            --arg dockerfile "$GLAMA_DOCKERFILE" \
+            '{ref: $ref, commit: $commit, version: $version, dockerfile: $dockerfile}')
+          echo "Triggering Glama rebuild for ${RELEASE_REF} (${RELEASE_SHA:0:7}) using ${GLAMA_DOCKERFILE}"
+          if ! HTTP_STATUS=$(curl -s --connect-timeout 10 --max-time 30 \
+              -o /dev/null -w "%{http_code}" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              -X POST "$GLAMA_WEBHOOK_URL"); then
+            fail_or_warn "request failed before an HTTP response was received"
+            exit $?
+          fi
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "rebuild_triggered=true" >> "$GITHUB_OUTPUT"
             echo "Glama rebuild triggered successfully"
           else
-            echo "::warning::Glama rebuild trigger returned HTTP ${HTTP_STATUS} — may need manual rebuild"
+            fail_or_warn "returned HTTP ${HTTP_STATUS}"
+            exit $?
+          fi
+
+      # Glama re-crawls listings on its own cadence (can be hours), so a tight
+      # post-trigger freshness window can legitimately fail on release day.
+      # Preserve the distinction between a successful trigger and no trigger.
+      - name: Verify Glama listing freshness
+        continue-on-error: true
+        env:
+          EXPECTED_VERSION: ${{ needs.release.outputs.version }}
+          EXPECTED_TOOL_COUNT: ${{ needs.release.outputs.tool_count }}
+          REBUILD_TRIGGERED: ${{ steps.glama_trigger.outputs.rebuild_triggered }}
+        run: |
+          if ! python scripts/check_glama_listing.py \
+              --expected "$EXPECTED_VERSION" \
+              --expected-tool-count "$EXPECTED_TOOL_COUNT" \
+              --retries 6 \
+              --delay-seconds 30; then
+            if [ "$REBUILD_TRIGGERED" = "true" ]; then
+              echo "::warning::Glama listing has not refreshed yet after the rebuild trigger. Glama re-crawls asynchronously and may take hours. Listing: https://glama.ai/mcp/servers/msaad00/agent-bom"
+            else
+              echo "::warning::Glama listing remains stale and no rebuild was triggered. Configure the repository Actions secret GLAMA_WEBHOOK_URL or rebuild the exact release manually. Listing: https://glama.ai/mcp/servers/msaad00/agent-bom"
+            fi
           fi
 
   clawhub:
     name: Publish to ClawHub
+    needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Extract version
-        id: meta
-        env:
-          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            # workflow_dispatch may run from main or a tag — prefer tag, fall back to pyproject.toml
-            REF="${GITHUB_REF_NAME#v}"
-            if echo "$REF" | grep -qE '^[0-9]+\.[0-9]+'; then
-              VERSION="$REF"
-            else
-              VERSION=$(grep '^version' pyproject.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-            fi
-          else
-            VERSION="${HEAD_BRANCH#v}"
-            if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
-              VERSION=$(grep '^version' pyproject.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-            fi
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Keep privileged workflow code on the trusted default branch. Exact
+          # release assets are exported as inert regular files below; the
+          # workflow never checks out or executes the release tree.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "20"
 
-      - name: Publish to ClawHub
+      - name: Check ClawHub configuration
+        id: clawhub_config
         env:
           CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
-          VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          if [ -z "$CLAWHUB_TOKEN" ]; then
-            echo "::error::CLAWHUB_TOKEN not set — cannot publish to ClawHub"
+          if [ -z "${CLAWHUB_TOKEN:-}" ]; then
+            echo "::notice::CLAWHUB_TOKEN not configured — skipping ClawHub publish"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Stage exact release ClawHub assets
+        if: steps.clawhub_config.outputs.enabled == 'true'
+        env:
+          RELEASE_SHA: ${{ needs.release.outputs.release_sha }}
+          CLAWHUB_RELEASE_ROOT: ${{ runner.temp }}/clawhub-release
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$RELEASE_SHA"
+
+          # A privileged workflow must not check out or execute a data-derived
+          # release tree. Export only the curated OpenClaw subtree, and reject
+          # symlinks, submodules, and executable files before extraction.
+          INVALID_ENTRIES=$(git ls-tree -r "$RELEASE_SHA" -- integrations/openclaw |
+            awk '$1 != "100644" { print }')
+          if [ -n "$INVALID_ENTRIES" ]; then
+            echo "::error::Only regular, non-executable release assets may be published to ClawHub"
+            printf '%s\n' "$INVALID_ENTRIES"
             exit 1
           fi
 
-          echo "Publishing agent-bom v${VERSION} to ClawHub..."
+          mkdir -p "$CLAWHUB_RELEASE_ROOT"
+          git archive --format=tar "$RELEASE_SHA" -- integrations/openclaw |
+            tar -xf - --directory "$CLAWHUB_RELEASE_ROOT" --no-same-owner --no-same-permissions
+          if find "$CLAWHUB_RELEASE_ROOT" -type l -print -quit | grep -q .; then
+            echo "::error::ClawHub release staging produced a symbolic link"
+            exit 1
+          fi
 
-          # Direct API publish — bypasses clawhub CLI v0.7.0 acceptLicenseTerms bug.
-          # API: POST /api/v1/skills with multipart form: payload JSON + file blobs.
+      - name: Install ClawHub CLI
+        if: steps.clawhub_config.outputs.enabled == 'true'
+        run: |
+          npm install -g clawhub@latest
+          # `clawhub --version` is not a supported option on the current CLI, so
+          # use --help as a binary-present probe instead. `npm install -g` already
+          # exits non-zero on install failure; this just confirms the command is
+          # on PATH before the publish step runs.
+          clawhub --help > /dev/null
+
+      - name: Publish to ClawHub
+        shell: bash
+        if: steps.clawhub_config.outputs.enabled == 'true'
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+          VERSION: ${{ needs.release.outputs.version }}
+          CLAWHUB_RELEASE_ROOT: ${{ runner.temp }}/clawhub-release
+        run: |
+          echo "Publishing agent-bom v${VERSION} to ClawHub..."
+          clawhub login --token "$CLAWHUB_TOKEN" --no-browser
+
           _publish_skill() {
             local DIR="$1" SLUG="$2" FATAL="${3:-true}"
             local DISPLAY_NAME="${4:-$SLUG}"
 
-            # Build file list (text files only, skip hidden/binary)
-            local CURL_ARGS=()
-            local FILE_COUNT=0
-            while IFS= read -r -d '' FILE; do
-              REL_PATH="${FILE#${DIR}/}"
-              CURL_ARGS+=(-F "files=@${FILE};filename=${REL_PATH};type=text/plain")
-              FILE_COUNT=$((FILE_COUNT + 1))
-            done < <(find "${DIR}" -maxdepth 2 -type f \( -name "*.md" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" -o -name "*.txt" \) -print0)
-
-            if [ "$FILE_COUNT" -eq 0 ]; then
+            if [ ! -d "$DIR" ]; then
               echo "::warning::No files found in ${DIR} — skipping"
               return 0
             fi
 
-            local PAYLOAD
-            PAYLOAD=$(cat <<EOJSON
-          {"slug":"${SLUG}","displayName":"${DISPLAY_NAME}","version":"${VERSION}","changelog":"Release v${VERSION}","tags":["latest"],"acceptLicenseTerms":true}
-          EOJSON
-            )
-
+            # Idempotency: if the exact same version already exists on ClawHub,
+            # treat it as success rather than churning the retry loop. Run the
+            # publish once and capture output so we can detect the 'already
+            # exists' signal in the retry-or-exit branch below.
+            local TMP_OUT
+            TMP_OUT=$(mktemp)
             for ATTEMPT in 1 2 3; do
               echo "ClawHub ${SLUG} attempt ${ATTEMPT}/3..."
-              HTTP_CODE=$(curl -s -o /tmp/clawhub_resp.json -w "%{http_code}" \
-                --connect-timeout 15 --max-time 120 \
-                -X POST "https://clawhub.ai/api/v1/skills" \
-                -H "Authorization: Bearer ${CLAWHUB_TOKEN}" \
-                -H "Accept: application/json" \
-                -F "payload=${PAYLOAD}" \
-                "${CURL_ARGS[@]}")
-              if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-                echo "ClawHub ${SLUG} v${VERSION} published (HTTP ${HTTP_CODE})"
-                cat /tmp/clawhub_resp.json
-                echo ""
+              if clawhub publish "$DIR" \
+                --slug "$SLUG" \
+                --name "$DISPLAY_NAME" \
+                --version "$VERSION" \
+                --changelog "Release v${VERSION}" \
+                --tags latest 2>&1 | tee "$TMP_OUT"; then
+                echo "ClawHub ${SLUG} v${VERSION} published"
+                rm -f "$TMP_OUT"
                 return 0
-              else
-                echo "ClawHub ${SLUG} failed (HTTP ${HTTP_CODE}): $(cat /tmp/clawhub_resp.json)"
-                [ "$ATTEMPT" -lt 3 ] && sleep $((ATTEMPT * 10))
+              fi
+              # Idempotent path: ClawHub reports 'already exists' / 'version
+              # already published' / HTTP 409 when the same version is re-pushed.
+              # That's success for a re-run of the same release — close #1547.
+              if grep -qiE 'already (exists|published)|version.*conflict|http 409|status.*409' "$TMP_OUT"; then
+                echo "::notice::ClawHub ${SLUG} v${VERSION} already published — treating as success (idempotent)"
+                rm -f "$TMP_OUT"
+                return 0
+              fi
+              echo "ClawHub ${SLUG} publish failed"
+              if [ "$ATTEMPT" -lt 3 ]; then
+                sleep $((ATTEMPT * 10))
               fi
             done
+            rm -f "$TMP_OUT"
             if [ "$FATAL" = "true" ]; then
               echo "::error::ClawHub ${SLUG} publish failed after 3 attempts"
               return 1
@@ -228,11 +594,15 @@ jobs:
             fi
           }
 
-          # Main consolidated skill (fatal on failure)
-          _publish_skill "integrations/openclaw" "agent-bom" true "agent-bom"
-
-          # Focused sub-skills (non-fatal — best-effort)
-          _publish_skill "integrations/openclaw/scan"       "agent-bom-scan"       false "agent-bom scan"
-          _publish_skill "integrations/openclaw/compliance" "agent-bom-compliance" false "agent-bom compliance"
-          _publish_skill "integrations/openclaw/registry"   "agent-bom-registry"   false "agent-bom registry"
-          _publish_skill "integrations/openclaw/runtime"    "agent-bom-runtime"    false "agent-bom runtime"
+          # Curated, focused skills only. Do not publish the oversized omnibus root
+          # skill to ClawHub — keep the marketplace surface small and guardrailed.
+          _publish_skill "${CLAWHUB_RELEASE_ROOT}/integrations/openclaw/scan"       "agent-bom-scan"       true  "agent-bom scan"
+          _publish_skill "${CLAWHUB_RELEASE_ROOT}/integrations/openclaw/compliance" "agent-bom-compliance" false "agent-bom compliance"
+          _publish_skill "${CLAWHUB_RELEASE_ROOT}/integrations/openclaw/registry"   "agent-bom-registry"   false "agent-bom registry"
+          _publish_skill "${CLAWHUB_RELEASE_ROOT}/integrations/openclaw/runtime"    "agent-bom-runtime"    false "agent-bom runtime"
+          _publish_skill "${CLAWHUB_RELEASE_ROOT}/integrations/openclaw/discover-aws" "agent-bom-discover-aws" false "agent-bom discover aws"
+          _publish_skill "${CLAWHUB_RELEASE_ROOT}/integrations/openclaw/discover-azure" "agent-bom-discover-azure" false "agent-bom discover azure"
+          _publish_skill "${CLAWHUB_RELEASE_ROOT}/integrations/openclaw/discover-gcp" "agent-bom-discover-gcp" false "agent-bom discover gcp"
+          _publish_skill "${CLAWHUB_RELEASE_ROOT}/integrations/openclaw/discover-snowflake" "agent-bom-discover-snowflake" false "agent-bom discover snowflake"
+          _publish_skill "${CLAWHUB_RELEASE_ROOT}/integrations/openclaw/ingest" "agent-bom-ingest" false "agent-bom ingest"
+          _publish_skill "${CLAWHUB_RELEASE_ROOT}/integrations/openclaw/vulnerability-intel" "agent-bom-vulnerability-intel" false "agent-bom vulnerability intel"

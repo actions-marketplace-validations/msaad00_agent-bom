@@ -3,19 +3,27 @@
 The primary query pattern is:
     vulns = lookup_package(conn, ecosystem="PyPI", name="requests", version="2.0.0")
 
-Version range matching uses a simple string comparison (semver-like).
-For precise semver ordering the caller should use packaging.version.Version.
+Version range matching uses the shared ecosystem-aware comparator from
+``agent_bom.version_utils`` so Debian, Alpine, and RPM advisories use the
+same semantics as CLI, image, and OSV scans.
 """
 
 from __future__ import annotations
 
 import logging
 import sqlite3
+from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
+from agent_bom.api.tracing import get_tracer
+from agent_bom.os_advisory import OS_DISTRO_COMPARATOR_FAMILIES
+
 _logger = logging.getLogger(__name__)
+_LOOKUP_TRACER = get_tracer("agent_bom.db.lookup")
 
 
 @dataclass
@@ -27,16 +35,98 @@ class LocalVuln:
     severity: str
     cvss_score: Optional[float]
     fixed_version: Optional[str]
+    cvss_vector: Optional[str] = None
     epss_probability: Optional[float] = None
     epss_percentile: Optional[float] = None
     is_kev: bool = False
     kev_date_added: Optional[str] = None
+    kev_due_date: Optional[str] = None  # CISA BOD 22-01 remediation deadline
+    published_at: Optional[str] = None
+    modified_at: Optional[str] = None
     source: str = "osv"
     ecosystem: str = ""
     package_name: str = ""
     introduced: Optional[str] = None
     aliases: list[str] = field(default_factory=list)
     cwe_ids: list[str] = field(default_factory=list)
+    # Set only by the CPE matcher so the finding surfaces as nvd_cpe_candidate;
+    # left None for OSV/distro rows, which compute their tier downstream.
+    match_confidence_tier: Optional[str] = None
+
+
+def _cve_candidates(vuln_id: str, raw_aliases: str) -> list[str]:
+    """Return unique CVE identifiers associated with one vulnerability row."""
+    candidates: list[str] = []
+    if vuln_id.startswith("CVE-"):
+        candidates.append(vuln_id)
+    for alias in (raw_aliases or "").split(","):
+        alias = alias.strip()
+        if alias.startswith("CVE-") and alias not in candidates:
+            candidates.append(alias)
+    return candidates
+
+
+def _load_cve_enrichment(
+    conn: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+) -> tuple[dict[str, tuple[Optional[float], Optional[float]]], dict[str, tuple[Optional[str], Optional[str]]]]:
+    """Load EPSS and KEV data for any CVE aliases referenced by *rows*."""
+    cve_ids: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for cve_id in _cve_candidates(row["id"], row["aliases"] or ""):
+            if cve_id not in seen:
+                seen.add(cve_id)
+                cve_ids.append(cve_id)
+
+    if not cve_ids:
+        return {}, {}
+
+    placeholders = ", ".join("?" for _ in cve_ids)
+    epss_query = f"""
+        SELECT cve_id, probability, percentile
+        FROM epss_scores
+        WHERE cve_id IN ({placeholders})
+    """  # nosec B608 - placeholders are generated solely from "?" markers
+    kev_query = f"""
+        SELECT cve_id, date_added, due_date
+        FROM kev_entries
+        WHERE cve_id IN ({placeholders})
+    """  # nosec B608 - placeholders are generated solely from "?" markers
+    epss_rows = conn.execute(epss_query, cve_ids).fetchall()
+    kev_rows = conn.execute(kev_query, cve_ids).fetchall()
+
+    epss_map = {row["cve_id"]: (row["probability"], row["percentile"]) for row in epss_rows}
+    kev_map = {row["cve_id"]: (row["date_added"], row["due_date"]) for row in kev_rows}
+    return epss_map, kev_map
+
+
+def _resolve_row_enrichment(
+    row: sqlite3.Row,
+    epss_map: dict[str, tuple[Optional[float], Optional[float]]],
+    kev_map: dict[str, tuple[Optional[str], Optional[str]]],
+) -> tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
+    """Return EPSS probability/percentile and KEV dates, falling back to CVE aliases.
+
+    ``kev_due_date`` is the CISA BOD 22-01 remediation deadline. It is carried
+    alongside ``date_added`` because every downstream consumer (CSV, CycloneDX,
+    SPDX, Markdown, Parquet, the ``check`` CLI) already renders it.
+    """
+    epss_prob = row["epss_prob"]
+    epss_pct = row["epss_pct"]
+    kev_date = row["kev_date"]
+    kev_due = row["kev_due_date"]
+    if epss_prob is not None and kev_date is not None:
+        return epss_prob, epss_pct, kev_date, kev_due
+
+    for cve_id in _cve_candidates(row["id"], row["aliases"] or ""):
+        if epss_prob is None and cve_id in epss_map:
+            epss_prob, epss_pct = epss_map[cve_id]
+        if kev_date is None and cve_id in kev_map:
+            kev_date, kev_due = kev_map[cve_id]
+        if epss_prob is not None and kev_date is not None:
+            break
+    return epss_prob, epss_pct, kev_date, kev_due
 
 
 def lookup_package(
@@ -51,58 +141,123 @@ def lookup_package(
     affected range.  Version matching is a simple lexicographic check — for exact
     semver semantics use ``lookup_package_strict()``.
     """
-    from agent_bom.models import normalize_package_name
+    from agent_bom.package_utils import normalize_package_name
 
     norm_name = normalize_package_name(name, ecosystem)
     eco_lower = ecosystem.lower()
 
-    rows = conn.execute(
-        """
-        SELECT
-            v.id, v.summary, v.severity, v.cvss_score, v.fixed_version, v.cwe_ids, COALESCE(v.aliases, '') AS aliases, v.source,
-            a.ecosystem, a.package_name, a.introduced, a.fixed, a.last_affected,
-            e.probability AS epss_prob, e.percentile AS epss_pct,
-            k.date_added AS kev_date
-        FROM affected a
-        JOIN vulns v ON v.id = a.vuln_id
-        LEFT JOIN epss_scores e ON e.cve_id = v.id
-        LEFT JOIN kev_entries k ON k.cve_id = v.id
-        WHERE a.ecosystem = ? AND a.package_name = ?
-        ORDER BY v.cvss_score DESC NULLS LAST
-        """,
-        (eco_lower, norm_name),
-    ).fetchall()
+    span_cm = _LOOKUP_TRACER.start_as_current_span("db.lookup_package") if _LOOKUP_TRACER else nullcontext()
+    with span_cm as span:
+        rows = conn.execute(
+            """
+            SELECT
+                v.id, v.summary, v.severity, v.cvss_score, v.cvss_vector, v.fixed_version, v.cwe_ids,
+                COALESCE(v.aliases, '') AS aliases, v.source,
+                v.published, v.modified,
+                a.ecosystem, a.package_name, a.introduced, a.fixed, a.last_affected,
+                e.probability AS epss_prob, e.percentile AS epss_pct,
+                k.date_added AS kev_date, k.due_date AS kev_due_date
+            FROM affected a
+            JOIN vulns v ON v.id = a.vuln_id
+            LEFT JOIN epss_scores e ON e.cve_id = v.id
+            LEFT JOIN kev_entries k ON k.cve_id = v.id
+            WHERE a.ecosystem = ? AND a.package_name = ?
+            ORDER BY v.cvss_score DESC NULLS LAST
+            """,
+            (eco_lower, norm_name),
+        ).fetchall()
 
-    results: list[LocalVuln] = []
-    for row in rows:
-        if version and not _version_affected(version, row["introduced"], row["fixed"], row["last_affected"]):
+        epss_map, kev_map = _load_cve_enrichment(conn, rows)
+        results: list[LocalVuln] = []
+        for row in _select_vulnerability_rows(rows, version):
+            # Parse comma-separated CWE IDs from DB column
+            raw_cwes = row["cwe_ids"] or ""
+            cwe_list = [c for c in raw_cwes.split(",") if c] if raw_cwes else []
+            raw_aliases = row["aliases"] or ""
+            alias_list = [a for a in raw_aliases.split(",") if a] if raw_aliases else []
+            epss_prob, epss_pct, kev_date, kev_due = _resolve_row_enrichment(row, epss_map, kev_map)
+
+            results.append(
+                LocalVuln(
+                    id=row["id"],
+                    summary=row["summary"],
+                    severity=row["severity"],
+                    cvss_score=row["cvss_score"],
+                    cvss_vector=row["cvss_vector"],
+                    fixed_version=_resolve_fixed_version_with_aliases(row, rows, version),
+                    epss_probability=epss_prob,
+                    epss_percentile=epss_pct,
+                    is_kev=kev_date is not None,
+                    kev_date_added=kev_date,
+                    kev_due_date=kev_due,
+                    published_at=row["published"],
+                    modified_at=row["modified"],
+                    source=row["source"],
+                    ecosystem=row["ecosystem"],
+                    package_name=row["package_name"],
+                    introduced=row["introduced"],
+                    aliases=alias_list,
+                    cwe_ids=cwe_list,
+                )
+            )
+
+        if span is not None:
+            span.set_attribute("agent_bom.lookup.ecosystem", eco_lower)
+            span.set_attribute("agent_bom.lookup.package_name", norm_name)
+            span.set_attribute("agent_bom.lookup.row_count", len(rows))
+            span.set_attribute("agent_bom.lookup.match_count", len(results))
+        return results
+
+
+def cpe_lookup_package(
+    conn: sqlite3.Connection, name: str, version: str, *, vendor: Optional[str] = None, limit: int = 500
+) -> list[LocalVuln]:
+    """Long-tail CPE-candidate matches for a component, hydrated from ``vulns``.
+
+    Maps the component to NVD CPE applicability ranges (see
+    :func:`agent_bom.cpe_match.match_component_cpe`) and hydrates each matched CVE
+    from the local ``vulns`` table so it carries real severity/CVSS/CWE. CVEs not
+    yet synced into ``vulns`` are skipped (no severity to report). Every result is
+    tagged ``nvd_cpe_candidate`` — a review-grade tier, never confirmed.
+    """
+    from agent_bom.cpe_match import MATCH_CONFIDENCE_NVD_CPE_CANDIDATE, match_component_cpe
+
+    matches = match_component_cpe(conn, name, version, vendor=vendor, limit=limit)
+    if not matches:
+        return []
+    cve_ids = [m["cve_id"] for m in matches]
+    placeholders = ", ".join("?" for _ in cve_ids)
+    rows = {
+        row["id"]: row
+        for row in conn.execute(
+            "SELECT id, summary, severity, cvss_score, cvss_vector, fixed_version, "
+            f"cwe_ids, aliases, published, modified FROM vulns WHERE id IN ({placeholders})",  # nosec B608 - placeholders are generated solely from "?" markers
+            cve_ids,
+        ).fetchall()
+    }
+    out: list[LocalVuln] = []
+    for cve_id in cve_ids:
+        row = rows.get(cve_id)
+        if row is None:
             continue
-        # Parse comma-separated CWE IDs from DB column
-        raw_cwes = row["cwe_ids"] or ""
-        cwe_list = [c for c in raw_cwes.split(",") if c] if raw_cwes else []
-        raw_aliases = row["aliases"] or ""
-        alias_list = [a for a in raw_aliases.split(",") if a] if raw_aliases else []
-
-        results.append(
+        out.append(
             LocalVuln(
                 id=row["id"],
                 summary=row["summary"],
                 severity=row["severity"],
                 cvss_score=row["cvss_score"],
-                fixed_version=row["fixed_version"] or row["fixed"],
-                epss_probability=row["epss_prob"],
-                epss_percentile=row["epss_pct"],
-                is_kev=row["kev_date"] is not None,
-                kev_date_added=row["kev_date"],
-                source=row["source"],
-                ecosystem=row["ecosystem"],
-                package_name=row["package_name"],
-                introduced=row["introduced"],
-                aliases=alias_list,
-                cwe_ids=cwe_list,
+                fixed_version=row["fixed_version"],
+                cvss_vector=row["cvss_vector"],
+                source="nvd",
+                package_name=name,
+                cwe_ids=[c for c in (row["cwe_ids"] or "").split(",") if c],
+                aliases=[a for a in (row["aliases"] or "").split(",") if a],
+                published_at=row["published"],
+                modified_at=row["modified"],
+                match_confidence_tier=MATCH_CONFIDENCE_NVD_CPE_CANDIDATE,
             )
         )
-    return results
+    return out
 
 
 def _version_affected(
@@ -110,41 +265,285 @@ def _version_affected(
     introduced: Optional[str],
     fixed: Optional[str],
     last_affected: Optional[str],
+    ecosystem: str = "",
 ) -> bool:
-    """Simple version-in-range check.
+    """Ecosystem-aware version-in-range check."""
+    from agent_bom.version_utils import version_in_range
 
-    Returns True when ``version`` is in [introduced, fixed) or [introduced, last_affected].
-    Empty/None introduced means "since beginning of time" (all earlier versions).
-    Empty/None fixed means "no fix yet" (all later versions affected).
+    return version_in_range(version, introduced, fixed, last_affected, _comparator_ecosystem(ecosystem))
+
+
+# Map a (possibly release-suffixed) DB ecosystem to a base family the version
+# comparator understands. The RPM/apk distro families (Red Hat, Rocky, AlmaLinux,
+# openSUSE/SUSE, Wolfi, Chainguard) are contributed by ``os_advisory`` so the
+# routing and comparator maps never drift apart.
+_ECO_FAMILY_TO_COMPARATOR = {
+    "debian": "deb",
+    "ubuntu": "deb",
+    "deb": "deb",
+    "alpine": "apk",
+    "apk": "apk",
+    "rpm": "rpm",
+    "linux": "rpm",
+    **OS_DISTRO_COMPARATOR_FAMILIES,
+}
+
+
+def _is_distro_release_ecosystem(ecosystem: str) -> bool:
+    """True for release-scoped OS ecosystems (``debian:10``, ``alpine:v3.18``, …).
+
+    For these the authoritative fixed version is the *per-release* ``affected.fixed``
+    column, not the cross-release ``vulns.fixed_version`` rollup. Debian/distro
+    advisories assign a different (backported) fix — or no fix at all — per release,
+    so reusing the global rollup both displays a wrong-release version and, worse,
+    makes a no-fix-for-this-release entry look fixed, defeating the default
+    unfixed-advisory suppression.
     """
-    # Normalise: empty string = None
-    intro = introduced or None
+    return _comparator_ecosystem(ecosystem) in ("deb", "apk", "rpm")
+
+
+def _resolve_fixed_version(row: sqlite3.Row) -> Optional[str]:
+    """Pick the fixed version to report for a matched affected row.
+
+    Distro releases use the per-release ``affected.fixed`` (empty means *no fix for
+    this release*); application ecosystems keep the existing rollup-then-range
+    preference so a missing range fix can fall back to the advisory-level fix.
+    """
+    if _is_distro_release_ecosystem(row["ecosystem"]):
+        return (row["fixed"] or "").strip() or None
+    # Prefer the version-matched range fix over the advisory-level rollup. For a
+    # multi-branch advisory the rollup names the fix on a *different* branch, so
+    # reporting it against an installed version on another branch can advise a
+    # downgrade. Fall back to the rollup only when the matched range carries no
+    # fix, and never present an invalid (e.g. git-SHA) rollup as a usable fix.
+    from agent_bom.scanners.osv import is_valid_fix_version
+
+    matched = (row["fixed"] or "").strip()
+    if matched:
+        return matched
+    rollup = (row["fixed_version"] or "").strip()
+    if rollup and is_valid_fix_version(rollup):
+        return rollup
+    return None
+
+
+def _row_identifiers(row: sqlite3.Row) -> set[str]:
+    """Vulnerability id plus its comma-separated aliases as a set."""
+    ids = {row["id"]}
+    ids.update(alias.strip() for alias in (row["aliases"] or "").split(",") if alias.strip())
+    return ids
+
+
+def _alias_cluster_fix(row: sqlite3.Row, rows: list[sqlite3.Row], version: Optional[str]) -> Optional[str]:
+    """Recover a missing fix version from alias-linked sibling rows.
+
+    OSV mirrors one advisory under several ids (PYSEC / GHSA / …) linked by
+    aliases, and the sources disagree on fix metadata — e.g. CVE-2025-2999
+    surfaces via a PYSEC row with no fix while its GHSA alias row in the same
+    DB carries ``fixed=2.9.1``. Reporting the fix-less row as "no fix
+    available" over-claims and lets ``--exclude-unfixable`` drop a fixable
+    finding. For the same ecosystem/package, take the minimal valid fix among
+    alias siblings that still exceeds the queried version. Distro-release
+    ecosystems are excluded: there an empty per-release fix authoritatively
+    means *no fix for this release*.
+    """
+    if _is_distro_release_ecosystem(row["ecosystem"]):
+        return None
+    from agent_bom.scanners.osv import is_valid_fix_version
+    from agent_bom.version_utils import compare_version_order
+
+    identifiers = _row_identifiers(row)
+    comparator_eco = _comparator_ecosystem(row["ecosystem"])
+    best: Optional[str] = None
+    for other in rows:
+        if other["id"] == row["id"]:
+            continue
+        if other["ecosystem"] != row["ecosystem"] or other["package_name"] != row["package_name"]:
+            continue
+        if identifiers.isdisjoint(_row_identifiers(other)):
+            continue
+        # An alias row is only a valid source of remediation metadata when its
+        # own affected range includes the installed version.  Advisory mirrors
+        # frequently share aliases while covering different releases; taking
+        # a fix from an unrelated range makes an otherwise unfixable finding
+        # look remediable (or, worse, hides a real finding after upgrade).
+        if (
+            version
+            and _version_match_state(
+                version,
+                other["introduced"],
+                other["fixed"],
+                other["last_affected"],
+                other["ecosystem"],
+            )
+            != "affected"
+        ):
+            continue
+        fix = _resolve_fixed_version(other)
+        if not fix or not is_valid_fix_version(fix):
+            continue
+        if version:
+            fix_vs_version = compare_version_order(fix, version, comparator_eco)
+            if fix_vs_version is None or fix_vs_version <= 0:
+                continue  # a "fix" at/below the installed version resolves nothing
+        if best is None:
+            best = fix
+        else:
+            fix_vs_best = compare_version_order(fix, best, comparator_eco)
+            if fix_vs_best is not None and fix_vs_best < 0:
+                best = fix
+    return best
+
+
+def _resolve_fixed_version_with_aliases(row: sqlite3.Row, rows: list[sqlite3.Row], version: Optional[str]) -> Optional[str]:
+    """Per-row fix resolution, falling back to the alias cluster when missing."""
+    fixed = _resolve_fixed_version(row)
+    if fixed is not None:
+        return fixed
+    return _alias_cluster_fix(row, rows, version)
+
+
+def _comparator_ecosystem(ecosystem: str) -> str:
+    """Normalise a DB ecosystem to a key the version comparator can order.
+
+    DB ``affected`` rows store distro ecosystems with a release suffix
+    (``debian:10``, ``alpine:v3.18``, ``ubuntu:22.04``). The ecosystem-aware
+    version comparator only recognises the base families (``deb``/``apk``/
+    ``rpm``); handed the suffixed form it cannot pick a distro comparator and
+    returns "unknown" for every range. That silently flips already-fixed distro
+    advisories into conservative false positives (e.g. ``bash 5.0-4`` reported
+    against a fix of ``4.3-9.1``). Normalising to the base family restores
+    correct version ordering.
+    """
+    base = (ecosystem or "").split(":", 1)[0].strip().lower()
+    return _ECO_FAMILY_TO_COMPARATOR.get(base, base)
+
+
+@lru_cache(maxsize=131072)
+def _cached_version_match_state(
+    version: str,
+    introduced: Optional[str],
+    fixed: Optional[str],
+    last_affected: Optional[str],
+    ecosystem: str = "",
+) -> str:
+    from agent_bom.version_utils import _looks_like_commit_sha, compare_version_order, normalize_introduced
+
+    # ``introduced: "0"`` is the OSV sentinel for "before every version", not a
+    # version to compare against — see ``normalize_introduced``. Comparing to it
+    # literally dropped every Go pseudo-version out of every sentinel-opened
+    # window, while the OSV walker (which already stripped it) said affected.
+    intro = normalize_introduced(introduced)
     fix = fixed or None
     last = last_affected or None
+    # ``ambiguous``: a genuine version-vs-version comparison yielded no ordering
+    # (unusual/unparseable version string) — worth a conservative include.
+    # ``uncomparable``: a bound is a git-commit SHA or other non-version token
+    # that can never establish semver range membership — NOT grounds for
+    # inclusion. Mirrors ``version_utils.version_in_range`` returning False for
+    # SHA bounds so this offline path stops emitting OSS-Fuzz/OSV-2022 false
+    # positives against concrete semver versions.
+    ambiguous = False
+    uncomparable = False
 
-    try:
-        from packaging.version import Version
+    if intro:
+        if _looks_like_commit_sha(intro):
+            uncomparable = True
+        else:
+            intro_cmp = compare_version_order(version, intro, ecosystem)
+            if intro_cmp is not None and intro_cmp < 0:
+                return "unaffected"
+            if intro_cmp is None:
+                ambiguous = True
 
-        ver = Version(version)
+    if fix:
+        if _looks_like_commit_sha(fix):
+            uncomparable = True
+        else:
+            fix_cmp = compare_version_order(version, fix, ecosystem)
+            if fix_cmp is not None and fix_cmp >= 0:
+                return "unaffected"
+            if fix_cmp is None:
+                ambiguous = True
 
-        if intro and ver < Version(intro):
-            return False
-        if fix and ver >= Version(fix):
-            return False
-        if last and ver > Version(last):
-            return False
-        return True
-    except Exception as exc:
-        # Fall back to lexicographic comparison if packaging not available
-        # or version strings are non-standard
-        _logger.debug("Semantic version comparison failed for %r (falling back to lexicographic): %s", version, exc)
-        if intro and version < intro:
-            return False
-        if fix and version >= fix:
-            return False
-        if last and version > last:
-            return False
-        return True
+    if last:
+        if _looks_like_commit_sha(last):
+            uncomparable = True
+        else:
+            last_cmp = compare_version_order(version, last, ecosystem)
+            if last_cmp is not None and last_cmp > 0:
+                return "unaffected"
+            if last_cmp is None:
+                ambiguous = True
+
+    if ambiguous:
+        return "unknown"
+    if uncomparable:
+        return "uncomparable"
+    return "affected"
+
+
+def _version_match_state(
+    version: str,
+    introduced: Optional[str],
+    fixed: Optional[str],
+    last_affected: Optional[str],
+    ecosystem: str = "",
+) -> str:
+    """Classify one affected-range row for a version.
+
+    Returns ``affected`` / ``unaffected`` for a definitive semver comparison,
+    ``unknown`` for a genuine version-vs-version ambiguity (conservatively
+    included), or ``uncomparable`` when a bound is a git SHA / non-version token
+    that can never match a concrete semver (never a reason to include).
+    """
+    return _cached_version_match_state(version, introduced, fixed, last_affected, _comparator_ecosystem(ecosystem))
+
+
+def _select_vulnerability_rows(rows: list[sqlite3.Row], version: Optional[str]) -> list[sqlite3.Row]:
+    """Choose at most one authoritative affected row per vulnerability.
+
+    If any row for a vulnerability definitively matches the requested version,
+    include the vulnerability. If no rows match but at least one row
+    definitively excludes the version, suppress the vulnerability even if
+    sibling rows are ambiguous (for example, duplicate PYSEC rows with git-SHA
+    fix bounds). If all rows are genuinely ambiguous, include the first one
+    conservatively. Rows whose only signal is ``uncomparable`` (git-SHA /
+    non-version bounds — e.g. OSV-2022 OSS-Fuzz advisories) are never grounds
+    for inclusion, so a concrete semver version does not draw a false positive.
+    """
+    if not version:
+        grouped_rows: dict[str, list[sqlite3.Row]] = defaultdict(list)
+        for row in rows:
+            grouped_rows[row["id"]].append(row)
+        return [group[0] for group in grouped_rows.values()]
+
+    grouped: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    for row in rows:
+        grouped[row["id"]].append(row)
+
+    selected: list[sqlite3.Row] = []
+    for vuln_rows in grouped.values():
+        affected_row: sqlite3.Row | None = None
+        unknown_row: sqlite3.Row | None = None
+        saw_unaffected = False
+
+        for row in vuln_rows:
+            state = _version_match_state(version, row["introduced"], row["fixed"], row["last_affected"], row["ecosystem"])
+            if state == "affected":
+                affected_row = row
+                break
+            if state == "unknown" and unknown_row is None:
+                unknown_row = row
+            if state == "unaffected":
+                saw_unaffected = True
+
+        if affected_row is not None:
+            selected.append(affected_row)
+        elif not saw_unaffected and unknown_row is not None:
+            selected.append(unknown_row)
+
+    return selected
 
 
 def lookup_packages_batch(
@@ -176,73 +575,87 @@ def lookup_packages_batch(
 
     pairs = list(pair_set)
 
-    # Fetch all rows in chunks
-    all_rows: list[sqlite3.Row] = []
-    for start in range(0, len(pairs), chunk_size):
-        chunk = pairs[start : start + chunk_size]
-        placeholders = ", ".join(["(?, ?)"] * len(chunk))
-        params: list[str] = []
-        for eco, nm in chunk:
-            params.extend([eco, nm])
+    span_cm = _LOOKUP_TRACER.start_as_current_span("db.lookup_packages_batch") if _LOOKUP_TRACER else nullcontext()
+    with span_cm as span:
+        # Fetch all rows in chunks
+        all_rows: list[sqlite3.Row] = []
+        for start in range(0, len(pairs), chunk_size):
+            chunk = pairs[start : start + chunk_size]
+            placeholders = ", ".join(["(?, ?)"] * len(chunk))
+            params: list[str] = []
+            for eco, nm in chunk:
+                params.extend([eco, nm])
 
-        # placeholders is only "(?, ?)" repeated — no user data in the SQL string.
-        query = f"""
-            SELECT
-                v.id, v.summary, v.severity, v.cvss_score, v.fixed_version, v.cwe_ids, COALESCE(v.aliases, '') AS aliases, v.source,
-                a.ecosystem, a.package_name, a.introduced, a.fixed, a.last_affected,
-                e.probability AS epss_prob, e.percentile AS epss_pct,
-                k.date_added AS kev_date
-            FROM affected a
-            JOIN vulns v ON v.id = a.vuln_id
-            LEFT JOIN epss_scores e ON e.cve_id = v.id
-            LEFT JOIN kev_entries k ON k.cve_id = v.id
-            WHERE (a.ecosystem, a.package_name) IN (VALUES {placeholders})
-            ORDER BY v.cvss_score DESC NULLS LAST
-        """  # nosec B608
-        all_rows.extend(conn.execute(query, params).fetchall())
+            # placeholders is only "(?, ?)" repeated — no user data in the SQL string.
+            query = f"""
+                SELECT
+                    v.id, v.summary, v.severity, v.cvss_score, v.cvss_vector, v.fixed_version, v.cwe_ids,
+                    COALESCE(v.aliases, '') AS aliases, v.source,
+                    v.published, v.modified,
+                    a.ecosystem, a.package_name, a.introduced, a.fixed, a.last_affected,
+                    e.probability AS epss_prob, e.percentile AS epss_pct,
+                    k.date_added AS kev_date, k.due_date AS kev_due_date
+                FROM affected a
+                JOIN vulns v ON v.id = a.vuln_id
+                LEFT JOIN epss_scores e ON e.cve_id = v.id
+                LEFT JOIN kev_entries k ON k.cve_id = v.id
+                WHERE (a.ecosystem, a.package_name) IN (VALUES {placeholders})
+                ORDER BY v.cvss_score DESC NULLS LAST
+            """  # nosec B608
+            all_rows.extend(conn.execute(query, params).fetchall())
 
-    # Group rows by (lower_ecosystem, package_name)
-    from collections import defaultdict
+        epss_map, kev_map = _load_cve_enrichment(conn, all_rows)
 
-    grouped: dict[tuple[str, str], list[sqlite3.Row]] = defaultdict(list)
-    for row in all_rows:
-        grouped[(row["ecosystem"].lower(), row["package_name"])].append(row)
+        # Group rows by (lower_ecosystem, package_name)
+        grouped: dict[tuple[str, str], list[sqlite3.Row]] = defaultdict(list)
+        for row in all_rows:
+            grouped[(row["ecosystem"].lower(), row["package_name"])].append(row)
 
-    # Build results per input package (with version filtering)
-    results: dict[tuple[str, str, str], list[LocalVuln]] = {}
-    for eco, name, version in packages:
-        key = (eco, name, version)
-        eco_lower = eco.lower()
-        rows = grouped.get((eco_lower, name), [])
+        # Build results per input package (with version filtering)
+        results: dict[tuple[str, str, str], list[LocalVuln]] = {}
+        for eco, name, version in packages:
+            key = (eco, name, version)
+            eco_lower = eco.lower()
+            rows = grouped.get((eco_lower, name), [])
 
-        vulns: list[LocalVuln] = []
-        for row in rows:
-            if version and not _version_affected(version, row["introduced"], row["fixed"], row["last_affected"]):
-                continue
-            raw_cwes = row["cwe_ids"] or ""
-            cwe_list = [c for c in raw_cwes.split(",") if c] if raw_cwes else []
+            vulns: list[LocalVuln] = []
+            for row in _select_vulnerability_rows(rows, version):
+                raw_cwes = row["cwe_ids"] or ""
+                cwe_list = [c for c in raw_cwes.split(",") if c] if raw_cwes else []
+                raw_aliases = row["aliases"] or ""
+                alias_list = [a for a in raw_aliases.split(",") if a] if raw_aliases else []
+                epss_prob, epss_pct, kev_date, kev_due = _resolve_row_enrichment(row, epss_map, kev_map)
 
-            vulns.append(
-                LocalVuln(
-                    id=row["id"],
-                    summary=row["summary"],
-                    severity=row["severity"],
-                    cvss_score=row["cvss_score"],
-                    fixed_version=row["fixed_version"] or row["fixed"],
-                    epss_probability=row["epss_prob"],
-                    epss_percentile=row["epss_pct"],
-                    is_kev=row["kev_date"] is not None,
-                    kev_date_added=row["kev_date"],
-                    source=row["source"],
-                    ecosystem=row["ecosystem"],
-                    package_name=row["package_name"],
-                    introduced=row["introduced"],
-                    cwe_ids=cwe_list,
+                vulns.append(
+                    LocalVuln(
+                        id=row["id"],
+                        summary=row["summary"],
+                        severity=row["severity"],
+                        cvss_score=row["cvss_score"],
+                        cvss_vector=row["cvss_vector"],
+                        fixed_version=_resolve_fixed_version_with_aliases(row, rows, version),
+                        epss_probability=epss_prob,
+                        epss_percentile=epss_pct,
+                        is_kev=kev_date is not None,
+                        kev_date_added=kev_date,
+                        kev_due_date=kev_due,
+                        published_at=row["published"],
+                        modified_at=row["modified"],
+                        source=row["source"],
+                        ecosystem=row["ecosystem"],
+                        package_name=row["package_name"],
+                        introduced=row["introduced"],
+                        aliases=alias_list,
+                        cwe_ids=cwe_list,
+                    )
                 )
-            )
-        results[key] = vulns
+            results[key] = vulns
 
-    return results
+        if span is not None:
+            span.set_attribute("agent_bom.lookup.package_count", len(packages))
+            span.set_attribute("agent_bom.lookup.unique_pairs", len(pairs))
+            span.set_attribute("agent_bom.lookup.row_count", len(all_rows))
+        return results
 
 
 def package_in_db(conn: sqlite3.Connection, ecosystem: str, name: str) -> bool:
@@ -251,7 +664,7 @@ def package_in_db(conn: sqlite3.Connection, ecosystem: str, name: str) -> bool:
     Used to decide whether the DB is authoritative for a package (and OSV fallback
     can be skipped) vs. the package simply not being indexed yet.
     """
-    from agent_bom.models import normalize_package_name
+    from agent_bom.package_utils import normalize_package_name
 
     norm_name = normalize_package_name(name, ecosystem)
     row = conn.execute(
@@ -259,6 +672,35 @@ def package_in_db(conn: sqlite3.Connection, ecosystem: str, name: str) -> bool:
         (ecosystem.lower(), norm_name),
     ).fetchone()
     return row is not None
+
+
+def package_in_db_batch(
+    conn: sqlite3.Connection,
+    packages: list[tuple[str, str]],
+) -> set[tuple[str, str]]:
+    """Return the subset of ``(ecosystem, package_name)`` pairs present in affected."""
+    if not packages:
+        return set()
+
+    normalized = {(ecosystem.lower(), name) for ecosystem, name in packages}
+    pairs = list(normalized)
+    chunk_size = 400
+    present: set[tuple[str, str]] = set()
+
+    for start in range(0, len(pairs), chunk_size):
+        chunk = pairs[start : start + chunk_size]
+        placeholders = ", ".join(["(?, ?)"] * len(chunk))
+        params: list[str] = []
+        for eco, name in chunk:
+            params.extend([eco, name])
+        query = f"""
+            SELECT DISTINCT ecosystem, package_name
+            FROM affected
+            WHERE (ecosystem, package_name) IN (VALUES {placeholders})
+        """  # nosec B608
+        present.update((row["ecosystem"], row["package_name"]) for row in conn.execute(query, params).fetchall())
+
+    return present
 
 
 class VulnDB:

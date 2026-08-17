@@ -5,8 +5,10 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import time
 
+import agent_bom.agent_identity as identity_mod
 from agent_bom.agent_identity import (
     ANONYMOUS,
     check_identity,
@@ -187,13 +189,14 @@ def test_check_identity_valid_jwt_passes():
     assert block is None
 
 
-def test_check_identity_valid_jwt_required_passes():
+def test_check_identity_unsigned_jwt_required_blocks_without_verification_policy():
     token = _make_jwt({"sub": "agent-diana"})
     msg = _msg_with_identity(token)
     policy = {"require_agent_identity": True}
     agent_id, block = check_identity(msg, policy)
-    assert agent_id == "agent-diana"
-    assert block is None
+    assert agent_id == ANONYMOUS
+    assert block is not None
+    assert "signature verification required" in block
 
 
 def test_check_identity_expired_jwt_required_blocks():
@@ -235,6 +238,36 @@ def test_check_identity_unknown_token_required_blocks():
     assert block is not None
 
 
+def test_check_identity_sanitizes_error_before_logging(caplog, monkeypatch):
+    token = _make_jwt({"sub": "agent-x"}, header={"alg": "RS256", "kid": "line1\nline2"})
+    msg = _msg_with_identity(token)
+    # expected_audience is required for a direct jwks_uri; set it so verification
+    # reaches the header/kid decode where the sanitized error under test surfaces.
+    policy = {
+        "require_agent_identity": True,
+        "jwks_uri": "https://idp.example.invalid/jwks",
+        "expected_audience": "svc",
+    }
+    monkeypatch.setattr(identity_mod, "_fetch_jwks", lambda _uri: {"keys": []})
+
+    caplog.set_level(logging.DEBUG, logger="agent_bom.agent_identity")
+    _agent_id, block = check_identity(msg, policy)
+
+    assert block is not None
+    assert "line1 line2" in block
+    assert "\n" not in block
+    assert "\r" not in block
+    assert "\\n" not in block
+    assert "\\r" not in block
+    assert all(
+        "\n" not in record.getMessage()
+        and "\r" not in record.getMessage()
+        and "\\n" not in record.getMessage()
+        and "\\r" not in record.getMessage()
+        for record in caplog.records
+    )
+
+
 # ─── log_tool_call carries agent_id ──────────────────────────────────────────
 
 
@@ -244,6 +277,8 @@ def test_log_tool_call_agent_id_written():
     buf.seek(0)
     record = json.loads(buf.readline())
     assert record["agent_id"] == "agent-eve"
+    assert record["event_relationships"]["actor"]["id"] == "agent-eve"
+    assert record["event_relationships"]["actor"]["role"] == "caller"
 
 
 def test_log_tool_call_anonymous_default():
@@ -252,6 +287,7 @@ def test_log_tool_call_anonymous_default():
     buf.seek(0)
     record = json.loads(buf.readline())
     assert record["agent_id"] == ANONYMOUS
+    assert "actor" not in record["event_relationships"]
 
 
 def test_log_tool_call_blocked_carries_agent_id():
@@ -261,3 +297,34 @@ def test_log_tool_call_blocked_carries_agent_id():
     record = json.loads(buf.readline())
     assert record["agent_id"] == "bad-bot"
     assert record["policy"] == "blocked"
+    assert record["event_relationships"]["actor"]["id"] == "bad-bot"
+
+
+def test_log_tool_call_redacts_nested_arguments_and_relationships():
+    buf = io.StringIO()
+    token = "ghp_" + "abcdefghijklmnopqrstuvwxyz" + "123456"
+    api_key = "sk-" + "live-" + "abcdefghijklmnopqrstuvwxyz"
+    log_tool_call(
+        buf,
+        "fetch",
+        {
+            "url": f"https://user:pass@example.com/callback?token={token}",
+            "body": {"api_key": api_key},
+            "path": "/Users/alice/prod-secrets/openai-key.env",
+        },
+        agent_id="agent-eve",
+    )
+
+    raw = buf.getvalue()
+    record = json.loads(raw)
+    encoded = json.dumps(record)
+    assert "user:pass" not in encoded
+    assert token not in encoded
+    assert "sk-live" not in encoded
+    assert "/Users/alice" not in encoded
+    assert "prod-secrets" not in encoded
+    assert "token=" not in encoded
+    assert "args" not in record
+    resources = record["event_relationships"]["resources"]
+    assert {"type": "url", "id": "https://example.com/callback", "role": "referenced_input", "source_field": "url"} in resources
+    assert {"type": "path", "id": "<path:openai-key.env>", "role": "referenced_input", "source_field": "path"} in resources

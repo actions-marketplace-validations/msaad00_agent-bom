@@ -12,24 +12,10 @@ import os
 import secrets
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import datetime, timedelta, timezone
+from typing import Protocol
 
-
-class Role(str, Enum):
-    """User roles for RBAC."""
-
-    ADMIN = "admin"
-    ANALYST = "analyst"
-    VIEWER = "viewer"
-
-
-# Role hierarchy: admin > analyst > viewer
-_ROLE_HIERARCHY: dict[Role, int] = {
-    Role.ADMIN: 3,
-    Role.ANALYST: 2,
-    Role.VIEWER: 1,
-}
+from agent_bom.rbac import Role, role_rank
 
 
 @dataclass
@@ -45,21 +31,96 @@ class ApiKey:
     created_at: str = ""
     expires_at: str | None = None
     scopes: list[str] = field(default_factory=list)
+    tenant_id: str = "default"
+    revoked_at: str | None = None
+    rotation_overlap_until: str | None = None
+    replacement_key_id: str | None = None
+    scim_subject_id: str | None = None
+    # Stable identifier of the user this key was issued on behalf of (SCIM
+    # user_id / user_name / external_id). Lets deprovisioning revoke free-form
+    # CI keys whose ``name`` doesn't match the departing user.
+    owner: str | None = None
+    # Canonical stable principal id this key is bound to. Set at creation
+    # (explicit → scim_subject_id → owner). Deprovisioning a subject revokes
+    # every key keyed to its principal_id, independent of the display ``name``.
+    principal_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.created_at:
             self.created_at = datetime.now(timezone.utc).isoformat()
 
-    def is_expired(self) -> bool:
+    @staticmethod
+    def _parse_timestamp(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    def is_expired(self, *, now: datetime | None = None) -> bool:
         if not self.expires_at:
             return False
-        return datetime.now(timezone.utc).isoformat() > self.expires_at
+        current = now or datetime.now(timezone.utc)
+        expires_at = self._parse_timestamp(self.expires_at)
+        return bool(expires_at and current > expires_at)
+
+    def is_revoked(self) -> bool:
+        return bool(self.revoked_at)
+
+    def is_within_rotation_overlap(self, *, now: datetime | None = None) -> bool:
+        if not self.replacement_key_id or not self.rotation_overlap_until:
+            return False
+        current = now or datetime.now(timezone.utc)
+        overlap_until = self._parse_timestamp(self.rotation_overlap_until)
+        return bool(overlap_until and current <= overlap_until)
+
+    def is_usable(self, *, now: datetime | None = None) -> bool:
+        if self.is_revoked():
+            return False
+        if self.is_expired(now=now):
+            return False
+        if self.replacement_key_id:
+            return self.is_within_rotation_overlap(now=now)
+        return True
+
+    def lifecycle_state(self, *, now: datetime | None = None) -> str:
+        if self.is_revoked():
+            return "revoked"
+        if self.is_expired(now=now):
+            return "expired"
+        if self.replacement_key_id:
+            return "rotation_overlap" if self.is_within_rotation_overlap(now=now) else "rotated"
+        return "active"
 
     def has_role(self, required: Role) -> bool:
         """Check if this key's role meets or exceeds the required role."""
-        return _ROLE_HIERARCHY.get(self.role, 0) >= _ROLE_HIERARCHY.get(required, 0)
+        return role_rank(self.role) >= role_rank(required)
+
+    def has_scope(self, required_scope: str | None) -> bool:
+        """Check whether this key's scopes allow the requested action."""
+        if not required_scope:
+            return True
+        if not self.scopes:
+            return True
+        if any(scope in {"saml-session", "browser-session", "oidc-session"} for scope in self.scopes):
+            return True
+        for scope in self.scopes:
+            if scope == "*" or scope == required_scope:
+                return True
+            if scope.endswith(":*") and required_scope.startswith(scope[:-1]):
+                return True
+            if scope.endswith(".*") and required_scope.startswith(scope[:-1]):
+                return True
+        return False
 
     def to_dict(self) -> dict:
+        current = datetime.now(timezone.utc)
+        overlap_remaining_seconds = None
+        if self.rotation_overlap_until:
+            overlap_until = self._parse_timestamp(self.rotation_overlap_until)
+            if overlap_until is not None:
+                overlap_remaining_seconds = max(0, int((overlap_until - current).total_seconds()))
         return {
             "key_id": self.key_id,
             "key_prefix": self.key_prefix,
@@ -68,7 +129,217 @@ class ApiKey:
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "scopes": self.scopes,
+            "tenant_id": self.tenant_id,
+            "revoked_at": self.revoked_at,
+            "rotation_overlap_until": self.rotation_overlap_until,
+            "replacement_key_id": self.replacement_key_id,
+            "scim_subject_id": self.scim_subject_id,
+            "owner": self.owner,
+            "principal_id": self.principal_id,
+            "state": self.lifecycle_state(now=current),
+            "overlap_seconds_remaining": overlap_remaining_seconds,
         }
+
+
+@dataclass(frozen=True)
+class ApiKeyPolicy:
+    """Operator-controlled API key lifetime policy."""
+
+    default_ttl_seconds: int = 30 * 24 * 60 * 60
+    max_ttl_seconds: int = 90 * 24 * 60 * 60
+    default_overlap_seconds: int = 0
+    max_overlap_seconds: int = 24 * 60 * 60
+
+
+@dataclass(frozen=True)
+class SCIMRoleResolution:
+    """Runtime auth role resolved from tenant-bound SCIM lifecycle state."""
+
+    matched: bool
+    active: bool
+    role: Role | None = None
+    user_id: str | None = None
+    user_name: str | None = None
+
+
+def _dedupe_subjects(subjects: tuple[object, ...]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for subject in subjects:
+        candidate = str(subject or "").strip()
+        if not candidate:
+            continue
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
+
+
+def _highest_role(values: list[str]) -> Role | None:
+    best: Role | None = None
+    for value in values:
+        try:
+            candidate = Role(str(value).strip().lower())
+        except ValueError:
+            continue
+        if best is None or role_rank(candidate) > role_rank(best):
+            best = candidate
+    return best
+
+
+def resolve_scim_user_role(tenant_id: str, *subjects: object) -> SCIMRoleResolution:
+    """Resolve an active SCIM user's highest role within one tenant.
+
+    The resolver is intentionally tenant-scoped and only matches indexed SCIM
+    identity fields so runtime auth does not scan all provisioned users.
+    """
+
+    from agent_bom.api.scim import scim_enabled_from_env
+
+    if not scim_enabled_from_env():
+        return SCIMRoleResolution(matched=False, active=False)
+
+    candidates = _dedupe_subjects(subjects)
+    if not tenant_id or not candidates:
+        return SCIMRoleResolution(matched=False, active=False)
+
+    from agent_bom.api.stores import _get_scim_store
+    from agent_bom.platform_invariants import normalize_tenant_id
+
+    tenant = normalize_tenant_id(tenant_id)
+    users = []
+    seen_users: set[str] = set()
+    store = _get_scim_store()
+    for subject in candidates:
+        for attr in ("userName", "externalId", "id"):
+            for user in store.list_users(tenant, filter_attr=attr, filter_value=subject):
+                key = f"{user.tenant_id}:{user.user_id}"
+                if key not in seen_users:
+                    seen_users.add(key)
+                    users.append(user)
+
+    if not users:
+        return SCIMRoleResolution(matched=False, active=False)
+
+    active_users = [user for user in users if user.active]
+    if not active_users:
+        user = users[0]
+        return SCIMRoleResolution(matched=True, active=False, user_id=user.user_id, user_name=user.user_name)
+
+    best_user = active_users[0]
+    best_role: Role | None = None
+    for user in active_users:
+        role = _highest_role(user.roles)
+        if role is None:
+            role = Role.VIEWER
+        if best_role is None or role_rank(role) > role_rank(best_role):
+            best_role = role
+            best_user = user
+
+    return SCIMRoleResolution(matched=True, active=True, role=best_role, user_id=best_user.user_id, user_name=best_user.user_name)
+
+
+def resolve_scim_subject_binding(request: object, explicit: str | None = None) -> str | None:
+    """Resolve the SCIM subject id to persist on a newly issued API key.
+
+    Precedence: explicit request field → runtime SCIM resolution on the session →
+    parent key binding → canonical SCIM user id for OIDC/SAML callers.
+    """
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()
+
+    state = getattr(request, "state", request)
+    state_user_id = getattr(state, "scim_user_id", None)
+    if state_user_id:
+        return str(state_user_id)
+
+    bound = getattr(state, "scim_subject_id", None)
+    if bound:
+        return str(bound)
+
+    key_id = getattr(state, "api_key_id", None)
+    if key_id:
+        parent = get_key_store().get(str(key_id))
+        if parent and parent.scim_subject_id:
+            return parent.scim_subject_id
+
+    tenant_id = getattr(state, "tenant_id", None) or "default"
+    auth_method = str(getattr(state, "auth_method", "") or "")
+    api_key_name = str(getattr(state, "api_key_name", "") or "")
+    if auth_method in {"saml", "oidc", "browser_session"} and api_key_name:
+        subjects: tuple[object, ...] = (api_key_name.removeprefix("saml:"), api_key_name)
+        resolution = resolve_scim_user_role(tenant_id, *subjects)
+        if resolution.user_id:
+            return resolution.user_id
+    return None
+
+
+def get_api_key_policy() -> ApiKeyPolicy:
+    """Load API key lifetime policy from env with safe defaults."""
+    default_ttl = int(os.environ.get("AGENT_BOM_API_KEY_DEFAULT_TTL_SECONDS", str(30 * 24 * 60 * 60)))
+    max_ttl = int(os.environ.get("AGENT_BOM_API_KEY_MAX_TTL_SECONDS", str(90 * 24 * 60 * 60)))
+    default_overlap = int(os.environ.get("AGENT_BOM_API_KEY_DEFAULT_OVERLAP_SECONDS", "0"))
+    max_overlap = int(os.environ.get("AGENT_BOM_API_KEY_MAX_OVERLAP_SECONDS", str(24 * 60 * 60)))
+    if default_ttl <= 0:
+        raise ValueError("AGENT_BOM_API_KEY_DEFAULT_TTL_SECONDS must be > 0")
+    if max_ttl <= 0:
+        raise ValueError("AGENT_BOM_API_KEY_MAX_TTL_SECONDS must be > 0")
+    if default_ttl > max_ttl:
+        raise ValueError("AGENT_BOM_API_KEY_DEFAULT_TTL_SECONDS cannot exceed AGENT_BOM_API_KEY_MAX_TTL_SECONDS")
+    if default_overlap < 0:
+        raise ValueError("AGENT_BOM_API_KEY_DEFAULT_OVERLAP_SECONDS must be >= 0")
+    if max_overlap < 0:
+        raise ValueError("AGENT_BOM_API_KEY_MAX_OVERLAP_SECONDS must be >= 0")
+    if default_overlap > max_overlap:
+        raise ValueError("AGENT_BOM_API_KEY_DEFAULT_OVERLAP_SECONDS cannot exceed AGENT_BOM_API_KEY_MAX_OVERLAP_SECONDS")
+    return ApiKeyPolicy(
+        default_ttl_seconds=default_ttl,
+        max_ttl_seconds=max_ttl,
+        default_overlap_seconds=default_overlap,
+        max_overlap_seconds=max_overlap,
+    )
+
+
+def normalize_api_key_expiry(
+    expires_at: str | None,
+    *,
+    now: datetime | None = None,
+    policy: ApiKeyPolicy | None = None,
+) -> str:
+    """Normalize and enforce API key expiry under the configured policy."""
+    active_policy = policy or get_api_key_policy()
+    current = now or datetime.now(timezone.utc)
+    if expires_at:
+        try:
+            parsed = datetime.fromisoformat(expires_at)
+        except ValueError as exc:
+            raise ValueError("expires_at must be a valid ISO-8601 datetime with timezone") from exc
+        if parsed.tzinfo is None:
+            raise ValueError("expires_at must include timezone information")
+        if parsed <= current:
+            raise ValueError("expires_at must be in the future")
+        max_expiry = current + timedelta(seconds=active_policy.max_ttl_seconds)
+        if parsed > max_expiry:
+            raise ValueError(f"expires_at exceeds the maximum allowed API key lifetime ({active_policy.max_ttl_seconds} seconds)")
+        return parsed.isoformat()
+    return (current + timedelta(seconds=active_policy.default_ttl_seconds)).isoformat()
+
+
+def normalize_rotation_overlap_seconds(
+    overlap_seconds: int | None,
+    *,
+    policy: ApiKeyPolicy | None = None,
+) -> int:
+    """Normalize a requested key-rotation overlap window under operator policy."""
+    active_policy = policy or get_api_key_policy()
+    candidate = active_policy.default_overlap_seconds if overlap_seconds is None else overlap_seconds
+    if candidate < 0:
+        raise ValueError("overlap_seconds must be >= 0")
+    if candidate > active_policy.max_overlap_seconds:
+        raise ValueError(f"overlap_seconds exceeds the maximum allowed overlap window ({active_policy.max_overlap_seconds} seconds)")
+    return candidate
 
 
 def _derive_key(raw_key: str, salt: bytes) -> str:
@@ -89,6 +360,10 @@ def create_api_key(
     role: Role,
     expires_at: str | None = None,
     scopes: list[str] | None = None,
+    tenant_id: str = "default",
+    scim_subject_id: str | None = None,
+    owner: str | None = None,
+    principal_id: str | None = None,
 ) -> tuple[str, ApiKey]:
     """Generate a new API key.
 
@@ -96,21 +371,55 @@ def create_api_key(
     and should be given to the user. Only the scrypt-derived hash is stored.
     """
     raw_key = f"abom_{secrets.token_urlsafe(32)}"
+    return raw_key, create_api_key_record(
+        raw_key,
+        name=name,
+        role=role,
+        expires_at=expires_at,
+        scopes=scopes,
+        tenant_id=tenant_id,
+        scim_subject_id=scim_subject_id,
+        owner=owner,
+        principal_id=principal_id,
+    )
+
+
+def create_api_key_record(
+    raw_key: str,
+    name: str,
+    role: Role,
+    expires_at: str | None = None,
+    scopes: list[str] | None = None,
+    tenant_id: str = "default",
+    scim_subject_id: str | None = None,
+    owner: str | None = None,
+    principal_id: str | None = None,
+) -> ApiKey:
+    """Create a stored API key record for an operator-supplied raw key."""
     salt = os.urandom(16)
     key_hash = _derive_key(raw_key, salt)
-    key_id = secrets.token_hex(8)
-
-    api_key = ApiKey(
-        key_id=key_id,
+    normalized_expiry = normalize_api_key_expiry(expires_at)
+    owner_normalized = owner.strip() if isinstance(owner, str) and owner.strip() else None
+    scim_subject_normalized = scim_subject_id.strip() if isinstance(scim_subject_id, str) and scim_subject_id.strip() else scim_subject_id
+    # The canonical stable binding: an explicit principal id wins; otherwise fall
+    # back to the SCIM subject id, then the free-form owner, so every key carries
+    # a revocation key even when the caller only supplied one of the legacy hints.
+    principal_normalized = principal_id.strip() if isinstance(principal_id, str) and principal_id.strip() else None
+    resolved_principal = principal_normalized or scim_subject_normalized or owner_normalized
+    return ApiKey(
+        key_id=secrets.token_hex(8),
         key_hash=key_hash,
         key_salt=salt.hex(),
         key_prefix=raw_key[:12],
         name=name,
         role=role,
-        expires_at=expires_at,
+        expires_at=normalized_expiry,
         scopes=scopes or [],
+        tenant_id=tenant_id,
+        scim_subject_id=scim_subject_id,
+        owner=owner_normalized,
+        principal_id=resolved_principal,
     )
-    return raw_key, api_key
 
 
 def verify_api_key(raw_key: str, stored_keys: list[ApiKey]) -> ApiKey | None:
@@ -119,11 +428,13 @@ def verify_api_key(raw_key: str, stored_keys: list[ApiKey]) -> ApiKey | None:
     Uses scrypt KDF with per-key salt and constant-time comparison.
     Returns the matching ApiKey if found and not expired, else None.
     """
-    for stored in stored_keys:
+    key_prefix = raw_key[:12]
+    candidates = [stored for stored in stored_keys if stored.key_prefix == key_prefix]
+    for stored in candidates:
         salt = bytes.fromhex(stored.key_salt)
         candidate = _derive_key(raw_key, salt)
         if hmac.compare_digest(stored.key_hash, candidate):
-            if stored.is_expired():
+            if not stored.is_usable():
                 return None
             return stored
     return None
@@ -145,39 +456,125 @@ class KeyStore:
         with self._lock:
             self._keys.append(key)
 
+    def provision_tenant_key(self, key: ApiKey, *, team_name: str) -> None:
+        """Provision a tenant's first key for the in-memory self-hosted store.
+
+        The in-memory backend has no separate team registry, so provisioning is
+        equivalent to adding the already tenant-scoped key. Persistent stores
+        override this method to create their tenant FK root atomically.
+        """
+        del team_name
+        self.add(key)
+
     def remove(self, key_id: str) -> bool:
         with self._lock:
-            before = len(self._keys)
-            self._keys = [k for k in self._keys if k.key_id != key_id]
-            return len(self._keys) < before
+            for key in self._keys:
+                if key.key_id == key_id and not key.is_revoked():
+                    key.revoked_at = datetime.now(timezone.utc).isoformat()
+                    key.rotation_overlap_until = None
+                    return True
+            return False
 
-    def list_keys(self) -> list[ApiKey]:
+    def revoke_by_principal_id(self, principal_id: str, tenant_id: str | None = None) -> list[str]:
+        """Revoke every active key bound to ``principal_id`` and return their ids.
+
+        Id-based, complete revocation: a deprovisioned subject loses all of its
+        keys regardless of display ``name``. Scoped to ``tenant_id`` when given so
+        one tenant's deprovision never revokes another tenant's identically-keyed
+        credentials.
+        """
+        if not principal_id:
+            return []
+        revoked: list[str] = []
+        now = datetime.now(timezone.utc).isoformat()
         with self._lock:
-            return list(self._keys)
+            for key in self._keys:
+                if key.principal_id != principal_id or key.is_revoked():
+                    continue
+                if tenant_id is not None and key.tenant_id != tenant_id:
+                    continue
+                key.revoked_at = now
+                key.rotation_overlap_until = None
+                revoked.append(key.key_id)
+        return revoked
+
+    def mark_rotating(self, key_id: str, *, replacement_key_id: str, overlap_until: str) -> bool:
+        with self._lock:
+            for key in self._keys:
+                if key.key_id == key_id and not key.is_revoked():
+                    key.replacement_key_id = replacement_key_id
+                    key.rotation_overlap_until = overlap_until
+                    return True
+            return False
+
+    def get(self, key_id: str) -> ApiKey | None:
+        with self._lock:
+            return next((k for k in self._keys if k.key_id == key_id), None)
+
+    def list_keys(self, tenant_id: str | None = None) -> list[ApiKey]:
+        with self._lock:
+            keys = list(self._keys)
+        if tenant_id is None:
+            return keys
+        return [k for k in keys if k.tenant_id == tenant_id]
+
+    def delete_tenant(self, tenant_id: str) -> int:
+        """Permanently remove every key belonging to one confirmed tenant purge."""
+        with self._lock:
+            before = len(self._keys)
+            self._keys = [key for key in self._keys if key.tenant_id != tenant_id]
+            return before - len(self._keys)
 
     def verify(self, raw_key: str) -> ApiKey | None:
+        # Hold the lock only long enough to snapshot the key list; the expensive
+        # scrypt derivation in ``verify_api_key`` then runs lock-free so it
+        # neither stalls the caller under the lock nor serializes concurrent
+        # verifies (each worker thread derives independently). ``is_usable()`` is
+        # still evaluated at match time, so revocation/expiry semantics are
+        # unchanged.
         with self._lock:
-            return verify_api_key(raw_key, self._keys)
+            keys_snapshot = list(self._keys)
+        return verify_api_key(raw_key, keys_snapshot)
 
     def has_keys(self) -> bool:
         with self._lock:
             return len(self._keys) > 0
 
 
-_key_store: KeyStore | None = None
+class KeyStoreProtocol(Protocol):
+    """Interface shared by in-memory and persistent API key stores."""
+
+    def add(self, key: ApiKey) -> None: ...
+    def provision_tenant_key(self, key: ApiKey, *, team_name: str) -> None: ...
+    def remove(self, key_id: str) -> bool: ...
+    def revoke_by_principal_id(self, principal_id: str, tenant_id: str | None = None) -> list[str]: ...
+    def mark_rotating(self, key_id: str, *, replacement_key_id: str, overlap_until: str) -> bool: ...
+    def get(self, key_id: str) -> ApiKey | None: ...
+    def list_keys(self, tenant_id: str | None = None) -> list[ApiKey]: ...
+    def delete_tenant(self, tenant_id: str) -> int: ...
+    def verify(self, raw_key: str) -> ApiKey | None: ...
+    def has_keys(self) -> bool: ...
+
+
+_key_store: KeyStoreProtocol | None = None
 _store_lock = threading.Lock()
 
 
-def get_key_store() -> KeyStore:
+def get_key_store() -> KeyStoreProtocol:
     global _key_store
     if _key_store is None:
         with _store_lock:
             if _key_store is None:
-                _key_store = KeyStore()
+                if os.environ.get("AGENT_BOM_POSTGRES_URL"):
+                    from agent_bom.api.postgres_access import PostgresKeyStore
+
+                    _key_store = PostgresKeyStore()
+                else:
+                    _key_store = KeyStore()
     return _key_store
 
 
-def set_key_store(store: KeyStore) -> None:
+def set_key_store(store: KeyStoreProtocol) -> None:
     global _key_store
     with _store_lock:
         _key_store = store

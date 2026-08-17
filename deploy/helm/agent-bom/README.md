@@ -1,0 +1,179 @@
+# agent-bom Helm chart
+
+Helm packaging for `agent-bom` in your Kubernetes cluster — scheduled scanner
+jobs, optional runtime monitor, and (when enabled) the self-hosted API +
+dashboard control plane.
+
+## Default render is scanner-only
+
+`controlPlane.enabled` defaults to **`false`**. A plain `helm install` deploys
+the scanner CronJob and supporting RBAC only. The API, dashboard, gateway,
+proxy, firewall, MCP server mode, and Postgres wiring stay off until you opt in.
+
+For the full platform (browse findings in the UI, hit the REST API, enforce
+runtime policy), start from a shipped profile. Profiles provide the required
+Postgres secret wiring and deployment-specific egress/ingress rules:
+
+```bash
+python scripts/install_helm_profile.py focused-pilot --print-command
+python scripts/install_helm_profile.py focused-pilot
+```
+
+The chart does not provision Postgres. A Postgres-backed control plane supplies
+three database identities through `controlPlane.postgresSecrets`: tenant-bound
+app, scoped maintenance, and migration/admin. The chart injects app +
+maintenance into the API, admin + app + maintenance into the migration Job, and
+maintenance only into backups; duplicate or missing names fail template
+validation. The migration hook runs the idempotent packaged upgrade/reconcile
+entrypoint and never inherits or falls back to generic API credentials.
+The chart then runs a post-migration portability hook using only the app and
+maintenance references; it fails closed when TLS, schema, or runtime-role RLS
+safety is not ready. Set `controlPlane.postgres.provider` to label the managed
+service in health and doctor output; the label never implies certification.
+Secret-sync and workload releases are isolated by the standard Helm instance
+label, including teardown cleanup; uninstalling one release cannot
+collection-delete ExternalSecrets owned by the other.
+
+Without that flag, Helm succeeds quietly and only scanner pieces land in the
+cluster. See the `controlPlane:` block in `values.yaml` for every subcomponent
+the flag toggles.
+
+## Quick start
+
+From a checked-out repo (chart path `deploy/helm/agent-bom/`):
+
+```bash
+# Scanner CronJob only (default)
+helm upgrade --install agent-bom deploy/helm/agent-bom \
+  -n agent-bom --create-namespace
+
+# API + UI control plane (use a shipped profile; it includes Postgres wiring)
+python scripts/install_helm_profile.py focused-pilot
+
+# Custom scan schedule
+helm upgrade --install agent-bom deploy/helm/agent-bom \
+  -n agent-bom --create-namespace \
+  --set scanner.schedule="0 */2 * * *"
+```
+
+### Production ExternalSecrets are a separate stage
+
+A Helm pre-install migration hook runs before normal release resources, so it
+cannot safely consume a Secret created by an `ExternalSecret` in that same
+release. The chart rejects that configuration. For the production profile,
+install the secret-sync release first and wait for its four target Secrets:
+
+```bash
+helm upgrade --install agent-bom-secrets deploy/helm/agent-bom \
+  -n agent-bom --create-namespace \
+  -f deploy/helm/agent-bom/examples/eks-production-values.yaml \
+  -f deploy/helm/agent-bom/examples/eks-production-secret-sync-values.yaml
+
+kubectl wait -n agent-bom --for=condition=Ready --timeout=2m \
+  externalsecret/agent-bom-control-plane-db \
+  externalsecret/agent-bom-control-plane-maintenance \
+  externalsecret/agent-bom-control-plane-admin \
+  externalsecret/agent-bom-control-plane-auth
+
+kubectl get -n agent-bom secret \
+  agent-bom-control-plane-db \
+  agent-bom-control-plane-maintenance \
+  agent-bom-control-plane-admin \
+  agent-bom-control-plane-auth
+
+helm upgrade --install agent-bom deploy/helm/agent-bom \
+  -n agent-bom \
+  -f deploy/helm/agent-bom/examples/eks-production-values.yaml
+```
+
+The sync overlay renders only `ExternalSecret` resources. The workload release
+keeps `controlPlane.externalSecrets.enabled=false`, consumes the pre-created
+Secrets, and owns the migration/API/UI resources. Keep the sync release in
+place for Secret reconciliation, and roll workloads after rotation according
+to your operator policy. Missing targets fail the migration Pod closed; they
+never cause fallback to app or inline credentials.
+
+## Shipped profiles
+
+Production-ready value overlays live in [`examples/`](examples/README.md).
+Validate every profile locally:
+
+```bash
+python scripts/validate_helm_profiles.py
+```
+
+Install a named profile in one command:
+
+```bash
+python scripts/install_helm_profile.py focused-pilot --print-command
+python scripts/install_helm_profile.py focused-pilot
+```
+
+| Profile | Starting file | Use when |
+|---|---|---|
+| `focused-pilot` | `examples/eks-mcp-pilot-values.yaml` | Narrow EKS pilot with control plane |
+| `eks-vanilla` | `examples/eks-vanilla-values.yaml` | EKS + Postgres + IRSA, no mesh/ESO |
+| `production-secret-sync` | production + `examples/eks-production-secret-sync-values.yaml` | ExternalSecrets-only bootstrap release |
+| `production` | `examples/eks-production-values.yaml` | Postgres + staged ExternalSecrets + autoscaling |
+| `sqlite-pilot` | `examples/eks-control-plane-sqlite-pilot-values.yaml` | Short-lived demo without Postgres |
+
+Full profile matrix: [`examples/README.md`](examples/README.md).
+
+## Cloud-SDK collector image
+
+The scheduled cloud scan runs a dedicated **collector image**
+(`agentbom/agent-bom-collector`, built from
+[`deploy/docker/Dockerfile.collector`](../../docker/Dockerfile.collector)) that
+ships the provider SDK layer — boto3, the Azure management SDKs, the Google
+Cloud SDKs, and the Snowflake connector — separately from the control-plane
+image. This lets the fast-moving SDK layer be rebuilt and re-tagged on its own
+cadence: a daily CI job (`refresh-collector-latest`) rebuilds
+`agent-bom-collector:latest` to absorb newer provider-SDK wheels within the
+pinned floors **without** a control-plane version bump. The collector keeps the
+BYOC trust boundary intact — a direct, read-only, least-privilege link to the
+customer's cloud, with no external MCP in the credential/data path.
+
+The SDK versions come from the cloud provider extras in `pyproject.toml` (the
+single source of truth the [cloud-SDK drift gate](../../../scripts/check_cloud_sdk_drift.py)
+enforces); the image never re-declares them. To pin a newer SDK-only build
+between control-plane releases:
+
+```bash
+helm upgrade agent-bom agent-bom/agent-bom \
+  --reuse-values --set collectorImage.tag=<sdk-only-build>
+```
+
+`collectorImage` mirrors the `image`/`uiImage`/`runtimeImage` block convention; a
+blank `collectorImage.tag` falls back to `image.tag`.
+
+## Key values
+
+| Value | Default | Description |
+|---|---|---|
+| `scanner.enabled` | `true` | Deploy CronJob scanner |
+| `scanner.schedule` | `0 */6 * * *` | Cron schedule |
+| `scanner.allNamespaces` | `true` | Scan all namespaces |
+| `scanner.cloud.aws.orgInventory` | `false` | Job/CLI only → `AGENT_BOM_AWS_ORG_INVENTORY`. Connections org fan-out uses `inventory_scope=organization` on the connection row, not this value. |
+| `scanner.cloud.azure.allSubscriptions` | `false` | Job/CLI only → `AGENT_BOM_AZURE_ALL_SUBSCRIPTIONS` (same Connections vs Job split as `orgInventory`) |
+| `scanner.cloud.gcp.allProjects` | `false` | Job/CLI only → `AGENT_BOM_GCP_ALL_PROJECTS` (same Connections vs Job split as `orgInventory`) |
+| `controlPlane.connectionsScheduler.enabled` | `false` | Injects `AGENT_BOM_CONNECTIONS_SCHEDULER=1` on the API; still requires per-connection `scan_interval_minutes` |
+| `controlPlane.connectionsScheduler.maxConcurrency` | `4` | Injects `AGENT_BOM_CONNECTIONS_SCHEDULER_MAX_CONCURRENCY` (due full-scans + continuous event drains) |
+| `controlPlane.connectionsScheduler.pollSeconds` | _(unset)_ | Optional; injects `AGENT_BOM_CONNECTIONS_SCHEDULER_POLL_SECONDS` when set |
+| `collectorImage.repository` | `agentbom/agent-bom-collector` | Cloud-SDK collector image the scan CronJob runs |
+| `collectorImage.tag` | release version | Collector tag — override to bump the SDK layer independently of the control plane; blank falls back to `image.tag` |
+| `controlPlane.enabled` | `false` | Package API + dashboard Deployments |
+| `controlPlane.postgres.provider` | `auto` | Diagnostic provider hint; does not change the PostgreSQL contract or certification state |
+| `controlPlane.postgres.verification.enabled` | `true` | Run a post-install/post-upgrade portability probe for canonical Postgres deployments |
+| `controlPlane.ingress.enabled` | `false` | Same-origin ingress for UI + API |
+| `monitor.enabled` | `false` | Optional node-wide runtime monitor |
+| `sidecarInjection.enabled` | `false` | Mutating webhook for proxy sidecars |
+| `networkPolicy.restrictIngress` | `true` | Deny ingress unless rules allow |
+
+Canonical env-var reference: [`docs/operations/ENV_VARS.md`](../../../docs/operations/ENV_VARS.md).
+
+## Further reading
+
+- [Packaged API + UI control plane](https://msaad00.github.io/agent-bom/deployment/control-plane-helm/) — topology, secrets, ingress
+- [Kubernetes deployment](https://msaad00.github.io/agent-bom/deployment/kubernetes/) — raw manifests vs Helm
+- [Deployment overview](https://msaad00.github.io/agent-bom/deployment/overview/) — choose laptop, compose, EKS, or Snowflake path
+- [Vanilla EKS quickstart](https://msaad00.github.io/agent-bom/deployment/eks-vanilla-quickstart/) — paved production rollout

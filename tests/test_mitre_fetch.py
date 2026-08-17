@@ -1,4 +1,4 @@
-"""Tests for mitre_fetch.py — MITRE ATT&CK + CAPEC STIX fetching and caching."""
+"""Tests for mitre_fetch.py — bundled + refreshable MITRE ATT&CK catalogs."""
 
 from __future__ import annotations
 
@@ -13,8 +13,10 @@ from agent_bom.mitre_fetch import (
     _parse_attack_stix,
     _parse_capec_stix,
     build_catalog,
+    get_catalog_metadata,
     get_cwe_to_attack,
     get_techniques,
+    sync_catalog,
 )
 
 # ─── Minimal STIX fixtures ────────────────────────────────────────────────────
@@ -32,6 +34,21 @@ def _attack_bundle(techniques: list[dict]) -> dict:
     ]
     objects.extend(techniques)
     return {"type": "bundle", "id": "bundle--test", "objects": objects}
+
+
+def _attack_bundle_current_schema(techniques: list[dict]) -> dict:
+    """Build a minimal current-style enterprise ATT&CK bundle."""
+    objects = [
+        {
+            "type": "x-mitre-matrix",
+            "id": "x-mitre-matrix--test",
+            "name": "Enterprise ATT&CK",
+            "modified": "2025-04-25T14:41:40.982Z",
+            "x_mitre_attack_spec_version": "3.2.0",
+        }
+    ]
+    objects.extend(techniques)
+    return {"type": "bundle", "id": "bundle--current", "objects": objects}
 
 
 def _technique(
@@ -67,10 +84,25 @@ def test_parse_extracts_technique_in_scope():
     assert "execution" in techniques["T1059"]["tactics"]
 
 
-def test_parse_excludes_out_of_scope_tactic():
+def test_parse_includes_reconnaissance_tactic():
+    # Reconnaissance (TA0043) is one of the 14 Enterprise tactics and is in scope.
     bundle = _attack_bundle([_technique("attack-pattern--recon", "T1595", "Active Scanning", ["reconnaissance"])])
     _, techniques = _parse_attack_stix(bundle)
-    assert "T1595" not in techniques  # reconnaissance not in TOP_TACTIC_PHASE_NAMES
+    assert "T1595" in techniques
+    assert "reconnaissance" in techniques["T1595"]["tactics"]
+
+
+def test_parse_includes_resource_development_tactic():
+    # Resource Development (TA0042) is one of the 14 Enterprise tactics.
+    bundle = _attack_bundle([_technique("attack-pattern--rd", "T1583", "Acquire Infrastructure", ["resource-development"])])
+    _, techniques = _parse_attack_stix(bundle)
+    assert "T1583" in techniques
+
+
+def test_parse_excludes_unknown_tactic():
+    bundle = _attack_bundle([_technique("attack-pattern--x", "T9998", "Bogus", ["not-a-real-tactic"])])
+    _, techniques = _parse_attack_stix(bundle)
+    assert "T9998" not in techniques  # phase name not in TOP_TACTIC_PHASE_NAMES
 
 
 def test_parse_excludes_deprecated():
@@ -85,6 +117,12 @@ def test_parse_extracts_version():
     assert version == "16.1"
 
 
+def test_parse_extracts_snapshot_version_from_matrix():
+    bundle = _attack_bundle_current_schema([])
+    version, _ = _parse_attack_stix(bundle)
+    assert version == "snapshot 2025-04-25 (spec 3.2.0)"
+
+
 def test_parse_empty_bundle():
     _, techniques = _parse_attack_stix({"objects": []})
     assert techniques == {}
@@ -95,13 +133,13 @@ def test_parse_multiple_techniques():
         [
             _technique("attack-pattern--a", "T1059", "Execution Tech", ["execution"]),
             _technique("attack-pattern--b", "T1552", "Cred Tech", ["credential-access"]),
-            _technique("attack-pattern--c", "T1595", "Recon Tech", ["reconnaissance"]),  # out of scope
+            _technique("attack-pattern--c", "T1595", "Recon Tech", ["reconnaissance"]),  # now in scope
         ]
     )
     _, techniques = _parse_attack_stix(bundle)
     assert "T1059" in techniques
     assert "T1552" in techniques
-    assert "T1595" not in techniques
+    assert "T1595" in techniques
 
 
 def test_all_parsed_tactics_in_top_scope():
@@ -190,6 +228,27 @@ def test_capec_parse_derives_cwe_to_attack_mapping():
     assert "T1059" in mapping["CWE-78"]
 
 
+def test_capec_parse_current_direct_refs_schema():
+    attack_techniques = {"T1059": {"name": "Command and Scripting Interpreter", "tactics": ["execution"], "capec_refs": []}}
+    bundle = {
+        "type": "bundle",
+        "objects": [
+            {
+                "type": "attack-pattern",
+                "id": "attack-pattern--capec-88",
+                "name": "OS Command Injection",
+                "external_references": [
+                    {"source_name": "capec", "external_id": "CAPEC-88"},
+                    {"source_name": "cwe", "external_id": "CWE-78"},
+                    {"source_name": "ATTACK", "external_id": "T1059"},
+                ],
+            }
+        ],
+    }
+    mapping = _parse_capec_stix(bundle, attack_techniques)
+    assert mapping == {"CWE-78": ["T1059"]}
+
+
 def test_capec_parse_excludes_out_of_scope_techniques():
     """ATT&CK technique not in our catalog is excluded from CWE mapping."""
     attack_techniques = {}  # empty — no techniques in scope
@@ -226,59 +285,122 @@ def test_capec_cwe_normalised_to_uppercase():
         assert key.startswith("CWE-"), f"CWE key not normalised: {key!r}"
 
 
-# ─── build_catalog ────────────────────────────────────────────────────────────
+# ─── build_catalog / sync_catalog ─────────────────────────────────────────────
 
 
-def test_build_catalog_uses_cache(tmp_path):
-    cache = {
+def _catalog(version: str, source: str = "bundled") -> dict:
+    return {
+        "schema_version": 1,
+        "catalog_id": "mitre_attack_enterprise_capec",
+        "catalog_type": "mitre_attack",
+        "source": source,
+        "attack_version": version,
+        "updated_at": "2026-04-10T00:00:00+00:00",
         "fetched_at": time.time(),
-        "attack_version": "cached",
-        "techniques": {"T1059": {"name": "Cached Technique", "tactics": ["execution"]}},
-        "cwe_to_attack": {},
+        "normalized_sha256": "sha",
+        "sources": {},
+        "techniques": {"T1059": {"name": "Command and Scripting Interpreter", "tactics": ["execution"]}},
+        "cwe_to_attack": {"CWE-78": ["T1059"]},
     }
-    cache_file = tmp_path / "mitre-attack-catalog.json"
-    cache_file.write_text(json.dumps(cache))
-
-    with patch("agent_bom.mitre_fetch._CACHE_PATH", cache_file):
-        catalog = build_catalog()
-
-    assert catalog["attack_version"] == "cached"
-    assert "T1059" in catalog["techniques"]
 
 
-def test_build_catalog_expired_cache_triggers_fetch(tmp_path):
-    old_cache = {
-        "fetched_at": 0.0,  # expired immediately
-        "attack_version": "old",
-        "techniques": {},
-        "cwe_to_attack": {},
-    }
-    cache_file = tmp_path / "mitre-attack-catalog.json"
-    cache_file.write_text(json.dumps(old_cache))
+def test_build_catalog_uses_bundled_by_default(tmp_path, monkeypatch):
+    bundled_file = tmp_path / "bundled.json"
+    bundled_file.write_text(json.dumps(_catalog("bundled-v1", source="bundled")))
+    monkeypatch.setattr("agent_bom.mitre_fetch._BUNDLED_CATALOG_PATH", bundled_file)
+    monkeypatch.setattr("agent_bom.mitre_fetch._DEFAULT_SYNC_PATH", tmp_path / "missing-synced.json")
+    monkeypatch.delenv("AGENT_BOM_MITRE_CATALOG_PATH", raising=False)
+    monkeypatch.delenv("AGENT_BOM_MITRE_CATALOG_MODE", raising=False)
+
+    catalog = build_catalog()
+
+    assert catalog["attack_version"] == "bundled-v1"
+    assert catalog["source"] == "bundled"
+
+
+def test_build_catalog_auto_prefers_synced_catalog(tmp_path, monkeypatch):
+    bundled_file = tmp_path / "bundled.json"
+    bundled_file.write_text(json.dumps(_catalog("bundled-v1", source="bundled")))
+    synced_file = tmp_path / "synced.json"
+    synced_file.write_text(json.dumps(_catalog("synced-v2", source="synced")))
+
+    monkeypatch.setattr("agent_bom.mitre_fetch._BUNDLED_CATALOG_PATH", bundled_file)
+    monkeypatch.setenv("AGENT_BOM_MITRE_CATALOG_PATH", str(synced_file))
+    monkeypatch.setenv("AGENT_BOM_MITRE_CATALOG_MODE", "auto")
+
+    catalog = build_catalog()
+
+    assert catalog["attack_version"] == "synced-v2"
+    assert catalog["source"] == "synced"
+
+
+def test_sync_catalog_writes_normalized_override(tmp_path, monkeypatch):
+    bundled_file = tmp_path / "bundled.json"
+    bundled_file.write_text(json.dumps(_catalog("bundled-v1", source="bundled")))
+    out_file = tmp_path / "synced.json"
+    monkeypatch.setattr("agent_bom.mitre_fetch._BUNDLED_CATALOG_PATH", bundled_file)
+    monkeypatch.setenv("AGENT_BOM_MITRE_CATALOG_PATH", str(out_file))
 
     fresh_attack = _attack_bundle([_technique("attack-pattern--exec", "T1059", "Command and Scripting Interpreter", ["execution"])])
+    fresh_capec = _capec_bundle_with_mapping(
+        cwe_ext_id="CWE-78",
+        capec_stix_id="attack-pattern--capec-88",
+        capec_ext_id="CAPEC-88",
+        attack_stix_id="attack-pattern--t1059",
+        attack_ext_id="T1059",
+        technique_metadata={"name": "Command and Scripting Interpreter"},
+    )
 
-    with (
-        patch("agent_bom.mitre_fetch._CACHE_PATH", cache_file),
-        patch("agent_bom.mitre_fetch._fetch_json", side_effect=[fresh_attack, None]),
-    ):
-        catalog = build_catalog()
+    with patch("agent_bom.mitre_fetch._fetch_text", side_effect=[json.dumps(fresh_attack), json.dumps(fresh_capec)]):
+        catalog = sync_catalog()
 
-    assert "T1059" in catalog["techniques"]
+    assert out_file.exists()
+    assert catalog["source"] == "synced"
     assert catalog["attack_version"] == "16.1"
+    assert catalog["cwe_to_attack"]["CWE-78"] == ["T1059"]
 
 
-def test_build_catalog_network_failure_returns_empty(tmp_path):
-    cache_file = tmp_path / "mitre-attack-catalog.json"
+def test_sync_failure_uses_last_known_good_synced(tmp_path, monkeypatch):
+    bundled_file = tmp_path / "bundled.json"
+    bundled_file.write_text(json.dumps(_catalog("bundled-v1", source="bundled")))
+    synced_file = tmp_path / "synced.json"
+    synced_file.write_text(json.dumps(_catalog("synced-v2", source="synced")))
 
-    with (
-        patch("agent_bom.mitre_fetch._CACHE_PATH", cache_file),
-        patch("agent_bom.mitre_fetch._fetch_json", return_value=None),
-    ):
-        catalog = build_catalog()
+    monkeypatch.setattr("agent_bom.mitre_fetch._BUNDLED_CATALOG_PATH", bundled_file)
+    monkeypatch.setenv("AGENT_BOM_MITRE_CATALOG_PATH", str(synced_file))
 
-    assert catalog["techniques"] == {}
-    assert catalog["cwe_to_attack"] == {}
+    with patch("agent_bom.mitre_fetch._fetch_text", return_value=None):
+        catalog = sync_catalog()
+
+    assert catalog["attack_version"] == "synced-v2"
+    assert catalog["source"] == "synced"
+
+
+def test_sync_failure_without_synced_uses_bundled(tmp_path, monkeypatch):
+    bundled_file = tmp_path / "bundled.json"
+    bundled_file.write_text(json.dumps(_catalog("bundled-v1", source="bundled")))
+    monkeypatch.setattr("agent_bom.mitre_fetch._BUNDLED_CATALOG_PATH", bundled_file)
+    monkeypatch.setenv("AGENT_BOM_MITRE_CATALOG_PATH", str(tmp_path / "missing.json"))
+
+    with patch("agent_bom.mitre_fetch._fetch_text", return_value=None):
+        catalog = sync_catalog()
+
+    assert catalog["attack_version"] == "bundled-v1"
+    assert catalog["source"] == "bundled"
+
+
+def test_get_catalog_metadata_exposes_counts(tmp_path, monkeypatch):
+    bundled_file = tmp_path / "bundled.json"
+    bundled_file.write_text(json.dumps(_catalog("bundled-v1", source="bundled")))
+    monkeypatch.setattr("agent_bom.mitre_fetch._BUNDLED_CATALOG_PATH", bundled_file)
+    monkeypatch.setattr("agent_bom.mitre_fetch._DEFAULT_SYNC_PATH", tmp_path / "missing-synced.json")
+    monkeypatch.delenv("AGENT_BOM_MITRE_CATALOG_PATH", raising=False)
+
+    metadata = get_catalog_metadata()
+
+    assert metadata["attack_version"] == "bundled-v1"
+    assert metadata["technique_count"] == 1
+    assert metadata["cwe_mapping_count"] == 1
 
 
 # ─── TOP_TACTIC_PHASE_NAMES coverage ─────────────────────────────────────────
@@ -289,8 +411,13 @@ def test_top_tactics_is_frozenset():
 
 
 def test_top_tactics_count():
-    """Exactly 10 tactics are in scope."""
-    assert len(TOP_TACTIC_PHASE_NAMES) == 10
+    """All 14 MITRE ATT&CK Enterprise tactics are in scope."""
+    assert len(TOP_TACTIC_PHASE_NAMES) == 14
+
+
+def test_reconnaissance_and_resource_development_in_scope():
+    assert "reconnaissance" in TOP_TACTIC_PHASE_NAMES
+    assert "resource-development" in TOP_TACTIC_PHASE_NAMES
 
 
 def test_top_tactics_all_lowercase_hyphenated():
@@ -330,64 +457,26 @@ def test_get_cwe_to_attack_returns_dict():
     assert "T1059" in result["CWE-78"]
 
 
-# ─── Offline fallback: stale cache on network failure (#409) ──────────────────
+def test_refresh_mode_uses_live_sync(tmp_path, monkeypatch):
+    bundled_file = tmp_path / "bundled.json"
+    bundled_file.write_text(json.dumps(_catalog("bundled-v1", source="bundled")))
+    out_file = tmp_path / "synced.json"
+    monkeypatch.setattr("agent_bom.mitre_fetch._BUNDLED_CATALOG_PATH", bundled_file)
+    monkeypatch.setenv("AGENT_BOM_MITRE_CATALOG_PATH", str(out_file))
+    monkeypatch.setenv("AGENT_BOM_MITRE_CATALOG_MODE", "refresh")
 
+    fresh_attack = _attack_bundle([_technique("attack-pattern--exec", "T1059", "Command and Scripting Interpreter", ["execution"])])
+    fresh_capec = _capec_bundle_with_mapping(
+        cwe_ext_id="CWE-78",
+        capec_stix_id="attack-pattern--capec-88",
+        capec_ext_id="CAPEC-88",
+        attack_stix_id="attack-pattern--t1059",
+        attack_ext_id="T1059",
+        technique_metadata={"name": "Command and Scripting Interpreter"},
+    )
 
-def test_network_failure_uses_stale_cache(tmp_path):
-    """When the cache is expired AND the network fetch fails, serve stale cache."""
-    stale_cache = {
-        "fetched_at": 1.0,  # expired long ago
-        "attack_version": "stale-v15",
-        "techniques": {"T1059": {"name": "Stale Technique", "tactics": ["execution"]}},
-        "cwe_to_attack": {"CWE-78": ["T1059"]},
-    }
-    cache_file = tmp_path / "mitre-attack-catalog.json"
-    cache_file.write_text(json.dumps(stale_cache))
-
-    with (
-        patch("agent_bom.mitre_fetch._CACHE_PATH", cache_file),
-        patch("agent_bom.mitre_fetch._fetch_json", return_value=None),
-    ):
+    with patch("agent_bom.mitre_fetch._fetch_text", side_effect=[json.dumps(fresh_attack), json.dumps(fresh_capec)]):
         catalog = build_catalog()
 
-    # Should return stale data rather than empty dict
-    assert catalog["attack_version"] == "stale-v15"
-    assert "T1059" in catalog["techniques"]
-    assert "CWE-78" in catalog["cwe_to_attack"]
-
-
-def test_network_failure_no_cache_returns_empty(tmp_path):
-    """When network fails AND no cache exists at all, return empty catalog."""
-    cache_file = tmp_path / "mitre-attack-catalog.json"
-    # cache_file does NOT exist
-
-    with (
-        patch("agent_bom.mitre_fetch._CACHE_PATH", cache_file),
-        patch("agent_bom.mitre_fetch._fetch_json", return_value=None),
-    ):
-        catalog = build_catalog()
-
-    assert catalog["techniques"] == {}
-    assert catalog["attack_version"] == "unavailable"
-
-
-def test_load_cache_ignore_ttl(tmp_path):
-    """_load_cache(ignore_ttl=True) returns stale cache even if expired."""
-    from agent_bom.mitre_fetch import _load_cache
-
-    stale = {
-        "fetched_at": 1.0,
-        "attack_version": "old",
-        "techniques": {"T9999": {}},
-        "cwe_to_attack": {},
-    }
-    cache_file = tmp_path / "mitre-attack-catalog.json"
-    cache_file.write_text(json.dumps(stale))
-
-    with patch("agent_bom.mitre_fetch._CACHE_PATH", cache_file):
-        # Normal load: expired → None
-        assert _load_cache() is None
-        # ignore_ttl: returns data anyway
-        result = _load_cache(ignore_ttl=True)
-        assert result is not None
-        assert result["attack_version"] == "old"
+    assert catalog["source"] == "synced"
+    assert catalog["attack_version"] == "16.1"

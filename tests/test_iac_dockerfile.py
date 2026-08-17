@@ -54,6 +54,11 @@ class TestDockerRootUser:
         docker002 = [f for f in findings if f.rule_id == "DOCKER-002"]
         assert any("root" in f.title.lower() for f in docker002)
 
+    def test_user_root_group(self, tmp_dockerfile):
+        findings = scan_dockerfile(tmp_dockerfile("FROM python:3.12\nUSER 0:0\nHEALTHCHECK CMD true"))
+        docker002 = [f for f in findings if f.rule_id == "DOCKER-002"]
+        assert len(docker002) == 1
+
     def test_no_user_directive(self, tmp_dockerfile):
         findings = scan_dockerfile(tmp_dockerfile("FROM python:3.12\nRUN echo hi\nHEALTHCHECK CMD true"))
         docker002 = [f for f in findings if f.rule_id == "DOCKER-002"]
@@ -90,6 +95,13 @@ class TestDockerAdd:
         findings = scan_dockerfile(tmp_dockerfile(content))
         docker004 = [f for f in findings if f.rule_id == "DOCKER-004"]
         assert len(docker004) == 1
+
+    def test_remote_add_is_high_severity(self, tmp_dockerfile):
+        content = "FROM python:3.12\nADD https://example.com/install.sh /tmp/install.sh\nUSER app\nHEALTHCHECK CMD true"
+        findings = scan_dockerfile(tmp_dockerfile(content))
+        docker022 = [f for f in findings if f.rule_id == "DOCKER-022"]
+        assert len(docker022) == 1
+        assert docker022[0].severity == "high"
 
     def test_copy_ok(self, tmp_dockerfile):
         content = "FROM python:3.12\nCOPY . /app\nUSER app\nHEALTHCHECK CMD true"
@@ -186,6 +198,13 @@ class TestDockerCopyDot:
         docker009 = [f for f in findings if f.rule_id == "DOCKER-009"]
         assert len(docker009) == 0
 
+    def test_copy_chmod_world_writable(self, tmp_dockerfile):
+        content = "FROM python:3.12\nCOPY --chmod=0777 scripts/ /app/scripts/\nUSER app\nHEALTHCHECK CMD true"
+        findings = scan_dockerfile(tmp_dockerfile(content))
+        docker021 = [f for f in findings if f.rule_id == "DOCKER-021"]
+        assert len(docker021) == 1
+        assert docker021[0].severity == "high"
+
 
 class TestDockerUnpinnedDigest:
     """DOCKER-010: FROM without digest pin."""
@@ -218,7 +237,10 @@ class TestDockerSeverities:
     """Verify severity levels match the spec."""
 
     def test_severity_levels(self, tmp_dockerfile):
-        content = "FROM ubuntu\nENV API_KEY=sk-verylongsecretvalue123\nADD . /app\nRUN curl https://x.com/i | sh\nEXPOSE 22\n"
+        content = (
+            "FROM ubuntu\nENV API_KEY=sk-verylongsecretvalue123\nADD https://x.com/i /tmp/i\n"
+            "COPY --chmod=777 app /app\nRUN curl https://x.com/i | sh\nEXPOSE 22\n"
+        )
         findings = scan_dockerfile(tmp_dockerfile(content))
         by_id = {f.rule_id: f.severity for f in findings}
         assert by_id.get("DOCKER-001") == "high"
@@ -226,3 +248,36 @@ class TestDockerSeverities:
         assert by_id.get("DOCKER-004") == "medium"
         assert by_id.get("DOCKER-005") == "medium"
         assert by_id.get("DOCKER-008") == "medium"
+        assert by_id.get("DOCKER-021") == "high"
+        assert by_id.get("DOCKER-022") == "high"
+
+
+class TestSingleFileScanParity:
+    """A single explicit file path must scan that file, not silently no-op.
+
+    Regression: ``scan_iac_with_context`` early-returned ``not-applicable`` for
+    any non-directory root, so ``agent-bom iac Dockerfile`` reported zero
+    findings while the same file inside a directory reported many — a silent
+    false-negative in CI gates.
+    """
+
+    def test_single_file_matches_directory(self, tmp_path: Path):
+        from agent_bom.iac import scan_iac_with_context
+
+        content = "FROM ubuntu\nUSER root\nADD https://x.com/i /tmp/i\nRUN curl https://x.com/i | sh\n"
+        dockerfile = tmp_path / "Dockerfile"
+        dockerfile.write_text(content)
+
+        file_result = scan_iac_with_context(dockerfile)
+        dir_result = scan_iac_with_context(tmp_path)
+
+        assert file_result.findings, "single-file scan must return findings, not silently no-op"
+        assert {f.rule_id for f in file_result.findings} == {f.rule_id for f in dir_result.findings}
+        assert any(v.status == "ran" for v in file_result.verdicts)
+
+    def test_missing_path_is_clean_no_op(self, tmp_path: Path):
+        from agent_bom.iac import scan_iac_with_context
+
+        result = scan_iac_with_context(tmp_path / "does-not-exist")
+        assert result.findings == []
+        assert all(v.status in {"not-applicable", "disabled"} for v in result.verdicts)

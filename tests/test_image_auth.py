@@ -1,4 +1,4 @@
-"""Tests for Docker image scanning: registry auth, multi-arch, and platform support."""
+"""Tests for native Docker image scanning: auth helpers, pull behavior, and platform support."""
 
 from __future__ import annotations
 
@@ -6,15 +6,22 @@ import json
 import shutil
 import subprocess
 
+import pytest
 from click.testing import CliRunner
 
 from agent_bom.cli import main
 from agent_bom.image import (
     ImageScanError,
     _build_scanner_env,
+    _docker_inspect,
+    _scan_with_docker,
+    _scan_with_grype,
+    _scan_with_syft,
     detect_multi_arch,
     scan_image,
 )
+from agent_bom.models import Severity
+from agent_bom.security import SecurityError
 
 # ─── _build_scanner_env ─────────────────────────────────────────────────────
 
@@ -51,120 +58,34 @@ def test_build_scanner_env_explicit_overrides_envvar(monkeypatch):
     assert env["GRYPE_REGISTRY_AUTH_USERNAME"] == "explicit"
 
 
-# ─── Grype auth + platform passthrough ───────────────────────────────────────
+# ─── Native image scan behavior ──────────────────────────────────────────────
 
 
-def test_grype_auth_env_passed(monkeypatch):
-    """Auth env vars are passed to Grype subprocess."""
-    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/" + cmd)
+def test_scan_image_uses_native_docker_scanner(monkeypatch):
+    """scan_image delegates to the native Docker-backed scanner."""
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/docker" if cmd == "docker" else None)
     captured = {}
 
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = list(cmd)
-        captured["env"] = kwargs.get("env")
+    def fake_scan(image_ref, platform=None):
+        captured["image_ref"] = image_ref
+        captured["platform"] = platform
+        return []
 
-        class R:
-            returncode = 0
-            stdout = json.dumps({"matches": []})
-            stderr = ""
-
-        return R()
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    scan_image("myapp:latest", registry_user="user1", registry_pass="pass1")
-    assert captured["env"]["GRYPE_REGISTRY_AUTH_USERNAME"] == "user1"
-    assert captured["env"]["GRYPE_REGISTRY_AUTH_PASSWORD"] == "pass1"
+    monkeypatch.setattr("agent_bom.image._scan_with_docker", fake_scan)
+    _packages, strategy = scan_image("myapp:latest", platform="linux/arm64")
+    assert captured["image_ref"] == "myapp:latest"
+    assert captured["platform"] == "linux/arm64"
+    assert strategy == "native"
 
 
-def test_grype_platform_flag(monkeypatch):
-    """Platform flag is passed to Grype command."""
-    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/" + cmd)
-    captured = {}
-
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = list(cmd)
-
-        class R:
-            returncode = 0
-            stdout = json.dumps({"matches": []})
-            stderr = ""
-
-        return R()
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    scan_image("myapp:latest", platform="linux/arm64")
-    assert "--platform" in captured["cmd"]
-    assert "linux/arm64" in captured["cmd"]
-
-
-def test_grype_no_auth_env_when_none(monkeypatch):
-    """No auth env when no credentials provided."""
-    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/" + cmd)
-    # Clear any env vars that might interfere
-    monkeypatch.delenv("AGENT_BOM_REGISTRY_USER", raising=False)
-    monkeypatch.delenv("AGENT_BOM_REGISTRY_PASS", raising=False)
-    captured = {}
-
-    def fake_run(cmd, **kwargs):
-        captured["env"] = kwargs.get("env")
-
-        class R:
-            returncode = 0
-            stdout = json.dumps({"matches": []})
-            stderr = ""
-
-        return R()
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    scan_image("myapp:latest")
-    assert captured["env"] is None  # No custom env = inherit parent
-
-
-# ─── Syft auth + platform passthrough ────────────────────────────────────────
-
-
-def test_syft_auth_env_passed(monkeypatch):
-    """Auth env vars are passed to Syft subprocess."""
-    # Make grype unavailable, syft available
-    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/syft" if cmd == "syft" else None)
-    captured = {}
-
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = list(cmd)
-        captured["env"] = kwargs.get("env")
-
-        class R:
-            returncode = 0
-            stdout = json.dumps({"components": []})
-            stderr = ""
-
-        return R()
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    scan_image("myapp:latest", registry_user="user2", registry_pass="pass2")
-    assert captured["env"]["SYFT_REGISTRY_AUTH_USERNAME"] == "user2"
-    assert captured["env"]["SYFT_REGISTRY_AUTH_PASSWORD"] == "pass2"
-
-
-def test_syft_platform_flag(monkeypatch):
-    """Platform flag is passed to Syft command."""
-    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/syft" if cmd == "syft" else None)
-    captured = {}
-
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = list(cmd)
-
-        class R:
-            returncode = 0
-            stdout = json.dumps({"components": []})
-            stderr = ""
-
-        return R()
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    scan_image("myapp:latest", platform="linux/amd64")
-    assert "--platform" in captured["cmd"]
-    assert "linux/amd64" in captured["cmd"]
+def test_scan_image_no_docker(monkeypatch):
+    """scan_image raises when Docker is unavailable."""
+    monkeypatch.setattr(shutil, "which", lambda _: None)
+    try:
+        scan_image("myapp:latest")
+        assert False, "Expected ImageScanError"
+    except ImageScanError as e:
+        assert "Docker is not available" in str(e)
 
 
 # ─── Docker platform passthrough ─────────────────────────────────────────────
@@ -172,7 +93,6 @@ def test_syft_platform_flag(monkeypatch):
 
 def test_docker_pull_platform_flag(monkeypatch):
     """Platform flag is passed to docker pull command."""
-    # Make grype/syft unavailable, docker available
     monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/docker" if cmd == "docker" else None)
     captured_cmds = []
 
@@ -183,7 +103,6 @@ def test_docker_pull_platform_flag(monkeypatch):
             pass
 
         r = R()
-        # docker inspect fails first time (triggers pull)
         if "inspect" in cmd and len(captured_cmds) == 1:
             r.returncode = 1
             r.stdout = ""
@@ -196,19 +115,10 @@ def test_docker_pull_platform_flag(monkeypatch):
             r.returncode = 0
             r.stdout = json.dumps([{"Config": {}}])
             r.stderr = ""
-        elif "create" in cmd:
-            r.returncode = 0
-            r.stdout = "container123"
-            r.stderr = ""
-        elif "export" in cmd:
-            # Create a minimal tar
-            r.returncode = 1  # Let it fail — we just want to test the pull command
+        elif "save" in cmd:
+            r.returncode = 1
             r.stdout = ""
-            r.stderr = "export failed"
-        elif "rm" in cmd:
-            r.returncode = 0
-            r.stdout = ""
-            r.stderr = ""
+            r.stderr = "save failed"
         else:
             r.returncode = 0
             r.stdout = ""
@@ -217,15 +127,112 @@ def test_docker_pull_platform_flag(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     try:
-        scan_image("myapp:latest", platform="linux/arm64")
+        _docker_inspect("myapp:latest", platform="linux/arm64")
     except ImageScanError:
-        pass  # Expected — docker export fails
+        pass
 
-    # Find the pull command
     pull_cmds = [c for c in captured_cmds if "pull" in c]
     assert len(pull_cmds) > 0
     assert "--platform" in pull_cmds[0]
     assert "linux/arm64" in pull_cmds[0]
+
+
+def test_external_scanner_helpers_validate_image_ref():
+    """Internal Grype/Syft wrappers should not bypass image-ref validation."""
+    try:
+        _scan_with_grype("-o=json")
+        assert False, "Expected SecurityError"
+    except SecurityError as exc:
+        assert "Invalid image reference" in str(exc)
+
+
+def test_grype_debian_cve_uses_related_canonical_cve_score(monkeypatch):
+    """Debian advisories without scores inherit severity from related CVE data."""
+    grype_payload = {
+        "matches": [
+            {
+                "artifact": {"type": "deb", "name": "bash", "version": "5.2"},
+                "vulnerability": {
+                    "id": "DEBIAN-CVE-2014-6271",
+                    "severity": "Unknown",
+                    "description": "Debian advisory without a direct score",
+                    "cvss": [],
+                },
+                "relatedVulnerabilities": [
+                    {
+                        "id": "CVE-2014-6271",
+                        "severity": "Unknown",
+                        "cvss": [{"metrics": {"baseScore": 9.8}}],
+                    }
+                ],
+            }
+        ]
+    }
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            returncode = 0
+            stdout = json.dumps(grype_payload)
+            stderr = ""
+
+        return R()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    packages = _scan_with_grype("debian:bookworm")
+
+    vuln = packages[0].vulnerabilities[0]
+    assert vuln.id == "DEBIAN-CVE-2014-6271"
+    assert vuln.cvss_score == 9.8
+    assert vuln.severity == Severity.CRITICAL
+
+
+def test_external_scanner_helpers_validate_platform():
+    """External scanner platform args are fixed values, not shell fragments."""
+    try:
+        _scan_with_syft("nginx:latest", platform="linux/amd64;id")
+        assert False, "Expected SecurityError"
+    except SecurityError as exc:
+        assert "Invalid container platform" in str(exc)
+
+
+def test_docker_helpers_validate_platform_before_subprocess(monkeypatch):
+    """Native Docker helper rejects invalid platform before invoking docker."""
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: calls.append(args))
+
+    try:
+        _docker_inspect("nginx:latest", platform="--privileged")
+        assert False, "Expected SecurityError"
+    except SecurityError:
+        pass
+
+    assert calls == []
+
+
+def test_native_scan_errors_on_zero_extracted_packages(monkeypatch, tmp_path):
+    """Native image scan must fail loudly when both OCI and export paths extract nothing."""
+    monkeypatch.setattr("agent_bom.image._docker_inspect", lambda image_ref, platform=None: {"Config": {}})
+    monkeypatch.setattr("agent_bom.oci_parser.scan_oci", lambda path: ([], "oci-tarball"))
+    monkeypatch.setattr("agent_bom.image._packages_from_tar", lambda path: [])
+
+    save_result = subprocess.CompletedProcess(["docker", "save"], 0, "", "")
+    create_result = subprocess.CompletedProcess(["docker", "create"], 0, "container123\n", "")
+    export_result = subprocess.CompletedProcess(["docker", "export"], 0, b"", b"")
+    rm_result = subprocess.CompletedProcess(["docker", "rm"], 0, "", "")
+    results = iter([save_result, create_result, export_result, rm_result])
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: next(results),
+    )
+
+    try:
+        _scan_with_docker("myapp:latest")
+        assert False, "Expected ImageScanError"
+    except ImageScanError as e:
+        assert "0 packages" in str(e)
 
 
 # ─── detect_multi_arch ───────────────────────────────────────────────────────
@@ -285,7 +292,34 @@ def test_detect_multi_arch_not_manifest_list(monkeypatch):
 def test_scan_cli_has_registry_options():
     """scan --help includes registry auth and platform options."""
     runner = CliRunner()
-    result = runner.invoke(main, ["scan", "--help"])
+    result = runner.invoke(main, ["scan", "--help-all"])
     assert "--registry-user" in result.output
     assert "--registry-pass" in result.output
     assert "--platform" in result.output
+
+
+def test_pull_failure_surfaces_the_docker_error(monkeypatch):
+    """A failed `docker pull` must report *why* it failed, not just that it did.
+
+    The Docker binary can be installed while the daemon is down. `_docker_available`
+    only checks for the binary, so the scan proceeds, `docker inspect` misses, and
+    `docker pull` fails with "Cannot connect to the Docker daemon". Swallowing that
+    stderr leaves the README's image entry point with an unactionable dead end.
+    """
+    import subprocess as _subprocess
+
+    from agent_bom.image import ImageScanError, _docker_inspect
+
+    daemon_error = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+
+    def _fake_run(cmd, **kwargs):
+        return _subprocess.CompletedProcess(cmd, 1, stdout="", stderr=daemon_error)
+
+    monkeypatch.setattr(_subprocess, "run", _fake_run)
+
+    with pytest.raises(ImageScanError) as excinfo:
+        _docker_inspect("alpine:3.14")
+
+    message = str(excinfo.value)
+    assert "alpine:3.14" in message
+    assert "docker daemon" in message.lower(), message

@@ -6,14 +6,17 @@ Later phases will add cloud CIS, proxy alerts, SAST, and skill findings.
 
 from __future__ import annotations
 
-import uuid
+import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-# Stable namespace for agent-bom deterministic UUIDs
-# Using a fixed UUID so IDs are reproducible across machines and versions
-_AGENT_BOM_NS = uuid.UUID("7f3e4b2a-9c1d-5f8e-a0b4-12c3d4e5f6a7")
+from agent_bom.canonical_ids import canonical_finding_id, canonical_id, source_ids
+
+if TYPE_CHECKING:
+    from agent_bom.remediation import Remediation
+
+FINDING_SCHEMA_VERSION = "1"
 
 
 def _stable_id(*parts: str) -> str:
@@ -22,8 +25,7 @@ def _stable_id(*parts: str) -> str:
     Same inputs always produce the same UUID. Use this for asset IDs
     and finding IDs so the same entity is tracked consistently across scans.
     """
-    fingerprint = ":".join(p.lower().strip() for p in parts if p)
-    return str(uuid.uuid5(_AGENT_BOM_NS, fingerprint))
+    return canonical_id(*parts)
 
 
 def stable_id(*parts: str) -> str:
@@ -34,11 +36,15 @@ def stable_id(*parts: str) -> str:
 class FindingType(str, Enum):
     """What category of issue this finding represents."""
 
-    CVE = "CVE"  # Software vulnerability (from OSV/GHSA/NVIDIA)
+    CVE = "CVE"  # Legacy software-vulnerability value (from OSV/GHSA/NVIDIA)
     CIS_FAIL = "CIS_FAIL"  # CIS benchmark control failure
+    CIS_ERROR = "CIS_ERROR"  # CIS control could not be evaluated reliably
+    CLOUD_BEST_PRACTICE_FAIL = "CLOUD_BEST_PRACTICE_FAIL"
+    CLOUD_BEST_PRACTICE_ERROR = "CLOUD_BEST_PRACTICE_ERROR"
     CREDENTIAL_EXPOSURE = "CREDENTIAL_EXPOSURE"  # Credential found in environment/config
     TOOL_DRIFT = "TOOL_DRIFT"  # MCP tool description changed (rug pull)
     INJECTION = "INJECTION"  # Prompt/argument injection in MCP tool
+    PROMPT_SECURITY = "PROMPT_SECURITY"  # Prompt template or prompt content security finding
     EXFILTRATION = "EXFILTRATION"  # Data exfiltration pattern detected by proxy
     CLOAKING = "CLOAKING"  # Invisible chars / SVG cloaking in response
     SAST = "SAST"  # Static analysis finding (CWE-mapped)
@@ -46,6 +52,13 @@ class FindingType(str, Enum):
     BROWSER_EXT = "BROWSER_EXT"  # Suspicious browser extension
     LICENSE = "LICENSE"  # License compliance violation
     RATE_LIMIT = "RATE_LIMIT"  # Rate limit abuse by MCP tool
+    MCP_BLOCKLIST = "MCP_BLOCKLIST"  # Curated malicious/suspicious MCP server match
+    COMBINATION = "COMBINATION"  # Toxic combination — multiple signals chained into one exploitable path
+    MALICIOUS_PACKAGE = "MALICIOUS_PACKAGE"  # Known-malicious / typosquat package with no CVE row
+    MALICIOUS_MODEL = "MALICIOUS_MODEL"  # Content-confirmed executable payload in a model artifact
+    MODEL_INTEGRITY = "MODEL_INTEGRITY"  # Model artifact provenance/integrity gap (tampered, unsigned, unscanned)
+    CIEM_OVER_PRIVILEGE = "CIEM_OVER_PRIVILEGE"  # Cloud identity granted permissions it never uses (right-sizing)
+    SENSITIVE_DATA = "SENSITIVE_DATA"  # Content-confirmed sensitive data at rest (DSPM object/database sampling)
 
 
 class FindingSource(str, Enum):
@@ -55,12 +68,120 @@ class FindingSource(str, Enum):
     CONTAINER = "CONTAINER"  # container image scan (Syft/Grype/Trivy ingestion)
     SBOM = "SBOM"  # SBOM ingest (CycloneDX / SPDX)
     CLOUD_CIS = "CLOUD_CIS"  # cloud CIS benchmark (AWS/Azure/GCP/Snowflake)
+    CLOUD_SECURITY = "CLOUD_SECURITY"  # vendor-authored cloud security best practices
     PROXY = "PROXY"  # runtime proxy detector
     SAST = "SAST"  # static analysis (Semgrep)
     SKILL = "SKILL"  # skill file auditor
     BROWSER_EXT = "BROWSER_EXT"  # browser extension scanner
     EXTERNAL = "EXTERNAL"  # ingested from external scanner (Trivy/Grype/Syft JSON)
     FILESYSTEM = "FILESYSTEM"  # filesystem mount scan
+    PROMPT_SCAN = "PROMPT_SCAN"  # prompt template/content scanner
+    SECRET_SCAN = "SECRET_SCAN"  # hardcoded secret / PII scanner
+    GRAPH_ANALYSIS = "GRAPH_ANALYSIS"  # graph-level correlation (toxic combinations, attack-path fusion)
+    DSPM = "DSPM"  # data security posture content classifier (S3/GCS/Azure Blob/database sampling)
+    MODEL_SCAN = "MODEL_SCAN"  # static model-artifact safety scanner
+
+
+@dataclass(frozen=True)
+class ControlTag:
+    """Normalized framework control attached to a finding.
+
+    Legacy finding payloads expose framework-specific arrays such as
+    ``owasp_tags`` and ``soc2_tags``. ``ControlTag`` gives new consumers one
+    structured list while those legacy arrays remain serialized for backward
+    compatibility.
+    """
+
+    framework: str
+    control: str
+    version: Optional[str] = None
+    confidence: Optional[float] = None
+    source: Optional[str] = None
+    via: Optional[str] = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "framework": self.framework,
+            "control": self.control,
+            "version": self.version,
+            "confidence": self.confidence,
+            "source": self.source,
+            "via": self.via,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> "ControlTag":
+        raw_confidence = payload.get("confidence")
+        confidence: Optional[float] = None
+        if isinstance(raw_confidence, (int, float, str)):
+            try:
+                confidence = float(raw_confidence)
+            except ValueError:
+                confidence = None
+        raw_source = payload.get("source") or payload.get("via")
+        raw_via = payload.get("via")
+
+        return cls(
+            framework=str(payload.get("framework") or ""),
+            control=str(payload.get("control") or ""),
+            version=str(payload["version"]) if payload.get("version") is not None else None,
+            confidence=confidence,
+            source=str(raw_source) if raw_source else None,
+            via=str(raw_via) if raw_via else None,
+        )
+
+
+LEGACY_CONTROL_FIELDS: tuple[tuple[str, str], ...] = (
+    ("compliance_tags", "generic"),
+    ("owasp_tags", "owasp_llm"),
+    ("atlas_tags", "mitre_atlas"),
+    ("attack_tags", "mitre_attack"),
+    ("nist_ai_rmf_tags", "nist_ai_rmf"),
+    ("owasp_mcp_tags", "owasp_mcp"),
+    ("owasp_agentic_tags", "owasp_agentic"),
+    ("eu_ai_act_tags", "eu_ai_act"),
+    ("nist_csf_tags", "nist_csf"),
+    ("iso_27001_tags", "iso_27001"),
+    ("soc2_tags", "soc2"),
+    ("cis_tags", "cis"),
+    ("cmmc_tags", "cmmc"),
+    ("nist_800_53_tags", "nist_800_53"),
+    ("fedramp_tags", "fedramp"),
+    ("pci_dss_tags", "pci_dss"),
+)
+
+_LEGACY_CONTROL_VERSION_BY_FRAMEWORK: dict[str, str] = {
+    "generic": "legacy",
+    "owasp_llm": "2025",
+    "mitre_atlas": "bundled",
+    "mitre_attack": "enterprise-bundled",
+    "nist_ai_rmf": "1.0",
+    "owasp_mcp": "2025",
+    "owasp_agentic": "2026",
+    "eu_ai_act": "2024",
+    "nist_csf": "2.0",
+    "iso_27001": "2022",
+    "soc2": "2017",
+    "cis": "v8",
+    "cmmc": "2.0",
+    "nist_800_53": "rev5",
+    "fedramp": "moderate",
+    "pci_dss": "4.0",
+}
+
+
+def _dedupe_control_tags(tags: list[ControlTag]) -> list[ControlTag]:
+    seen: set[tuple[str, str]] = set()
+    out: list[ControlTag] = []
+    for tag in tags:
+        if not tag.framework or not tag.control:
+            continue
+        key = (tag.framework, tag.control)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(tag)
+    return out
 
 
 @dataclass
@@ -72,6 +193,14 @@ class Asset:
     identifier: Optional[str] = None  # purl, ARN, image digest, etc.
     location: Optional[str] = None  # file path, URL, cloud region
 
+    # Explicit scope — where this asset lives. Optional/nullable so non-cloud
+    # assets (packages, files) serialize unchanged. ``account_ref`` is a single
+    # normalized string (e.g. ``aws:123456789012``) built by finding_scope.
+    provider: Optional[str] = None  # aws | azure | gcp | snowflake | ...
+    account_ref: Optional[str] = None  # normalized ``<provider>:<account>``
+    region: Optional[str] = None
+    environment: Optional[str] = None  # prod | staging | dev | ...
+
     @property
     def stable_id(self) -> str:
         """Deterministic UUID derived from asset content.
@@ -81,6 +210,16 @@ class Asset:
         """
         identifier = self.identifier or f"{self.name}:{self.location or ''}"
         return _stable_id(self.asset_type, identifier)
+
+    @property
+    def canonical_id(self) -> str:
+        """Canonical alias for stable_id used by reports and graph joins."""
+        return self.stable_id
+
+    @property
+    def source_ids(self) -> dict[str, str]:
+        """Original source identifiers retained as provenance."""
+        return source_ids(identifier=self.identifier, location=self.location)
 
 
 @dataclass
@@ -97,6 +236,14 @@ class Finding:
     asset: Asset
     severity: str  # mirrors Severity enum value; str for forward-compat
 
+    # Explicit scope (issue #3946) — carried on the finding for query/filter
+    # convenience and mirrored onto the asset at ingest. All optional/nullable
+    # so existing findings serialize unchanged.
+    provider: Optional[str] = None  # aws | azure | gcp | snowflake | ...
+    account_ref: Optional[str] = None  # normalized ``<provider>:<account>``
+    region: Optional[str] = None
+    environment: Optional[str] = None  # prod | staging | dev | ...
+
     # Vendor severity (from source scanner) vs normalised CVSS severity
     vendor_severity: Optional[str] = None  # severity as reported by vendor/scanner
     cvss_severity: Optional[str] = None  # normalised from CVSS base score
@@ -107,15 +254,31 @@ class Finding:
     cve_id: Optional[str] = None  # e.g. "CVE-2024-1234"
     cwe_ids: list[str] = field(default_factory=list)  # e.g. ["CWE-79"]
     cvss_score: Optional[float] = None
+    cvss_vector: Optional[str] = None
+    attack_vector: Optional[str] = None
+    attack_complexity: Optional[str] = None
+    privileges_required: Optional[str] = None
+    user_interaction: Optional[str] = None
+    network_exploitable: bool = False
     epss_score: Optional[float] = None
     is_kev: bool = False  # CISA Known Exploited Vulnerability
+    is_malicious: bool = False  # Known-malicious package (MAL- IDs, typosquat, etc.)
+    malicious_reason: Optional[str] = None
 
     # Remediation
     fixed_version: Optional[str] = None
     remediation_guidance: Optional[str] = None
+    # Structured advisory remediation (fix + least-privilege-to-apply + optional
+    # artifact). Additive + optional: findings without it serialize unchanged.
+    # Read-only forever — agent-bom recommends, the user applies.
+    remediation: Optional["Remediation"] = None
 
     # Compliance mappings (same tags as BlastRadius for parity)
     compliance_tags: list[str] = field(default_factory=list)  # all framework tags combined
+    # Framework slugs that govern this finding (set by compliance_hub.apply_hub_classification).
+    # Distinct from the per-framework `*_tags` fields below, which hold control codes.
+    applicable_frameworks: list[str] = field(default_factory=list)
+    controls: list[ControlTag] = field(default_factory=list)
     owasp_tags: list[str] = field(default_factory=list)
     atlas_tags: list[str] = field(default_factory=list)
     attack_tags: list[str] = field(default_factory=list)
@@ -127,23 +290,108 @@ class Finding:
     iso_27001_tags: list[str] = field(default_factory=list)
     soc2_tags: list[str] = field(default_factory=list)
     cis_tags: list[str] = field(default_factory=list)
+    cmmc_tags: list[str] = field(default_factory=list)
+    nist_800_53_tags: list[str] = field(default_factory=list)
+    fedramp_tags: list[str] = field(default_factory=list)
+    pci_dss_tags: list[str] = field(default_factory=list)
 
     # Graph / correlation
     related_findings: list[str] = field(default_factory=list)  # IDs of related findings
     evidence: dict = field(default_factory=dict)  # raw evidence payload
+    # First-class graph FKs (optional, additive). ``node_id`` is the estate /
+    # asset UnifiedNode this finding attaches to; ``finding_node_id`` is the
+    # vulnerability/misconfiguration node (e.g. ``vuln:CVE-…``) when materialised.
+    # ``entity_type`` mirrors EntityType.value for the asset node when known.
+    node_id: Optional[str] = None
+    finding_node_id: Optional[str] = None
+    entity_type: Optional[str] = None
 
     # Risk
     risk_score: float = 0.0  # 0-10 unified risk score
+    reachability: Optional[str] = None
+    is_actionable: Optional[bool] = None
+    impact_category: Optional[str] = None
+
+    # Suppression state (mirrors BlastRadius; preserved through the unified stream
+    # so a suppressed finding never appears unsuppressed downstream)
+    suppressed: bool = False
+    suppression_id: Optional[str] = None
+    suppression_state: Optional[str] = None
+    suppression_reason: Optional[str] = None
+    unsuppressed_risk_score: Optional[float] = None
+
+    # AI-native risk context (mirrors BlastRadius)
+    ai_risk_context: Optional[str] = None
+    ai_summary: Optional[str] = None
+    attack_vector_summary: Optional[str] = None
+
+    # Reach / blast-radius lists — kept structured rather than collapsed to counts
+    affected_servers: list[str] = field(default_factory=list)  # MCP server names on the impacted path
+    affected_agents: list[str] = field(default_factory=list)  # agent names reachable along the path
+    exposed_credentials: list[str] = field(default_factory=list)  # credential env-var names at risk
+    exposed_tools: list[str] = field(default_factory=list)  # tool names accessible through the path
+
+    # CWPP runtime/EDR workload evidence (optional, additive). Never implies the
+    # workload is clean — summaries carry clean_workload_assertion=False.
+    workload_runtime_evidence: Optional[dict] = None
+
+    # Ownership + remediation SLA (additive, optional). ``first_seen`` anchors
+    # the SLA window (scan-observation time for a fresh scan); ``owner`` surfaces
+    # the triage assignee when one exists; ``sla_due_at`` is severity-derived
+    # from ``first_seen`` with a KEV override. All left None by default so
+    # existing findings serialize unchanged and to_dict() derives on demand.
+    first_seen: Optional[str] = None
+    owner: Optional[str] = None
+    sla_due_at: Optional[str] = None
 
     # Unique ID — deterministic UUID v5 based on content (computed in __post_init__)
     # Pass an explicit id= to override (e.g. when ingesting from external scanner)
     id: str = field(default="")
 
+    # Appended after the long-standing explicit-ID slot so additive workflow
+    # state does not shift legacy positional construction of this public model.
+    lifecycle_status: Optional[str] = None
+
     def __post_init__(self) -> None:
         """Compute stable ID from finding content if not explicitly set."""
+        from agent_bom.graph.severity import normalize_severity
+
+        self.severity = normalize_severity(self.severity)
+        # Keep finding scope and asset scope consistent: mirror finding-level
+        # scope down to the asset when the asset does not already carry it (and
+        # lift asset scope up when only the asset was populated). Non-cloud
+        # findings leave every field None, so this is a no-op for them.
+        for _scope_field in ("provider", "account_ref", "region", "environment"):
+            finding_val = getattr(self, _scope_field)
+            asset_val = getattr(self.asset, _scope_field, None)
+            if finding_val is not None and asset_val is None:
+                setattr(self.asset, _scope_field, finding_val)
+            elif finding_val is None and asset_val is not None:
+                setattr(self, _scope_field, asset_val)
+        if self.vendor_severity is not None:
+            self.vendor_severity = normalize_severity(self.vendor_severity)
+        if self.cvss_severity is not None:
+            self.cvss_severity = normalize_severity(self.cvss_severity)
+        self.controls = _dedupe_control_tags(
+            [
+                *(tag if isinstance(tag, ControlTag) else ControlTag.from_dict(tag) for tag in self.controls),
+                *self._legacy_control_tags(),
+            ]
+        )
+        # Derive entity_type from asset_type aliases without mutating asset_type
+        # (asset_type feeds stable_id / finding id — must stay byte-stable).
+        if not self.entity_type:
+            try:
+                from agent_bom.graph.asset_entity import entity_type_for_asset_type
+
+                mapped = entity_type_for_asset_type(self.asset.asset_type)
+                if mapped is not None:
+                    self.entity_type = mapped.value
+            except Exception:  # noqa: BLE001 — finding construction must stay resilient
+                pass
         if not self.id:
             # Deterministic ID: same CVE on same asset always same ID
-            cve_part = self.cve_id or self.title
+            cve_part = self.vulnerability_id or self.title
             pkg_name = ""
             pkg_version = ""
             if self.asset.asset_type == "package" and self.asset.identifier:
@@ -152,12 +400,85 @@ class Finding:
                 pkg_part = purl.split("/")[-1] if "/" in purl else purl
                 if "@" in pkg_part:
                     pkg_name, pkg_version = pkg_part.rsplit("@", 1)
-            self.id = _stable_id(
+            elif isinstance(self.evidence, dict):
+                # Asset is a server/container/etc — the affected package lives in
+                # evidence. Fold it into the discriminator so two CVEs on distinct
+                # packages under one asset don't collide on the same id.
+                pkg_name = str(self.evidence.get("package_name") or "")
+                pkg_version = str(self.evidence.get("package_version") or "")
+            self.id = canonical_finding_id(
                 self.asset.stable_id,
                 cve_part,
                 pkg_name,
                 pkg_version,
             )
+
+    @property
+    def canonical_id(self) -> str:
+        """Canonical alias for id used by report and graph consumers."""
+        return self.id
+
+    @property
+    def vulnerability_id(self) -> Optional[str]:
+        """Canonical advisory identity, regardless of CVE/GHSA/OSV namespace.
+
+        ``cve_id`` remains the wire-compatible legacy field. New producers may
+        populate ``evidence.vulnerability_id`` and consumers should prefer this
+        namespace-neutral alias when joining findings to advisories.
+        """
+        if self.cve_id:
+            return self.cve_id
+        raw = self.evidence.get("vulnerability_id") if isinstance(self.evidence, dict) else None
+        return str(raw).strip() or None if raw is not None else None
+
+    @property
+    def advisory_ids(self) -> list[str]:
+        """Return deterministic, de-duplicated CVE/GHSA/OSV advisory aliases."""
+        raw: list[object] = [self.vulnerability_id]
+        if isinstance(self.evidence, dict):
+            raw.extend(self.evidence.get("cve_ids") or [])
+            raw.extend(self.evidence.get("advisory_aliases") or [])
+            raw.extend(self.evidence.get("advisory_ids") or [])
+        seen: set[str] = set()
+        result: list[str] = []
+        for value in raw:
+            item = str(value or "").strip()
+            if item and item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result
+
+    @property
+    def finding_category(self) -> str:
+        """Stable category for consumers while legacy finding types remain intact."""
+        if self.finding_type is FindingType.CVE:
+            return "vulnerability"
+        if self.finding_type in {FindingType.CIS_FAIL, FindingType.CIS_ERROR}:
+            return "compliance"
+        return self.finding_type.value.lower()
+
+    def _legacy_control_tags(self) -> list[ControlTag]:
+        """Return normalized controls derived from legacy tag arrays."""
+        tags: list[ControlTag] = []
+        for field_name, framework in LEGACY_CONTROL_FIELDS:
+            values = getattr(self, field_name)
+            for value in values:
+                if value:
+                    tags.append(
+                        ControlTag(
+                            framework=framework,
+                            control=str(value),
+                            version=_LEGACY_CONTROL_VERSION_BY_FRAMEWORK.get(framework, "legacy"),
+                            confidence=0.75,
+                            source=f"legacy:{field_name}",
+                            via=field_name,
+                        )
+                    )
+        return tags
+
+    def normalized_controls(self) -> list[ControlTag]:
+        """Return deduplicated structured controls for this finding."""
+        return _dedupe_control_tags([*self.controls, *self._legacy_control_tags()])
 
     def all_compliance_tags(self) -> list[str]:
         """Return deduplicated union of all compliance tag lists."""
@@ -176,6 +497,11 @@ class Finding:
             + self.iso_27001_tags
             + self.soc2_tags
             + self.cis_tags
+            + self.cmmc_tags
+            + self.nist_800_53_tags
+            + self.fedramp_tags
+            + self.pci_dss_tags
+            + [tag.control for tag in self.normalized_controls()]
         ):
             if tag not in seen:
                 seen.add(tag)
@@ -185,6 +511,649 @@ class Finding:
     def effective_severity(self) -> str:
         """Return the best severity value: vendor > cvss > base severity."""
         return self.vendor_severity or self.cvss_severity or self.severity
+
+    @property
+    def security_domain(self) -> str:
+        """Derived posture lane: one of cspm/vuln/aspm/dspm/aispm.
+
+        A pure function of source + finding type (+ evidence for the cloud
+        data-vs-config split), so the overview and findings surfaces route each
+        finding to exactly one coverage lane without double counting.
+        """
+        from agent_bom.finding_scope import security_domain_for
+
+        return security_domain_for(self.source, self.finding_type, self.evidence)
+
+    def to_dict(self) -> dict:
+        """Return a JSON-serializable finding payload."""
+        from agent_bom.graph.sla import finding_owner, sla_due_at
+
+        kev_due_date = self.evidence.get("kev_due_date") if isinstance(self.evidence, dict) else None
+        resolved_sla = self.sla_due_at or sla_due_at(
+            self.effective_severity(),
+            self.first_seen,
+            kev_due_date=kev_due_date,
+        )
+        return {
+            "schema_version": FINDING_SCHEMA_VERSION,
+            "id": self.id,
+            "canonical_id": self.canonical_id,
+            "finding_type": self.finding_type.value,
+            "finding_category": self.finding_category,
+            "source": self.source.value,
+            "asset": {
+                "name": self.asset.name,
+                "asset_type": self.asset.asset_type,
+                "identifier": self.asset.identifier,
+                "location": self.asset.location,
+                "stable_id": self.asset.stable_id,
+                "canonical_id": self.asset.canonical_id,
+                "source_ids": self.asset.source_ids,
+                "provider": self.asset.provider,
+                "account_ref": self.asset.account_ref,
+                "region": self.asset.region,
+                "environment": self.asset.environment,
+            },
+            # First-class scope + taxonomy (issue #3946)
+            "provider": self.provider,
+            "account_ref": self.account_ref,
+            "region": self.region,
+            "environment": self.environment,
+            "security_domain": self.security_domain,
+            "severity": self.severity,
+            "effective_severity": self.effective_severity(),
+            "vendor_severity": self.vendor_severity,
+            "cvss_severity": self.cvss_severity,
+            "title": self.title,
+            "description": self.description,
+            "cve_id": self.cve_id,
+            "vulnerability_id": self.vulnerability_id,
+            "advisory_ids": self.advisory_ids,
+            "cve_ids": self.evidence.get("cve_ids") or ([self.cve_id] if self.cve_id else []),
+            "match_confidence_tier": self.evidence.get("match_confidence_tier"),
+            "advisory_aliases": self.evidence.get("advisory_aliases") or [],
+            "cwe_ids": self.cwe_ids,
+            "cvss_score": self.cvss_score,
+            "cvss_vector": self.cvss_vector,
+            "attack_vector": self.attack_vector,
+            "attack_complexity": self.attack_complexity,
+            "privileges_required": self.privileges_required,
+            "user_interaction": self.user_interaction,
+            "network_exploitable": self.network_exploitable,
+            "epss_score": self.epss_score,
+            "is_kev": self.is_kev,
+            "is_malicious": self.is_malicious,
+            "malicious_reason": self.malicious_reason,
+            "fixed_version": self.fixed_version,
+            "remediation_guidance": self.remediation_guidance,
+            # Structured advisory remediation — emitted only when populated so
+            # findings without it keep their existing serialization shape.
+            **({"remediation": self.remediation.to_dict()} if self.remediation is not None else {}),
+            "compliance_tags": self.all_compliance_tags(),
+            "applicable_frameworks": list(self.applicable_frameworks),
+            "controls": [tag.to_dict() for tag in self.normalized_controls()],
+            "owasp_tags": self.owasp_tags,
+            "atlas_tags": self.atlas_tags,
+            "attack_tags": self.attack_tags,
+            "nist_ai_rmf_tags": self.nist_ai_rmf_tags,
+            "owasp_mcp_tags": self.owasp_mcp_tags,
+            "owasp_agentic_tags": self.owasp_agentic_tags,
+            "eu_ai_act_tags": self.eu_ai_act_tags,
+            "nist_csf_tags": self.nist_csf_tags,
+            "iso_27001_tags": self.iso_27001_tags,
+            "soc2_tags": self.soc2_tags,
+            "cis_tags": self.cis_tags,
+            "cmmc_tags": self.cmmc_tags,
+            "nist_800_53_tags": self.nist_800_53_tags,
+            "fedramp_tags": self.fedramp_tags,
+            "pci_dss_tags": self.pci_dss_tags,
+            "related_findings": self.related_findings,
+            "evidence": self.evidence,
+            "node_id": self.node_id,
+            "finding_node_id": self.finding_node_id,
+            "entity_type": self.entity_type,
+            "risk_score": self.risk_score,
+            "reachability": self.reachability,
+            "is_actionable": self.is_actionable,
+            "impact_category": self.impact_category,
+            # Ownership + remediation SLA (derived, single source of truth in
+            # agent_bom.graph.sla). ``owner`` is an explicit None when nobody is
+            # assigned (an honest absence for the API/exports; the CLI/UI render
+            # it as "Unassigned"); ``sla_due_at`` is None when no deadline can be
+            # derived (unrated severity + no anchor/KEV date).
+            "first_seen": self.first_seen,
+            "owner": finding_owner(self.owner),
+            "sla_due_at": resolved_sla,
+            "status": self.lifecycle_status,
+            "lifecycle_status": self.lifecycle_status,
+            # Suppression state — a suppressed finding must never surface as
+            # unsuppressed downstream (mirrors BlastRadius / SARIF suppressions[]).
+            "suppressed": self.suppressed,
+            "suppression_id": self.suppression_id,
+            "suppression_state": self.suppression_state,
+            "suppression_reason": self.suppression_reason,
+            "unsuppressed_risk_score": self.unsuppressed_risk_score,
+            # AI-native risk context
+            "ai_risk_context": self.ai_risk_context,
+            "ai_summary": self.ai_summary,
+            "attack_vector_summary": self.attack_vector_summary,
+            # Structured reach / blast-radius lists (not collapsed to counts)
+            "affected_servers": list(self.affected_servers),
+            "affected_agents": list(self.affected_agents),
+            "exposed_credentials": list(self.exposed_credentials),
+            "exposed_tools": list(self.exposed_tools),
+            # CWPP runtime/EDR — omit when unset so plain findings stay unchanged
+            **(
+                {"workload_runtime_evidence": dict(self.workload_runtime_evidence)}
+                if isinstance(self.workload_runtime_evidence, dict)
+                else {}
+            ),
+        }
+
+
+def _package_occurrence_evidence(occurrence: object) -> dict[str, object]:
+    """Return layer/package provenance in a stable dict shape."""
+    if hasattr(occurrence, "to_dict"):
+        raw = occurrence.to_dict()
+        if isinstance(raw, dict):
+            return raw
+    return {
+        "layer_index": getattr(occurrence, "layer_index", None),
+        "layer_id": getattr(occurrence, "layer_id", None),
+        "layer_path": getattr(occurrence, "layer_path", None),
+        "package_path": getattr(occurrence, "package_path", None),
+        "created_by": getattr(occurrence, "created_by", None),
+        "dockerfile_instruction": getattr(occurrence, "dockerfile_instruction", None),
+    }
+
+
+def _evidence_payload(value: object) -> object:
+    """Normalize common model objects before recursive evidence sanitization."""
+    if isinstance(value, dict):
+        return {str(key): _evidence_payload(child) for key, child in value.items()}
+    if isinstance(value, list | tuple | set):
+        return [_evidence_payload(item) for item in value]
+    if hasattr(value, "to_dict"):
+        raw = value.to_dict()
+        if isinstance(raw, dict):
+            return _evidence_payload(raw)
+    if hasattr(value, "name"):
+        payload: dict[str, object] = {"name": getattr(value, "name", None)}
+        for attr in ("version", "ecosystem", "hop", "id", "transport", "url", "command", "args"):
+            if hasattr(value, attr):
+                payload[attr] = getattr(value, attr)
+        return payload
+    return value
+
+
+def _evidence_key_looks_sensitive(key: object | None) -> bool:
+    if key is None:
+        return False
+    from agent_bom.security import SENSITIVE_PATTERNS
+
+    return any(re.search(pattern, str(key).lower()) for pattern in SENSITIVE_PATTERNS)
+
+
+def _evidence_key_looks_like_url(key: object | None) -> bool:
+    if key is None:
+        return False
+    key_text = str(key).lower()
+    return key_text in {"url", "uri", "endpoint", "webhook"} or key_text.endswith(("_url", "_uri", "_endpoint", "_webhook"))
+
+
+def _evidence_key_looks_like_path(key: object | None) -> bool:
+    if key is None:
+        return False
+    key_text = str(key).lower()
+    return (
+        "path" in key_text
+        or key_text in {"cwd", "workspace", "dir", "directory"}
+        or key_text.endswith(("_dir", "_directory", "_cwd", "_workspace"))
+    )
+
+
+def _sanitized_evidence_value(value: object, *, key: object | None = None, depth: int = 0) -> object:
+    from agent_bom.security import sanitize_path_label, sanitize_sensitive_payload, sanitize_text, sanitize_url
+
+    if depth >= 8:
+        return "[truncated]"
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, str):
+        if _evidence_key_looks_sensitive(key):
+            return "***REDACTED***"
+        if _evidence_key_looks_like_url(key):
+            return sanitize_url(value)
+        if _evidence_key_looks_like_path(key):
+            return sanitize_path_label(value)
+        return sanitize_text(value)
+    if isinstance(value, dict):
+        sanitized: dict[str, object] = {}
+        for raw_key, raw_value in value.items():
+            clean_key = sanitize_text(raw_key, max_len=200)
+            sanitized[clean_key] = _sanitized_evidence_value(raw_value, key=clean_key, depth=depth + 1)
+        return sanitized
+    if isinstance(value, list | tuple | set):
+        return [_sanitized_evidence_value(item, key=key, depth=depth + 1) for item in list(value)]
+    return sanitize_sensitive_payload(value)
+
+
+def _sanitized_evidence_field(value: object) -> object:
+    return _sanitized_evidence_value(_evidence_payload(value))
+
+
+def _source_for_blast_radius(br: object) -> FindingSource:
+    """Derive finding source from the actual affected surface.
+
+    Generic package/image/SBOM findings should not inherit MCP/AI framework
+    applicability just because they flowed through the blast-radius shim.
+    """
+    surfaces = [getattr(server, "surface", None) for server in getattr(br, "affected_servers", []) or []]
+    surface_values = {getattr(surface, "value", str(surface)) for surface in surfaces if surface is not None}
+    if any(getattr(server, "is_mcp_surface", False) for server in getattr(br, "affected_servers", []) or []):
+        return FindingSource.MCP_SCAN
+    if {"container-image", "oci-tarball"} & surface_values:
+        return FindingSource.CONTAINER
+    if "filesystem" in surface_values:
+        return FindingSource.FILESYSTEM
+    if "external-scan" in surface_values:
+        return FindingSource.EXTERNAL
+    if "sast" in surface_values:
+        return FindingSource.SAST
+    if {"sbom", "os-packages"} & surface_values:
+        return FindingSource.SBOM
+    return FindingSource.SBOM
+
+
+def _remediation_guidance_for_vulnerability(vuln: object, pkg: object) -> str:
+    """Return actionable guidance for vulnerability findings.
+
+    Some upstream parsers attach explicit remediation text dynamically. When
+    they do not, derive a conservative fix from the normalized vulnerability
+    model so JSON/SARIF/API consumers do not receive a null remediation field
+    for fixable CVEs.
+    """
+    explicit = getattr(vuln, "remediation", None) or getattr(vuln, "recommendation", None)
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+
+    package_name = getattr(pkg, "name", "the affected package") or "the affected package"
+    if getattr(pkg, "is_malicious", False):
+        reason = getattr(pkg, "malicious_reason", None)
+        detail = f" ({reason})" if isinstance(reason, str) and reason.strip() else ""
+        return f"Remove {package_name} from all environments immediately{detail}."
+
+    fixed_version = _forward_fixed_version(
+        getattr(vuln, "fixed_version", None),
+        getattr(pkg, "version", None),
+        getattr(pkg, "ecosystem", None),
+    )
+    if isinstance(fixed_version, str) and fixed_version.strip():
+        return f"Upgrade {package_name} to {fixed_version.strip()}."
+
+    vuln_id = getattr(vuln, "id", None)
+    if getattr(vuln, "is_kev", False):
+        cve_context = f" {vuln_id}" if vuln_id else ""
+        return f"Prioritize vendor mitigation for{cve_context}; it is listed in CISA KEV and no fixed version is recorded."
+
+    references = getattr(vuln, "references", None) or []
+    if references:
+        return "Review the linked advisory references and apply the vendor-recommended mitigation or upgrade path."
+    return "Review the advisory and apply the vendor-recommended mitigation, upgrade path, or compensating control."
+
+
+def _forward_fixed_version(fixed_version: str | None, current_version: str | None, ecosystem: str | None) -> str | None:
+    """Return ``fixed_version`` only when it is a forward upgrade for ``current_version``."""
+    if not isinstance(fixed_version, str) or not fixed_version.strip():
+        return None
+    fixed = fixed_version.strip()
+    current = (current_version or "").strip()
+    if not current:
+        return fixed
+    from agent_bom.version_utils import compare_versions
+
+    eco = (ecosystem or "").strip()
+    if compare_versions(current, fixed, eco):
+        return fixed
+    return None
+
+
+def _safe_secret_preview(value: object) -> str:
+    """Return a display-only secret preview that cannot carry raw secret bytes."""
+    from agent_bom.security import sanitize_text
+
+    preview = sanitize_text(value, max_len=160).strip()
+    if not preview:
+        return "***REDACTED***"
+    lowered = preview.lower()
+    if "redact" in lowered or "***" in preview or "[secret_" in lowered or "[credential_" in lowered or "[pii_" in lowered:
+        return preview
+    return "***REDACTED***"
+
+
+def secret_dict_to_finding(secret: dict) -> "Finding":
+    """Convert a secret_scanner result dict into a unified CREDENTIAL_EXPOSURE Finding.
+
+    The secret *value* is never carried — only the already-redacted preview,
+    type, category, and file:line — so a machine consumer (JSON / SARIF) sees
+    that a secret is hardcoded and where, without the secret bytes ever leaking.
+    """
+    from agent_bom.security import sanitize_text
+
+    file_path = sanitize_text(secret.get("file", "") or "", max_len=500)
+    raw_line = secret.get("line")
+    line = raw_line if isinstance(raw_line, int) else sanitize_text(raw_line, max_len=40) if raw_line is not None else None
+    secret_type = sanitize_text(secret.get("type", "secret") or "secret", max_len=120)
+    category = sanitize_text(secret.get("category", "secret") or "secret", max_len=120)
+    severity = sanitize_text(secret.get("severity", "medium") or "medium", max_len=40)
+    loc = f"{file_path}:{line}" if line else file_path
+    return Finding(
+        finding_type=FindingType.CREDENTIAL_EXPOSURE,
+        source=FindingSource.SECRET_SCAN,
+        asset=Asset(
+            name=f"{secret_type} in {file_path}" if file_path else secret_type,
+            asset_type="file",
+            identifier=loc or None,
+            location=file_path or None,
+        ),
+        severity=severity,
+        title=f"Hardcoded {category}: {secret_type}",
+        description=(
+            f"A {category} ({secret_type}) was found hardcoded at {loc}. "
+            "Secrets must live only as OS/shell environment variables or in a "
+            "secret manager — never committed in code."
+        ),
+        remediation_guidance=("Remove the hardcoded value, rotate it, and load it from an environment variable or secret manager."),
+        evidence={
+            "file": file_path,
+            "line": line,
+            "secret_type": secret_type,
+            "category": category,
+            "redacted_preview": _safe_secret_preview(secret.get("preview")),
+        },
+    )
+
+
+def cloud_cis_check_to_finding(check: dict, provider: str) -> "Finding":
+    """Convert one failed or unevaluable cloud posture check into a Finding.
+
+    Lifts cloud posture failures out of the side-block (``*_cis_benchmark_data``) into
+    the unified findings stream so ``--fail-on-severity``, SARIF, and severity
+    rollups see them — previously a ``cloud`` scan exited 0 even with HIGH/CRITICAL
+    misconfigurations. CIS providers retain CIS identity; vendor best-practice
+    providers remain explicitly non-CIS.
+    """
+    from agent_bom.security import sanitize_text
+
+    check_id = sanitize_text(str(check.get("check_id", "") or "unknown"), max_len=40)
+    title = sanitize_text(str(check.get("title", "") or check_id), max_len=300)
+    # A control that reports no severity is unrated, not medium. Defaulting to a
+    # rated band published a judgement the evidence does not support and folded
+    # unevaluable controls into the medium tile; ``unknown`` normalizes to the
+    # explicit ``unrated`` bucket, still counted and still visible (#4631).
+    severity = sanitize_text(str(check.get("severity") or "unknown"), max_len=40)
+    evidence_text = sanitize_text(str(check.get("evidence", "") or ""), max_len=600)
+    recommendation = sanitize_text(str(check.get("recommendation", "") or ""), max_len=600)
+    # A benchmark check carries its fix under "remediation" (a structured block)
+    # while the prose summary lives under "recommendation". The live scanner
+    # emits both; the demo overlay and several vendor payloads emit only the
+    # former, so reading "recommendation" alone left every one of those findings
+    # with no guidance at all and no copy-pasteable command.
+    check_fix = check.get("remediation")
+    check_fix = check_fix if isinstance(check_fix, dict) else {}
+    if not recommendation:
+        recommendation = sanitize_text(
+            str(check_fix.get("fix_console") or check_fix.get("fix_cli") or ""),
+            max_len=600,
+        )
+    resource_ids = [sanitize_text(str(r), max_len=300) for r in (check.get("resource_ids") or []) if str(r).strip()]
+    primary = resource_ids[0] if resource_ids else f"{provider}-account"
+    attack = [str(t) for t in (check.get("attack_techniques") or []) if str(t).strip()]
+    is_vendor_best_practice = provider.lower() == "databricks"
+    compliance = ([] if is_vendor_best_practice else [f"CIS-{check_id}"]) + [
+        str(t) for t in (check.get("compliance_tags") or []) if str(t).strip()
+    ]
+    cis_section = sanitize_text(str(check.get("cis_section", "") or ""), max_len=200)
+    benchmark_version = sanitize_text(str(check.get("benchmark_version", "") or ""), max_len=40)
+    status = str(check.get("status", "FAIL") or "FAIL").upper()
+    if is_vendor_best_practice:
+        finding_type = FindingType.CLOUD_BEST_PRACTICE_ERROR if status == "ERROR" else FindingType.CLOUD_BEST_PRACTICE_FAIL
+    else:
+        finding_type = FindingType.CIS_ERROR if status == "ERROR" else FindingType.CIS_FAIL
+    benchmark_label = "Security best-practice" if is_vendor_best_practice else "CIS benchmark"
+
+    # Explicit scope (issue #3946): the converter already knows the provider and
+    # the resource id/ARN — parse the account/region out of the ARN, prefer an
+    # explicit ``account_id`` on the check, and normalize into one account ref.
+    from agent_bom.finding_scope import account_ref_from_arn, normalize_account_ref, region_from_arn
+
+    raw_account = str(check.get("account_id") or "").strip() or account_ref_from_arn(primary)
+    account_ref = normalize_account_ref(provider, raw_account)
+    region = sanitize_text(str(check.get("region") or "" or region_from_arn(primary) or ""), max_len=64) or None
+    environment = sanitize_text(str(check.get("environment") or ""), max_len=64) or None
+
+    finding = Finding(
+        finding_type=finding_type,
+        source=FindingSource.CLOUD_SECURITY if is_vendor_best_practice else FindingSource.CLOUD_CIS,
+        asset=Asset(
+            name=primary,
+            asset_type="cloud_resource",
+            identifier=primary,
+            location=provider,
+            provider=provider,
+            account_ref=account_ref,
+            region=region,
+            environment=environment,
+        ),
+        severity=severity,
+        provider=provider,
+        account_ref=account_ref,
+        region=region,
+        environment=environment,
+        # CIS phrases controls as assertions of the desired state ("No root
+        # account access keys"), which is right for a control name and wrong for
+        # a finding title: the finding exists because the assertion is false.
+        # Titling a critical FAIL with the state it failed to reach put 1,581
+        # findings on screen headlined as though nothing were wrong. "not met"
+        # rather than a negated control name, because every CIS title is an
+        # assertion and mechanical negation is not grammatical across them.
+        title=(
+            f"{'Databricks best practice' if is_vendor_best_practice else 'CIS'} {check_id} "
+            f"{'not evaluated' if status == 'ERROR' else 'not met'}: {title}"
+        ),
+        description=evidence_text
+        or (
+            f"{benchmark_label} control {check_id} could not be evaluated for {provider}."
+            if status == "ERROR"
+            else f"{benchmark_label} control {check_id} failed for {provider}."
+        ),
+        remediation_guidance=recommendation or None,
+        compliance_tags=sorted(set(compliance)),
+        attack_tags=sorted(set(attack)),
+        evidence={
+            "provider": provider,
+            "check_id": check_id,
+            "control_title": title,
+            # The check's own fix outranks a generic catalog entry keyed only by
+            # check id: it names this resource, in this account.
+            **({"remediation_fix": check_fix} if check_fix else {}),
+            "status": status,
+            "cis_section": cis_section,
+            "benchmark_version": benchmark_version,
+            "resource_ids": resource_ids,
+            "benchmark": "Databricks Security Best Practices" if is_vendor_best_practice else "CIS",
+        },
+    )
+    # Populate applicable_frameworks via the hub selection table, consistent with
+    # every other finding generator (blast_radius/malicious/auth). Previously this
+    # converter set only compliance_tags, leaving applicable_frameworks empty so
+    # the finding was invisible in the hub posture aggregation. CIS providers
+    # resolve to the CIS framework only (no fabricated SOC2/ISO/NIST crosswalk);
+    # vendor best-practice providers keep their source baseline.
+    from agent_bom.compliance_hub import apply_hub_classification
+
+    apply_hub_classification(finding)
+
+    # Reference pattern for the advisory-remediation foundation: attach the
+    # structured fix + least-privilege-to-apply + runbook artifact. Advisory
+    # only — agent-bom recommends, the user applies.
+    from agent_bom.remediation import build_remediation as _build_remediation
+
+    finding.remediation = _build_remediation(finding)
+    return finding
+
+
+def iac_finding_to_finding(iac: dict) -> "Finding":
+    """Convert one IaC misconfiguration into a unified Finding.
+
+    IaC scanning (Terraform / CloudFormation / K8s / Dockerfile) previously
+    reached only the JSON side block and SARIF's dedicated IaC loop, never the
+    unified stream — so exec ``total_findings``, ``--fail-on-severity``, and the
+    severity rollups under-counted it. Modeled as a ``CIS_FAIL`` carrying the
+    ``iac`` evidence marker so :func:`agent_bom.finding_scope.security_domain_for`
+    keeps its primary CSPM lane while :func:`_is_iac_misconfig` also adds the ASPM
+    lens (IaC is a code-layer config concern). SARIF keeps rendering it via the
+    richer dedicated loop; the unified SARIF loop skips it to avoid duplicates.
+    """
+    from agent_bom.security import sanitize_text
+
+    rule_id = sanitize_text(str(iac.get("rule_id", "") or "unknown"), max_len=80)
+    file_path = sanitize_text(str(iac.get("file_path", "") or "unknown"), max_len=400)
+    line_number = iac.get("line_number") or 0
+    try:
+        line_number = int(line_number)
+    except (TypeError, ValueError):
+        line_number = 0
+    category = sanitize_text(str(iac.get("category", "iac") or "iac"), max_len=64).lower()
+    severity = sanitize_text(str(iac.get("severity", "medium") or "medium"), max_len=40)
+    title = sanitize_text(str(iac.get("title", "") or rule_id), max_len=300)
+    message = sanitize_text(str(iac.get("message", "") or ""), max_len=600)
+    remediation = sanitize_text(str(iac.get("remediation", "") or ""), max_len=600)
+    compliance = [str(t) for t in (iac.get("compliance") or []) if str(t).strip()]
+    attack = [str(t) for t in (iac.get("attack_techniques") or []) if str(t).strip()]
+
+    return Finding(
+        finding_type=FindingType.CIS_FAIL,
+        source=FindingSource.CLOUD_SECURITY,
+        asset=Asset(
+            name=file_path,
+            asset_type="iac_resource",
+            identifier=f"iac:{category}:{file_path}:{line_number}",
+            location=file_path,
+        ),
+        severity=severity,
+        title=f"IaC misconfiguration {rule_id}: {title}" if title != rule_id else f"IaC misconfiguration {rule_id}",
+        description=message or f"IaC rule {rule_id} failed for {file_path}.",
+        remediation_guidance=remediation or None,
+        compliance_tags=sorted(set(compliance)),
+        attack_tags=sorted(set(attack)),
+        evidence={
+            "iac": True,
+            "rule_id": rule_id,
+            "category": category,
+            "scan_type": "iac",
+            "file_path": file_path,
+            "line_number": line_number,
+            "compliance": compliance,
+        },
+        is_actionable=True,
+        impact_category="iac_misconfiguration",
+        id=stable_id("iac", rule_id, file_path, str(line_number)),
+    )
+
+
+def snowflake_governance_finding_to_finding(finding: dict, account: str) -> "Finding":
+    """Convert one derived Snowflake governance finding into a unified Finding.
+
+    Governance findings (write-access risk, sensitive-data access, agent-usage
+    anomalies) live in the side block ``snowflake_governance_data['findings']``.
+    Lift severity-bearing ones into the unified stream so ``--fail-on-severity``,
+    SARIF, and severity rollups see them — otherwise a ``cloud`` scan exits 0 even
+    when governance surfaced HIGH/CRITICAL access risks.
+    """
+    from agent_bom.security import sanitize_text
+
+    category = sanitize_text(str(finding.get("category", "") or "access"), max_len=60)
+    severity = sanitize_text(str(finding.get("severity", "medium") or "medium"), max_len=40)
+    title = sanitize_text(str(finding.get("title", "") or category), max_len=300)
+    description = sanitize_text(str(finding.get("description", "") or ""), max_len=600)
+    agent_or_role = sanitize_text(str(finding.get("agent_or_role", "") or ""), max_len=300)
+    object_name = sanitize_text(str(finding.get("object_name", "") or ""), max_len=300)
+    primary = object_name or agent_or_role or f"snowflake:{account or 'account'}"
+
+    from agent_bom.finding_scope import normalize_account_ref
+
+    account_ref = normalize_account_ref("snowflake", account)
+    return Finding(
+        finding_type=FindingType.CIS_FAIL,
+        source=FindingSource.CLOUD_CIS,
+        asset=Asset(
+            name=primary,
+            asset_type="cloud_resource",
+            identifier=primary,
+            location="snowflake",
+            provider="snowflake",
+            account_ref=account_ref,
+        ),
+        severity=severity,
+        provider="snowflake",
+        account_ref=account_ref,
+        title=f"Snowflake governance: {title}",
+        description=description or f"Snowflake governance risk ({category}) for {primary}.",
+        compliance_tags=[f"SNOWFLAKE-GOVERNANCE-{category.upper()}"],
+        evidence={
+            "provider": "snowflake",
+            "account": account,
+            "category": category,
+            "agent_or_role": agent_or_role,
+            "object_name": object_name,
+            "details": finding.get("details", {}) or {},
+        },
+    )
+
+
+def cloud_org_architecture_finding_to_finding(finding: dict, *, provider: str, org_id: str = "") -> "Finding":
+    """Convert an AWS/GCP org-architecture finding into a unified Finding."""
+    from agent_bom.finding_scope import normalize_account_ref
+    from agent_bom.security import sanitize_text
+
+    provider_key = sanitize_text(str(provider or "cloud"), max_len=40).lower() or "cloud"
+    check_id = sanitize_text(str(finding.get("check_id") or finding.get("title") or "ORG"), max_len=80)
+    severity = sanitize_text(str(finding.get("severity") or "medium"), max_len=40).lower() or "medium"
+    title = sanitize_text(str(finding.get("title") or check_id), max_len=300)
+    detail = sanitize_text(str(finding.get("detail") or ""), max_len=800)
+    org_label = sanitize_text(str(org_id or "standalone"), max_len=120)
+    account_ref = normalize_account_ref(provider_key, org_label)
+
+    return Finding(
+        finding_type=FindingType.CLOUD_BEST_PRACTICE_FAIL,
+        source=FindingSource.CLOUD_SECURITY,
+        asset=Asset(
+            name=f"{provider_key}-org:{org_label}",
+            asset_type="cloud_resource",
+            identifier=f"{provider_key}-org:{org_label}",
+            location=provider_key,
+            provider=provider_key,
+            account_ref=account_ref,
+        ),
+        severity=severity,
+        provider=provider_key,
+        account_ref=account_ref,
+        title=title,
+        description=detail or title,
+        compliance_tags=[f"CLOUD-ORG-{check_id}"],
+        evidence={
+            "provider": provider_key,
+            "org_id": org_id,
+            "check_id": check_id,
+            "category": finding.get("category") or "estate_architecture",
+            "account_count": finding.get("account_count"),
+            "hierarchy_depth": finding.get("hierarchy_depth"),
+        },
+        is_actionable=True,
+        impact_category="estate_architecture",
+        id=stable_id("cloud-org", provider_key, check_id, org_label),
+    )
 
 
 def blast_radius_to_finding(br: object) -> "Finding":
@@ -198,17 +1167,21 @@ def blast_radius_to_finding(br: object) -> "Finding":
     if not isinstance(br, BlastRadius):
         raise TypeError(f"Expected BlastRadius, got {type(br)}")
 
+    from agent_bom.asset_provenance import package_discovery_provenance, package_version_provenance
+
     vuln = br.vulnerability
     pkg = br.package
 
     # Asset: primary server or package
     if br.affected_servers:
         primary_server = br.affected_servers[0]
+        from agent_bom.security import sanitize_launch_command
+
         asset = Asset(
             name=primary_server.name,
             asset_type="mcp_server",
             identifier=None,
-            location=primary_server.command or None,
+            location=sanitize_launch_command(primary_server.command, primary_server.args) or None,
         )
     else:
         asset = Asset(
@@ -222,20 +1195,116 @@ def blast_radius_to_finding(br: object) -> "Finding":
         "package_name": pkg.name,
         "package_version": pkg.version,
         "ecosystem": pkg.ecosystem,
+        "package_is_direct": pkg.is_direct,
+        "package_parent": pkg.parent_package,
+        "package_dependency_depth": pkg.dependency_depth,
+        "package_dependency_scope": pkg.dependency_scope,
+        "package_reachability_evidence": pkg.reachability_evidence,
         "affected_server_count": len(br.affected_servers),
         "exposed_credential_count": len(br.exposed_credentials),
         "exposed_tool_count": len(br.exposed_tools),
+        "hop_depth": getattr(br, "hop_depth", 1),
+        "delegation_chain": _sanitized_evidence_field(getattr(br, "delegation_chain", [])),
+        "transitive_agents": _sanitized_evidence_field(getattr(br, "transitive_agents", [])),
+        "transitive_servers": _sanitized_evidence_field(getattr(br, "transitive_servers", [])),
+        "transitive_packages": _sanitized_evidence_field(getattr(br, "transitive_packages", [])),
+        "transitive_credential_count": len(getattr(br, "transitive_credentials", []) or []),
+        "transitive_risk_score": getattr(br, "transitive_risk_score", 0.0),
+        "graph_reachable": getattr(br, "graph_reachable", None),
+        "graph_min_hop_distance": getattr(br, "graph_min_hop_distance", None),
+        "graph_reachable_from_agents": _sanitized_evidence_field(getattr(br, "graph_reachable_from_agents", [])),
+        "symbol_reachability": getattr(br, "symbol_reachability", None),
+        "reachable_affected_symbols": _sanitized_evidence_field(getattr(br, "reachable_affected_symbols", [])),
+        "layer_attribution": _sanitized_evidence_field([_package_occurrence_evidence(occ) for occ in br.layer_attribution]),
+        "published_at": getattr(vuln, "published_at", None),
+        "modified_at": getattr(vuln, "modified_at", None),
+        "severity_source": getattr(vuln, "severity_source", None),
+        "cvss_vector": getattr(vuln, "cvss_vector", None),
+        "attack_vector": getattr(vuln, "attack_vector", None),
+        "attack_complexity": getattr(vuln, "attack_complexity", None),
+        "privileges_required": getattr(vuln, "privileges_required", None),
+        "user_interaction": getattr(vuln, "user_interaction", None),
+        "network_exploitable": getattr(vuln, "network_exploitable", False),
+        "epss_percentile": getattr(vuln, "epss_percentile", None),
+        "kev_date_added": getattr(vuln, "kev_date_added", None),
+        "kev_due_date": getattr(vuln, "kev_due_date", None),
+        "vulnerability_compliance_tags": _sanitized_evidence_field(getattr(vuln, "compliance_tags", {}) or {}),
     }
+    package_provenance = package_discovery_provenance(pkg)
+    if package_provenance:
+        evidence["package_discovery_provenance"] = package_provenance
+    evidence["package_version_provenance"] = package_version_provenance(pkg)
+    from agent_bom.checksums import integrity_verdict
+
+    integrity = integrity_verdict(pkg)
+    if integrity is not None:
+        # --verify-integrity verdict travels with the finding so SARIF/CSV and
+        # the findings API carry it, not just the package-shaped SBOM formats.
+        for key, value in integrity.items():
+            evidence[f"package_{key}"] = value
+    if getattr(pkg, "is_malicious", False):
+        evidence["package_is_malicious"] = True
+        reason = getattr(pkg, "malicious_reason", None)
+        if isinstance(reason, str) and reason.strip():
+            evidence["malicious_reason"] = reason.strip()
     if vuln.references:
-        evidence["references"] = vuln.references[:5]
+        evidence["references"] = _sanitized_evidence_field(vuln.references[:5])
+
+    tier = getattr(vuln, "match_confidence_tier", None)
+    if tier:
+        evidence["match_confidence_tier"] = tier
+    if getattr(vuln, "vex_status", None):
+        evidence["vex_status"] = vuln.vex_status
+    if getattr(vuln, "vex_justification", None):
+        evidence["vex_justification"] = vuln.vex_justification
+    if getattr(vuln, "aliases", None):
+        evidence["advisory_aliases"] = _sanitized_evidence_field(list(vuln.aliases))
+    from agent_bom.advisory_ids import all_cve_identifiers
+
+    cve_ids = all_cve_identifiers(vuln.id, getattr(vuln, "aliases", []) or [])
+    if cve_ids:
+        evidence["cve_ids"] = cve_ids
+    if getattr(br, "symbol_reachability", None):
+        from agent_bom.reachability_cve import extract_advisory_identifiers
+
+        reach_ids = extract_advisory_identifiers(vuln)
+        if reach_ids.cwe_ids:
+            evidence["reachability_advisory_cwe_ids"] = list(reach_ids.cwe_ids)
+        if reach_ids.cpe_ids:
+            evidence["reachability_advisory_cpe_ids"] = list(reach_ids.cpe_ids)
 
     sev = vuln.severity.value if hasattr(vuln.severity, "value") else str(vuln.severity)
+    from agent_bom.exploitability import fused_triage_priority
 
-    return Finding(
+    evidence["triage_priority"] = fused_triage_priority(
+        severity=sev,
+        is_kev=bool(vuln.is_kev),
+        epss_score=getattr(vuln, "epss_score", None),
+        network_exploitable=bool(getattr(vuln, "network_exploitable", False)),
+        impact_category=getattr(br, "impact_category", None),
+        reachable=getattr(br, "graph_reachable", None),
+        exposed_credential_count=len(br.exposed_credentials),
+        exposed_tool_count=len(br.exposed_tools),
+        symbol_reachability=getattr(br, "symbol_reachability", None),
+    )
+
+    from agent_bom.compliance_hub import apply_hub_classification
+
+    # Deterministic graph FKs — package/vuln node ids match builder conventions
+    # so investigation can join without CVE-label heuristics alone.
+    from agent_bom.package_utils import canonical_package_key
+    from agent_bom.vex import is_vex_suppressed
+
+    package_node_id = f"pkg:{canonical_package_key(pkg.name, pkg.version or '', pkg.ecosystem or '', getattr(pkg, 'purl', None))}"
+    finding_node_id = f"vuln:{vuln.id}" if vuln.id else None
+
+    finding = Finding(
         finding_type=FindingType.CVE,
-        source=FindingSource.MCP_SCAN,
+        source=_source_for_blast_radius(br),
         asset=asset,
         severity=sev,
+        node_id=package_node_id or None,
+        finding_node_id=finding_node_id,
         vendor_severity=getattr(vuln, "vendor_severity", None),
         cvss_severity=getattr(vuln, "cvss_severity", None),
         title=f"{vuln.id}: {pkg.name}@{pkg.version or 'unknown'}",
@@ -243,10 +1312,18 @@ def blast_radius_to_finding(br: object) -> "Finding":
         cve_id=vuln.id,  # Vulnerability.id is the CVE/OSV ID
         cwe_ids=list(getattr(vuln, "cwe_ids", []) or []),
         cvss_score=vuln.cvss_score,
+        cvss_vector=getattr(vuln, "cvss_vector", None),
+        attack_vector=getattr(vuln, "attack_vector", None),
+        attack_complexity=getattr(vuln, "attack_complexity", None),
+        privileges_required=getattr(vuln, "privileges_required", None),
+        user_interaction=getattr(vuln, "user_interaction", None),
+        network_exploitable=bool(getattr(vuln, "network_exploitable", False)),
         epss_score=vuln.epss_score,
         is_kev=bool(vuln.is_kev),
-        fixed_version=vuln.fixed_version,
-        remediation_guidance=getattr(vuln, "remediation", None),
+        is_malicious=bool(getattr(pkg, "is_malicious", False)),
+        malicious_reason=getattr(pkg, "malicious_reason", None),
+        fixed_version=_forward_fixed_version(vuln.fixed_version, pkg.version, pkg.ecosystem),
+        remediation_guidance=_remediation_guidance_for_vulnerability(vuln, pkg),
         owasp_tags=list(br.owasp_tags),
         atlas_tags=list(br.atlas_tags),
         attack_tags=list(br.attack_tags),
@@ -258,6 +1335,69 @@ def blast_radius_to_finding(br: object) -> "Finding":
         iso_27001_tags=list(br.iso_27001_tags),
         soc2_tags=list(br.soc2_tags),
         cis_tags=list(br.cis_tags),
+        cmmc_tags=list(getattr(br, "cmmc_tags", [])),
+        nist_800_53_tags=list(getattr(br, "nist_800_53_tags", [])),
+        fedramp_tags=list(getattr(br, "fedramp_tags", [])),
+        pci_dss_tags=list(getattr(br, "pci_dss_tags", [])),
         evidence=evidence,
         risk_score=br.risk_score,
+        reachability=getattr(br, "reachability", None),
+        is_actionable=getattr(br, "is_actionable", None),
+        impact_category=getattr(br, "impact_category", None),
+        suppressed=bool(getattr(br, "suppressed", False)) or is_vex_suppressed(vuln),
+        suppression_id=getattr(br, "suppression_id", None),
+        suppression_state=getattr(br, "suppression_state", None),
+        suppression_reason=getattr(br, "suppression_reason", None),
+        unsuppressed_risk_score=getattr(br, "unsuppressed_risk_score", None),
+        ai_risk_context=getattr(br, "ai_risk_context", None),
+        ai_summary=getattr(br, "ai_summary", None),
+        attack_vector_summary=getattr(br, "attack_vector_summary", None),
+        affected_servers=[s.name for s in br.affected_servers],
+        affected_agents=[getattr(a, "name", str(a)) for a in br.affected_agents],
+        exposed_credentials=list(br.exposed_credentials),
+        exposed_tools=[getattr(t, "name", str(t)) for t in br.exposed_tools],
     )
+    return apply_hub_classification(finding)
+
+
+def malicious_package_to_finding(
+    pkg: object,
+    *,
+    affected_agents: list[str],
+    affected_servers: list[str],
+) -> Finding:
+    """Synthesize a unified finding for a malicious package with no CVE BlastRadius."""
+    from agent_bom.package_utils import normalize_package_ecosystem
+
+    name = str(getattr(pkg, "name", "") or "unknown")
+    version = str(getattr(pkg, "version", "") or "unknown")
+    ecosystem = normalize_package_ecosystem(str(getattr(pkg, "ecosystem", "") or ""))
+    purl = getattr(pkg, "purl", None)
+    identifier = str(purl) if purl else f"pkg:{ecosystem}/{name}@{version}"
+    reason = str(getattr(pkg, "malicious_reason", "") or "").strip() or "Known malicious or typosquat package"
+    evidence_payload: dict[str, object] = {
+        "package_name": name,
+        "package_version": version,
+        "ecosystem": ecosystem,
+        "package_is_malicious": True,
+        "malicious_reason": reason,
+        "finding_kind": "malicious-package",
+    }
+    finding = Finding(
+        finding_type=FindingType.MALICIOUS_PACKAGE,
+        source=FindingSource.MCP_SCAN,
+        asset=Asset(name=name, asset_type="package", identifier=identifier),
+        severity="critical",
+        title=f"Malicious package: {name}@{version}",
+        description=reason,
+        is_malicious=True,
+        malicious_reason=reason,
+        is_actionable=True,
+        risk_score=10.0,
+        affected_agents=list(affected_agents),
+        affected_servers=list(affected_servers),
+        evidence=evidence_payload,
+    )
+    from agent_bom.compliance_hub import apply_hub_classification
+
+    return apply_hub_classification(finding)

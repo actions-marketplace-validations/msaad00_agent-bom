@@ -13,14 +13,24 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
-from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import Optional
 
 from agent_bom.models import TransportType
-from agent_bom.parsers.skills import SkillMetadata, SkillScanResult
+from agent_bom.parsers.skill_audit_behavior import (
+    _DANGEROUS_ARG_KEYWORDS,
+    _DANGEROUS_SERVER_NAME_KEYWORDS,
+    _SHELL_COMMANDS,
+    _scan_behavioral_risks,
+    _scan_js_ts_semantic_risks,
+    _scan_python_ast_risks,
+    _summarize_behavioral_findings,
+)
+from agent_bom.parsers.skill_audit_metadata import _check_metadata_quality
+from agent_bom.parsers.skill_audit_types import SkillAuditResult, SkillFinding
+from agent_bom.parsers.skills import SkillScanResult
+from agent_bom.security import sanitize_url
 
 logger = logging.getLogger(__name__)
 
@@ -42,363 +52,6 @@ def _load_registry() -> dict:
         return {entry["package"]: entry for entry in servers}
     except Exception:
         return {}
-
-
-# ── Data structures ──────────────────────────────────────────────────────────
-
-
-@dataclass
-class SkillFinding:
-    """A single security finding from the skill audit."""
-
-    severity: str  # "critical" | "high" | "medium" | "low"
-    category: str  # typosquat | unverified_server | excessive_permissions | shell_access | unknown_package | dangerous_tool | external_url
-    title: str
-    detail: str
-    source_file: str
-    package: str | None = None
-    server: str | None = None
-    recommendation: str = ""
-    context: str = "config_block"  # "config_block" | "code_block" | "env_reference" — where the data was extracted from
-    ai_analysis: str | None = None  # LLM-generated context-aware explanation
-    ai_adjusted_severity: str | None = None  # LLM may adjust severity or mark "false_positive"
-
-
-@dataclass
-class SkillAuditResult:
-    """Aggregated result of the skill security audit."""
-
-    findings: list[SkillFinding] = field(default_factory=list)
-    packages_checked: int = 0
-    servers_checked: int = 0
-    credentials_checked: int = 0
-    passed: bool = True  # no critical/high findings
-    ai_skill_summary: str | None = None  # LLM-generated overall narrative
-    ai_overall_risk_level: str | None = None  # "critical"|"high"|"medium"|"low"|"safe"
-
-
-# ── Shell / dangerous keywords ───────────────────────────────────────────────
-
-_SHELL_COMMANDS = {"sh", "bash", "cmd", "powershell", "zsh"}
-
-_DANGEROUS_ARG_KEYWORDS = {
-    "--allow-exec",
-    "exec",
-    "shell",
-    "--dangerous",
-    "--yolo",
-}
-
-_DANGEROUS_SERVER_NAME_KEYWORDS = {"exec", "shell", "terminal", "command"}
-
-
-# ── Behavioral risk pattern definitions ──────────────────────────────────────
-
-
-class _BehavioralPattern(NamedTuple):
-    """A regex-based behavioral risk pattern to detect in skill file prose/code."""
-
-    category: str  # e.g. "credential_file_access"
-    severity: str  # "critical" | "high" | "medium" | "low"
-    title: str  # Human-readable finding title
-    pattern: re.Pattern  # Compiled regex
-    description: str  # Recommendation text
-
-
-_BEHAVIORAL_PATTERNS: list[_BehavioralPattern] = [
-    # ── CRITICAL ──────────────────────────────────────────────────────────
-    _BehavioralPattern(
-        category="credential_file_access",
-        severity="critical",
-        title="Credential/secret file access",
-        pattern=re.compile(
-            r"""
-            \b op \s+ (signin|vault|item|read)          # 1Password CLI
-            | \b security \s+ find-generic-password       # macOS Keychain
-            | cat \s+ ~/? \. (config|ssh|aws|gnupg)       # dotfile credential dirs
-            | \b vault \s+ (kv|read|write) \s             # HashiCorp Vault
-            | \b aws \s+ secretsmanager                   # AWS Secrets Manager
-            """,
-            re.VERBOSE | re.IGNORECASE,
-        ),
-        description="Review and remove direct credential/secret file access. Use scoped environment variables instead.",
-    ),
-    _BehavioralPattern(
-        category="confirmation_bypass",
-        severity="critical",
-        title="Safety confirmation bypass",
-        pattern=re.compile(
-            r"""
-            --yolo \b                                     # Codex --yolo
-            | --full-auto \b                              # Full auto mode
-            | --no-sandbox \b                             # Sandbox disable
-            | --dangerously-skip-permissions \b           # Claude Code skip perms
-            | \b elevated \s* [:=] \s* true \b            # Elevated mode
-            | \b auto_approve \s* [:=] \s* true \b        # Auto-approve
-            | --no-verify \b                              # Git no-verify
-            | \b allowedTools \s* [:=] \s* \[? \s* \*     # Wildcard tool allow
-            """,
-            re.VERBOSE | re.IGNORECASE,
-        ),
-        description="Remove safety bypasses. Never disable confirmation prompts or sandbox protections.",
-    ),
-    # ── HIGH ──────────────────────────────────────────────────────────────
-    _BehavioralPattern(
-        category="messaging_capability",
-        severity="high",
-        title="Messaging/impersonation capability",
-        pattern=re.compile(
-            r"""
-            \b imsg \s+ send \b                           # iMessage CLI
-            | \b wacli \s+ send \b                        # WhatsApp CLI
-            | \b slack \s+ (sendMessage|chat\.postMessage) # Slack API
-            | \b discord \s+ send \b                      # Discord
-            | \b twilio \s+ messages \b                   # Twilio SMS
-            | \b sendgrid \b                              # SendGrid email
-            | \b send[-_]?email \b                        # Generic email send
-            """,
-            re.VERBOSE | re.IGNORECASE,
-        ),
-        description="Messaging capabilities let the agent impersonate the user. Require explicit confirmation for every message.",
-    ),
-    _BehavioralPattern(
-        category="voice_telephony",
-        severity="high",
-        title="Voice/telephony capability",
-        pattern=re.compile(
-            r"""
-            \b voicecall \s+ call \b                      # Voice call CLI
-            | \b twilio \s+ calls \b                      # Twilio voice
-            | \b telnyx \b                                # Telnyx telephony
-            | \b plivo \b                                 # Plivo telephony
-            """,
-            re.VERBOSE | re.IGNORECASE,
-        ),
-        description="Voice/telephony lets the agent make calls as the user. Remove or require human-in-the-loop.",
-    ),
-    _BehavioralPattern(
-        category="agent_delegation",
-        severity="high",
-        title="Sub-agent delegation/spawning",
-        pattern=re.compile(
-            r"""
-            \b codex \s+ (exec|--yolo) \b                 # Codex execution
-            | \b claude \s+ (exec|--dangerously) \b       # Claude Code execution
-            | \b spawn \s+ agent \b                       # Generic agent spawn
-            | \b sub[-_]?agent \b                         # Sub-agent reference
-            | \b Task \s* \( .*? subagent                 # SDK Task() with subagent
-            """,
-            re.VERBOSE | re.IGNORECASE,
-        ),
-        description="Sub-agent delegation can bypass safety controls. Ensure child agents inherit permission restrictions.",
-    ),
-    _BehavioralPattern(
-        category="input_injection",
-        severity="high",
-        title="Keystroke/input injection",
-        pattern=re.compile(
-            r"""
-            \b tmux \s+ send-keys \b                      # tmux injection
-            | \b xdotool \s+ (key|type) \b                # X11 input injection
-            | \b osascript .* keystroke \b                 # macOS keystroke
-            | \b xdg-open \b                              # Open arbitrary URLs
-            | \b AppleScript .* activate \b               # macOS app control
-            """,
-            re.VERBOSE | re.IGNORECASE,
-        ),
-        description="Input injection can control other applications. Remove keystroke/input simulation capabilities.",
-    ),
-    _BehavioralPattern(
-        category="surveillance_access",
-        severity="high",
-        title="Camera/screen surveillance access",
-        pattern=re.compile(
-            r"""
-            \b camsnap \b                                 # Camera snapshot
-            | \b rtsp://                                  # RTSP camera stream
-            | \b imagesnap \b                             # macOS camera
-            | \b screencapture \b                         # macOS screenshot
-            | \b ffmpeg .* /dev/video                     # Linux webcam
-            | \b screenshot \s+ capture \b                # Generic screenshot
-            """,
-            re.VERBOSE | re.IGNORECASE,
-        ),
-        description="Surveillance access can capture sensitive visual data. Remove camera/screen capture capabilities.",
-    ),
-    _BehavioralPattern(
-        category="privilege_escalation",
-        severity="high",
-        title="Privilege escalation",
-        pattern=re.compile(
-            r"""
-            \b sudo \s+ \S                               # sudo with command
-            | \b su \s+ -                                 # Switch user
-            | \b doas \s+ \S                              # OpenBSD doas
-            | \b chmod \s+ u\+s \b                        # Set SUID bit
-            | \b chown \s+ root \b                        # Change owner to root
-            """,
-            re.VERBOSE | re.IGNORECASE,
-        ),
-        description="Privilege escalation grants root/admin access. Never run agents with elevated privileges.",
-    ),
-    _BehavioralPattern(
-        category="financial_transaction",
-        severity="high",
-        title="Financial transaction capability",
-        pattern=re.compile(
-            r"""
-            \b reorder \s+ --confirm \b                   # Auto-reorder
-            | \b stripe \s+ charges \s+ create \b         # Stripe charge
-            | \b paypal \s+ send \b                       # PayPal transfer
-            | \b transfer[-_]?funds \b                    # Generic fund transfer
-            | \b purchase[-_]?order \b                    # Purchase order
-            | \b bitcoin[-_]?send \b                      # Crypto send
-            """,
-            re.VERBOSE | re.IGNORECASE,
-        ),
-        description="Financial transactions should never be automated without human approval. Add confirmation gates.",
-    ),
-    # ── MEDIUM ────────────────────────────────────────────────────────────
-    _BehavioralPattern(
-        category="network_exposure",
-        severity="medium",
-        title="Network exposure (bind to all interfaces)",
-        pattern=re.compile(
-            r"""
-            --host \s+ 0\.0\.0\.0                         # Bind all interfaces
-            | \b bind \s+ 0\.0\.0\.0                      # Socket bind all
-            | \b ngrok \b                                 # ngrok tunnel
-            | \b localtunnel \b                           # localtunnel
-            | \b cloudflared \s+ tunnel \b                # Cloudflare tunnel
-            """,
-            re.VERBOSE | re.IGNORECASE,
-        ),
-        description="Binding to 0.0.0.0 or tunneling exposes local services to the network. Use 127.0.0.1 instead.",
-    ),
-    _BehavioralPattern(
-        category="data_exfiltration",
-        severity="medium",
-        title="Data exfiltration / private data access",
-        pattern=re.compile(
-            r"""
-            \b imsg \s+ history \b                        # iMessage history
-            | \b read[-_]?contacts \b                     # Contact list access
-            | \b sqlite3 .* (History|Cookies|Login)       # Browser data
-            | \b chat[-_]?history \b                      # Chat history access
-            | \b export[-_]?contacts \b                   # Contact export
-            """,
-            re.VERBOSE | re.IGNORECASE,
-        ),
-        description="Accessing private data (messages, contacts, browser history) is a privacy risk. Remove data access commands.",
-    ),
-    _BehavioralPattern(
-        category="persistence_mechanism",
-        severity="medium",
-        title="Persistence mechanism (cron/launchd/systemd)",
-        pattern=re.compile(
-            r"""
-            \b crontab \s+ -[ei] \b                       # Edit crontab
-            | \*/\d+ \s+ \*                               # Cron schedule pattern
-            | \b launchctl \s+ load \b                    # macOS launchd
-            | \b systemctl \s+ enable \b                  # Linux systemd
-            | \b schtasks \s+ /create \b                  # Windows task scheduler
-            """,
-            re.VERBOSE | re.IGNORECASE,
-        ),
-        description="Persistence mechanisms let agents run unattended. Remove scheduled task creation capabilities.",
-    ),
-    _BehavioralPattern(
-        category="memory_poisoning",
-        severity="medium",
-        title="Agent memory/config poisoning",
-        pattern=re.compile(
-            r"""
-            \b (write|append|echo|cat\s*>) .* MEMORY\.md  # Claude memory
-            | \b (write|append|echo|cat\s*>) .* CLAUDE\.md # Claude config
-            | \b (write|append|echo|cat\s*>) .* \.cursorrules # Cursor config
-            | \b (write|append|echo|cat\s*>) .* AGENTS\.md # Agents config
-            | \b (write|append|echo|cat\s*>) .* \.windsurfrules # Windsurf config
-            """,
-            re.VERBOSE | re.IGNORECASE,
-        ),
-        description="Writing to agent config files can poison future sessions. Never allow skills to modify agent memory.",
-    ),
-    _BehavioralPattern(
-        category="repository_modification",
-        severity="medium",
-        title="Repository modification (push/merge)",
-        pattern=re.compile(
-            r"""
-            \b git \s+ push \b (?! .* --dry-run)          # git push (not dry-run)
-            | \b git \s+ push \s+ --force \b              # Force push
-            | \b gh \s+ pr \s+ merge \b                   # GitHub PR merge
-            | \b git \s+ commit \b                        # git commit
-            """,
-            re.VERBOSE | re.IGNORECASE,
-        ),
-        description="Repository modifications can ship unreviewed code. Require human review before push/merge.",
-    ),
-    _BehavioralPattern(
-        category="destructive_action",
-        severity="medium",
-        title="Destructive system action",
-        pattern=re.compile(
-            r"""
-            \b rm \s+ -r?f \b                             # rm -rf / rm -f
-            | \b kill \s+ -9 \b                           # Force kill process
-            | \b DROP \s+ TABLE \b                        # SQL drop table
-            | \b TRUNCATE \s+ TABLE \b                    # SQL truncate
-            | \b shred \b                                 # Secure file deletion
-            | \b mkfs \b                                  # Format filesystem
-            """,
-            re.VERBOSE | re.IGNORECASE,
-        ),
-        description="Destructive actions can cause data loss. Add confirmation prompts before any delete/destroy operation.",
-    ),
-]
-
-
-# ── Behavioral scanning function ─────────────────────────────────────────────
-
-
-def _scan_behavioral_risks(raw_content: dict[str, str]) -> list[SkillFinding]:
-    """Scan full skill file text for behavioral risk patterns.
-
-    Args:
-        raw_content: Mapping of filename → full text content.
-
-    Returns:
-        List of SkillFinding with context="behavioral".
-    """
-    findings: list[SkillFinding] = []
-
-    for filename, content in raw_content.items():
-        seen_categories: set[str] = set()
-
-        for bp in _BEHAVIORAL_PATTERNS:
-            if bp.category in seen_categories:
-                continue
-
-            match = bp.pattern.search(content)
-            if match:
-                seen_categories.add(bp.category)
-                snippet = match.group(0).strip()
-                if len(snippet) > 120:
-                    snippet = snippet[:117] + "..."
-
-                findings.append(
-                    SkillFinding(
-                        severity=bp.severity,
-                        category=bp.category,
-                        title=bp.title,
-                        detail=(f'Detected in {filename}: "{snippet}". {bp.description}'),
-                        source_file=filename,
-                        recommendation=bp.description,
-                        context="behavioral",
-                    )
-                )
-
-    return findings
 
 
 # ── Dynamic package verification ─────────────────────────────────────────────
@@ -446,13 +99,20 @@ async def _batch_verify_packages(
     results: dict[str, bool] = {}
     sem = asyncio.Semaphore(20)
 
-    async def _check(name: str, eco: str) -> None:
+    async def _check(name: str, eco: str) -> tuple[str, bool]:
         async with sem:
             found = await _verify_package_exists(name, eco)
             # fail-open: treat network errors as "exists" to avoid false flags
-            results[name] = found if found is not None else True
+            return name, found if found is not None else True
 
-    await asyncio.gather(*[_check(n, e) for n, e in packages])
+    outcomes = await asyncio.gather(*[_check(n, e) for n, e in packages], return_exceptions=True)
+    for package, outcome in zip(packages, outcomes, strict=False):
+        name = package[0]
+        if isinstance(outcome, BaseException):
+            logger.debug("Package verify task failed for %s; fail-open as exists", name)
+            results[name] = True
+            continue
+        results[outcome[0]] = outcome[1]
     return results
 
 
@@ -477,6 +137,7 @@ def audit_skill_result(result: SkillScanResult) -> SkillAuditResult:
       5. Dangerous server names (HIGH)
       6. Excessive credential exposure (MEDIUM)
       7. External URL / data exfiltration (MEDIUM)
+      8. MCP blocklist match on extracted servers (CRITICAL/HIGH)
     """
     registry = _load_registry()
     audit = SkillAuditResult()
@@ -551,6 +212,8 @@ def audit_skill_result(result: SkillScanResult) -> SkillAuditResult:
     if result.raw_content:
         behavioral_findings = _scan_behavioral_risks(result.raw_content)
         audit.findings.extend(behavioral_findings)
+        audit.findings.extend(_scan_python_ast_risks(result.raw_content))
+        audit.findings.extend(_scan_js_ts_semantic_risks(result.raw_content))
 
     # ── Metadata quality checks (SKILL.md frontmatter) ───────────────
     if result.metadata is not None:
@@ -558,6 +221,7 @@ def audit_skill_result(result: SkillScanResult) -> SkillAuditResult:
         audit.findings.extend(metadata_findings)
 
     # ── Final pass/fail ──────────────────────────────────────────────────
+    audit.behavioral_summary = _summarize_behavioral_findings(audit.findings)
     audit.passed = not any(f.severity in ("critical", "high") for f in audit.findings)
 
     return audit
@@ -647,7 +311,7 @@ def _check_server(
     source_file: str,
     audit: SkillAuditResult,
 ) -> None:
-    """Run checks 2, 4-5, and 7 against a single MCP server."""
+    """Run checks 2, 4-5, 7, and 8 against a single MCP server."""
     # ── Check 4: Shell/exec access via command ───────────────────────────
     cmd_base = srv.command.rsplit("/", 1)[-1].lower() if srv.command else ""
     if cmd_base in _SHELL_COMMANDS:
@@ -746,6 +410,37 @@ def _check_server(
             )
         )
 
+    # ── Check 8: MCP blocklist (skill-extracted servers) ───────────────
+    try:
+        from agent_bom.mcp_blocklist import match_mcp_server
+    except Exception:  # pragma: no cover - import guard
+        match_mcp_server = None  # type: ignore[assignment]
+    if match_mcp_server is not None:
+        for match in match_mcp_server(srv):
+            detail_bits = [match.description or match.title]
+            if match.matched_value:
+                detail_bits.append(f"Matched value: {match.matched_value!r} ({match.match_type}).")
+            detail_bits.append(f"Extracted from skill/instruction surface {source_file}.")
+            audit.findings.append(
+                SkillFinding(
+                    severity=str(match.severity or "high").lower(),
+                    category="mcp_blocklist",
+                    title=match.title,
+                    detail=" ".join(bit for bit in detail_bits if bit),
+                    source_file=source_file,
+                    server=srv.name,
+                    package=match.package or None,
+                    recommendation=(
+                        "Remove or disable the matched MCP server until the blocklist entry is reviewed."
+                        if match.default_recommendation == "block"
+                        else "Review the matched MCP server against the blocklist entry before use."
+                    ),
+                    context="config_block",
+                    evidence_source="external_registry",
+                    confidence=str(match.confidence or "high"),
+                )
+            )
+
     # ── Check 7: External URL ────────────────────────────────────────────
     if srv.transport in (TransportType.SSE, TransportType.STREAMABLE_HTTP) and srv.url:
         url_lower = srv.url.lower()
@@ -761,7 +456,7 @@ def _check_server(
                     title=f"External URL on server '{srv.name}'",
                     detail=(
                         f"MCP server config '{srv.name}' (from JSON block in {source_file}) "
-                        f"connects to external URL '{srv.url}'. "
+                        f"connects to external URL '{sanitize_url(srv.url)}'. "
                         "Data sent to this server may leave your network."
                     ),
                     source_file=source_file,
@@ -770,182 +465,6 @@ def _check_server(
                     context="config_block",
                 )
             )
-
-
-# ── Metadata quality checks ──────────────────────────────────────────────────
-
-# Commands that imply runtime dependencies needing declaration
-_RUNTIME_DEP_PATTERNS: dict[str, list[str]] = {
-    "docker": [r"\bdocker\b", r"--image\b", r"\bcontainer\b"],
-    "grype": [r"\bgrype\b", r"\bsyft\b"],
-    "kubectl": [r"\bkubectl\b", r"\bk8s\b", r"\bkubernetes\b"],
-    "terraform": [r"\bterraform\b", r"\btf\b"],
-    "helm": [r"\bhelm\b"],
-}
-
-
-def _check_metadata_quality(
-    meta: SkillMetadata,
-    raw_content: dict[str, str],
-    source_file: str,
-) -> list[SkillFinding]:
-    """Check SKILL.md metadata for completeness and transparency gaps.
-
-    Modeled after OpenClaw's security assessment categories:
-      - Purpose & Capability: source/homepage consistency
-      - Install Mechanism: source verification, multiple install methods
-      - Instruction Scope: undeclared runtime dependencies
-      - Credentials: documented scope
-    """
-
-    findings: list[SkillFinding] = []
-
-    # ── Missing source / homepage ─────────────────────────────────────
-    if not meta.homepage and not meta.source:
-        findings.append(
-            SkillFinding(
-                severity="medium",
-                category="missing_source",
-                title="No homepage or source URL in skill metadata",
-                detail=(
-                    f"Skill '{meta.name or 'unknown'}' in {source_file} has no homepage "
-                    "or source URL in its frontmatter. Users cannot verify the publisher "
-                    "or audit the source code."
-                ),
-                source_file=source_file,
-                recommendation="Add 'homepage' and 'source' fields to the YAML frontmatter.",
-                context="metadata",
-            )
-        )
-
-    # ── Missing license ───────────────────────────────────────────────
-    if not meta.license:
-        findings.append(
-            SkillFinding(
-                severity="low",
-                category="missing_license",
-                title="No license declared in skill metadata",
-                detail=(
-                    f"Skill '{meta.name or 'unknown'}' in {source_file} does not declare "
-                    "a license. This makes it unclear under what terms the skill can be used."
-                ),
-                source_file=source_file,
-                recommendation="Add a 'license' field (e.g. 'Apache-2.0', 'MIT') to the frontmatter.",
-                context="metadata",
-            )
-        )
-
-    # ── Undeclared runtime dependencies ───────────────────────────────
-    all_text = " ".join(raw_content.values()).lower()
-    declared_bins = set(b.lower() for b in meta.required_bins + meta.optional_bins)
-
-    for dep_name, patterns in _RUNTIME_DEP_PATTERNS.items():
-        if dep_name.lower() in declared_bins:
-            continue
-        for pat in patterns:
-            if re.search(pat, all_text, re.IGNORECASE):
-                findings.append(
-                    SkillFinding(
-                        severity="medium",
-                        category="undeclared_dependency",
-                        title=f"Undeclared runtime dependency: '{dep_name}'",
-                        detail=(
-                            f"Skill '{meta.name or 'unknown'}' in {source_file} references "
-                            f"'{dep_name}' in its instructions but does not declare it "
-                            "in required_bins or optional_bins. Users may encounter failures "
-                            "if the binary is not installed."
-                        ),
-                        source_file=source_file,
-                        recommendation=(
-                            f"Add '{dep_name}' to 'optional_bins' (if optional) or "
-                            "'requires.bins' (if required) in the frontmatter metadata."
-                        ),
-                        context="metadata",
-                    )
-                )
-                break  # One finding per dep, not per pattern match
-
-    # ── Single install method ─────────────────────────────────────────
-    if len(meta.install_methods) == 1:
-        findings.append(
-            SkillFinding(
-                severity="low",
-                category="limited_install",
-                title="Only one install method declared",
-                detail=(
-                    f"Skill '{meta.name or 'unknown'}' in {source_file} only provides "
-                    f"'{meta.install_methods[0]}' as an install method. Offering "
-                    "multiple install options (uv, pip, pipx) improves accessibility."
-                ),
-                source_file=source_file,
-                recommendation="Add alternative install methods (pip, pipx) to the frontmatter.",
-                context="metadata",
-            )
-        )
-
-    # ── Read-only claims without source verification ──────────────────
-    read_only_claimed = any("read-only" in text.lower() or "read only" in text.lower() for text in raw_content.values())
-    if read_only_claimed and not meta.source and not meta.homepage:
-        findings.append(
-            SkillFinding(
-                severity="medium",
-                category="unverifiable_claim",
-                title="Read-only claim without source verification",
-                detail=(
-                    f"Skill '{meta.name or 'unknown'}' in {source_file} claims read-only "
-                    "behavior but provides no source URL for users to verify this claim. "
-                    "Without access to the source code, read-only guarantees are runtime "
-                    "assertions that cannot be audited."
-                ),
-                source_file=source_file,
-                recommendation=("Add a 'source' URL to the frontmatter so users can audit the code and verify read-only behavior."),
-                context="metadata",
-            )
-        )
-
-    # ── Network endpoints not documented ──────────────────────────────
-    # Check if skill content references API calls but doesn't have a
-    # "network" or "endpoints" or "API" documentation section
-    has_api_refs = bool(
-        re.search(
-            r"https?://(?:api\.|registry\.|services\.)",
-            all_text,
-        )
-    )
-    # Look for documentation sections about network/endpoints, not just API URLs
-    has_network_docs = bool(
-        re.search(
-            r"(?:^|\n)#+\s+.*(?:network|endpoint|transparenc|api.+call)",
-            all_text,
-            re.IGNORECASE,
-        )
-    ) or bool(
-        re.search(
-            r"(?:network\s+endpoint|endpoint.+call|api.+(?:read-only|read only))",
-            all_text,
-            re.IGNORECASE,
-        )
-    )
-    if has_api_refs and not has_network_docs:
-        findings.append(
-            SkillFinding(
-                severity="medium",
-                category="undocumented_network",
-                title="API endpoints referenced but not documented",
-                detail=(
-                    f"Skill '{meta.name or 'unknown'}' in {source_file} references "
-                    "external API URLs but does not document which network endpoints "
-                    "are called or what data is transmitted."
-                ),
-                source_file=source_file,
-                recommendation=(
-                    "Add a 'Transparency' or 'Network endpoints' section documenting all external APIs called and what data is sent."
-                ),
-                context="metadata",
-            )
-        )
-
-    return findings
 
 
 def _match_server_to_registry(srv, registry: dict) -> dict | None:
@@ -970,3 +489,105 @@ def _match_server_to_registry(srv, registry: dict) -> dict | None:
             if pkg_name and pkg_name in candidate:
                 return entry
     return None
+
+
+# ── Unified Finding stream ───────────────────────────────────────────────────
+
+
+def _risk_score(severity: str) -> float:
+    return {
+        "critical": 9.0,
+        "high": 7.5,
+        "medium": 5.0,
+        "low": 2.5,
+    }.get(str(severity or "").lower(), 1.0)
+
+
+def _finding_type_for_skill_category(category: str):
+    """Map skill-audit categories onto the unified Finding taxonomy.
+
+    Behavioral / package / server findings stay ``SKILL_RISK`` so the skill
+    lane keeps a single rule id in SARIF/exports. Only curated MCP blocklist
+    hits cross-walk to ``MCP_BLOCKLIST`` (same policy signal as MCP scan).
+    """
+    from agent_bom.finding import FindingType
+
+    normalized = str(category or "").lower()
+    if normalized == "mcp_blocklist":
+        return FindingType.MCP_BLOCKLIST
+    return FindingType.SKILL_RISK
+
+
+def skill_audit_data_to_findings(skill_audit: dict) -> list:
+    """Convert serialized skill-audit data into the unified Finding stream.
+
+    Mirrors ``prompt_scan_data_to_findings`` so main-scan / API reports carry
+    ``FindingType.SKILL_RISK`` (and MCP blocklist hits) instead of leaving
+    skill results only in the ``skill_audit_data`` sidecar.
+    """
+    from agent_bom.finding import Asset, Finding, FindingSource
+
+    if not isinstance(skill_audit, dict):
+        return []
+
+    unified = []
+    for item in skill_audit.get("findings") or []:
+        if not isinstance(item, dict):
+            continue
+        source_file = str(item.get("source_file") or "")
+        category = str(item.get("category") or "skill_risk")
+        severity = str(item.get("ai_adjusted_severity") or item.get("severity") or "unknown").lower()
+        if severity == "false_positive":
+            continue
+        title = str(item.get("title") or "Skill security finding")
+        asset_name = str(item.get("server") or item.get("package") or "") or (Path(source_file).name if source_file else "skill")
+        asset_type = "mcp_server" if item.get("server") else ("package" if item.get("package") else "skill_file")
+        identifier = item.get("server") or item.get("package") or source_file or None
+        unified.append(
+            Finding(
+                finding_type=_finding_type_for_skill_category(category),
+                source=FindingSource.SKILL,
+                asset=Asset(
+                    name=asset_name,
+                    asset_type=asset_type,
+                    identifier=str(identifier) if identifier else None,
+                    location=source_file or None,
+                ),
+                severity=severity,
+                title=title,
+                description=str(item.get("detail") or title),
+                remediation_guidance=str(item.get("recommendation") or "") or None,
+                owasp_tags=["LLM01"] if "injection" in category or "prompt" in category else [],
+                owasp_mcp_tags=["MCP04", "MCP07"] if category == "mcp_blocklist" else [],
+                nist_ai_rmf_tags=["MAP-4.1", "MEASURE-2.6"],
+                evidence={
+                    "category": category,
+                    "package": item.get("package"),
+                    "server": item.get("server"),
+                    "context": item.get("context"),
+                    "confidence": item.get("confidence"),
+                    "evidence_source": item.get("evidence_source"),
+                    "source_line": item.get("source_line"),
+                    "ai_detected": item.get("ai_detected"),
+                    "scanner": "skill_audit",
+                },
+                risk_score=_risk_score(severity),
+            )
+        )
+    return unified
+
+
+def replace_skill_findings(report, skill_audit: dict | None) -> int:
+    """Replace ``FindingSource.SKILL`` rows on *report* from serialized audit data.
+
+    Returns the number of findings attached.
+    """
+    from agent_bom.finding import FindingSource
+
+    if skill_audit is None:
+        return 0
+    existing = list(getattr(report, "findings", None) or [])
+    retained = [finding for finding in existing if getattr(finding, "source", None) != FindingSource.SKILL]
+    added = skill_audit_data_to_findings(skill_audit)
+    report.findings = retained + added
+    return len(added)

@@ -23,6 +23,10 @@ Each ADR follows this structure:
 | 003 | [FastAPI APIRouter Pattern](003-fastapi-apirouter-pattern.md) | Accepted | 2026-03-11 |
 | 004 | [Proxy-Based Runtime Enforcement](004-proxy-runtime-enforcement.md) | Accepted | 2026-03-11 |
 | 005 | [Re-Export Pattern for Backward Compatibility](005-re-export-pattern.md) | Accepted | 2026-03-11 |
+| 006 | [Unified Graph Write Batching](006-unified-graph-write-batching.md) | Accepted | 2026-04-25 |
+| 007 | [MCP Package Version Provenance](007-mcp-package-version-provenance.md) | Accepted | 2026-05-01 |
+| 008 | [Pluggable Neptune Graph Backend](008-pluggable-neptune-graph-backend.md) | Proposed | 2026-05-13 |
+| 009 | [Python-Primary Runtime; Optional Go Sidecar Later](009-python-primary-go-sidecar-later.md) | Accepted | 2026-07-23 |
 
 ## Adding a New ADR
 

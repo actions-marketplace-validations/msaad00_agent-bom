@@ -1,0 +1,1335 @@
+"""UnifiedGraph — the single graph container with traversal, filtering, and views."""
+
+from __future__ import annotations
+
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+from agent_bom.graph.analysis import GraphAnalysisStatus, analysis_status_map_from_dict, analysis_status_map_to_dict
+from agent_bom.graph.bottleneck import BottleneckAnalysis, compute_bottlenecks
+from agent_bom.graph.edge import UnifiedEdge
+from agent_bom.graph.node import UnifiedNode
+from agent_bom.graph.ocsf import FINDING_ENTITY_TYPES
+from agent_bom.graph.severity import SEVERITY_RANK
+from agent_bom.graph.types import EntityType, GraphSemanticLayer, NodeStatus, RelationshipType
+from agent_bom.graph.util import _now_iso
+
+
+@dataclass(slots=True)
+class TechniqueMapping:
+    """A typed MITRE ATT&CK / ATLAS technique mapped to one hop of an attack path.
+
+    These are *potential* techniques derived from the graph's observed evidence
+    (the hop's edge relationship type + the target node's entity type + the
+    edge's evidence), NOT a claim that the technique was detected being used.
+    ``technique_id`` / ``tactics`` always resolve against the bundled catalog
+    (see :mod:`agent_bom.graph.attack_path_mitre`); a hop whose evidence maps to
+    no known technique is simply left without a mapping (fail-closed).
+    """
+
+    hop_index: int  # 0-based position in the kill-chain edge sequence
+    technique_id: str  # e.g. "T1078" (ATT&CK) or "AML.T0053" (ATLAS)
+    technique_name: str = ""
+    catalog: str = "attack"  # "attack" | "atlas"
+    tactics: list[str] = field(default_factory=list)
+    provenance: str = ""  # observed evidence that produced the mapping
+    confidence: float = 0.0  # 0..1 signal, never an assertion of activity
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "hop_index": self.hop_index,
+            "technique_id": self.technique_id,
+            "technique_name": self.technique_name,
+            "catalog": self.catalog,
+            "tactics": self.tactics,
+            "provenance": self.provenance,
+            "confidence": self.confidence,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TechniqueMapping:
+        return cls(
+            hop_index=int(data.get("hop_index", 0)),
+            technique_id=data["technique_id"],
+            technique_name=data.get("technique_name", ""),
+            catalog=data.get("catalog", "attack"),
+            tactics=list(data.get("tactics", [])),
+            provenance=data.get("provenance", ""),
+            confidence=float(data.get("confidence", 0.0)),
+        )
+
+
+def technique_mappings_from_json(raw: object) -> list["TechniqueMapping"]:
+    """Decode persisted ``technique_mappings`` JSON into typed objects.
+
+    Tolerant of legacy rows: ``None`` / empty / malformed values yield ``[]``.
+    """
+    import json
+
+    if not raw:
+        return []
+    if isinstance(raw, (str, bytes, bytearray)):
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return []
+    else:
+        data = raw
+    if not isinstance(data, list):
+        return []
+    return [TechniqueMapping.from_dict(m) for m in data if isinstance(m, dict)]
+
+
+@dataclass(slots=True)
+class AttackPath:
+    """Precomputed attack path between two nodes."""
+
+    source: str
+    target: str
+    hops: list[str] = field(default_factory=list)
+    edges: list[str] = field(default_factory=list)
+    composite_risk: float = 0.0
+    summary: str = ""
+    credential_exposure: list[str] = field(default_factory=list)
+    tool_exposure: list[str] = field(default_factory=list)
+    vuln_ids: list[str] = field(default_factory=list)
+    # Stable Finding.id values that anchor this path (preferred over CVE labels
+    # in vuln_ids). Additive — empty on legacy rows; API may recompute from
+    # vulnerability node attributes.finding_id.
+    finding_ids: list[str] = field(default_factory=list)
+    # Typed MITRE ATT&CK / ATLAS techniques mapped from this path's observed
+    # evidence, ordered by hop. Potential/mapped techniques for the kill-chain
+    # sequence — never a claim of observed attacker activity.
+    technique_mappings: list[TechniqueMapping] = field(default_factory=list)
+
+    def mitre_technique_ids(self) -> list[str]:
+        """Deduped, sorted technique IDs mapped across all hops (convenience)."""
+        return sorted({m.technique_id for m in self.technique_mappings})
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "target": self.target,
+            "hops": self.hops,
+            "edges": self.edges,
+            "composite_risk": self.composite_risk,
+            "summary": self.summary,
+            "credential_exposure": self.credential_exposure,
+            "tool_exposure": self.tool_exposure,
+            "vuln_ids": self.vuln_ids,
+            "finding_ids": self.finding_ids,
+            "technique_mappings": [m.to_dict() for m in self.technique_mappings],
+            "mitre_technique_ids": self.mitre_technique_ids(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AttackPath:
+        return cls(
+            source=data["source"],
+            target=data["target"],
+            hops=data.get("hops", []),
+            edges=data.get("edges", []),
+            composite_risk=data.get("composite_risk", 0.0),
+            summary=data.get("summary", ""),
+            credential_exposure=data.get("credential_exposure", []),
+            tool_exposure=data.get("tool_exposure", []),
+            vuln_ids=data.get("vuln_ids", []),
+            finding_ids=list(data.get("finding_ids") or []),
+            technique_mappings=[TechniqueMapping.from_dict(m) for m in data.get("technique_mappings", [])],
+        )
+
+
+@dataclass(slots=True)
+class Campaign:
+    """A deterministic cluster of fused attack paths converging on one crown jewel.
+
+    Campaigns are the large-estate decision surface: instead of thousands of raw
+    paths, an operator sees a handful of prioritized campaigns, each grouping every
+    kill-chain that terminates at the same crown-jewel data store. Identity is
+    derived from ``tenant_id`` + the jewel's canonical id, so the *same estate*
+    yields the *same* ``campaign_id`` across runs and backends.
+    """
+
+    campaign_id: str
+    crown_jewel: str
+    crown_jewel_label: str
+    partition: str
+    owner: str
+    business_impact: str
+    exploitability: float
+    expected_risk_reduction: float
+    path_count: int
+    top_path_summary: str
+    cross_partition: bool
+    evidence: list[str] = field(default_factory=list)
+    member_paths: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "campaign_id": self.campaign_id,
+            "crown_jewel": self.crown_jewel,
+            "crown_jewel_label": self.crown_jewel_label,
+            "partition": self.partition,
+            "owner": self.owner,
+            "business_impact": self.business_impact,
+            "exploitability": self.exploitability,
+            "expected_risk_reduction": self.expected_risk_reduction,
+            "path_count": self.path_count,
+            "top_path_summary": self.top_path_summary,
+            "cross_partition": self.cross_partition,
+            "evidence": self.evidence,
+            "member_paths": self.member_paths,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Campaign:
+        return cls(
+            campaign_id=str(data["campaign_id"]),
+            crown_jewel=str(data.get("crown_jewel", "")),
+            crown_jewel_label=str(data.get("crown_jewel_label", "")),
+            partition=str(data.get("partition", "")),
+            owner=str(data.get("owner", "")),
+            business_impact=str(data.get("business_impact", "")),
+            exploitability=float(data.get("exploitability", 0.0)),
+            expected_risk_reduction=float(data.get("expected_risk_reduction", 0.0)),
+            path_count=int(data.get("path_count", 0)),
+            top_path_summary=str(data.get("top_path_summary", "")),
+            cross_partition=bool(data.get("cross_partition", False)),
+            evidence=list(data.get("evidence", [])),
+            member_paths=list(data.get("member_paths", [])),
+        )
+
+
+@dataclass(slots=True)
+class InteractionRisk:
+    """Cross-agent interaction risk pattern."""
+
+    pattern: str
+    agents: list[str]
+    risk_score: float
+    description: str
+    owasp_agentic_tag: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pattern": self.pattern,
+            "agents": self.agents,
+            "risk_score": self.risk_score,
+            "description": self.description,
+            "owasp_agentic_tag": self.owasp_agentic_tag,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> InteractionRisk:
+        return cls(
+            pattern=data["pattern"],
+            agents=data.get("agents", []),
+            risk_score=data.get("risk_score", 0.0),
+            description=data.get("description", ""),
+            owasp_agentic_tag=data.get("owasp_agentic_tag"),
+        )
+
+
+def resolve_node_budget(budget: int | None) -> int | None:
+    """Normalize a node budget; non-positive means unbounded.
+
+    Callers that need a whole graph to be correct — snapshot diff, compare,
+    anything computing removals — must be able to opt out, because a truncated
+    graph would read as deletions that never happened.
+    """
+    if budget is None or budget <= 0:
+        return None
+    return budget
+
+
+def apply_node_budget(graph: "UnifiedGraph", budget: int | None) -> "UnifiedGraph":
+    """Trim *graph* in place to the highest-risk ``budget`` nodes.
+
+    For backends that cannot push a limit into their query, this keeps the
+    bounded-and-declared contract uniform: the same completeness descriptor is
+    populated whether the cap was applied in SQL or afterwards. Edges whose
+    endpoints were dropped go too, so no edge dangles.
+    """
+    resolved = resolve_node_budget(budget)
+    total = len(graph.nodes)
+    if resolved is None or total <= resolved:
+        graph.completeness = GraphCompleteness(node_budget=resolved, total_nodes=total, returned_nodes=total)
+        return graph
+
+    ranked = sorted(graph.nodes.values(), key=lambda n: (-(n.risk_score or 0.0), n.id))
+    keep = {node.id for node in ranked[:resolved]}
+    graph.nodes = {node_id: node for node_id, node in graph.nodes.items() if node_id in keep}
+
+    surviving = [edge for edge in graph.edges if edge.source in keep and edge.target in keep]
+    graph.edges = []
+    graph.adjacency = defaultdict(list)
+    graph.reverse_adjacency = defaultdict(list)
+    graph._edge_keys = set()
+    for edge in surviving:
+        graph.add_edge(edge)
+    graph.completeness = GraphCompleteness(
+        truncated=True,
+        node_budget=resolved,
+        total_nodes=total,
+        returned_nodes=len(graph.nodes),
+        reason="node_budget",
+    )
+    return graph
+
+
+@dataclass(slots=True)
+class GraphCompleteness:
+    """Whether a loaded graph is the whole snapshot, and what was left out.
+
+    A bounded load is fine; a *silent* one is not. Without this a caller cannot
+    tell an empty blast radius from a trimmed one, which is the difference
+    between "nothing reaches this" and "we stopped looking".
+    """
+
+    truncated: bool = False
+    node_budget: int | None = None
+    total_nodes: int = 0
+    returned_nodes: int = 0
+    reason: str = ""
+    depth_limited: bool = False
+    """The walk stopped at ``max_depth`` with reachable neighbours still unwalked.
+
+    Distinct from ``truncated``, which is a *budget* overrun: widening the node
+    budget recovers different nodes than widening the depth. Both mean the
+    result is not exhaustive, so both surface as ``truncated`` in ``to_dict``;
+    the reason names which one. Set only when the frontier was demonstrably
+    non-empty, so a walk that really did exhaust the graph inside its depth cap
+    still reports ``complete``.
+    """
+
+    @property
+    def omitted_nodes(self) -> int:
+        return max(0, self.total_nodes - self.returned_nodes)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize through the shared graph-completeness contract.
+
+        The API already has one shape for "is this response exhaustive"; this
+        must not become a second one that clients have to branch on.
+        """
+        from agent_bom.graph.completeness import graph_completeness
+
+        return graph_completeness(
+            returned=self.returned_nodes,
+            total=self.total_nodes,
+            truncated=self.truncated or self.depth_limited,
+            reason=self.reason or ("depth_limit" if self.depth_limited else ""),
+        )
+
+
+@dataclass
+class UnifiedGraph:
+    """The canonical graph structure for agent-bom.
+
+    Direction-aware: only bidirectional edges get reverse adjacency entries.
+    """
+
+    nodes: dict[str, UnifiedNode] = field(default_factory=dict)
+    edges: list[UnifiedEdge] = field(default_factory=list)
+    adjacency: dict[str, list[UnifiedEdge]] = field(default_factory=lambda: defaultdict(list))
+    reverse_adjacency: dict[str, list[UnifiedEdge]] = field(default_factory=lambda: defaultdict(list))
+    _edge_keys: set[tuple[str, str, str]] = field(default_factory=set, repr=False)
+
+    attack_paths: list[AttackPath] = field(default_factory=list)
+    attack_campaigns: list[Campaign] = field(default_factory=list)
+    interaction_risks: list[InteractionRisk] = field(default_factory=list)
+    analysis_status: dict[str, GraphAnalysisStatus] = field(default_factory=dict)
+
+    # NHI-governance findings materialized during the build (over-grant, dormant/
+    # orphaned, high-risk identities). Held as opaque Finding objects so callers
+    # (CLI scan_cmd + API pipeline) can route them into the unified finding
+    # stream without the container importing the finding module.
+    nhi_governance_findings: list[Any] = field(default_factory=list)
+
+    scan_id: str = ""
+    tenant_id: str = ""
+    created_at: str = ""
+    completeness: "GraphCompleteness" = field(default_factory=lambda: GraphCompleteness())
+
+    def __post_init__(self) -> None:
+        if not self.created_at:
+            self.created_at = _now_iso()
+
+    # ── Mutation ─────────────────────────────────────────────────────────
+
+    def add_node(self, node: UnifiedNode) -> None:
+        """Add or merge a node.  Cross-source metadata is unioned."""
+        existing = self.nodes.get(node.id)
+        if existing:
+            existing.last_seen = node.last_seen or _now_iso()
+            existing.attributes.update(node.attributes)
+            # Severity: higher wins
+            if SEVERITY_RANK.get(node.severity, 0) > SEVERITY_RANK.get(existing.severity, 0):
+                existing.severity = node.severity
+                existing.severity_id = node.severity_id
+            # Risk score: higher wins
+            if node.risk_score > existing.risk_score:
+                existing.risk_score = node.risk_score
+            # Union data_sources
+            existing_sources = set(existing.data_sources)
+            for ds in node.data_sources:
+                if ds not in existing_sources:
+                    existing.data_sources.append(ds)
+                    existing_sources.add(ds)
+            # Union compliance_tags
+            existing_tags = set(existing.compliance_tags)
+            for tag in node.compliance_tags:
+                if tag not in existing_tags:
+                    existing.compliance_tags.append(tag)
+                    existing_tags.add(tag)
+            # Merge dimensions (non-empty wins)
+            existing.dimensions = existing.dimensions.merge(node.dimensions)
+            return
+        self.nodes[node.id] = node
+
+    def add_edge(self, edge: UnifiedEdge) -> None:
+        """Add an edge with O(1) deduplication.
+
+        Reverse adjacency is ONLY added for bidirectional edges.
+        Directed edges are one-way in the adjacency map.
+
+        When the (source, target, relationship) triple already exists,
+        the new edge's ``evidence`` dict is **merged into** the kept
+        edge instead of being silently dropped. The graph builder adds
+        the same logical edge from multiple paths (package-path edge
+        first, blast-radius edge second); without the merge, the second
+        caller's evidence (cvss, epss, kev, attack tags) was lost.
+        """
+        rel = edge.relationship.value if isinstance(edge.relationship, RelationshipType) else str(edge.relationship)
+        key = (edge.source, edge.target, rel)
+        if key in self._edge_keys:
+            if edge.evidence:
+                for stored in self.adjacency.get(edge.source, []):
+                    if stored.target == edge.target and stored.relationship == edge.relationship:
+                        for evidence_key, value in edge.evidence.items():
+                            if value in (None, "", [], {}):
+                                continue
+                            if evidence_key not in stored.evidence or stored.evidence[evidence_key] in (None, "", [], {}):
+                                stored.evidence[evidence_key] = value
+                        break
+            return
+        self._edge_keys.add(key)
+        self.edges.append(edge)
+        self.adjacency[edge.source].append(edge)
+        # Reverse index: "what points at this node?" — always populated
+        self.reverse_adjacency[edge.target].append(edge)
+        # Forward adjacency for bidirectional edges (traversal both ways)
+        if edge.is_bidirectional:
+            reverse = UnifiedEdge(
+                source=edge.target,
+                target=edge.source,
+                relationship=edge.relationship,
+                direction=edge.direction,
+                weight=edge.weight,
+                traversable=edge.traversable,
+                first_seen=edge.first_seen,
+                last_seen=edge.last_seen,
+                valid_from=edge.valid_from,
+                valid_to=edge.valid_to,
+                source_scan_id=edge.source_scan_id,
+                source_run_id=edge.source_run_id,
+                evidence=edge.evidence,
+                confidence=edge.confidence,
+                provenance=edge.provenance,
+                activity_id=edge.activity_id,
+            )
+            self.adjacency[edge.target].append(reverse)
+            self.reverse_adjacency[edge.source].append(reverse)
+
+    # ── Query ────────────────────────────────────────────────────────────
+
+    def get_node(self, node_id: str) -> Optional[UnifiedNode]:
+        return self.nodes.get(node_id)
+
+    def nodes_by_type(self, entity_type: EntityType) -> list[UnifiedNode]:
+        return [n for n in self.nodes.values() if n.entity_type == entity_type]
+
+    def edges_from(self, node_id: str) -> list[UnifiedEdge]:
+        return self.adjacency.get(node_id, [])
+
+    def neighbors(self, node_id: str) -> list[str]:
+        return [e.target for e in self.adjacency.get(node_id, [])]
+
+    def has_node(self, node_id: str) -> bool:
+        return node_id in self.nodes
+
+    def has_edge(self, source: str, target: str) -> bool:
+        return any(e.target == target for e in self.adjacency.get(source, []))
+
+    # ── Reverse queries ("what points at X?") ────────────────────────────
+
+    def edges_to(self, node_id: str) -> list[UnifiedEdge]:
+        """All edges whose target is this node (O(1) via reverse index)."""
+        return self.reverse_adjacency.get(node_id, [])
+
+    def sources_of(self, node_id: str) -> list[str]:
+        """All node IDs that have an edge pointing at this node."""
+        return [e.source for e in self.reverse_adjacency.get(node_id, [])]
+
+    def impact_of(self, node_id: str, max_depth: int = 4) -> dict:
+        """Compute blast radius / impact stats for a node.
+
+        Follows edges IN REVERSE: "what is affected by this node?"
+        Uses reverse_adjacency for directed edges, forward adjacency
+        for bidirectional edges.
+
+        Returns:
+            {
+                "node_id": str,
+                "affected_nodes": [str],
+                "affected_by_type": {"agent": N, "server": N, ...},
+                "affected_count": int,
+                "max_depth_reached": int,
+            }
+        """
+        if node_id not in self.nodes:
+            return {"node_id": node_id, "affected_nodes": [], "affected_by_type": {}, "affected_count": 0, "max_depth_reached": 0}
+
+        # BFS in reverse direction
+        visited: set[str] = {node_id}
+        queue: deque[tuple[str, int]] = deque([(node_id, 0)])
+        max_depth_reached = 0
+
+        while queue:
+            current, depth = queue.popleft()
+            if depth >= max_depth:
+                continue
+            # Follow reverse edges (who depends on / points to current?)
+            for edge in self.reverse_adjacency.get(current, []):
+                if edge.source not in visited:
+                    visited.add(edge.source)
+                    queue.append((edge.source, depth + 1))
+                    max_depth_reached = max(max_depth_reached, depth + 1)
+
+        visited.discard(node_id)
+        by_type: dict[str, int] = defaultdict(int)
+        for nid in visited:
+            node = self.nodes.get(nid)
+            if node:
+                et = node.entity_type.value if isinstance(node.entity_type, EntityType) else node.entity_type
+                by_type[et] += 1
+
+        return {
+            "node_id": node_id,
+            "affected_nodes": sorted(visited),
+            "affected_by_type": dict(by_type),
+            "affected_count": len(visited),
+            "max_depth_reached": max_depth_reached,
+        }
+
+    def search_nodes(self, query: str, limit: int = 50) -> list[UnifiedNode]:
+        """Search nodes by label, attributes, or compliance tags.
+
+        Case-insensitive substring match across label, entity_type,
+        severity, data_sources, compliance_tags, and string attribute values.
+        """
+        q = query.lower()
+        results: list[UnifiedNode] = []
+        for node in self.nodes.values():
+            if len(results) >= limit:
+                break
+            if q in node.label.lower():
+                results.append(node)
+                continue
+            if q in (node.entity_type.value if isinstance(node.entity_type, EntityType) else node.entity_type):
+                results.append(node)
+                continue
+            if q in node.severity.lower():
+                results.append(node)
+                continue
+            if any(q in ds.lower() for ds in node.data_sources):
+                results.append(node)
+                continue
+            if any(q in tag.lower() for tag in node.compliance_tags):
+                results.append(node)
+                continue
+            if any(q in str(v).lower() for v in node.attributes.values() if isinstance(v, str)):
+                results.append(node)
+                continue
+        return results
+
+    # ── Filtering ────────────────────────────────────────────────────────
+
+    def filter_nodes(
+        self,
+        *,
+        entity_types: set[EntityType] | None = None,
+        min_severity: str = "",
+        status: NodeStatus | None = None,
+        data_source: str = "",
+        dimension_filters: dict[str, str] | None = None,
+    ) -> list[UnifiedNode]:
+        result: list[UnifiedNode] = []
+        min_rank = SEVERITY_RANK.get(min_severity, 0)
+        for node in self.nodes.values():
+            if entity_types and node.entity_type not in entity_types:
+                continue
+            if min_severity and SEVERITY_RANK.get(node.severity, 0) < min_rank:
+                continue
+            if status and node.status != status:
+                continue
+            if data_source and data_source not in node.data_sources:
+                continue
+            if dimension_filters:
+                dims = node.dimensions.to_dict()
+                if not all(dims.get(k) == v for k, v in dimension_filters.items()):
+                    continue
+            result.append(node)
+        return result
+
+    def filter_edges(
+        self,
+        *,
+        relationships: set[RelationshipType] | None = None,
+        traversable_only: bool = False,
+        min_weight: float = 0.0,
+        static_only: bool = False,
+        dynamic_only: bool = False,
+    ) -> list[UnifiedEdge]:
+        result: list[UnifiedEdge] = []
+        for edge in self.edges:
+            if relationships and edge.relationship not in relationships:
+                continue
+            if traversable_only and not edge.traversable:
+                continue
+            if edge.weight < min_weight:
+                continue
+            if static_only and edge.relationship in _DYNAMIC_RELS:
+                continue
+            if dynamic_only and edge.relationship not in _DYNAMIC_RELS:
+                continue
+            result.append(edge)
+        return result
+
+    # ── Traversal (direction-aware) ──────────────────────────────────────
+
+    def bfs(
+        self,
+        source: str,
+        max_depth: int = 4,
+        traversable_only: bool = True,
+    ) -> list[list[str]]:
+        """BFS from source, respecting edge direction via adjacency map."""
+        if source not in self.nodes:
+            return []
+        paths: list[list[str]] = []
+        queue: deque[tuple[str, list[str]]] = deque([(source, [source])])
+        visited: set[str] = {source}
+        while queue:
+            current, path = queue.popleft()
+            if len(path) > max_depth + 1:
+                continue
+            if len(path) > 1:
+                paths.append(path)
+            for edge in self.adjacency.get(current, []):
+                if traversable_only and not edge.traversable:
+                    continue
+                if edge.target not in visited:
+                    visited.add(edge.target)
+                    queue.append((edge.target, path + [edge.target]))
+        return paths
+
+    def shortest_path(self, source: str, target: str) -> list[str] | None:
+        """BFS shortest path, direction-aware."""
+        if source not in self.nodes or target not in self.nodes:
+            return None
+        if source == target:
+            return [source]
+        queue: deque[tuple[str, list[str]]] = deque([(source, [source])])
+        visited: set[str] = {source}
+        while queue:
+            current, path = queue.popleft()
+            for edge in self.adjacency.get(current, []):
+                if edge.target == target:
+                    return path + [target]
+                if edge.target not in visited:
+                    visited.add(edge.target)
+                    queue.append((edge.target, path + [edge.target]))
+        return None
+
+    def reachable_from(
+        self,
+        source: str,
+        max_depth: int = 6,
+        *,
+        traversable_only: bool = False,
+        include_source: bool = True,
+    ) -> set[str]:
+        """All node IDs reachable from source, direction-aware."""
+        if source not in self.nodes:
+            return set()
+        visited: set[str] = {source}
+        queue: deque[tuple[str, int]] = deque([(source, 0)])
+        while queue:
+            current, depth = queue.popleft()
+            if depth >= max_depth:
+                continue
+            for edge in self.adjacency.get(current, []):
+                if traversable_only and not edge.traversable:
+                    continue
+                if edge.target not in visited:
+                    visited.add(edge.target)
+                    queue.append((edge.target, depth + 1))
+        if not include_source:
+            visited.discard(source)
+        return visited
+
+    def traverse_subgraph(
+        self,
+        roots: list[str],
+        *,
+        direction: str = "forward",
+        max_depth: int = 4,
+        max_nodes: int = 500,
+        max_edges: int = 10_000,
+        deadline_monotonic: float | None = None,
+        traversable_only: bool = False,
+        relationship_types: set[RelationshipType] | None = None,
+        static_only: bool = False,
+        dynamic_only: bool = False,
+        include_roots: bool = True,
+    ) -> tuple[UnifiedGraph, dict[str, int], bool]:
+        """Traverse the graph from one or more roots and return a bounded subgraph.
+
+        ``direction`` controls whether traversal follows outgoing edges,
+        incoming edges, or both. The returned edges always preserve their
+        original orientation in the canonical graph.
+        """
+        sub = UnifiedGraph(
+            scan_id=self.scan_id,
+            tenant_id=self.tenant_id,
+            created_at=self.created_at,
+            analysis_status=dict(self.analysis_status),
+        )
+        if not roots:
+            return self._inherit_completeness(sub), {}, False
+
+        visited: set[str] = set()
+        depth_by_node: dict[str, int] = {}
+        traversed_edges: dict[tuple[str, str, str], UnifiedEdge] = {}
+        queue: deque[tuple[str, int]] = deque()
+
+        for root in roots:
+            if root not in self.nodes:
+                continue
+            queue.append((root, 0))
+            if include_roots:
+                visited.add(root)
+            depth_by_node[root] = 0
+
+        truncated = False
+        depth_limited = False
+        edge_count = 0
+
+        def _edge_allowed(edge: UnifiedEdge) -> bool:
+            if relationship_types and edge.relationship not in relationship_types:
+                return False
+            if traversable_only and not edge.traversable:
+                return False
+            if static_only and edge.relationship in _DYNAMIC_RELS:
+                return False
+            if dynamic_only and edge.relationship not in _DYNAMIC_RELS:
+                return False
+            return True
+
+        while queue:
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                truncated = True
+                break
+            current, depth = queue.popleft()
+
+            candidates: list[tuple[str, UnifiedEdge]] = []
+            if direction in {"forward", "both"}:
+                candidates.extend((edge.target, edge) for edge in self.adjacency.get(current, []))
+            if direction in {"reverse", "both"}:
+                candidates.extend((edge.source, edge) for edge in self.reverse_adjacency.get(current, []))
+
+            if depth >= max_depth:
+                # The walk stops here. Say so only if it actually left something
+                # behind: a frontier node whose neighbours were all visited
+                # anyway cost the caller nothing, and flagging it would make
+                # `truncated` meaningless on every bounded query.
+                if not depth_limited and any(
+                    neighbor not in visited and neighbor in self.nodes and _edge_allowed(edge) for neighbor, edge in candidates
+                ):
+                    depth_limited = True
+                continue
+
+            for neighbor, edge in candidates:
+                if not _edge_allowed(edge):
+                    continue
+                edge_count += 1
+                if edge_count > max_edges:
+                    truncated = True
+                    break
+
+                rel = edge.relationship.value if isinstance(edge.relationship, RelationshipType) else str(edge.relationship)
+                traversed_edges[(edge.source, edge.target, rel)] = edge
+
+                if neighbor in visited:
+                    continue
+                if len(visited) >= max_nodes:
+                    truncated = True
+                    continue
+                visited.add(neighbor)
+                depth_by_node[neighbor] = depth + 1
+                queue.append((neighbor, depth + 1))
+            if truncated and (edge_count > max_edges or (deadline_monotonic is not None and time.monotonic() >= deadline_monotonic)):
+                break
+
+        if include_roots:
+            visited.update(root for root in roots if root in self.nodes)
+
+        for node_id in visited:
+            node = self.nodes.get(node_id)
+            if node:
+                sub.add_node(node)
+
+        for edge in traversed_edges.values():
+            if edge.source in sub.nodes and edge.target in sub.nodes:
+                sub.add_edge(edge)
+
+        self._inherit_completeness(
+            sub,
+            truncated=truncated,
+            reason="traversal_budget",
+            node_budget=max_nodes if truncated else None,
+            depth_limited=depth_limited,
+        )
+        return sub, depth_by_node, truncated
+
+    # ── Centrality ───────────────────────────────────────────────────────
+
+    def degree_centrality(self) -> dict[str, float]:
+        """Distinct neighbours in EITHER direction, normalised.
+
+        Out-degree alone scored a node that 50,000 identities point at as 0 —
+        the single most-referenced node in an estate read as unconnected.
+        Counting distinct neighbours (rather than edges) keeps a bidirectional
+        edge, which is indexed both ways, from counting twice.
+        """
+        if not self.nodes:
+            return {}
+        max_possible = max(len(self.nodes) - 1, 1)
+
+        def degree(node_id: str) -> int:
+            out = {edge.target for edge in self.adjacency.get(node_id, ())}
+            incoming = {edge.source for edge in self.reverse_adjacency.get(node_id, ())}
+            return len(out | incoming)
+
+        return {nid: degree(nid) / max_possible for nid in self.nodes}
+
+    def bottleneck_analysis(self, top_n: int = 5) -> BottleneckAnalysis:
+        """Ranked bottlenecks with the source sample they were derived from."""
+        return compute_bottlenecks(
+            list(self.nodes),
+            lambda node_id: (edge.target for edge in self.adjacency.get(node_id, ())),
+            top_n=top_n,
+        )
+
+    def bottleneck_nodes(self, top_n: int = 5) -> list[tuple[str, float]]:
+        """Ranked bottlenecks only. Prefer :meth:`bottleneck_analysis` — any
+        surface that PRESENTS this ranking has to disclose that it is a sample."""
+        return self.bottleneck_analysis(top_n).nodes
+
+    # ── Stats ────────────────────────────────────────────────────────────
+
+    def stats(self) -> dict[str, Any]:
+        type_counts: dict[str, int] = defaultdict(int)
+        severity_counts: dict[str, int] = defaultdict(int)
+        for node in self.nodes.values():
+            et = node.entity_type.value if isinstance(node.entity_type, EntityType) else node.entity_type
+            type_counts[et] += 1
+            if node.severity:
+                severity_counts[node.severity] += 1
+        rel_counts: dict[str, int] = defaultdict(int)
+        for edge in self.edges:
+            rel = edge.relationship.value if isinstance(edge.relationship, RelationshipType) else edge.relationship
+            rel_counts[rel] += 1
+        return {
+            "total_nodes": len(self.nodes),
+            # Estate size BEFORE any load-time bound. `total_nodes` counts what
+            # this graph holds; without the source total beside it a bounded
+            # load reads as the whole estate, and contradicts the `completeness`
+            # block shipped in the same response.
+            "total_nodes_source": max(self.completeness.total_nodes, len(self.nodes)),
+            "total_edges": len(self.edges),
+            "node_types": dict(type_counts),
+            "severity_counts": dict(severity_counts),
+            "relationship_types": dict(rel_counts),
+            "attack_path_count": len(self.attack_paths),
+            "attack_campaign_count": len(self.attack_campaigns),
+            "interaction_risk_count": len(self.interaction_risks),
+            "max_attack_path_risk": max((p.composite_risk for p in self.attack_paths), default=0.0),
+            "highest_interaction_risk": max((r.risk_score for r in self.interaction_risks), default=0.0),
+            "analysis_status": analysis_status_map_to_dict(self.analysis_status),
+        }
+
+    # ── Serialisation ────────────────────────────────────────────────────
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scan_id": self.scan_id,
+            "tenant_id": self.tenant_id,
+            "created_at": self.created_at,
+            "nodes": [n.to_dict() for n in self.nodes.values()],
+            "edges": [e.to_dict() for e in self.edges],
+            "attack_paths": [p.to_dict() for p in self.attack_paths],
+            "attack_campaigns": [c.to_dict() for c in self.attack_campaigns],
+            "interaction_risks": [r.to_dict() for r in self.interaction_risks],
+            "analysis_status": analysis_status_map_to_dict(self.analysis_status),
+            "stats": self.stats(),
+            # Whether this payload is the whole snapshot or a bounded slice of
+            # it. A budget-trimmed graph that serializes without this reads to
+            # every consumer as the complete estate — an empty blast radius
+            # becomes indistinguishable from one we stopped walking.
+            "completeness": self.completeness.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> UnifiedGraph:
+        graph = cls(
+            scan_id=data.get("scan_id", ""),
+            tenant_id=data.get("tenant_id", ""),
+            created_at=data.get("created_at", ""),
+            analysis_status=analysis_status_map_from_dict(data.get("analysis_status", {})),
+        )
+        completeness = data.get("completeness")
+        if isinstance(completeness, dict):
+            graph.completeness = GraphCompleteness(
+                truncated=bool(completeness.get("truncated", False)),
+                total_nodes=int(completeness.get("total", 0) or 0),
+                returned_nodes=int(completeness.get("returned", 0) or 0),
+                reason=str(completeness.get("reason", "") or ""),
+            )
+        for nd in data.get("nodes", []):
+            graph.add_node(UnifiedNode.from_dict(nd))
+        for ed in data.get("edges", []):
+            graph.add_edge(UnifiedEdge.from_dict(ed))
+        for pd in data.get("attack_paths", []):
+            graph.attack_paths.append(AttackPath.from_dict(pd))
+        for cd in data.get("attack_campaigns", []):
+            graph.attack_campaigns.append(Campaign.from_dict(cd))
+        for rd in data.get("interaction_risks", []):
+            graph.interaction_risks.append(InteractionRisk.from_dict(rd))
+        return graph
+
+    # ── OCSF export (findings only) ──────────────────────────────────────
+
+    def to_ocsf_events(self, product_version: str = "0.0.0", *, enrich_neighbors: bool = True) -> list[dict[str, Any]]:
+        """Export finding-type nodes as OCSF events.
+
+        When ``enrich_neighbors=True`` (default), each event includes a
+        ``graph_context`` block with affected agents, servers, credentials,
+        and attack path depth — so SOC analysts see blast radius in the SIEM
+        without querying the graph API separately.
+        """
+        events = []
+        for node in self.nodes.values():
+            if node.entity_type not in FINDING_ENTITY_TYPES:
+                continue
+            event = node.to_ocsf_event(product_version)
+            if enrich_neighbors:
+                sources = self.sources_of(node.id)
+                impact = self.impact_of(node.id)
+                source_nodes = [self.nodes[s] for s in sources if s in self.nodes]
+                event["graph_context"] = {
+                    "affected_agents": [n.label for n in source_nodes if n.entity_type == EntityType.AGENT],
+                    "affected_servers": [n.label for n in source_nodes if n.entity_type == EntityType.SERVER],
+                    "affected_packages": [n.label for n in source_nodes if n.entity_type == EntityType.PACKAGE],
+                    "exposed_credentials": [n.label for n in source_nodes if n.entity_type == EntityType.CREDENTIAL],
+                    "blast_radius": impact["affected_count"],
+                    "blast_by_type": impact["affected_by_type"],
+                }
+            events.append(event)
+        return events
+
+    # ── Graph views (subgraphs) ──────────────────────────────────────────
+
+    def inventory_view(self) -> UnifiedGraph:
+        sub = self._subgraph(
+            node_filter=lambda n: (
+                n.status == NodeStatus.ACTIVE
+                and n.entity_type
+                not in (
+                    EntityType.VULNERABILITY,
+                    EntityType.MISCONFIGURATION,
+                )
+            ),
+            edge_filter=lambda e: (
+                e.relationship
+                in (
+                    RelationshipType.HOSTS,
+                    RelationshipType.USES,
+                    RelationshipType.DEPENDS_ON,
+                    RelationshipType.PROVIDES_TOOL,
+                    RelationshipType.EXPOSES_CRED,
+                    RelationshipType.REACHES_TOOL,
+                    RelationshipType.SERVES_MODEL,
+                    RelationshipType.CONTAINS,
+                )
+            ),
+        )
+        return self._inherit_completeness(sub)
+
+    def attack_path_view(self) -> UnifiedGraph:
+        return self._inherit_completeness(self._subgraph(edge_filter=lambda e: e.traversable))
+
+    def lateral_movement_view(self) -> UnifiedGraph:
+        lateral_rels = {
+            RelationshipType.SHARES_SERVER,
+            RelationshipType.SHARES_CRED,
+            RelationshipType.LATERAL_PATH,
+            RelationshipType.USES,
+            RelationshipType.EXPOSES_CRED,
+            RelationshipType.PROVIDES_TOOL,
+            RelationshipType.REACHES_TOOL,
+            RelationshipType.VULNERABLE_TO,
+        }
+        return self._inherit_completeness(self._subgraph(edge_filter=lambda e: e.relationship in lateral_rels))
+
+    def compliance_view(self, framework: str = "") -> UnifiedGraph:
+        def node_filter(n: UnifiedNode) -> bool:
+            if not n.compliance_tags:
+                return False
+            if framework:
+                return any(framework.upper() in t.upper() for t in n.compliance_tags)
+            return True
+
+        return self._inherit_completeness(self._subgraph(node_filter=node_filter))
+
+    def runtime_view(self) -> UnifiedGraph:
+        runtime_rels = {
+            RelationshipType.INVOKED,
+            RelationshipType.ACCESSED,
+            RelationshipType.DELEGATED_TO,
+        }
+        return self._inherit_completeness(self._subgraph(edge_filter=lambda e: e.relationship in runtime_rels))
+
+    def filtered_view(self, filters: GraphFilterOptions) -> UnifiedGraph:
+        """Build a subgraph from user-controlled filter options."""
+        entity_set = filters.entity_types if filters.entity_types else None
+        rel_set = filters.relationship_types if filters.relationship_types else None
+        edge_scoped = bool(rel_set or filters.static_only or filters.dynamic_only)
+
+        def node_filter(n: UnifiedNode) -> bool:
+            if entity_set and n.entity_type not in entity_set:
+                return False
+            if filters.min_severity and SEVERITY_RANK.get(n.severity, 0) < SEVERITY_RANK.get(filters.min_severity, 0):
+                return False
+            if filters.include_ids and n.id not in filters.include_ids:
+                return False
+            if filters.exclude_ids and n.id in filters.exclude_ids:
+                return False
+            return True
+
+        def edge_filter(e: UnifiedEdge) -> bool:
+            if rel_set and e.relationship not in rel_set:
+                return False
+            if filters.static_only and e.relationship in _DYNAMIC_RELS:
+                return False
+            if filters.dynamic_only and e.relationship not in _DYNAMIC_RELS:
+                return False
+            return True
+
+        sub = self._subgraph(node_filter=node_filter, edge_filter=edge_filter)
+        if not edge_scoped:
+            return self._inherit_completeness(sub)
+
+        keep_ids = set(filters.include_ids)
+        for edge in sub.edges:
+            keep_ids.add(edge.source)
+            keep_ids.add(edge.target)
+
+        pruned = UnifiedGraph(
+            scan_id=sub.scan_id,
+            tenant_id=sub.tenant_id,
+            created_at=sub.created_at,
+            analysis_status=dict(sub.analysis_status),
+        )
+        for node_id in keep_ids:
+            node = sub.nodes.get(node_id)
+            if node:
+                pruned.add_node(node)
+        for edge in sub.edges:
+            if edge.source in pruned.nodes and edge.target in pruned.nodes:
+                pruned.add_edge(edge)
+        return self._inherit_completeness(pruned)
+
+    def _inherit_completeness(
+        self,
+        view: "UnifiedGraph",
+        *,
+        truncated: bool = False,
+        reason: str = "",
+        node_budget: int | None = None,
+        depth_limited: bool = False,
+    ) -> "UnifiedGraph":
+        """Carry the source's truncation onto a derived view.
+
+        Truncation is a property of the SOURCE snapshot. Filtering cannot make
+        it untrue: nodes that were never loaded might have matched the filter,
+        and nobody can know whether they did. So the flag and reason propagate
+        unchanged, ``returned_nodes`` is recomputed for what this view actually
+        holds, and ``total_nodes`` stays the upstream total so ``omitted_nodes``
+        keeps meaning "how much of the estate we never saw".
+
+        ``truncated`` lets a derivation that bounded itself — a traversal that
+        exhausted its node/edge/time budget — OR its own loss in. The source's
+        reason wins when both are truncated: it describes the deeper loss, and
+        a caller that widens the traversal budget still would not see the nodes
+        the loader never fetched.
+
+        Every derived view goes through here — the typed views as much as
+        ``filtered_view`` and ``traverse_subgraph`` — so no projection can
+        report completeness its source does not have.
+        """
+        view.completeness.truncated = self.completeness.truncated or truncated
+        view.completeness.depth_limited = self.completeness.depth_limited or depth_limited
+        view.completeness.node_budget = self.completeness.node_budget if self.completeness.node_budget is not None else node_budget
+        view.completeness.reason = self.completeness.reason or (reason if truncated else "")
+        # An untruncated graph built by hand never populates total_nodes; falling
+        # back to the source's own size keeps `total` from reading as 0 next to a
+        # non-empty `returned`.
+        view.completeness.total_nodes = self.completeness.total_nodes or len(self.nodes)
+        view.completeness.returned_nodes = len(view.nodes)
+        return view
+
+    def _subgraph(
+        self,
+        node_filter: Any = None,
+        edge_filter: Any = None,
+    ) -> UnifiedGraph:
+        sub = UnifiedGraph(
+            scan_id=self.scan_id,
+            tenant_id=self.tenant_id,
+            created_at=self.created_at,
+            analysis_status=dict(self.analysis_status),
+        )
+        if edge_filter and not node_filter:
+            matching_edges = [e for e in self.edges if edge_filter(e)]
+            referenced_ids = set()
+            for e in matching_edges:
+                referenced_ids.add(e.source)
+                referenced_ids.add(e.target)
+            for nid in referenced_ids:
+                node = self.nodes.get(nid)
+                if node:
+                    sub.add_node(node)
+            for e in matching_edges:
+                sub.add_edge(e)
+        elif node_filter:
+            node_ids = set()
+            for node in self.nodes.values():
+                if node_filter(node):
+                    sub.add_node(node)
+                    node_ids.add(node.id)
+            for edge in self.edges:
+                if edge.source in node_ids and edge.target in node_ids:
+                    if not edge_filter or edge_filter(edge):
+                        sub.add_edge(edge)
+        return sub
+
+
+# ── Dynamic relationship set ─────────────────────────────────────────────
+
+_DYNAMIC_RELS = {RelationshipType.INVOKED, RelationshipType.ACCESSED, RelationshipType.DELEGATED_TO}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Graph filter options & legend
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(slots=True)
+class GraphFilterOptions:
+    """User-controlled filter options for graph views.
+
+    Used by both Python API and TypeScript UI (mirrored in graph-schema.ts).
+    """
+
+    # Depth/hops
+    max_depth: int = 6
+    max_hops: int = 0  # 0 = unlimited
+
+    # Severity filter
+    min_severity: str = ""  # "critical" / "high" / "medium" / "low"
+
+    # Entity type toggles (empty = all)
+    entity_types: set[EntityType] = field(default_factory=set)
+
+    # Relationship type toggles (empty = all)
+    relationship_types: set[RelationshipType] = field(default_factory=set)
+
+    # Static vs dynamic edge filters
+    static_only: bool = False
+    dynamic_only: bool = False
+
+    # Include/exclude specific node IDs
+    include_ids: set[str] = field(default_factory=set)
+    exclude_ids: set[str] = field(default_factory=set)
+
+    # Layout
+    layout: str = "dagre"  # dagre / force / radial / hierarchical / grid
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "max_depth": self.max_depth,
+            "max_hops": self.max_hops,
+            "min_severity": self.min_severity,
+            "entity_types": sorted(et.value for et in self.entity_types),
+            "relationship_types": sorted(rt.value for rt in self.relationship_types),
+            "static_only": self.static_only,
+            "dynamic_only": self.dynamic_only,
+            "include_ids": sorted(self.include_ids),
+            "exclude_ids": sorted(self.exclude_ids),
+            "layout": self.layout,
+        }
+
+
+@dataclass(slots=True)
+class LegendEntry:
+    """Single entry in the graph legend."""
+
+    key: str
+    label: str
+    color: str
+    shape: str = "circle"  # circle / diamond / square / triangle
+    layer: str = ""
+
+
+# Entity legend
+ENTITY_LEGEND: list[LegendEntry] = [
+    LegendEntry(key="agent", label="AI Agent", color="#10b981", shape="circle", layer=GraphSemanticLayer.ORCHESTRATION.value),
+    LegendEntry(key="server", label="MCP Server", color="#3b82f6", shape="circle", layer=GraphSemanticLayer.MCP_SERVER.value),
+    LegendEntry(key="package", label="Package", color="#52525b", shape="square", layer=GraphSemanticLayer.PACKAGE.value),
+    LegendEntry(key="tool", label="Tool", color="#a855f7", shape="diamond", layer=GraphSemanticLayer.TOOL.value),
+    LegendEntry(key="tool_call", label="Tool Call", color="#c084fc", shape="diamond", layer=GraphSemanticLayer.RUNTIME_EVIDENCE.value),
+    LegendEntry(key="vulnerability", label="Vulnerability", color="#ef4444", shape="triangle", layer=GraphSemanticLayer.FINDING.value),
+    LegendEntry(key="credential", label="Credential", color="#f59e0b", shape="diamond", layer=GraphSemanticLayer.IDENTITY.value),
+    LegendEntry(
+        key="credential_ref",
+        label="Credential Reference",
+        color="#fbbf24",
+        shape="diamond",
+        layer=GraphSemanticLayer.IDENTITY.value,
+    ),
+    LegendEntry(
+        key="misconfiguration", label="Misconfiguration", color="#f97316", shape="triangle", layer=GraphSemanticLayer.FINDING.value
+    ),
+    LegendEntry(key="model", label="Model", color="#8b5cf6", shape="square", layer=GraphSemanticLayer.ASSET.value),
+    LegendEntry(
+        key="framework",
+        label="AI Framework",
+        color="#06b6d4",
+        shape="square",
+        layer=GraphSemanticLayer.ORCHESTRATION.value,
+    ),
+    LegendEntry(key="container", label="Container", color="#6366f1", shape="square", layer=GraphSemanticLayer.INFRA.value),
+    LegendEntry(key="cloud_resource", label="Cloud Resource", color="#0ea5e9", shape="square", layer=GraphSemanticLayer.INFRA.value),
+    LegendEntry(key="resource", label="Resource", color="#38bdf8", shape="square", layer=GraphSemanticLayer.ASSET.value),
+    LegendEntry(key="directory", label="Directory", color="#0d9488", shape="square", layer=GraphSemanticLayer.CODE.value),
+    LegendEntry(key="source_file", label="Source File", color="#22d3ee", shape="square", layer=GraphSemanticLayer.CODE.value),
+    LegendEntry(key="code_module", label="Code Module", color="#06b6d4", shape="circle", layer=GraphSemanticLayer.CODE.value),
+    LegendEntry(key="config_file", label="Config File", color="#f97316", shape="square", layer=GraphSemanticLayer.CODE.value),
+    LegendEntry(key="external_import", label="External Import", color="#f59e0b", shape="circle", layer=GraphSemanticLayer.CODE.value),
+    LegendEntry(key="ci_job", label="CI/CD Job", color="#a855f7", shape="diamond", layer=GraphSemanticLayer.CI.value),
+    LegendEntry(key="org", label="Organization", color="#115e59", shape="square", layer=GraphSemanticLayer.IDENTITY.value),
+    LegendEntry(key="account", label="Account", color="#0f766e", shape="square", layer=GraphSemanticLayer.IDENTITY.value),
+    LegendEntry(key="user", label="User", color="#14b8a6", shape="circle", layer=GraphSemanticLayer.USER.value),
+    LegendEntry(key="group", label="Group", color="#0d9488", shape="circle", layer=GraphSemanticLayer.IDENTITY.value),
+    LegendEntry(key="role", label="Role", color="#ea580c", shape="circle", layer=GraphSemanticLayer.IDENTITY.value),
+    LegendEntry(key="policy", label="Policy", color="#d97706", shape="diamond", layer=GraphSemanticLayer.IDENTITY.value),
+    LegendEntry(key="service_account", label="Service Account", color="#0f766e", shape="circle", layer=GraphSemanticLayer.IDENTITY.value),
+    LegendEntry(
+        key="service_principal", label="Service Principal", color="#0f766e", shape="circle", layer=GraphSemanticLayer.IDENTITY.value
+    ),
+    LegendEntry(
+        key="federated_identity",
+        label="Federated Identity",
+        color="#0e7490",
+        shape="circle",
+        layer=GraphSemanticLayer.IDENTITY.value,
+    ),
+    LegendEntry(key="fleet", label="Fleet", color="#6b7280", shape="square", layer=GraphSemanticLayer.INFRA.value),
+    LegendEntry(key="cluster", label="Cluster", color="#4b5563", shape="square", layer=GraphSemanticLayer.INFRA.value),
+    LegendEntry(key="dataset", label="Dataset", color="#06b6d4", shape="square", layer=GraphSemanticLayer.ASSET.value),
+    LegendEntry(key="environment", label="Environment", color="#9ca3af", shape="square", layer=GraphSemanticLayer.INFRA.value),
+    LegendEntry(key="provider", label="Provider", color="#d1d5db", shape="square", layer=GraphSemanticLayer.INFRA.value),
+    LegendEntry(key="managed_identity", label="Managed Identity", color="#0891b2", shape="circle", layer=GraphSemanticLayer.IDENTITY.value),
+    LegendEntry(key="access_grant", label="Access Grant", color="#ca8a04", shape="diamond", layer=GraphSemanticLayer.IDENTITY.value),
+    LegendEntry(key="access_policy", label="Access Policy", color="#a16207", shape="diamond", layer=GraphSemanticLayer.IDENTITY.value),
+    LegendEntry(key="drift_incident", label="Drift Incident", color="#fb923c", shape="triangle", layer=GraphSemanticLayer.FINDING.value),
+    LegendEntry(key="data_store", label="Data Store", color="#0284c7", shape="square", layer=GraphSemanticLayer.ASSET.value),
+    LegendEntry(key="application", label="Application", color="#7c3aed", shape="circle", layer=GraphSemanticLayer.APP.value),
+    LegendEntry(key="api_gateway", label="API Gateway", color="#2563eb", shape="diamond", layer=GraphSemanticLayer.API_GATEWAY.value),
+    LegendEntry(key="blueprint", label="Blueprint", color="#818cf8", shape="square", layer=GraphSemanticLayer.ORCHESTRATION.value),
+]
+
+RELATIONSHIP_LEGEND: list[LegendEntry] = [
+    # Static inventory
+    LegendEntry(key="hosts", label="Hosts", color="#6b7280"),
+    LegendEntry(key="uses", label="Uses", color="#10b981"),
+    LegendEntry(key="uses_framework", label="Uses Framework", color="#06b6d4"),
+    LegendEntry(key="depends_on", label="Depends On", color="#52525b"),
+    LegendEntry(key="provides_tool", label="Provides Tool", color="#a855f7"),
+    LegendEntry(key="exposes_cred", label="Exposes Credential", color="#f59e0b"),
+    LegendEntry(key="reaches_tool", label="Credential Reaches Tool", color="#fbbf24"),
+    LegendEntry(key="serves_model", label="Serves Model", color="#8b5cf6"),
+    LegendEntry(key="contains", label="Contains", color="#6366f1"),
+    LegendEntry(key="imports", label="Imports", color="#22d3ee"),
+    LegendEntry(key="defines", label="Defines", color="#06b6d4"),
+    LegendEntry(key="runs", label="Runs", color="#a855f7"),
+    LegendEntry(key="configures", label="Configures", color="#f97316"),
+    LegendEntry(key="observes", label="Observes", color="#22d3ee"),
+    # Vulnerability
+    LegendEntry(key="vulnerable_to", label="Vulnerable To", color="#ef4444"),
+    LegendEntry(key="affects", label="Affects", color="#dc2626"),
+    LegendEntry(key="exploitable_via", label="Exploitable Via", color="#b91c1c"),
+    LegendEntry(key="remediates", label="Remediates", color="#22c55e"),
+    LegendEntry(key="triggers", label="Triggers", color="#f97316"),
+    # Lateral movement
+    LegendEntry(key="shares_server", label="Shares Server", color="#22d3ee"),
+    LegendEntry(key="shares_cred", label="Shares Credential", color="#f97316"),
+    LegendEntry(key="lateral_path", label="Lateral Path", color="#ea580c"),
+    # Ownership
+    LegendEntry(key="manages", label="Manages", color="#14b8a6"),
+    LegendEntry(key="owns", label="Owns", color="#0d9488"),
+    LegendEntry(key="part_of", label="Part Of", color="#6b7280"),
+    LegendEntry(key="member_of", label="Member Of", color="#4b5563"),
+    LegendEntry(key="assumes", label="Assumes", color="#ea580c"),
+    LegendEntry(key="trusts", label="Trusts", color="#0891b2"),
+    LegendEntry(key="attached", label="Attached", color="#d97706"),
+    LegendEntry(key="inherits", label="Inherits", color="#a16207"),
+    LegendEntry(key="can_access", label="Can Access", color="#dc2626"),
+    LegendEntry(key="cross_account_trust", label="Cross-Account Trust", color="#be123c"),
+    # Runtime
+    LegendEntry(key="acted_as", label="Acted As (runtime)", color="#14b8a6"),
+    LegendEntry(key="invoked", label="Invoked (runtime)", color="#10b981"),
+    LegendEntry(key="called", label="Called (runtime)", color="#c084fc"),
+    LegendEntry(key="used_credential", label="Used Credential (runtime)", color="#fbbf24"),
+    LegendEntry(key="accessed", label="Accessed (runtime)", color="#3b82f6"),
+    LegendEntry(key="delegated_to", label="Delegated To (runtime)", color="#a855f7"),
+    # Cross-environment correlation (#1892)
+    LegendEntry(key="correlates_with", label="Correlates With (cross-env)", color="#0ea5e9"),
+    LegendEntry(key="possibly_correlates_with", label="Possibly Correlates With (low confidence)", color="#7dd3fc"),
+    # Agent-identity governance
+    LegendEntry(key="authenticates_as", label="Authenticates As", color="#0891b2"),
+    LegendEntry(key="scoped_to", label="Scoped To", color="#22d3ee"),
+    LegendEntry(key="governs", label="Governs", color="#a16207"),
+    LegendEntry(key="exhibits_drift", label="Exhibits Drift", color="#fb923c"),
+    # Cloud-CNAPP
+    LegendEntry(key="exposed_to", label="Exposed To", color="#e11d48"),
+    LegendEntry(key="stores", label="Stores", color="#0284c7"),
+    LegendEntry(key="has_permission", label="Has Permission", color="#dc2626"),
+    LegendEntry(key="protects", label="Protects (WAF/gateway)", color="#2563eb"),
+    # ASPM
+    LegendEntry(key="belongs_to", label="Belongs To (application)", color="#7c3aed"),
+]

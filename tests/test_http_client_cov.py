@@ -2,17 +2,33 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 
 from agent_bom.http_client import (
+    _jittered_wait,
     _safe_url,
     _sanitize_for_log,
     create_client,
     request_with_retry,
+    sync_request_with_retry,
 )
+
+
+@pytest.fixture(autouse=True)
+def _patch_url_validation(monkeypatch):
+    """Keep retry tests focused on HTTP behavior, not ambient DNS resolution."""
+    monkeypatch.setattr("agent_bom.security.validate_url", lambda _url: None)
+    # The registry rate-limit breaker is global state; reset it around every
+    # test so 429-bearing cases don't leak a tripped host into later tests.
+    from agent_bom.http_client import reset_rate_limit_breaker
+
+    reset_rate_limit_breaker()
+    yield
+    reset_rate_limit_breaker()
 
 
 class TestSanitizeForLog:
@@ -56,8 +72,17 @@ class TestCreateClient:
         client = create_client()
         assert isinstance(client, httpx.AsyncClient)
 
+    def test_redirects_disabled_by_default(self):
+        client = create_client()
+        assert client.follow_redirects is False
+
 
 class TestRequestWithRetry:
+    def test_jittered_wait_stays_within_cap(self, monkeypatch):
+        monkeypatch.setattr("agent_bom.http_client.random.uniform", lambda lo, hi: hi)
+        wait = _jittered_wait(10.0)
+        assert wait == 11.0
+
     @pytest.mark.asyncio
     async def test_success_on_first_try(self):
         mock_response = MagicMock()
@@ -78,6 +103,22 @@ class TestRequestWithRetry:
         client.request.side_effect = [mock_429, mock_200]
         result = await request_with_retry(client, "GET", "https://example.com", max_retries=2)
         assert result.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_github_advisory_429_fails_fast_without_retry(self, monkeypatch):
+        mock_429 = MagicMock()
+        mock_429.status_code = 429
+        mock_429.headers = {"Retry-After": "60"}
+        client = AsyncMock()
+        client.request.return_value = mock_429
+        sleep = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep)
+
+        result = await request_with_retry(client, "GET", "https://api.github.com/advisories", max_retries=3)
+
+        assert result.status_code == 429
+        assert client.request.await_count == 1
+        sleep.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_retries_on_500(self):
@@ -144,3 +185,61 @@ class TestRequestWithRetry:
         client.request.side_effect = [mock_429, mock_200]
         result = await request_with_retry(client, "GET", "https://example.com", max_retries=2)
         assert result.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_retry_wait_uses_jitter(self, monkeypatch):
+        mock_429 = MagicMock()
+        mock_429.status_code = 429
+        mock_429.headers = {"Retry-After": "0.1"}
+        mock_200 = MagicMock()
+        mock_200.status_code = 200
+        client = AsyncMock()
+        client.request.side_effect = [mock_429, mock_200]
+        sleep_calls: list[float] = []
+
+        async def _fake_sleep(delay: float) -> None:
+            sleep_calls.append(delay)
+
+        monkeypatch.setattr("agent_bom.http_client.random.uniform", lambda lo, hi: 0.01)
+        monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+        result = await request_with_retry(client, "GET", "https://example.com", max_retries=2)
+        assert result.status_code == 200
+        assert sleep_calls == [0.11]
+
+
+def test_sync_github_advisory_429_fails_fast_without_retry(monkeypatch):
+    mock_429 = MagicMock()
+    mock_429.status_code = 429
+    mock_429.headers = {"Retry-After": "60"}
+    client = MagicMock()
+    client.request.return_value = mock_429
+    sleep = MagicMock()
+    monkeypatch.setattr("agent_bom.http_client.time.sleep", sleep)
+
+    result = sync_request_with_retry(client, "GET", "https://api.github.com/advisories", max_retries=3)
+
+    assert result.status_code == 429
+    assert client.request.call_count == 1
+    sleep.assert_not_called()
+
+
+def test_sync_retry_wait_uses_jitter(monkeypatch):
+    mock_503 = MagicMock()
+    mock_503.status_code = 503
+    mock_503.headers = {}
+    mock_200 = MagicMock()
+    mock_200.status_code = 200
+    client = MagicMock()
+    client.request.side_effect = [mock_503, mock_200]
+    sleep_calls: list[float] = []
+
+    def _fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr("agent_bom.http_client.random.uniform", lambda lo, hi: 0.05)
+    monkeypatch.setattr("agent_bom.http_client.time.sleep", _fake_sleep)
+
+    result = sync_request_with_retry(client, "GET", "https://example.com/data", max_retries=2)
+
+    assert result.status_code == 200
+    assert sleep_calls == [1.05]

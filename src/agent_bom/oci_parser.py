@@ -10,11 +10,13 @@ Supported image formats:
 - **OCI image layout directory** — same structure, unarchived (for skopeo/crane output).
 
 Package ecosystems extracted from each layer filesystem:
-- Python: ``*.dist-info/METADATA``
+- Python: ``*.dist-info/METADATA`` (modern wheels) and the legacy
+  ``*.egg-info/PKG-INFO`` / ``*.egg-info/METADATA`` (setuptools/pip on older
+  base images such as Debian buster ship pip/setuptools/wheel this way)
 - Node: ``node_modules/*/package.json``
 - Debian/Ubuntu: ``var/lib/dpkg/status``
 - Alpine Linux: ``lib/apk/db/installed``
-- RPM: ``var/lib/rpm/rpmdb.sqlite`` (sqlite3) + ``var/log/installed-rpms`` (log manifest)
+- RPM: modern SQLite plus legacy BerkeleyDB/NDB package databases and ``var/log/installed-rpms``
 - Java: ``*.jar``/``*.war``/``*.ear`` → ``META-INF/maven/*/pom.properties`` or ``META-INF/MANIFEST.MF``
 - Go binaries: embedded buildinfo (``\xff Go buildinf:`` magic, dep lines)
 - Ruby: ``**/specifications/*.gemspec`` (regex name/version extraction)
@@ -34,6 +36,8 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
+import posixpath
 import re
 import sqlite3
 import struct
@@ -42,11 +46,173 @@ import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import IO, Optional
 
-from agent_bom.models import Package
+from agent_bom.models import Package, PackageOccurrence
+from agent_bom.package_utils import parse_debian_source_name
 
 _logger = logging.getLogger(__name__)
+_MAX_JSON_MEMBER_BYTES = 100 * 1024 * 1024
+_MAX_LAYER_UNCOMPRESSED_BYTES = 5 * 1024 * 1024 * 1024
+_MAX_JAR_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+_MAX_DECOMPRESSION_RATIO = 100
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
+def _max_json_member_bytes() -> int:
+    return _env_int("AGENT_BOM_MAX_MANIFEST_BYTES", _MAX_JSON_MEMBER_BYTES)
+
+
+def _max_layer_uncompressed_bytes() -> int:
+    return _env_int("AGENT_BOM_OCI_MAX_LAYER_UNCOMPRESSED_BYTES", _MAX_LAYER_UNCOMPRESSED_BYTES)
+
+
+def _max_jar_uncompressed_bytes() -> int:
+    return _env_int("AGENT_BOM_OCI_MAX_JAR_UNCOMPRESSED_BYTES", _MAX_JAR_UNCOMPRESSED_BYTES)
+
+
+def _max_decompression_ratio() -> int:
+    return _env_int("AGENT_BOM_OCI_MAX_DECOMPRESSION_RATIO", _MAX_DECOMPRESSION_RATIO)
+
+
+def _decompression_ratio_exceeded(uncompressed_bytes: int, compressed_bytes: int) -> bool:
+    if compressed_bytes <= 0 or uncompressed_bytes <= 0:
+        return False
+    return uncompressed_bytes > compressed_bytes * _max_decompression_ratio()
+
+
+# ── Tar member safety ────────────────────────────────────────────────────────
+#
+# Image tarballs are untrusted input. A malicious tar can carry members whose
+# names escape the extraction root, members that are symlinks pointing outside
+# the tar, or hardlinks to arbitrary files. `tarfile.TarFile` does not validate
+# these by default (Python's `data_filter` arrived in 3.12 but we target 3.11+
+# and call `extractfile()` which bypasses it anyway).
+#
+# The helpers below give us two guarantees the parser relies on:
+#   1. `_is_safe_tar_member_name(name)` — the member name, after POSIX
+#      normalization, stays inside the tar root. Rejects `../` traversal,
+#      absolute paths, and NUL-injected names.
+#   2. `_safe_getmember(tf, name)` — resolves a member by name and also
+#      requires it to be a regular file. Symlinks and hardlinks never reach
+#      `extractfile()`, so the parser cannot be tricked into reading a host
+#      file by a crafted tar with `METADATA -> /etc/passwd`.
+#
+# Both helpers log at debug level when they reject something, so operators
+# scanning hostile images can see why certain layers contributed zero
+# packages.
+
+
+def _is_safe_tar_member_name(name: str) -> bool:
+    """Return True iff ``name`` is safe to treat as a relative path inside a tar.
+
+    Rejects absolute paths, parent-traversal (``../``), NUL-injected names,
+    and any name whose POSIX-normalized form escapes the tar root.
+    """
+    if not name or "\x00" in name:
+        return False
+    if name.startswith("/"):
+        return False
+    # posixpath.normpath collapses "./foo/../bar" → "bar" but preserves a
+    # leading ".." if the name escapes. "a/../b" → "b" (safe);
+    # "../a" → "../a" (escapes); "a/../../b" → "../b" (escapes).
+    normalized = posixpath.normpath(name)
+    if normalized.startswith("../") or normalized == "..":
+        return False
+    if normalized.startswith("/"):
+        return False
+    # Belt-and-suspenders against split-by-"/" bypasses on odd separators.
+    parts = normalized.split("/")
+    if any(p == ".." for p in parts):
+        return False
+    return True
+
+
+def _safe_tar_names(tf: tarfile.TarFile) -> set[str]:
+    """Return member names that are safe regular files inside ``tf``.
+
+    Filters out:
+      - names failing ``_is_safe_tar_member_name`` (traversal / absolute / NUL)
+      - symlink members (``SYMTYPE``) and hardlink members (``LNKTYPE``)
+      - device / fifo members
+
+    Directory members are excluded because this helper exists to feed
+    file-reading loops; directories carry no file payload.
+    """
+    safe: set[str] = set()
+    rejected_traversal = 0
+    rejected_link = 0
+    for member in tf.getmembers():
+        name = member.name
+        if not _is_safe_tar_member_name(name):
+            rejected_traversal += 1
+            continue
+        if member.issym() or member.islnk():
+            # Symlinks / hardlinks inside an image layer are legitimate OS
+            # artifacts — but we never follow them for package parsing. We
+            # only ingest concrete regular-file payloads.
+            rejected_link += 1
+            continue
+        if not member.isfile():
+            # Skip directories, devices, fifos, etc.
+            continue
+        safe.add(name)
+    if rejected_traversal:
+        _logger.debug(
+            "Rejected %d tar member(s) with unsafe names (traversal / absolute / NUL)",
+            rejected_traversal,
+        )
+    if rejected_link:
+        _logger.debug(
+            "Skipped %d symlink/hardlink member(s) — package parsing reads concrete files only",
+            rejected_link,
+        )
+    return safe
+
+
+def _safe_getmember(tf: tarfile.TarFile, name: str) -> tarfile.TarInfo | None:
+    """Resolve ``name`` to a tar member only if the name is safe AND the member is a regular file.
+
+    Returns ``None`` (instead of raising ``KeyError``) so callers can treat a
+    missing-or-unsafe member the same way they treat a missing-but-legitimate
+    member: skip and move on.
+    """
+    if not _is_safe_tar_member_name(name):
+        return None
+    try:
+        member = tf.getmember(name)
+    except KeyError:
+        return None
+    if member.issym() or member.islnk() or not member.isfile():
+        return None
+    return member
+
+
+def _safe_extractfile(tf: tarfile.TarFile, name: str) -> IO[bytes] | None:
+    """Open a tar member by name, but only if it is safe (see ``_safe_getmember``).
+
+    Returns ``None`` if the member is missing, a symlink / hardlink, has an
+    unsafe name, or can't be opened as a stream. Callers can treat ``None``
+    uniformly as "skip this member" without distinguishing the cause.
+    """
+    member = _safe_getmember(tf, name)
+    if member is None:
+        return None
+    try:
+        return tf.extractfile(member)
+    except (tarfile.TarError, OSError) as e:
+        _logger.debug("Failed to open tar member %s: %s: %s", name, type(e).__name__, e)
+        return None
+
 
 # Whiteout prefix per OCI image spec
 _WHITEOUT_PREFIX = ".wh."
@@ -75,6 +241,12 @@ _GEMSPEC_VER_RE = re.compile(r'\.version\s*=\s*(?:Gem::Version\.new\()?["\']([^"
 
 # RPM sqlite: database path candidates in a container layer
 _RPM_SQLITE_PATHS = ("var/lib/rpm/rpmdb.sqlite", "./var/lib/rpm/rpmdb.sqlite")
+# Legacy RPM database paths: BerkeleyDB ``Packages`` (RPM < 4.16,
+# RHEL/CentOS <= 8 and older UBI images) and NDB ``Packages.db``.
+_RPM_BDB_PATHS = ("var/lib/rpm/Packages", "./var/lib/rpm/Packages")
+_RPM_NDB_PATHS = ("var/lib/rpm/Packages.db", "./var/lib/rpm/Packages.db")
+_RPM_MANIFEST_PATHS = ("var/log/installed-rpms", "./var/log/installed-rpms")
+_MAX_LEGACY_RPMDB_BYTES = 512 * 1024 * 1024
 # RPM header magic (8 bytes)
 _RPM_HDR_MAGIC = b"\x8e\xad\xe8\x01\x00\x00\x00\x00"
 _RPMTAG_NAME = 1000
@@ -108,6 +280,144 @@ class OCIParseError(Exception):
     """Raised when an OCI image cannot be parsed."""
 
 
+@dataclass(frozen=True)
+class LayerMetadata:
+    """Build and filesystem provenance for a concrete image layer."""
+
+    layer_index: int
+    layer_id: str
+    layer_path: str
+    created_by: Optional[str] = None
+    dockerfile_instruction: Optional[str] = None
+
+
+def _normalize_layer_id(layer_path: str) -> str:
+    """Return a stable layer identifier from a tar/layout path."""
+    layer_path = layer_path.lstrip("./")
+    if layer_path.startswith("blobs/sha256/"):
+        return f"sha256:{layer_path.rsplit('/', 1)[-1]}"
+    if layer_path.endswith("/layer.tar"):
+        return layer_path[: -len("/layer.tar")]
+    return layer_path
+
+
+def _normalize_dockerfile_instruction(created_by: Optional[str]) -> Optional[str]:
+    """Convert raw OCI history ``created_by`` text into a Dockerfile-like instruction."""
+    if not created_by:
+        return None
+
+    raw = created_by.strip()
+    for prefix in ("/bin/sh -c #(nop) ", "cmd /S /C #(nop) "):
+        if raw.startswith(prefix):
+            return raw[len(prefix) :].strip() or raw
+
+    for prefix in ("/bin/sh -c ", "cmd /S /C "):
+        if raw.startswith(prefix):
+            command = raw[len(prefix) :].strip()
+            return f"RUN {command}" if command else "RUN"
+
+    return raw
+
+
+def _build_layer_metadata(layer_paths: list[str], config: dict | None = None) -> list[LayerMetadata]:
+    """Map image layers to normalized build-step metadata."""
+    histories = (config or {}).get("history", [])
+    metadata: list[LayerMetadata] = []
+    history_cursor = 0
+
+    for index, layer_path in enumerate(layer_paths, start=1):
+        created_by: str | None = None
+        dockerfile_instruction: str | None = None
+
+        while history_cursor < len(histories):
+            entry = histories[history_cursor]
+            history_cursor += 1
+            if entry.get("empty_layer"):
+                continue
+            created_by = entry.get("created_by")
+            dockerfile_instruction = _normalize_dockerfile_instruction(created_by)
+            break
+
+        metadata.append(
+            LayerMetadata(
+                layer_index=index,
+                layer_id=_normalize_layer_id(layer_path),
+                layer_path=layer_path,
+                created_by=created_by,
+                dockerfile_instruction=dockerfile_instruction,
+            )
+        )
+
+    return metadata
+
+
+def _resolve_tar_member(tf: tarfile.TarFile, member_path: str) -> tarfile.TarInfo | None:
+    """Resolve a tar member path with common Docker/OCI prefixes."""
+    normalized = member_path.lstrip("./")
+    for candidate in (member_path, normalized, f"./{normalized}"):
+        try:
+            return tf.getmember(candidate)
+        except KeyError:
+            continue
+    return None
+
+
+def _read_json_member_from_tar(tf: tarfile.TarFile, member_path: str) -> dict | None:
+    """Read and decode a JSON file from an outer tarball when present."""
+    member = _resolve_tar_member(tf, member_path)
+    if member is None:
+        return None
+    if member.size > _max_json_member_bytes():
+        _logger.debug("Skipping oversized JSON member %s", member_path)
+        return None
+    fileobj = tf.extractfile(member)
+    if fileobj is None:
+        return None
+    try:
+        data = fileobj.read(_max_json_member_bytes() + 1)
+        if len(data) > _max_json_member_bytes():
+            return None
+        return json.loads(data.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def _read_json_path_limited(path: Path) -> dict | list | None:
+    try:
+        if path.stat().st_size > _max_json_member_bytes():
+            _logger.debug("Skipping oversized JSON file: %s", path)
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def _tar_uncompressed_regular_size(tf: tarfile.TarFile) -> int:
+    total = 0
+    for member in tf.getmembers():
+        if member.isfile() and _is_safe_tar_member_name(member.name):
+            total += max(0, int(member.size))
+            if total > _max_layer_uncompressed_bytes():
+                break
+    return total
+
+
+def _zip_uncompressed_size(zf: zipfile.ZipFile) -> int:
+    total = 0
+    for info in zf.infolist():
+        total += max(0, int(info.file_size))
+        if total > _max_jar_uncompressed_bytes():
+            break
+    return total
+
+
+def _zip_compressed_size(zf: zipfile.ZipFile) -> int:
+    total = 0
+    for info in zf.infolist():
+        total += max(0, int(info.compress_size))
+    return total
+
+
 # ─── RPM header parser ────────────────────────────────────────────────────────
 
 
@@ -115,18 +425,34 @@ def _parse_rpm_header_blob(blob: bytes) -> Optional[tuple[str, str]]:
     """Parse a minimal RPM header blob and return (name, version) or None.
 
     RPM header layout (big-endian):
-    - 8 bytes magic
+    - 8 bytes magic  -- PRESENT on legacy BerkeleyDB/NDB records, ABSENT in the
+      ``rpmdb.sqlite`` ``Packages.blob`` column
     - 4 bytes nindex (number of tag entries)
     - 4 bytes hsize (size of data section)
     - nindex × 16-byte entries: tag(4) type(4) offset(4) count(4)
     - data section (hsize bytes)
+
+    Both framings are accepted. Requiring the magic meant every blob from a
+    ``rpmdb.sqlite`` returned None, so RHEL 9+, UBI9, Fedora 33+, Amazon Linux
+    2023 and Rocky 9 images -- everything on RPM >= 4.16, which is the default
+    backend -- reported **zero** OS packages and therefore zero OS CVEs. A
+    scanner that finds nothing on the most common enterprise base image is the
+    "reports less than it found" failure, and it looks clean.
     """
-    if len(blob) < 16 or blob[:8] != _RPM_HDR_MAGIC:
+    if len(blob) < 16:
         return None
     try:
-        nindex = struct.unpack_from(">I", blob, 8)[0]
-        # hsize = struct.unpack_from(">I", blob, 12)[0]  # unused
-        index_start = 16
+        if blob[:8] == _RPM_HDR_MAGIC:
+            nindex = struct.unpack_from(">I", blob, 8)[0]
+            index_start = 16
+        else:
+            # sqlite framing: the record begins at nindex directly.
+            nindex = struct.unpack_from(">I", blob, 0)[0]
+            index_start = 8
+        # A wild nindex means this is not a header at all; bound it before it
+        # becomes a multi-gigabyte slice.
+        if nindex == 0 or nindex > 100_000:
+            return None
         data_start = index_start + nindex * 16
 
         if data_start > len(blob):
@@ -163,51 +489,212 @@ def _parse_rpm_header_blob(blob: bytes) -> Optional[tuple[str, str]]:
         return None
 
 
+def _parse_legacy_rpmdb_bytes(database: bytes) -> list[tuple[str, str]]:
+    """Extract embedded RPM header records from BerkeleyDB or NDB payloads.
+
+    Both legacy backends store canonical RPM header blobs as record values. The
+    database page/index format is backend-specific, but the value format is not:
+    every package header starts with ``_RPM_HDR_MAGIC`` and carries bounded index
+    and data lengths. Scanning for those self-describing records avoids a native
+    BerkeleyDB dependency while preserving exact RPM name/version/release data.
+    """
+    packages: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    cursor = 0
+    while True:
+        start = database.find(_RPM_HDR_MAGIC, cursor)
+        if start < 0:
+            break
+        cursor = start + len(_RPM_HDR_MAGIC)
+        if start + 16 > len(database):
+            continue
+        try:
+            nindex, hsize = struct.unpack_from(">II", database, start + 8)
+        except struct.error:
+            continue
+        if nindex > 100_000 or hsize > _MAX_LEGACY_RPMDB_BYTES:
+            continue
+        record_size = 16 + nindex * 16 + hsize
+        end = start + record_size
+        if record_size < 16 or end > len(database):
+            continue
+        parsed = _parse_rpm_header_blob(database[start:end])
+        if parsed is None or parsed[0] == "gpg-pubkey" or parsed in seen:
+            continue
+        seen.add(parsed)
+        packages.append(parsed)
+        cursor = end
+    return packages
+
+
+def _query_legacy_rpmdb(layer_tf: tarfile.TarFile, database_path: str) -> list[tuple[str, str]]:
+    """Read and decode one bounded BerkeleyDB/NDB package database member."""
+    member = _safe_getmember(layer_tf, database_path)
+    if member is None or not member.isfile() or member.size > _MAX_LEGACY_RPMDB_BYTES:
+        raise OCIParseError("Legacy RPM database is missing, invalid, or exceeds the 512 MiB safety limit")
+    source = _safe_extractfile(layer_tf, database_path)
+    if source is None:
+        raise OCIParseError("Legacy RPM database could not be read safely")
+    packages = _parse_legacy_rpmdb_bytes(source.read())
+    if not packages:
+        raise OCIParseError("Legacy RPM database contains no valid package header records")
+    return packages
+
+
 # ─── Package extraction from a layer filesystem ───────────────────────────────
 
 
 def _add_package(
-    seen: set[tuple[str, str]],
+    packages_by_key: dict[tuple[str, str], Package],
     packages: list[Package],
     name: str,
     version: str,
     ecosystem: str,
     purl: Optional[str] = None,
+    *,
+    source_package: str | None = None,
+    distro_name: str | None = None,
+    distro_version: str | None = None,
+    layer: LayerMetadata | None = None,
+    package_path: str | None = None,
 ) -> None:
     key = (name.lower(), ecosystem)
-    if key not in seen:
-        seen.add(key)
-        packages.append(
-            Package(
-                name=name,
-                version=version,
-                ecosystem=ecosystem,
-                purl=purl or f"pkg:{ecosystem}/{name}@{version}",
-                is_direct=False,
-                resolved_from_registry=False,
-            )
+    package = packages_by_key.get(key)
+    if package is None:
+        package = Package(
+            name=name,
+            version=version,
+            ecosystem=ecosystem,
+            purl=purl or f"pkg:{ecosystem}/{name}@{version}",
+            is_direct=False,
+            resolved_from_registry=False,
+            source_package=source_package,
+            distro_name=distro_name,
+            distro_version=distro_version,
         )
+        packages_by_key[key] = package
+        packages.append(package)
+    else:
+        # When a later layer rewrites package metadata (common for lockfiles and
+        # package DBs), keep the final image view aligned to the latest version.
+        if version and package.version != version:
+            package.version = version
+            package.purl = purl or f"pkg:{ecosystem}/{name}@{version}"
+            package.source_package = source_package
+            package.distro_name = distro_name or package.distro_name
+            package.distro_version = distro_version or package.distro_version
+            package.occurrences.clear()
+        elif purl and package.purl != purl:
+            package.purl = purl
+        if source_package is not None:
+            package.source_package = source_package
+        if distro_name is not None:
+            package.distro_name = distro_name
+        if distro_version is not None:
+            package.distro_version = distro_version
+
+    if layer is None:
+        return
+
+    occurrence = PackageOccurrence(
+        layer_index=layer.layer_index,
+        layer_id=layer.layer_id,
+        layer_path=layer.layer_path,
+        package_path=package_path,
+        created_by=layer.created_by,
+        dockerfile_instruction=layer.dockerfile_instruction,
+    )
+    occurrence_key = (occurrence.layer_index, occurrence.layer_id, occurrence.package_path or "")
+    existing_keys = {(occ.layer_index, occ.layer_id, occ.package_path or "") for occ in package.occurrences}
+    if occurrence_key not in existing_keys:
+        package.occurrences.append(occurrence)
+
+
+def _parse_rfc822_name_version(fileobj: IO[bytes]) -> tuple[str, str]:
+    """Extract ``Name``/``Version`` from an RFC822 Python metadata stream.
+
+    Shared by the modern ``*.dist-info/METADATA`` and the legacy
+    ``*.egg-info/PKG-INFO`` (or ``*.egg-info/METADATA``) parsers — both use the
+    same header format, only the file location differs.
+    """
+    pkg_name = pkg_version = ""
+    for raw_line in fileobj:
+        line = raw_line.decode("utf-8", errors="ignore").strip()
+        if line.startswith("Name:"):
+            pkg_name = line.split(":", 1)[1].strip()
+        elif line.startswith("Version:"):
+            pkg_version = line.split(":", 1)[1].strip()
+        if pkg_name and pkg_version:
+            break
+    return pkg_name, pkg_version
+
+
+def _read_os_release_from_layer(layer_tf: tarfile.TarFile, deleted_paths: set[str]) -> tuple[str | None, str | None]:
+    """Read distro metadata from ``os-release`` inside a layer.
+
+    Probes both the canonical ``usr/lib/os-release`` location and the historic
+    ``etc/os-release`` path. On Debian/Ubuntu ``/etc/os-release`` is a symlink
+    to ``/usr/lib/os-release``; the parser refuses to follow symlinks, so the
+    real file under ``usr/lib`` must be probed directly or distro detection
+    silently fails (which mis-routes OS-package CVE matching to the wrong
+    distribution release).
+    """
+    for os_release_path in (
+        "etc/os-release",
+        "./etc/os-release",
+        "usr/lib/os-release",
+        "./usr/lib/os-release",
+    ):
+        if os_release_path in deleted_paths:
+            continue
+        member = _safe_getmember(layer_tf, os_release_path)
+        if member is None:
+            # Missing, symlinked (refused), or unsafe name. Try next candidate.
+            continue
+        try:
+            f = layer_tf.extractfile(member)
+            if f is None:
+                continue
+            distro_name: str | None = None
+            distro_version: str | None = None
+            for raw_line in f:
+                line = raw_line.decode("utf-8", errors="ignore").strip()
+                if line.startswith("ID="):
+                    distro_name = line.split("=", 1)[1].strip().strip('"').strip("'").lower() or None
+                elif line.startswith("VERSION_ID="):
+                    distro_version = line.split("=", 1)[1].strip().strip('"').strip("'") or None
+            return distro_name, distro_version
+        except (tarfile.TarError, OSError, UnicodeDecodeError) as e:
+            _logger.debug("Failed to parse os-release %s: %s: %s", os_release_path, type(e).__name__, e)
+    return None, None
 
 
 def _extract_packages_from_layer(
     layer_tf: tarfile.TarFile,
-    seen: set[tuple[str, str]],
+    packages_by_key: dict[tuple[str, str], Package],
     packages: list[Package],
     deleted_paths: set[str],
+    layer: LayerMetadata,
+    warnings: list[str] | None = None,
 ) -> set[str]:
     """Extract packages from an open layer TarFile.
 
     Args:
         layer_tf: Open TarFile for the layer.
-        seen: Mutable set of (name, ecosystem) already found — updated in place.
+        packages_by_key: Mutable package map keyed by (name, ecosystem).
         packages: Mutable list of packages — updated in place.
         deleted_paths: Set of paths deleted in LATER layers (whiteouts already processed).
+        layer: Layer provenance metadata for this concrete tar blob.
+        warnings: Optional mutable list for non-fatal parser diagnostics.
 
     Returns:
         Set of paths marked as whiteout in THIS layer (for caller to accumulate).
     """
     whiteouts: set[str] = set()
-    names = set(layer_tf.getnames())
+    # `_safe_tar_names` filters out path-traversal members (normalized + split-part
+    # check, not just substring), absolute paths, NUL-injected names, AND symlink /
+    # hardlink members. Prior filter only substring-checked "..".
+    names = _safe_tar_names(layer_tf)
 
     # Collect whiteout paths from this layer
     for member_name in names:
@@ -231,29 +718,30 @@ def _extract_packages_from_layer(
                 return True
         return False
 
-    # --- Python: dist-info METADATA ---
+    # --- Python: dist-info METADATA (modern) + egg-info PKG-INFO/METADATA (legacy) ---
+    # Older base images (e.g. Debian buster) ship pip/setuptools/wheel as
+    # ``*.egg-info/PKG-INFO`` rather than ``*.dist-info/METADATA``. Both formats
+    # use the same RFC822 ``Name:``/``Version:`` headers. De-duplication is
+    # handled by ``_add_package`` (keyed on name+ecosystem), so a package found
+    # via both layouts is recorded once.
     for member_name in names:
-        if not member_name.endswith(".dist-info/METADATA"):
+        if member_name.endswith(".dist-info/METADATA"):
+            metadata_kind = "dist-info"
+        elif member_name.endswith(".egg-info/PKG-INFO") or member_name.endswith(".egg-info/METADATA"):
+            metadata_kind = "egg-info"
+        else:
             continue
         if _is_deleted(member_name):
             continue
         try:
-            f = layer_tf.extractfile(layer_tf.getmember(member_name))
+            f = _safe_extractfile(layer_tf, member_name)
             if f is None:
                 continue
-            pkg_name = pkg_version = ""
-            for raw_line in f:
-                line = raw_line.decode("utf-8", errors="ignore").strip()
-                if line.startswith("Name:"):
-                    pkg_name = line.split(":", 1)[1].strip()
-                elif line.startswith("Version:"):
-                    pkg_version = line.split(":", 1)[1].strip()
-                if pkg_name and pkg_version:
-                    break
+            pkg_name, pkg_version = _parse_rfc822_name_version(f)
             if pkg_name and pkg_version:
-                _add_package(seen, packages, pkg_name, pkg_version, "pypi")
+                _add_package(packages_by_key, packages, pkg_name, pkg_version, "pypi", layer=layer, package_path=member_name)
         except Exception:
-            _logger.debug("Skipped Python dist-info: %s", member_name)
+            _logger.debug("Skipped Python %s metadata: %s", metadata_kind, member_name)
 
     # --- Node: node_modules/*/package.json ---
     for member_name in names:
@@ -264,14 +752,14 @@ def _extract_packages_from_layer(
         if _is_deleted(member_name):
             continue
         try:
-            f = layer_tf.extractfile(layer_tf.getmember(member_name))
+            f = _safe_extractfile(layer_tf, member_name)
             if f is None:
                 continue
             data = json.loads(f.read().decode("utf-8", errors="ignore"))
             pkg_name = data.get("name", "")
             pkg_version = data.get("version", "unknown")
             if pkg_name:
-                _add_package(seen, packages, pkg_name, pkg_version, "npm")
+                _add_package(packages_by_key, packages, pkg_name, pkg_version, "npm", layer=layer, package_path=member_name)
         except Exception:
             _logger.debug("Skipped Node package.json: %s", member_name)
 
@@ -280,21 +768,45 @@ def _extract_packages_from_layer(
         if dpkg_path not in names or _is_deleted(dpkg_path):
             continue
         try:
-            f = layer_tf.extractfile(layer_tf.getmember(dpkg_path))
+            f = _safe_extractfile(layer_tf, dpkg_path)
             if f:
                 content = f.read().decode("utf-8", errors="ignore")
                 pkg_name = pkg_version = ""
+                source_package: str | None = None
                 for line in content.splitlines():
                     if line.startswith("Package:"):
                         pkg_name = line.split(":", 1)[1].strip()
                     elif line.startswith("Version:"):
                         pkg_version = line.split(":", 1)[1].strip()
+                    elif line.startswith("Source:"):
+                        source_package = parse_debian_source_name(line.split(":", 1)[1].strip())
                     elif line == "" and pkg_name and pkg_version:
-                        _add_package(seen, packages, pkg_name, pkg_version, "deb", f"pkg:deb/debian/{pkg_name}@{pkg_version}")
+                        _add_package(
+                            packages_by_key,
+                            packages,
+                            pkg_name,
+                            pkg_version,
+                            "deb",
+                            f"pkg:deb/debian/{pkg_name}@{pkg_version}",
+                            source_package=source_package,
+                            layer=layer,
+                            package_path=dpkg_path,
+                        )
                         pkg_name = pkg_version = ""
+                        source_package = None
                 # Flush last entry
                 if pkg_name and pkg_version:
-                    _add_package(seen, packages, pkg_name, pkg_version, "deb", f"pkg:deb/debian/{pkg_name}@{pkg_version}")
+                    _add_package(
+                        packages_by_key,
+                        packages,
+                        pkg_name,
+                        pkg_version,
+                        "deb",
+                        f"pkg:deb/debian/{pkg_name}@{pkg_version}",
+                        source_package=source_package,
+                        layer=layer,
+                        package_path=dpkg_path,
+                    )
         except Exception:
             _logger.debug("Failed to parse dpkg status")
         break
@@ -304,20 +816,44 @@ def _extract_packages_from_layer(
         if apk_path not in names or _is_deleted(apk_path):
             continue
         try:
-            f = layer_tf.extractfile(layer_tf.getmember(apk_path))
+            f = _safe_extractfile(layer_tf, apk_path)
             if f:
                 content = f.read().decode("utf-8", errors="ignore")
                 pkg_name = pkg_version = ""
+                apk_source_package: str | None = None
                 for line in content.splitlines():
                     if line.startswith("P:"):
                         pkg_name = line[2:].strip()
                     elif line.startswith("V:"):
                         pkg_version = line[2:].strip()
+                    elif line.startswith("o:") or line.startswith("O:"):
+                        apk_source_package = line[2:].strip() or None
                     elif line == "" and pkg_name and pkg_version:
-                        _add_package(seen, packages, pkg_name, pkg_version, "apk", f"pkg:apk/alpine/{pkg_name}@{pkg_version}")
+                        _add_package(
+                            packages_by_key,
+                            packages,
+                            pkg_name,
+                            pkg_version,
+                            "apk",
+                            f"pkg:apk/alpine/{pkg_name}@{pkg_version}",
+                            source_package=apk_source_package,
+                            layer=layer,
+                            package_path=apk_path,
+                        )
                         pkg_name = pkg_version = ""
+                        apk_source_package = None
                 if pkg_name and pkg_version:
-                    _add_package(seen, packages, pkg_name, pkg_version, "apk", f"pkg:apk/alpine/{pkg_name}@{pkg_version}")
+                    _add_package(
+                        packages_by_key,
+                        packages,
+                        pkg_name,
+                        pkg_version,
+                        "apk",
+                        f"pkg:apk/alpine/{pkg_name}@{pkg_version}",
+                        source_package=apk_source_package,
+                        layer=layer,
+                        package_path=apk_path,
+                    )
         except Exception:
             _logger.debug("Failed to parse Alpine apk db")
         break
@@ -327,7 +863,7 @@ def _extract_packages_from_layer(
         if rpm_path not in names or _is_deleted(rpm_path):
             continue
         try:
-            f = layer_tf.extractfile(layer_tf.getmember(rpm_path))
+            f = _safe_extractfile(layer_tf, rpm_path)
             if f:
                 for raw_line in f:
                     line = raw_line.decode("utf-8", errors="ignore").strip()
@@ -343,7 +879,16 @@ def _extract_packages_from_layer(
                             if rpm_name == "gpg-pubkey":
                                 continue
                             rpm_ver = nvr[idx1 + 1 : idx2]
-                            _add_package(seen, packages, rpm_name, rpm_ver, "rpm", f"pkg:rpm/redhat/{rpm_name}@{rpm_ver}")
+                            _add_package(
+                                packages_by_key,
+                                packages,
+                                rpm_name,
+                                rpm_ver,
+                                "rpm",
+                                f"pkg:rpm/redhat/{rpm_name}@{rpm_ver}",
+                                layer=layer,
+                                package_path=rpm_path,
+                            )
         except Exception:
             _logger.debug("Failed to parse rpm manifest")
         break
@@ -353,7 +898,7 @@ def _extract_packages_from_layer(
         if sqlite_path not in names or _is_deleted(sqlite_path):
             continue
         try:
-            f = layer_tf.extractfile(layer_tf.getmember(sqlite_path))
+            f = _safe_extractfile(layer_tf, sqlite_path)
             if f is None:
                 continue
             db_bytes = f.read()
@@ -371,7 +916,16 @@ def _extract_packages_from_layer(
                             if result:
                                 rpm_name, rpm_ver = result
                                 if rpm_name != "gpg-pubkey":
-                                    _add_package(seen, packages, rpm_name, rpm_ver, "rpm", f"pkg:rpm/redhat/{rpm_name}@{rpm_ver}")
+                                    _add_package(
+                                        packages_by_key,
+                                        packages,
+                                        rpm_name,
+                                        rpm_ver,
+                                        "rpm",
+                                        f"pkg:rpm/redhat/{rpm_name}@{rpm_ver}",
+                                        layer=layer,
+                                        package_path=sqlite_path,
+                                    )
                 except sqlite3.DatabaseError:
                     _logger.debug("Failed to query rpmdb.sqlite")
                 finally:
@@ -384,6 +938,26 @@ def _extract_packages_from_layer(
             _logger.debug("Failed to parse rpmdb.sqlite")
         break
 
+    # --- Legacy rpm database (BerkeleyDB / NDB) ---
+    has_modern_rpm_source = any(p in names and not _is_deleted(p) for p in (*_RPM_SQLITE_PATHS, *_RPM_MANIFEST_PATHS))
+    if not has_modern_rpm_source:
+        legacy_rpmdb = next(
+            (p for p in (*_RPM_BDB_PATHS, *_RPM_NDB_PATHS) if p in names and not _is_deleted(p)),
+            None,
+        )
+        if legacy_rpmdb:
+            for rpm_name, rpm_ver in _query_legacy_rpmdb(layer_tf, legacy_rpmdb):
+                _add_package(
+                    packages_by_key,
+                    packages,
+                    rpm_name,
+                    rpm_ver,
+                    "rpm",
+                    f"pkg:rpm/redhat/{rpm_name}@{rpm_ver}",
+                    layer=layer,
+                    package_path=legacy_rpmdb,
+                )
+
     # --- Java: JARs via META-INF/maven/*/pom.properties or MANIFEST.MF ---
     for member_name in names:
         if not _JAR_EXT_RE.search(member_name):
@@ -394,15 +968,22 @@ def _extract_packages_from_layer(
         name_for_hint = "/" + member_name.lower()
         if not any(hint in name_for_hint for hint in _JAR_DIR_HINTS):
             continue
+        member = _safe_getmember(layer_tf, member_name)
+        if member is None or member.size == 0 or member.size > _JAR_MAX_BYTES:
+            continue
         try:
-            member = layer_tf.getmember(member_name)
-            if not member.isfile() or member.size == 0 or member.size > _JAR_MAX_BYTES:
-                continue
             f = layer_tf.extractfile(member)
             if f is None:
                 continue
             jar_bytes = f.read()
             with zipfile.ZipFile(io.BytesIO(jar_bytes)) as zf:
+                jar_uncompressed_bytes = _zip_uncompressed_size(zf)
+                if jar_uncompressed_bytes > _max_jar_uncompressed_bytes():
+                    _logger.debug("Skipping oversized JAR payload: %s", member_name)
+                    continue
+                if _decompression_ratio_exceeded(jar_uncompressed_bytes, _zip_compressed_size(zf)):
+                    _logger.debug("Skipping high-ratio compressed JAR payload: %s", member_name)
+                    continue
                 jar_names = zf.namelist()
                 # Prefer META-INF/maven/*/pom.properties (groupId/artifactId/version)
                 pom_props_paths = [n for n in jar_names if re.match(r"META-INF/maven/[^/]+/[^/]+/pom\.properties$", n)]
@@ -418,7 +999,7 @@ def _extract_packages_from_layer(
                     group_id = props.get("groupId", "")
                     if artifact_id and version:
                         purl = f"pkg:maven/{group_id}/{artifact_id}@{version}" if group_id else f"pkg:maven/{artifact_id}@{version}"
-                        _add_package(seen, packages, artifact_id, version, "maven", purl)
+                        _add_package(packages_by_key, packages, artifact_id, version, "maven", purl, layer=layer, package_path=member_name)
                         found = True
                 # Fallback: MANIFEST.MF Implementation-Title/Version or Bundle-*
                 if not found and "META-INF/MANIFEST.MF" in jar_names:
@@ -430,7 +1011,7 @@ def _extract_packages_from_layer(
                     title = mf.get("Implementation-Title") or mf.get("Bundle-Name", "")
                     version = mf.get("Implementation-Version") or mf.get("Bundle-Version", "")
                     if title and version and not title.startswith("$") and not version.startswith("$"):
-                        _add_package(seen, packages, title, version, "maven")
+                        _add_package(packages_by_key, packages, title, version, "maven", layer=layer, package_path=member_name)
         except Exception:
             _logger.debug("Skipped JAR: %s", member_name)
 
@@ -440,10 +1021,10 @@ def _extract_packages_from_layer(
             continue
         if _is_deleted(member_name):
             continue
+        member = _safe_getmember(layer_tf, member_name)
+        if member is None or member.size < 64:
+            continue
         try:
-            member = layer_tf.getmember(member_name)
-            if not member.isfile() or member.size < 64:
-                continue
             f = layer_tf.extractfile(member)
             if f is None:
                 continue
@@ -455,7 +1036,16 @@ def _extract_packages_from_layer(
                 mod_path = m.group(1).decode("utf-8", errors="ignore").strip()
                 mod_ver = m.group(2).decode("utf-8", errors="ignore").strip()
                 if mod_path and mod_ver:
-                    _add_package(seen, packages, mod_path, mod_ver, "golang", f"pkg:golang/{mod_path}@{mod_ver}")
+                    _add_package(
+                        packages_by_key,
+                        packages,
+                        mod_path,
+                        mod_ver,
+                        "golang",
+                        f"pkg:golang/{mod_path}@{mod_ver}",
+                        layer=layer,
+                        package_path=member_name,
+                    )
         except Exception:
             _logger.debug("Skipped Go binary: %s", member_name)
 
@@ -466,7 +1056,7 @@ def _extract_packages_from_layer(
         if _is_deleted(member_name):
             continue
         try:
-            f = layer_tf.extractfile(layer_tf.getmember(member_name))
+            f = _safe_extractfile(layer_tf, member_name)
             if f is None:
                 continue
             content = f.read(32 * 1024).decode("utf-8", errors="ignore")
@@ -475,7 +1065,16 @@ def _extract_packages_from_layer(
             if name_m and ver_m:
                 gem_name = name_m.group(1)
                 gem_ver = ver_m.group(1)
-                _add_package(seen, packages, gem_name, gem_ver, "gem", f"pkg:gem/{gem_name}@{gem_ver}")
+                _add_package(
+                    packages_by_key,
+                    packages,
+                    gem_name,
+                    gem_ver,
+                    "gem",
+                    f"pkg:gem/{gem_name}@{gem_ver}",
+                    layer=layer,
+                    package_path=member_name,
+                )
         except Exception:
             _logger.debug("Skipped gemspec: %s", member_name)
 
@@ -486,7 +1085,7 @@ def _extract_packages_from_layer(
         if _is_deleted(member_name):
             continue
         try:
-            f = layer_tf.extractfile(layer_tf.getmember(member_name))
+            f = _safe_extractfile(layer_tf, member_name)
             if f is None:
                 continue
             deps = json.loads(f.read().decode("utf-8", errors="ignore"))
@@ -497,7 +1096,16 @@ def _extract_packages_from_layer(
                 if "/" in lib_key:
                     pkg_name, _, pkg_ver = lib_key.rpartition("/")
                     if pkg_name and pkg_ver:
-                        _add_package(seen, packages, pkg_name, pkg_ver, "nuget", f"pkg:nuget/{pkg_name}@{pkg_ver}")
+                        _add_package(
+                            packages_by_key,
+                            packages,
+                            pkg_name,
+                            pkg_ver,
+                            "nuget",
+                            f"pkg:nuget/{pkg_name}@{pkg_ver}",
+                            layer=layer,
+                            package_path=member_name,
+                        )
         except Exception:
             _logger.debug("Skipped deps.json: %s", member_name)
 
@@ -515,7 +1123,7 @@ def _extract_packages_from_layer(
             if path not in names or _is_deleted(path):
                 continue
             try:
-                f = layer_tf.extractfile(layer_tf.getmember(path))
+                f = _safe_extractfile(layer_tf, path)
                 if f is None:
                     continue
                 data = json.loads(f.read().decode("utf-8", errors="ignore"))
@@ -524,7 +1132,16 @@ def _extract_packages_from_layer(
                         name = pkg.get("name", "")
                         version = pkg.get("version", "unknown").lstrip("v")
                         if name:
-                            _add_package(seen, packages, name, version, "composer", f"pkg:composer/{name}@{version}")
+                            _add_package(
+                                packages_by_key,
+                                packages,
+                                name,
+                                version,
+                                "composer",
+                                f"pkg:composer/{name}@{version}",
+                                layer=layer,
+                                package_path=path,
+                            )
             except Exception:
                 _logger.debug("Failed to parse composer.lock: %s", path)
 
@@ -535,7 +1152,7 @@ def _extract_packages_from_layer(
             if path not in names or _is_deleted(path):
                 continue
             try:
-                f = layer_tf.extractfile(layer_tf.getmember(path))
+                f = _safe_extractfile(layer_tf, path)
                 if f is None:
                     continue
                 content = f.read().decode("utf-8", errors="ignore")
@@ -547,7 +1164,14 @@ def _extract_packages_from_layer(
                     ver_m = _re.search(r'version\s*=\s*"([^"]+)"', block)
                     if name_m and ver_m:
                         _add_package(
-                            seen, packages, name_m.group(1), ver_m.group(1), "cargo", f"pkg:cargo/{name_m.group(1)}@{ver_m.group(1)}"
+                            packages_by_key,
+                            packages,
+                            name_m.group(1),
+                            ver_m.group(1),
+                            "cargo",
+                            f"pkg:cargo/{name_m.group(1)}@{ver_m.group(1)}",
+                            layer=layer,
+                            package_path=path,
                         )
             except Exception:
                 _logger.debug("Failed to parse Cargo.lock: %s", path)
@@ -559,7 +1183,7 @@ def _extract_packages_from_layer(
             if path not in names or _is_deleted(path):
                 continue
             try:
-                f = layer_tf.extractfile(layer_tf.getmember(path))
+                f = _safe_extractfile(layer_tf, path)
                 if f is None:
                     continue
                 data = json.loads(f.read().decode("utf-8", errors="ignore"))
@@ -572,11 +1196,68 @@ def _extract_packages_from_layer(
                     version = pin.get("state", {}).get("version") or "unknown"
                     name = identity or (location.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") if location else "")
                     if name:
-                        _add_package(seen, packages, name, version, "swift", f"pkg:swift/{name}@{version}")
+                        _add_package(
+                            packages_by_key,
+                            packages,
+                            name,
+                            version,
+                            "swift",
+                            f"pkg:swift/{name}@{version}",
+                            layer=layer,
+                            package_path=path,
+                        )
             except Exception:
                 _logger.debug("Failed to parse Package.resolved: %s", path)
 
     return whiteouts
+
+
+def _occurrence_whiteout_deleted(
+    package_path: str | None,
+    layer_index: int,
+    whiteouts_by_index: dict[int, set[str]],
+) -> bool:
+    """Return True iff ``package_path`` is removed by a whiteout in a HIGHER layer.
+
+    Per the OCI overlay spec a whiteout deletes paths from layers *below* it
+    only. A file re-created in a higher layer therefore survives a lower-layer
+    whiteout for the same path. Applying whiteouts as a post-filter scoped to
+    strictly-higher layer indices captures both cases: genuine deletion (file in
+    a low layer, whiteout above it) and re-add (file in the same or a higher
+    layer than the whiteout — kept).
+    """
+    if not package_path:
+        return False
+    for whiteout_layer, paths in whiteouts_by_index.items():
+        if whiteout_layer <= layer_index:
+            continue
+        for w in paths:
+            if w.endswith("/"):
+                if package_path == w[:-1] or package_path.startswith(w):
+                    return True
+            elif package_path == w or package_path.startswith(w + "/"):
+                return True
+    return False
+
+
+def _drop_whiteout_deleted_packages(
+    packages: list[Package],
+    whiteouts_by_index: dict[int, set[str]],
+) -> list[Package]:
+    """Drop packages whose every occurrence was deleted by a higher-layer whiteout."""
+    if not whiteouts_by_index:
+        return packages
+    kept: list[Package] = []
+    for pkg in packages:
+        occurrences = pkg.occurrences
+        if not occurrences:
+            kept.append(pkg)
+            continue
+        survivors = [occ for occ in occurrences if not _occurrence_whiteout_deleted(occ.package_path, occ.layer_index, whiteouts_by_index)]
+        if survivors:
+            pkg.occurrences = survivors
+            kept.append(pkg)
+    return kept
 
 
 # ─── Docker save tarball format ───────────────────────────────────────────────
@@ -586,10 +1267,15 @@ def _parse_docker_save_manifest(tf: tarfile.TarFile) -> list[OCIManifest]:
     """Parse manifest.json from a Docker save tarball."""
     try:
         member = tf.getmember("manifest.json")
+        if member.size > _max_json_member_bytes():
+            raise OCIParseError("manifest.json exceeds parser size limit")
         f = tf.extractfile(member)
         if f is None:
             raise OCIParseError("manifest.json is not a regular file")
-        raw = json.loads(f.read().decode("utf-8"))
+        data = f.read(_max_json_member_bytes() + 1)
+        if len(data) > _max_json_member_bytes():
+            raise OCIParseError("manifest.json exceeds parser size limit")
+        raw = json.loads(data.decode("utf-8"))
     except KeyError:
         raise OCIParseError("No manifest.json found — not a Docker save tarball")
     except json.JSONDecodeError as e:
@@ -610,6 +1296,7 @@ def _parse_docker_save_manifest(tf: tarfile.TarFile) -> list[OCIManifest]:
 def _parse_layers_from_tarball(
     outer_tf: tarfile.TarFile,
     layer_paths: list[str],
+    layer_metadata: list[LayerMetadata] | None = None,
 ) -> tuple[list[Package], list[str]]:
     """Open each layer tarball from the outer tarball and extract packages.
 
@@ -619,27 +1306,21 @@ def _parse_layers_from_tarball(
     Returns:
         (packages, warnings)
     """
-    seen: set[tuple[str, str]] = set()
+    packages_by_key: dict[tuple[str, str], Package] = {}
     packages: list[Package] = []
     warnings: list[str] = []
+    detected_distro_name: str | None = None
+    detected_distro_version: str | None = None
+    layer_metadata = layer_metadata or _build_layer_metadata(layer_paths)
 
-    # First pass: collect all whiteouts per layer (in order)
-    # Then second pass: extract packages respecting accumulated deletions.
-    # For simplicity: single-pass, accumulate deletions from current layer
-    # only. Full whiteout handling would require two passes.
-    all_deleted: set[str] = set()
+    # Whiteouts are applied as a post-filter (see _drop_whiteout_deleted_packages)
+    # scoped to strictly-higher layers, so a file re-created in a higher layer is
+    # not wrongly suppressed by a lower-layer whiteout for the same path (the bug
+    # that silently dropped pip/setuptools dist-info on Debian-based images).
+    whiteouts_by_index: dict[int, set[str]] = {}
 
-    for layer_path in layer_paths:
-        # Normalize path (docker save may use paths with leading ./)
-        layer_path_norm = layer_path.lstrip("./")
-        # Try normalized and original
-        member = None
-        for candidate in (layer_path, layer_path_norm, "./" + layer_path_norm):
-            try:
-                member = outer_tf.getmember(candidate)
-                break
-            except KeyError:
-                continue
+    for layer_path, layer in zip(layer_paths, layer_metadata, strict=False):
+        member = _resolve_tar_member(outer_tf, layer_path)
 
         if member is None:
             warnings.append(f"Layer not found in tarball: {layer_path}")
@@ -650,15 +1331,41 @@ def _parse_layers_from_tarball(
             warnings.append(f"Layer is not a regular file: {layer_path}")
             continue
 
-        # Read into memory to allow tarfile to seek
-        layer_bytes = layer_fobj.read()
+        # Read into memory to allow tarfile to seek.
+        # Cap at 2 GB to prevent OOM on very large image layers (e.g. ML model weights).
+        max_layer_bytes = 2 * 1024 * 1024 * 1024  # 2 GB
+        layer_bytes = layer_fobj.read(max_layer_bytes + 1)
+        if len(layer_bytes) > max_layer_bytes:
+            warnings.append(f"Layer {layer_path} exceeds 2 GB — skipped to avoid OOM")
+            continue
         try:
             with tarfile.open(fileobj=io.BytesIO(layer_bytes), mode="r:*") as layer_tf:
-                whiteouts = _extract_packages_from_layer(layer_tf, seen, packages, all_deleted)
-                all_deleted.update(whiteouts)
+                uncompressed_bytes = _tar_uncompressed_regular_size(layer_tf)
+                if uncompressed_bytes > _max_layer_uncompressed_bytes():
+                    warnings.append(f"Layer {layer_path} exceeds uncompressed extraction limit — skipped")
+                    continue
+                if _decompression_ratio_exceeded(uncompressed_bytes, member.size):
+                    warnings.append(f"Layer {layer_path} exceeds decompression ratio limit — skipped")
+                    continue
+                layer_distro_name, layer_distro_version = _read_os_release_from_layer(layer_tf, set())
+                if layer_distro_name:
+                    detected_distro_name = layer_distro_name
+                if layer_distro_version:
+                    detected_distro_version = layer_distro_version
+                whiteouts = _extract_packages_from_layer(layer_tf, packages_by_key, packages, set(), layer, warnings)
+                if whiteouts:
+                    whiteouts_by_index.setdefault(layer.layer_index, set()).update(whiteouts)
         except tarfile.TarError as e:
             warnings.append(f"Failed to read layer {layer_path}: {e}")
             continue
+
+    packages = _drop_whiteout_deleted_packages(packages, whiteouts_by_index)
+
+    if detected_distro_name or detected_distro_version:
+        for pkg in packages:
+            if pkg.ecosystem in {"deb", "apk", "rpm"}:
+                pkg.distro_name = pkg.distro_name or detected_distro_name
+                pkg.distro_version = pkg.distro_version or detected_distro_version
 
     return packages, warnings
 
@@ -666,20 +1373,24 @@ def _parse_layers_from_tarball(
 # ─── OCI image layout format ──────────────────────────────────────────────────
 
 
-def _parse_oci_layout_index(tf: tarfile.TarFile) -> list[str]:
-    """Parse index.json from an OCI image layout tarball. Returns layer blob paths."""
+def _parse_oci_layout_manifest_from_tar(tf: tarfile.TarFile) -> tuple[dict, list[str], dict | None]:
+    """Parse index/manifest/config from an OCI image layout tarball."""
     try:
-        member = tf.getmember("index.json")
+        member = _resolve_tar_member(tf, "index.json")
+        if member is None:
+            raise OCIParseError("No index.json found — not an OCI image layout tarball")
+        if member.size > _max_json_member_bytes():
+            raise OCIParseError("index.json exceeds parser size limit")
         f = tf.extractfile(member)
         if f is None:
             raise OCIParseError("index.json is not a regular file")
-        index = json.loads(f.read().decode("utf-8"))
-    except KeyError:
-        raise OCIParseError("No index.json found — not an OCI image layout tarball")
+        data = f.read(_max_json_member_bytes() + 1)
+        if len(data) > _max_json_member_bytes():
+            raise OCIParseError("index.json exceeds parser size limit")
+        index = json.loads(data.decode("utf-8"))
     except json.JSONDecodeError as e:
         raise OCIParseError(f"Invalid index.json: {e}")
 
-    # Get first manifest digest
     manifests = index.get("manifests", [])
     if not manifests:
         raise OCIParseError("No manifests in OCI index.json")
@@ -690,22 +1401,22 @@ def _parse_oci_layout_index(tf: tarfile.TarFile) -> list[str]:
 
     manifest_hash = manifest_digest[len("sha256:") :]
     blob_path = f"blobs/sha256/{manifest_hash}"
-    try:
-        member = tf.getmember(blob_path)
-        f = tf.extractfile(member)
-        if f is None:
-            raise OCIParseError(f"Manifest blob not found: {blob_path}")
-        manifest = json.loads(f.read().decode("utf-8"))
-    except (KeyError, json.JSONDecodeError) as e:
-        raise OCIParseError(f"Failed to read OCI manifest blob: {e}")
+    manifest = _read_json_member_from_tar(tf, blob_path)
+    if manifest is None:
+        raise OCIParseError(f"Failed to read OCI manifest blob: {blob_path}")
 
-    layer_paths: list[str] = []
-    for layer in manifest.get("layers", []):
-        digest = layer.get("digest", "")
-        if digest.startswith("sha256:"):
-            layer_paths.append(f"blobs/sha256/{digest[len('sha256:') :]}")
+    layer_paths = [
+        f"blobs/sha256/{digest[len('sha256:') :]}"
+        for layer in manifest.get("layers", [])
+        if (digest := layer.get("digest", "")).startswith("sha256:")
+    ]
 
-    return layer_paths
+    config: dict | None = None
+    config_digest = manifest.get("config", {}).get("digest", "")
+    if config_digest.startswith("sha256:"):
+        config = _read_json_member_from_tar(tf, f"blobs/sha256/{config_digest[len('sha256:') :]}")
+
+    return manifest, layer_paths, config
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -748,7 +1459,9 @@ def parse_oci_tarball(path: Path) -> OCIParseResult:
                 return OCIParseResult(packages=[], strategy="oci-tarball", layer_count=0, warnings=["Empty manifest.json"])
             # Use first image (most users save one image)
             manifest = manifests[0]
-            packages, warnings = _parse_layers_from_tarball(outer_tf, manifest.layer_paths)
+            config = _read_json_member_from_tar(outer_tf, manifest.config_digest)
+            layer_metadata = _build_layer_metadata(manifest.layer_paths, config)
+            packages, warnings = _parse_layers_from_tarball(outer_tf, manifest.layer_paths, layer_metadata)
             return OCIParseResult(
                 packages=packages,
                 strategy="oci-tarball",
@@ -760,10 +1473,11 @@ def parse_oci_tarball(path: Path) -> OCIParseResult:
         elif "index.json" in names or "./index.json" in names:
             # OCI image layout format
             try:
-                layer_paths = _parse_oci_layout_index(outer_tf)
+                _manifest, layer_paths, config = _parse_oci_layout_manifest_from_tar(outer_tf)
             except OCIParseError:
                 raise
-            packages, warnings = _parse_layers_from_tarball(outer_tf, layer_paths)
+            layer_metadata = _build_layer_metadata(layer_paths, config)
+            packages, warnings = _parse_layers_from_tarball(outer_tf, layer_paths, layer_metadata)
             return OCIParseResult(
                 packages=packages,
                 strategy="oci-tarball",
@@ -796,10 +1510,9 @@ def parse_oci_layout_dir(path: Path) -> OCIParseResult:
     if not index_path.exists():
         raise OCIParseError(f"index.json not found in {path}")
 
-    try:
-        index = json.loads(index_path.read_text())
-    except (json.JSONDecodeError, OSError) as e:
-        raise OCIParseError(f"Failed to read index.json: {e}")
+    index = _read_json_path_limited(index_path)
+    if not isinstance(index, dict):
+        raise OCIParseError("Failed to read index.json")
 
     manifests = index.get("manifests", [])
     if not manifests:
@@ -814,33 +1527,63 @@ def parse_oci_layout_dir(path: Path) -> OCIParseResult:
     if not manifest_blob.exists():
         raise OCIParseError(f"Manifest blob not found: {manifest_blob}")
 
-    try:
-        manifest = json.loads(manifest_blob.read_text())
-    except (json.JSONDecodeError, OSError) as e:
-        raise OCIParseError(f"Failed to read manifest blob: {e}")
+    manifest = _read_json_path_limited(manifest_blob)
+    if not isinstance(manifest, dict):
+        raise OCIParseError("Failed to read manifest blob")
 
-    layer_digests = []
-    for layer in manifest.get("layers", []):
-        digest = layer.get("digest", "")
-        if digest.startswith("sha256:"):
-            layer_digests.append(digest[len("sha256:") :])
+    layer_digests = [
+        digest[len("sha256:") :] for layer in manifest.get("layers", []) if (digest := layer.get("digest", "")).startswith("sha256:")
+    ]
+    layer_paths = [f"blobs/sha256/{layer_hash}" for layer_hash in layer_digests]
+    config: dict | None = None
+    config_digest = manifest.get("config", {}).get("digest", "")
+    if config_digest.startswith("sha256:"):
+        config_blob = path / "blobs" / "sha256" / config_digest[len("sha256:") :]
+        if config_blob.exists():
+            maybe_config = _read_json_path_limited(config_blob)
+            config = maybe_config if isinstance(maybe_config, dict) else None
+    layer_metadata = _build_layer_metadata(layer_paths, config)
 
-    seen: set[tuple[str, str]] = set()
+    packages_by_key: dict[tuple[str, str], Package] = {}
     packages: list[Package] = []
     warnings: list[str] = []
-    all_deleted: set[str] = set()
+    detected_distro_name: str | None = None
+    detected_distro_version: str | None = None
+    whiteouts_by_index: dict[int, set[str]] = {}
 
-    for layer_hash in layer_digests:
+    for layer_hash, layer in zip(layer_digests, layer_metadata, strict=False):
         blob_path = path / "blobs" / "sha256" / layer_hash
         if not blob_path.exists():
             warnings.append(f"Layer blob not found: {blob_path}")
             continue
         try:
             with tarfile.open(str(blob_path), mode="r:*") as layer_tf:
-                whiteouts = _extract_packages_from_layer(layer_tf, seen, packages, all_deleted)
-                all_deleted.update(whiteouts)
+                uncompressed_bytes = _tar_uncompressed_regular_size(layer_tf)
+                if uncompressed_bytes > _max_layer_uncompressed_bytes():
+                    warnings.append(f"Layer {layer_hash[:12]} exceeds uncompressed extraction limit — skipped")
+                    continue
+                compressed_bytes = blob_path.stat().st_size
+                if _decompression_ratio_exceeded(uncompressed_bytes, compressed_bytes):
+                    warnings.append(f"Layer {layer_hash[:12]} exceeds decompression ratio limit — skipped")
+                    continue
+                layer_distro_name, layer_distro_version = _read_os_release_from_layer(layer_tf, set())
+                if layer_distro_name:
+                    detected_distro_name = layer_distro_name
+                if layer_distro_version:
+                    detected_distro_version = layer_distro_version
+                whiteouts = _extract_packages_from_layer(layer_tf, packages_by_key, packages, set(), layer, warnings)
+                if whiteouts:
+                    whiteouts_by_index.setdefault(layer.layer_index, set()).update(whiteouts)
         except tarfile.TarError as e:
             warnings.append(f"Failed to read layer blob {layer_hash[:12]}: {e}")
+
+    packages = _drop_whiteout_deleted_packages(packages, whiteouts_by_index)
+
+    if detected_distro_name or detected_distro_version:
+        for pkg in packages:
+            if pkg.ecosystem in {"deb", "apk", "rpm"}:
+                pkg.distro_name = pkg.distro_name or detected_distro_name
+                pkg.distro_version = pkg.distro_version or detected_distro_version
 
     return OCIParseResult(
         packages=packages,

@@ -1,66 +1,249 @@
 # Architecture
 
-This document describes the architecture of agent-bom through five diagrams covering the system overview, data flow pipeline, blast radius propagation, compliance framework mapping, and integration architecture.
+One `agent-bom` product, multiple operational surfaces. The package exposes
+CLI entry points, API/UI, MCP server mode, runtime proxy/gateway, cloud posture,
+IaC scanning, fleet, graph, reporting, and compliance workflows over shared
+finding, inventory, graph, and audit contracts.
+
+> **Product overview lives in [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md)** — the
+> canonical five-stage flow (intake → scan → evidence → control → artifacts) and
+> the symbol-level CVE reachability differentiator. This document is the deeper
+> surface and module architecture: it leads with the product mental model, then
+> the implementation stack.
 
 ---
 
-## 1. System Architecture Overview
+## 1. System Overview — Product Surfaces
 
-High-level view of input sources, the core processing engine, and output channels.
-
-```mermaid
-graph TB
-    subgraph Input["Input Sources"]
-        MCP["MCP Configs\n22 Clients"]
-        Docker["Docker Images"]
-        K8s["Kubernetes"]
-        Cloud["Cloud APIs\nAWS / Azure / GCP / Snowflake"]
-        SBOM["Existing SBOMs\nCycloneDX / SPDX"]
-        AI["AI Platforms\nHuggingFace / W&B / MLflow"]
-    end
-
-    subgraph Core["Core Engine"]
-        Discovery["Discovery Engine"]
-        Parser["Package Parser"]
-        Scanner["Vulnerability Scanner\nOSV + NVD + EPSS + KEV"]
-        Blast["Blast Radius Analyzer"]
-        Compliance["Compliance Tagger\n13 Frameworks"]
-        Assets["Asset Tracker\nfirst_seen / resolved / MTTR"]
-        Posture["Posture Scorer"]
-    end
-
-    subgraph Output["Output Channels"]
-        Console["Console / HTML"]
-        SBOM_Out["CycloneDX / SPDX / SARIF"]
-        API["REST API + MCP Server"]
-        Alerts["Slack / Webhook / Jira"]
-    end
-
-    MCP --> Discovery
-    Docker --> Discovery
-    K8s --> Discovery
-    Cloud --> Discovery
-    SBOM --> Discovery
-    AI --> Discovery
-
-    Discovery --> Parser
-    Parser --> Scanner
-    Scanner --> Blast
-    Blast --> Compliance
-    Compliance --> Assets
-    Assets --> Posture
-
-    Posture --> Console
-    Posture --> SBOM_Out
-    Posture --> API
-    Posture --> Alerts
+```
+pip install agent-bom    → shared core engine plus focused CLI entry points
 ```
 
+Read the architecture as three cooperating paths: local scanning, a self-hosted
+control plane, and runtime enforcement. They reuse lower-level services and
+evidence contracts, but they do not all traverse the same process or HTTP seam.
+This diagram is intentionally a product map, not a full module graph.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/architecture-dark.svg">
+  <img alt="agent-bom architecture: read-only sources feed scanning and enrichment, then unified Finding and UnifiedGraph evidence flows through the self-hosted API, scheduler, event intake, gateway, and MCP surfaces to people, agents, and export artifacts" src="images/architecture-light.svg">
+</picture>
+
+```mermaid
+flowchart TB
+    Sources["1. Evidence sources\nRepos, lockfiles, SBOMs\nAgents, MCP servers, tools\nCloud, IaC, containers, GPUs\nRuntime proxy and gateway events"]
+    Model["2. Shared evidence model\nInventory\nFindings + enrichment\nSecurity graph\nAudit + provenance"]
+    Surfaces["3. Product surfaces\nLocal scan: CLI, Docker, GitHub Action\nControl plane: REST API, UI, fleet, Helm\nRuntime enforcement: MCP server, proxy, gateway, Shield"]
+    Outputs["4. Decisions and artifacts\nDeveloper gates: terminal, SARIF, HTML\nSecurity triage: blast radius, graph paths\nGovernance: compliance evidence, audit trail\nOperations: fleet state, runtime blocks"]
+
+    Sources --> Model --> Surfaces --> Outputs
+```
+
+| Surface | First command | Primary artifact | Production move |
+|---|---|---|---|
+| Local scan | `agent-bom scan .` | findings, SBOM, SARIF, HTML, graph export | GitHub Action or Docker scan in CI |
+| Control plane | `agent-bom scan -p . --push-url ...` | fleet inventory, scan jobs, graph state | Helm/EKS with Postgres and tenant auth |
+| Runtime enforcement | `agent-bom proxy ...` or `agent-bom mcp server` | audit JSONL, policy decisions, blocks | gateway/proxy sidecars and Shield SDK |
+
+For a repo-level map of where each layer lives in `src/agent_bom/`, see
+[`PROJECT_STRUCTURE.md`](../PROJECT_STRUCTURE.md). For role-based entry paths,
+see [`START_HERE.md`](START_HERE.md).
+
 ---
 
-## 2. Data Flow Pipeline
+## 1a. Execution Paths and Persistence
 
-Sequence of operations from user invocation through enrichment to final report generation.
+The CLI invokes scanner libraries directly. Browser and SDK traffic crosses the
+HTTP middleware and FastAPI boundary. MCP server mode exposes shared services
+through MCP transports. Runtime proxy/gateway traffic crosses a separate policy
+and audit boundary. This distinction matters for auth, failure modes, and
+deployment sizing.
+
+```mermaid
+flowchart TB
+    subgraph entry["Entry points"]
+        CLI["CLI · CI · Docker"]
+        UI["Next.js UI · SDK clients"]
+        MCP["MCP clients"]
+        TRAFFIC["Runtime MCP/tool traffic"]
+    end
+    subgraph execution["Execution boundaries"]
+        CORE["Python scanner, enrichment,\ncorrelation + graph services"]
+        MW["HTTP middleware\nauth · RBAC · tenant · limits · audit"]
+        API["FastAPI routes + control-plane services"]
+        MCPS["MCP server + shared services"]
+        GATE["Gateway / proxy\npolicy · detectors · audit"]
+    end
+    subgraph operational["Primary operational persistence"]
+        SQLITE["SQLite\nlocal / single-node"]
+        POSTGRES["Postgres + RLS\nshared / multi-replica"]
+    end
+    subgraph optional["Optional specialized persistence"]
+        NEPTUNE["Neptune\ngraph backend"]
+        CLICKHOUSE["ClickHouse\nanalytics"]
+        SNOWFLAKE["Snowflake\nselected warehouse/store paths"]
+    end
+
+    CLI --> CORE
+    UI --> MW --> API --> CORE
+    MCP --> MCPS --> CORE
+    TRAFFIC --> GATE
+    CORE --> SQLITE
+    CORE --> POSTGRES
+    GATE --> SQLITE
+    GATE --> POSTGRES
+    CORE -. optional graph .-> NEPTUNE
+    CORE -. optional analytics .-> CLICKHOUSE
+    API -. selected protocols .-> SNOWFLAKE
+```
+
+SQLite and Postgres implement the primary transactional and graph paths.
+Neptune and ClickHouse are specialized options, not interchangeable control-
+plane databases. Snowflake supports selected job/fleet/schedule/exception/policy
+and warehouse-native paths; consult the backend parity matrix before deployment.
+
+---
+
+## 1b. Implementation Stack
+
+The scanner, CLI, API, MCP server, gateway/proxy, parsers, enrichment, graph,
+IaC, and CIS engines are Python 3.11+. The human cockpit is a separate
+Next.js/React TypeScript application in `ui/`; therefore the full product is not
+single-language. There is no mandatory Rust/Go/CGo extension on the scan path.
+Disk-image scans use native `dpkg` / RPM parsers
+(`src/agent_bom/filesystem.py`); the `syft` Go binary is opt-in only as a
+tar-archive fallback for VM-style images.
+
+Operational consequences:
+
+- The Python engine has one primary dependency/SBOM surface; the UI has its own
+  pinned Node.js toolchain and lockfile.
+- Wheels build cleanly on `linux/amd64` and `linux/arm64` — no per-arch native toolchain.
+- Slower than Rust/Go scanners on huge fanouts; per-package memory is higher. For VM disk-image scanning at scale, install `syft` alongside agent-bom and let the fallback path take over.
+
+Forward-looking runtime note:
+
+- An **optional Go sidecar** for proven hot paths (high-concurrency gateway
+  relay, long-lived collectors) is an accepted direction — see
+  [ADR-009](decisions/009-python-primary-go-sidecar-later.md). It is **not**
+  required on the scan path today and is not a second product edition.
+- `sdks/go` is a **control-plane CLIENT SDK** for calling the API. It is not a
+  second runtime engine alongside the Python scanners, connectors, MCP server,
+  or proxy/gateway.
+
+
+---
+
+## 1c. Data Flow - one scan request
+
+A single scan request walks discovery → extraction → scan → finding → graph →
+outputs. The same lower libraries serve the CLI and the API.
+
+```mermaid
+flowchart LR
+    REQ["Scan request\n(repo / path / image /\nSBOM / MCP config / URL / cloud)"]
+    DISC["Discovery\nfind agents, MCP servers, targets"]
+    EXT["Extraction\nparse packages, manifests, configs"]
+    SCAN["Scan\nOSV batch + advisories"]
+    ENR["Enrichment\nCVSS · EPSS · KEV · GHSA · compliance"]
+    FIND["Unified Finding\nnormalized, deduped, scored"]
+    GRAPH["UnifiedGraph\npackage → finding → server → tool → cred → agent"]
+    OUT["Outputs\nconsole · SARIF · SBOM · HTML · graph export · webhooks"]
+
+    REQ --> DISC --> EXT --> SCAN --> ENR --> FIND --> GRAPH --> OUT
+```
+
+**Value at each hop:** discovery finds shadow AI you did not know to ask about ·
+extraction reads 15 ecosystems with one command · enrichment ranks by real-world
+exploitability, not just CVSS · the graph makes "which agent does this reach?"
+answerable · outputs land in the gate, ticket, or SIEM you already run.
+
+---
+
+## 1d. Surface Boundaries
+
+| Surface | Calls | Auth / tenant boundary | Persistence behavior |
+|---|---|---|---|
+| CLI / CI / Docker | Python scan and output libraries directly | local process and provider credentials supplied by the operator | local artifacts; SQLite when persistence is enabled |
+| Next.js UI / SDK | FastAPI over HTTPS | API middleware: auth, RBAC, tenant scope, body/rate limits, audit | configured control-plane stores |
+| MCP server | shared Python services through MCP transports | MCP transport authentication and strict tool arguments | local or configured control-plane stores, depending on mode |
+| Gateway / proxy | upstream runtime traffic | listener auth, policy evaluation, detectors, rate limits, audit | runtime/audit stores and optional control-plane sink |
+
+The UI has no privileged data path, but that does not make HTTP middleware a
+universal seam for the CLI, MCP server, or runtime gateway.
+
+---
+
+## 1e. Auth & Connections
+
+Brokered control-plane sources use **connect once, act through the stored
+connection reference**. Standalone CLI scans remain independent and use local
+files or explicitly configured provider credentials.
+
+- **Humans** sign in via OAuth / OIDC / SAML SSO (standard providers plus a
+  Snowflake OAuth authorization-code + PKCE flow), with SCIM provisioning —
+  `src/agent_bom/api/{oidc,saml,scim}.py`, `src/agent_bom/api/snowflake_oauth.py`.
+- **Agents / CI** use scoped API keys / tokens.
+- **Sources** (AWS, Azure, GCP, Snowflake) are onboarded once via read-only,
+  agentless, brokered connectors — one least-privilege managed role per source,
+  short-lived brokered credentials (e.g. AWS `sts:AssumeRole`), and write-only
+  secrets (encrypted at rest, never read back). Scheduled or operator-triggered
+  control-plane collection can then reuse that connection.
+
+API auth mode, tenant scope, RBAC, and audit are enforced in
+`src/agent_bom/api/middleware.py`. MCP and runtime modes have separate transport
+and policy controls. Provider grants and setup are in
+[`CLOUD_CONNECT.md`](CLOUD_CONNECT.md); the enterprise auth surface and
+environment knobs are in [`ENTERPRISE.md`](ENTERPRISE.md).
+
+---
+
+## 1f. Input / Output Formats
+
+agent-bom is format-agnostic on both ends: ingest whatever evidence exists,
+emit whatever the next tool consumes.
+
+```mermaid
+flowchart LR
+    subgraph INPUTS["Inputs - no pre-instrumentation required"]
+        I1["Repo / path"]
+        I2["Container image"]
+        I3["SBOM"]
+        I4["MCP config"]
+        I5["Repo URL"]
+        I6["Cloud account"]
+        I7["IaC files"]
+    end
+    CORE["Normalized findings\nplus graph/evidence contracts"]
+    subgraph OUTPUTS["Outputs - drop into the tool you already run"]
+        O1["SARIF - code scanning"]
+        O2["CycloneDX - SBOM"]
+        O3["SPDX - SBOM"]
+        O4["OCSF - SIEM"]
+        O5["HTML / PDF - review"]
+        O6["JSON / CSV - automation"]
+        O7["Webhooks - alerting"]
+    end
+
+    I1 & I2 & I3 & I4 & I5 & I6 & I7 --> CORE
+    CORE --> O1 & O2 & O3 & O4 & O5 & O6 & O7
+```
+
+| Input | Value | Output | Value |
+|---|---|---|---|
+| Repo / path | scan source where it lives | SARIF | native code-scanning ingest |
+| Container image | catch base-image + layer risk | CycloneDX / SPDX | portable SBOM for downstream tooling |
+| SBOM | re-score an existing inventory | OCSF | normalized SIEM events |
+| MCP config | map the agent ↔ server ↔ tool mesh | HTML / PDF | human-reviewable evidence |
+| Repo URL | scan code you have not cloned | JSON / CSV | machine-readable for pipelines |
+| Cloud account | read-only estate + CIS posture | Webhooks | push to alerting / ticketing |
+| IaC files | block unsafe infra pre-deploy | | |
+
+---
+
+## 2. Scan Pipeline
+
+Sequence of operations from invocation to report.
 
 ```mermaid
 sequenceDiagram
@@ -70,7 +253,6 @@ sequenceDiagram
     participant Scanner
     participant Enrichment
     participant BlastRadius
-    participant ComplianceTagger
     participant Reporter
 
     User->>CLI: agent-bom scan [options]
@@ -82,195 +264,188 @@ sequenceDiagram
     Scanner-->>CLI: Raw CVE results
 
     CLI->>Enrichment: CVE IDs
-    Enrichment->>Enrichment: NVD CVSS v4
-    Enrichment->>Enrichment: EPSS exploit probability
-    Enrichment->>Enrichment: CISA KEV check
-    Enrichment->>Enrichment: GHSA + NVIDIA CSAF
+    Enrichment->>Enrichment: NVD CVSS · EPSS · CISA KEV · GHSA
     Enrichment-->>CLI: Enriched vulnerabilities
 
     CLI->>BlastRadius: Vulns + topology
-    BlastRadius->>BlastRadius: Map CVE to package to server
-    BlastRadius->>BlastRadius: Map server to agents + credentials + tools
-    BlastRadius-->>CLI: Blast radius chains
-
-    CLI->>ComplianceTagger: Findings
-    ComplianceTagger->>ComplianceTagger: Tag 13 frameworks
-    ComplianceTagger-->>CLI: Tagged findings
-
-    CLI->>CLI: Asset tracking (first_seen / resolved / MTTR)
+    BlastRadius->>BlastRadius: package → finding → server → agent → creds → tools
+    BlastRadius->>BlastRadius: Tag 15 frameworks + attach AISVS benchmark
+    BlastRadius-->>CLI: Scored + tagged findings
 
     CLI->>Reporter: Full results
-    Reporter-->>User: Console / JSON / HTML / SBOM / SARIF
+    Reporter-->>User: Console / JSON / SARIF / HTML / SBOM
 ```
+
+### Component model and extensibility direction
+
+The pipeline is built from four component roles: **scanners** (discover and
+produce raw findings), **enrichers** (add CVSS/EPSS/KEV/GHSA, compliance, cloud
+and cost context), **matchers/correlators** (`correlate.py`,
+`cross_env_correlation.py`, graph overlays), and a **reporter**. Scanner drivers
+are already registered through `scanners/registry.py` with capability metadata
+(surfaced by `agent-bom capabilities`), and `api/pipeline.py` (`ScanPipeline`,
+`_run_scan_sync`) runs the stages and emits per-step DAG events.
+
+Two seams are being formalized so new sources and detections plug in without
+editing core orchestration:
+
+- a **router** that resolves an input or connected source (path, image ref,
+  cloud credential, MCP config, ingested SARIF) to the scanner and provider
+  drivers that handle it, consolidating selection logic currently split across
+  the CLI, the pipeline, and `scanners/__init__.py`; and
+- an **orchestrator** that runs registered `scan → enrich → correlate → graph →
+  findings` stages, with enrichers and matchers registered through the same
+  capability-metadata pattern scanners already use.
+
+This keeps detection-as-code rule packs and additional providers additive at the
+registry boundary rather than as edits to the scan path.
 
 ---
 
 ## 3. Blast Radius Propagation
 
-How a single CVE propagates through the AI agent stack, exposing credentials and tools.
+How one CVE propagates through the AI agent stack.
 
 ```mermaid
 graph LR
-    CVE["CVE-2025-XXXX\nCRITICAL CVSS 9.8"]
+    CVE["CVE-2025-XXXX\nCRITICAL · CVSS 9.8"]
     PKG["Vulnerable Package\nnpm / PyPI / Go"]
-    SRV["MCP Server\nunverified / root"]
+    SRV["MCP Server\nunverified · root"]
 
-    AGT1["Agent: Cursor IDE\n4 servers / 12 tools"]
-    AGT2["Agent: Claude Desktop\n3 servers / 8 tools"]
+    AGT1["Cursor IDE\n4 servers · 12 tools"]
+    AGT2["Claude Desktop\n3 servers · 8 tools"]
 
-    CRED1["ANTHROPIC_KEY"]
-    CRED2["AWS_SECRET"]
-    CRED3["DB_URL"]
+    CRED["ANTHROPIC_KEY\nAWS_SECRET · DB_URL"]
+    TOOL["query_db · read_file\nwrite_file · run_shell"]
 
-    TOOL1["query_db"]
-    TOOL2["read_file"]
-    TOOL3["write_file"]
-    TOOL4["run_shell"]
-
-    CVE -->|"affects"| PKG
-    PKG -->|"dependency of"| SRV
-
-    SRV -->|"used by"| AGT1
-    SRV -->|"used by"| AGT2
-
-    AGT1 -->|"exposes"| CRED1
-    AGT1 -->|"exposes"| CRED2
-    AGT2 -->|"exposes"| CRED3
-
-    AGT1 -->|"reaches"| TOOL1
-    AGT1 -->|"reaches"| TOOL2
-    AGT2 -->|"reaches"| TOOL3
-    AGT2 -->|"reaches"| TOOL4
+    CVE -->|affects| PKG
+    SRV -->|depends_on| PKG
+    SRV -->|vulnerable_to| CVE
+    AGT1 & AGT2 -->|uses| SRV
+    SRV -->|exposes_cred| CRED
+    SRV -->|provides_tool| TOOL
+    CRED -->|reaches_tool| TOOL
 
     style CVE fill:#dc2626,color:#fff
     style PKG fill:#ea580c,color:#fff
     style SRV fill:#d97706,color:#fff
     style AGT1 fill:#2563eb,color:#fff
     style AGT2 fill:#2563eb,color:#fff
-    style CRED1 fill:#7c3aed,color:#fff
-    style CRED2 fill:#7c3aed,color:#fff
-    style CRED3 fill:#7c3aed,color:#fff
-    style TOOL1 fill:#059669,color:#fff
-    style TOOL2 fill:#059669,color:#fff
-    style TOOL3 fill:#059669,color:#fff
-    style TOOL4 fill:#059669,color:#fff
+    style CRED fill:#7c3aed,color:#fff
+    style TOOL fill:#059669,color:#fff
 ```
 
-**Color key:** Red = CVE, Orange = Package, Amber = Server, Blue = Agent, Purple = Credential, Green = Tool
+**Color key:** Red = CVE · Orange = Package · Amber = Server · Blue = Agent · Purple = Credentials · Green = Tools
+
+The full contract for what the graph promises and what it does not — entity types, edge kinds, scaling tiers, re-baseline procedure, and known coverage gaps — is in [docs/graph/CONTRACT.md](graph/CONTRACT.md).
+
+### Estate-scale roll-up
+
+Past a few hundred nodes a flat topology graph is unreadable. The estate is
+organized as a `CONTAINS` containment tree (org → account/folder/project → app
+→ resource), and `src/agent_bom/graph/rollup.py` collapses the graph along that
+tree to a handful of top-level container nodes — each carrying aggregate
+descendant counts, a by-type breakdown, worst-severity, a per-severity
+histogram, and internet-exposed / toxic-combination flags propagated from every
+descendant. The UI (and `GET /v1/graph/rollup`) drills down one level at a time
+instead of loading the whole estate, with an attack-path-first view that returns
+the nodes on materialized attack paths first. The roll-up is a pure read over
+the existing `UnifiedGraph` — no new collection. Two further overlays enrich the
+same graph: an ASPM layer (`aspm_overlay.py`) that organizes AppSec findings
+around `APPLICATION` nodes, and a FinOps layer (`cost_overlay.py`) that fuses
+LLM spend onto nodes and rolls it up along `CONTAINS` into `subtree_cost_usd`.
 
 ---
 
-## 4. Compliance Framework Mapping
+## 4. Compliance Tagging
 
-Every blast radius finding is tagged against 13 compliance frameworks simultaneously.
+Every finding is tagged against curated compliance frameworks, grouped into four families. OWASP AISVS is exposed as a separate benchmark result with per-check evidence. The bundled mappings are a curated **evidence helper** — a subset of each framework focused on AI/MCP/agent risk-relevant controls — not a certification claim, audit opinion, or complete catalog. See [Coverage per framework](#coverage-per-framework) below for the generated control counts.
 
 ```mermaid
-graph TD
-    Finding["Blast Radius Finding\nCVE + severity + context"]
+graph LR
+    F["Finding\nCVE + severity + context"]
 
-    OWASP_LLM["OWASP LLM Top 10\nLLM01 - LLM10"]
-    OWASP_MCP["OWASP MCP Top 10\nMCP01 - MCP10"]
-    OWASP_AGT["OWASP Agentic Top 10\nASI01 - ASI10"]
-    OWASP_AISVS["OWASP AISVS v1.0\nAI Supply Chain / Runtime Controls"]
-    ATLAS["MITRE ATLAS\nAML.T0010 / T0043 / T0051"]
-    NIST_AI["NIST AI RMF 1.0\nGovern / Map / Measure / Manage"]
-    EU_AI["EU AI Act\nART-5 through ART-17"]
-    NIST_CSF["NIST CSF 2.0\nIdentify / Protect / Detect / Respond"]
-    ISO["ISO 27001\nAnnex A controls"]
-    SOC2["SOC 2\nTrust Services Criteria"]
-    CIS["CIS Controls v8\nIG1 / IG2 / IG3"]
+    subgraph OWASP["OWASP"]
+        O1["LLM Top 10"]
+        O2["MCP Top 10"]
+        O3["Agentic Top 10"]
+        O4["AISVS v1.0"]
+    end
 
-    Finding --> OWASP_LLM
-    Finding --> OWASP_MCP
-    Finding --> OWASP_AGT
-    Finding --> OWASP_AISVS
-    Finding --> ATLAS
-    Finding --> NIST_AI
-    Finding --> EU_AI
-    Finding --> NIST_CSF
-    Finding --> ISO
-    Finding --> SOC2
-    Finding --> CIS
+    subgraph NIST["NIST / FedRAMP"]
+        N1["AI RMF 1.0"]
+        N2["CSF 2.0"]
+        N3["800-53 Rev 5"]
+        N4["FedRAMP"]
+    end
 
-    Tagged["Tagged Finding\nAll framework controls attached"]
+    subgraph INTL["Regulatory"]
+        I1["EU AI Act"]
+        I2["ISO 27001"]
+        I3["SOC 2"]
+        I4["CIS Controls v8"]
+        I5["CMMC 2.0"]
+    end
 
-    OWASP_LLM --> Tagged
-    OWASP_MCP --> Tagged
-    OWASP_AGT --> Tagged
-    OWASP_AISVS --> Tagged
-    ATLAS --> Tagged
-    NIST_AI --> Tagged
-    EU_AI --> Tagged
-    NIST_CSF --> Tagged
-    ISO --> Tagged
-    SOC2 --> Tagged
-    CIS --> Tagged
+    ATL["MITRE ATLAS"]
 
-    style Finding fill:#dc2626,color:#fff
-    style Tagged fill:#059669,color:#fff
+    F --> OWASP & NIST & INTL & ATL
+
+    T["Tagged Finding\n14 controls attached"]
+    OWASP & NIST & INTL & ATL --> T
+
+    style F fill:#dc2626,color:#fff
+    style T fill:#059669,color:#fff
 ```
+
+### Coverage per framework
+
+agent-bom ships a curated control set per framework, sized to the AI/MCP/agent threat surface rather than a generic compliance scanner's full catalog. Numbers below count the controls that are **bundled and actively mapped** by the canonical metadata in `src/agent_bom/compliance_coverage.py`; AISVS is counted from the benchmark check registry. They are intentionally a subset; consult each framework's source standard for full coverage.
+
+<!-- compliance-coverage:start -->
+| Family | Framework | Bundled controls | Source-standard size (approx.) | What's covered |
+|---|---|---|---|---|
+| OWASP | LLM Top 10 (2025) | 10 / 10 | 10 | Full Top-10 |
+| OWASP | MCP Top 10 (2025) | 10 / 10 | 10 | Full Top-10 |
+| OWASP | Agentic Top 10 (2026) | 10 / 10 | 10 | Full Top-10 |
+| OWASP | AISVS v1.0 | 9 checks | ~50 verification reqs | Programmatically verifiable subset (AI-4/5/6/7/8 categories) |
+| NIST / FedRAMP | AI RMF 1.0 | 14 subcategories | ~70 | Govern / Map / Measure / Manage controls relevant to AI supply chain + MCP |
+| NIST / FedRAMP | CSF 2.0 | 14 categories | ~108 | Supply-chain, identity, asset, monitoring categories |
+| NIST / FedRAMP | 800-53 Rev 5 | 29 controls | ~1,006 | Vulnerability-driven mapping (RA-5, SI-2, etc.); not a complete catalog |
+| NIST / FedRAMP | FedRAMP Moderate | 25 controls | ~325 | Subset of 800-53 controls in the Moderate baseline |
+| MITRE | ATLAS | 65 techniques | ~90 | Applicability overlay (not scored): LLM/AI techniques — prompt injection, jailbreak, supply-chain, exfiltration, agent tool abuse — that the observed findings make applicable |
+| MITRE | ATT&CK Enterprise | 691 techniques | ~700 | Applicability overlay (not scored): techniques MITRE's CWE → CAPEC → ATT&CK data associates with the weaknesses observed in the estate |
+| Regulatory | EU AI Act | 6 articles | ~113 | Articles 5/6/9/10/15/17 (prohibited practices, high-risk classification, risk mgmt, data governance, accuracy/cybersecurity, QMS) |
+| Regulatory | ISO/IEC 27001:2022 | 9 Annex A controls | 93 | Supplier, vulnerability, cryptography, secure-dev, evidence collection |
+| Regulatory | SOC 2 TSC | 9 criteria | ~64 | Common Criteria 6.x / 7.x / 8.x / 9.x (access, monitoring, change mgmt, vendor risk) |
+| Regulatory | CIS Controls v8 | 10 safeguards | 153 | Software inventory, vulnerability mgmt, secure-dev (CIS 02 / 07 / 16) |
+| Regulatory | CMMC 2.0 Level 2 | 17 practices | 110 | RA / SI / SC / CM / AC / IA practices most relevant to vulnerable-package risk |
+| Regulatory | PCI DSS v4.0 | 12 sub-requirements | 12 top-level requirements | Requirements 2, 6, 8, 11, 12 for vulnerable-package and evidence risk |
+<!-- compliance-coverage:end -->
+
+The bundled list is editable: see `src/agent_bom/compliance_coverage.py` for the framework metadata and `src/agent_bom/compliance_utils.py` for the `BlastRadius` field map. The UI consumes the same API response shape, so product coverage and dashboard controls should stay aligned with these catalogs.
 
 ---
 
-## 5. Integration Architecture
+## 5. Integration
 
-How agent-bom integrates with CI/CD pipelines, runtime environments, cloud providers, and enterprise systems.
+How agent-bom fits into CI/CD, runtime, cloud, and enterprise tooling.
 
 ```mermaid
 graph TB
-    subgraph CICD["CI/CD Pipeline"]
-        GHA["GitHub Actions"]
-        Policy["Policy Gate\n--fail-on-severity"]
-        SARIF["SARIF Upload\nGitHub Security Tab"]
-    end
-
-    subgraph Runtime["Runtime"]
-        Proxy["MCP Proxy\nPayload Integrity"]
-        Sidecar["Runtime Sidecar\nDocker Container"]
-        OTel["OpenTelemetry\nTrace Ingestion"]
-    end
-
-    subgraph Hosts["MCP Hosts"]
-        Claude["Claude Desktop / Code"]
-        Cursor["Cursor IDE"]
-        Codex["Codex CLI"]
-        Gemini["Gemini CLI"]
-        Others["14 more clients"]
-    end
-
-    subgraph CloudProv["Cloud Providers"]
-        AWS["AWS\nBedrock / Lambda / EKS"]
-        Azure["Azure\nAI Foundry / Functions"]
-        GCP["GCP\nVertex AI / GKE"]
-        Snow["Snowflake\nCortex / MCP / Snowpark"]
-    end
-
-    subgraph Export["Enterprise Export"]
-        SIEM["SIEM / Splunk"]
-        Slack["Slack Alerts"]
-        Jira["Jira Tickets"]
-        Webhook["Webhooks"]
-        Prom["Prometheus / Grafana"]
-    end
-
     AB["agent-bom\nCore Engine"]
 
-    GHA -->|"scan step"| AB
-    AB -->|"pass/fail"| Policy
-    AB -->|"upload"| SARIF
+    CI["CI/CD\nGitHub Actions · Policy Gate · SARIF Upload · JS supply-chain guard"]
+    RT["Runtime\nMCP Proxy · Docker Sidecar · OpenTelemetry"]
+    HOSTS["MCP Hosts\n30 client types"]
+    CLOUD["Cloud Providers\nAWS · Azure · GCP · Snowflake"]
+    ENT["Enterprise\nSIEM · Slack · Jira · Webhooks · Prometheus"]
 
-    Proxy -->|"intercept"| AB
-    Sidecar -->|"monitor"| AB
-    OTel -->|"traces"| AB
-
-    Hosts -->|"config discovery"| AB
-    CloudProv -->|"API discovery"| AB
-
-    AB -->|"alerts"| Slack
-    AB -->|"tickets"| Jira
-    AB -->|"events"| Webhook
-    AB -->|"metrics"| Prom
-    AB -->|"logs"| SIEM
+    CI -->|scan step| AB
+    RT -->|intercept / monitor| AB
+    HOSTS -->|config discovery| AB
+    CLOUD -->|API discovery| AB
+    AB -->|alerts / tickets / metrics| ENT
 
     style AB fill:#2563eb,color:#fff
 ```
@@ -281,20 +456,22 @@ graph TB
 
 | Module | Path | Responsibility |
 |--------|------|----------------|
-| CLI | `src/agent_bom/cli.py` | Click entry point, flag parsing |
-| Discovery | `src/agent_bom/discovery/__init__.py` | MCP client config discovery (22 clients) |
+| CLI | `src/agent_bom/cli/` | Click entry point, command dispatch |
+| Discovery | `src/agent_bom/discovery/__init__.py` | MCP client config discovery (29 first-class client types plus dynamic/project surfaces) |
 | Parsers | `src/agent_bom/parsers/__init__.py` | Package extraction + MCP registry lookup |
-| Skill Parsers | `src/agent_bom/parsers/skills.py` + `skill_audit.py` | SKILL.md/CLAUDE.md behavioral audit, typosquat, Sigstore trust |
-| Browser Extensions | `src/agent_bom/parsers/browser_extensions.py` | Chrome/Edge/Brave/Firefox manifest.json permission auditor |
-| Scanners | `src/agent_bom/scanners/__init__.py` | OSV batch scan + CVSS + AI risk tagging |
-| Output | `src/agent_bom/output/__init__.py` | JSON, CycloneDX, SARIF, SPDX, console output |
-| Policy | `src/agent_bom/policy.py` | Policy-as-code engine |
-| SBOM | `src/agent_bom/sbom.py` | SBOM ingestion (CycloneDX, SPDX) |
-| Image | `src/agent_bom/image.py` | Docker image scanning |
-| MCP Server | `src/agent_bom/mcp_server.py` | FastMCP server (32 tools) |
+| Scanners | `src/agent_bom/scanners/__init__.py` | OSV batch scan + CVSS + compliance tagging |
+| Enrichment | `src/agent_bom/enrichment.py` | NVD + EPSS + CISA KEV enrichment |
+| Models | `src/agent_bom/models.py` | Core data models (Package, Vulnerability, Agent, BlastRadius) |
+| Output | `src/agent_bom/output/__init__.py` | JSON, CycloneDX, SARIF, SPDX, console |
+| Policy | `src/agent_bom/policy.py` | Policy-as-code engine (17 conditions) |
+| Proxy | `src/agent_bom/proxy.py` | Runtime MCP proxy (7 inline detectors) |
+| MCP Server | `src/agent_bom/mcp_server*.py` | FastMCP server (81 tools across core, operator, runtime-catalog, and specialized modules) |
+| Cloud | `src/agent_bom/cloud/` | AWS, Azure, GCP, Snowflake, Databricks, ClickHouse estate inventory; CIS posture where published and Databricks security best practices |
+| Cloud side-scan | `src/agent_bom/cloud/side_scan.py`, `src/agent_bom/cloud/side_scan_targets.py`, `src/agent_bom/cloud/side_scan_lifecycle.py`, `src/agent_bom/cloud/side_scan_provider_adapters.py` | Agentless workload side-scan (CWPP) — AWS EBS plus injected-SDK Azure Managed Disk and GCP Persistent Disk lifecycle adapters with durable ownership/cleanup state; Azure/GCP share CLI, REST, MCP, UI, and scheduler surfaces plus SQLite/Postgres lifecycle persistence. Credentialed live-cloud proof remains outstanding. |
+| Registry sweep | `src/agent_bom/cloud/registry_sweep.py` | Registry-wide image enumeration + scan (ECR/ACR/GAR), digest-deduped, capped |
+| Audit trail | `src/agent_bom/cloud/audit_trail.py` | Read-only CloudTrail/Activity Log/Cloud Audit ingest → behavioral `ACCESSED`/`INVOKED` graph edges (counts only) |
 | Asset Tracker | `src/agent_bom/asset_tracker.py` | Persistent vuln tracking — first_seen, resolved, MTTR |
-| Context Graph | `src/agent_bom/context_graph.py` | Lateral movement analysis |
-| Cloud | `src/agent_bom/cloud/` | AWS, Azure, GCP, Snowflake, Databricks, Nebius |
-| Logging | `src/agent_bom/logging_config.py` | Structured JSON/console logging, env var config |
+| Context Graph | `src/agent_bom/context_graph.py` | Lateral movement analysis — see [Graph Contract](graph/CONTRACT.md) for entity/edge coverage, accuracy guarantees, and scaling boundaries |
+| Graph overlays | `src/agent_bom/graph/` | `rollup.py` (estate-scale `CONTAINS` roll-up + drill-down), `aspm_overlay.py` (application correlation), `cost_overlay.py` (LLM-spend fusion) |
+| Remediation | `src/agent_bom/remediation.py` | Advisory-only fixes with least-privilege-to-apply (`applied`/`auto_remediation` always false) |
 | Guard | `src/agent_bom/guard.py` | Pre-install CVE scan for pip/npm packages |
-| Glama | `src/agent_bom/glama.py` | Glama.ai registry sync (18,000+ MCP servers) |

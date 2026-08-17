@@ -6,6 +6,10 @@
 
 Report privately via [GitHub Security Advisories](https://github.com/msaad00/agent-bom/security/advisories/new).
 
+For procurement-facing support boundaries, patch cadence, escalation paths, and
+release-note security language, see
+[docs/ENTERPRISE_SUPPORT_MODEL.md](docs/ENTERPRISE_SUPPORT_MODEL.md).
+
 **Response SLA:**
 - Acknowledgement within **48 hours**
 - Triage and severity assessment within **5 business days**
@@ -18,6 +22,10 @@ Report privately via [GitHub Security Advisories](https://github.com/msaad00/age
 |---------|-----------|
 | Latest  | ✓ Yes     |
 | < Latest | ✗ No — upgrade to the latest release |
+
+The open-source project supports the latest released tag. Older release lines
+are not maintained as long-term support branches unless a separate commercial
+or customer-specific agreement exists.
 
 ## Security Design
 
@@ -38,7 +46,7 @@ agent-bom is a **read-only scanner**. It does not modify agent configurations, e
 
 ### Known limitations
 - **Credential redaction is heuristic** — non-standard or obfuscated key names may not be flagged
-- **Grype/Syft dependency** — container image scanning relies on external binaries; their CVEs apply to those tools
+- **External scanner dependency** — container image scanning can rely on external binaries; their CVEs apply to those tools
 - **Network dependency** — OSV/NVD/EPSS enrichment requires outbound HTTPS; air-gapped environments see reduced coverage
 - **MCP server execution** — agent-bom does NOT execute MCP servers it discovers; it only reads their configs
 - **Runtime proxy enforcement** — the proxy intercepts MCP traffic using a trust-on-first-use model; pre-existing compromised servers must be identified via scanning before proxy deployment
@@ -48,14 +56,35 @@ agent-bom is a **read-only scanner**. It does not modify agent configurations, e
 - API key auth via `AGENT_BOM_API_KEY` env var; OIDC/JWT via `AGENT_BOM_OIDC_ISSUER`
 - WebSocket endpoints require the same auth when `AGENT_BOM_API_KEY` is set
 - JWKS public key caching (1h TTL); RS256/RS384/RS512/ES256/ES384/ES512 supported; `alg: none` rejected
+- Dashboard HTML uses a route-specific CSP. The packaged FastAPI-served UI allows `script-src 'self' 'unsafe-inline'` for the Next.js runtime bootstrap; API JSON routes keep the stricter `default-src 'self'` policy.
+- `ui/vercel.json` is generated from the same CSP module as the standalone UI server (`ui/lib/security-headers.mjs`), so the two policies cannot drift and neither permits `eval`-style execution. Only the local development server relaxes `script-src`, for the Next.js dev runtime. That config exists for static UI previews and is not a supported control-plane deployment path: self-hosted control planes serve the dashboard from the Python API or the standalone UI container.
 
 ## Security Testing
 
 - **Static analysis**: ruff + mypy on every PR (required CI checks)
 - **Dependency scanning**: Dependabot weekly (Python + npm)
-- **Container image scanning**: Trivy in CI pipeline
+- **Container image scanning**: pinned scanner action in CI pipeline
 - **Pre-commit hooks**: ruff, ruff-format, detect-private-key, check-yaml, end-of-file-fixer
-- No third-party penetration testing yet (planned for v1.0)
+- **Third-party penetration testing**: not completed yet; required before `v1.0` runtime-enforcement GA. Scope and exit criteria are documented in [docs/PENTEST_READINESS.md](docs/PENTEST_READINESS.md)
+
+## Third-Party Pentest Plan
+
+The independent assessment planned before `v1.0` is expected to cover:
+
+- runtime proxy enforcement and audit integrity
+- multi-MCP gateway auth, policy evaluation, and upstream relay behavior
+- control-plane tenant isolation across API and dashboard surfaces
+- reference EKS / Helm deployment hardening
+
+The tracked scope, environment expectations, and `v1.0` release criteria live
+in [docs/PENTEST_READINESS.md](docs/PENTEST_READINESS.md).
+
+## Release verification and dependency controls
+
+The public verification path is documented:
+
+- [docs/RELEASE_VERIFICATION.md](docs/RELEASE_VERIFICATION.md) — Sigstore bundle verification, SLSA provenance inspection, and self-SBOM review
+- [docs/SUPPLY_CHAIN.md](docs/SUPPLY_CHAIN.md) — dependency bounds, lockfiles, extras audit coverage, fuzz targets, and release trust controls
 
 ## Vulnerability Disclosure Timeline
 
@@ -65,3 +94,18 @@ agent-bom is a **read-only scanner**. It does not modify agent configurations, e
 4. Fix developed on private branch; CVE ID requested if warranted
 5. Coordinated disclosure: patch released, advisory published simultaneously
 6. Reporter credited in release notes (unless anonymity requested)
+
+## Coordinated Disclosure Embargo
+
+agent-bom follows a **90-day coordinated disclosure** model aligned with industry practice (CERT/CC, Project Zero):
+
+- **Default embargo: 90 days** from the date the maintainer acknowledges the report
+- **Critical (CVSS ≥ 9.0)**: 30-day target with possible 14-day extension if a patch is in active review
+- **High (CVSS 7.0–8.9)**: 60-day target
+- **Medium / Low (CVSS < 7.0)**: 90-day target
+- **Extension requests** are considered case-by-case; the reporter is consulted before any extension
+- **Early disclosure** is permitted if the vulnerability is being actively exploited in the wild, or if the reporter and maintainer mutually agree
+- **Public CVE / GHSA publication** happens at the same moment as the patched release; the reporter is credited unless anonymity is requested
+- **Private pre-disclosure** to downstream packagers (PyPI security, Docker Hub, distros) may occur up to 7 days before public disclosure when the maintainer has reasonable grounds to believe coordinated patching reduces aggregate risk
+
+If the maintainer becomes unresponsive past the embargo deadline without prior coordination, reporters may publish at their own discretion 14 days after a documented final outreach attempt.

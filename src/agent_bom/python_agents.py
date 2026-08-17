@@ -33,11 +33,14 @@ Usage::
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
+from agent_bom.ast_signal_utils import is_agent_tool_decorator
 from agent_bom.models import Agent, AgentType, MCPServer, MCPTool, Package, TransportType
+from agent_bom.traversal import iter_discovery_files
 
 # ─── Framework registry ───────────────────────────────────────────────────────
 # Maps canonical PyPI package name → (display_name, framework_key, import_roots)
@@ -80,9 +83,12 @@ _AGENT_NAME_RE = re.compile(
     r'Agent\s*\(\s*(?:name\s*=\s*)?["\']([^"\']+)["\']',
 )
 
-# Tool decorators: @tool, @function_tool, @agent.tool
+# Any decorator sitting directly on a def, in bare or applied form. Which of
+# them registers an agent tool is decided by ``is_agent_tool_decorator`` — the
+# same predicate the two AST detectors use — rather than by a fourth literal
+# list, which had drifted into claiming ``@action`` and missing ``@mcp.tool()``.
 _TOOL_DECORATOR_RE = re.compile(
-    r"@(?:\w+\.)?(?:function_tool|tool|skill|action)\s*\n\s*(?:async\s+)?def\s+(\w+)",
+    r"@((?:\w+\.)*\w+)\s*(?:\([^)]*\))?\s*\n\s*(?:async\s+)?def\s+(\w+)",
 )
 
 # tools=[foo, bar, baz] argument
@@ -108,10 +114,11 @@ _ENV_REF_RE = re.compile(
 class _PythonAgentDef(NamedTuple):
     name: str
     framework: str
-    tools: list[str]
+    tools: list[tuple[str, str, str]]
     model: str
     env_refs: list[str]  # credential env var names referenced (never values)
     file: str
+    system_prompts: tuple[dict[str, Any], ...] = ()
 
 
 # ─── Requirement file parsers ─────────────────────────────────────────────────
@@ -161,16 +168,20 @@ def _parse_pyproject_toml(path: Path) -> dict[str, str]:
 
 
 def _collect_requirements(project: Path) -> dict[str, str]:
-    """Collect {package: version} from all requirement files in the project."""
+    """Collect {package: version} from all requirement files in the project.
+
+    Traversal prunes vendored/generated directories and nested VCS worktrees so
+    a repository that keeps agent worktrees (each a full nested checkout) does
+    not re-count every manifest once per worktree.
+    """
     pkgs: dict[str, str] = {}
-    for req_file in project.rglob("requirements*.txt"):
+    for path in iter_discovery_files(project):
+        name = path.name
         try:
-            pkgs.update(_parse_requirements_txt(req_file))
-        except OSError:
-            pass
-    for ppt in project.rglob("pyproject.toml"):
-        try:
-            pkgs.update(_parse_pyproject_toml(ppt))
+            if name.startswith("requirements") and name.endswith(".txt"):
+                pkgs.update(_parse_requirements_txt(path))
+            elif name == "pyproject.toml":
+                pkgs.update(_parse_pyproject_toml(path))
         except OSError:
             pass
     return pkgs
@@ -196,23 +207,93 @@ def _detect_frameworks_in_imports(tree: ast.Module) -> set[str]:
     return found
 
 
-def _extract_agent_defs(content: str, filename: str) -> list[_PythonAgentDef]:
-    """Extract agent definitions from Python source via regex (AST-free fallback)."""
-    defs: list[_PythonAgentDef] = []
+def _extract_string_literal(node: ast.AST | None) -> str:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return ""
 
-    # Detect framework from imports
+
+def _call_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _call_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    return ""
+
+
+def _decorator_name(node: ast.AST) -> str:
+    """Dotted name of a decorator, unwrapping the applied form ``@mcp.tool()``."""
+    if isinstance(node, ast.Call):
+        return _call_name(node.func)
+    return _call_name(node)
+
+
+def _keyword_value(node: ast.Call, name: str) -> ast.AST | None:
+    for kw in node.keywords:
+        if kw.arg == name:
+            return kw.value
+    return None
+
+
+def _dedupe_detected_tools(tools: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+    deduped: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for name, source, confidence in tools:
+        normalized = name.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append((normalized, source, confidence))
+    return deduped
+
+
+def _extract_env_refs_from_ast(tree: ast.Module) -> list[str]:
+    refs: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            call_name = _call_name(node.func)
+            if call_name in {"os.getenv", "getenv"} and node.args:
+                value = _extract_string_literal(node.args[0])
+                if value and _CRED_ENV_RE.search(value):
+                    refs.append(value)
+            elif call_name == "os.environ.get" and node.args:
+                value = _extract_string_literal(node.args[0])
+                if value and _CRED_ENV_RE.search(value):
+                    refs.append(value)
+        elif isinstance(node, ast.Subscript):
+            target_name = _call_name(node.value)
+            if target_name != "os.environ":
+                continue
+            slice_node = node.slice
+            value = _extract_string_literal(slice_node)
+            if value and _CRED_ENV_RE.search(value):
+                refs.append(value)
+    return list(dict.fromkeys(refs))
+
+
+def _framework_from_content(content: str) -> str:
     framework = "unknown"
     for root in _ALL_IMPORT_ROOTS:
         if re.search(rf"\bimport\s+{re.escape(root)}\b|from\s+{re.escape(root)}\b", content):
-            for pkg, (_, fkey, roots) in _FRAMEWORKS.items():
+            for _, (_, fkey, roots) in _FRAMEWORKS.items():
                 if root in roots:
                     framework = fkey
                     break
             if framework != "unknown":
                 break
+    return framework
+
+
+def _extract_agent_defs_regex(content: str, filename: str) -> list[_PythonAgentDef]:
+    """Extract agent definitions from Python source via regex fallback."""
+    defs: list[_PythonAgentDef] = []
+
+    # Detect framework from imports
+    framework = _framework_from_content(content)
 
     # Extract @tool / @function_tool decorated functions
-    tool_names = _TOOL_DECORATOR_RE.findall(content)
+    tool_names = [func for decorator, func in _TOOL_DECORATOR_RE.findall(content) if is_agent_tool_decorator(decorator)]
 
     # Extract env var references
     env_refs = [v for v in _ENV_REF_RE.findall(content) if _CRED_ENV_RE.search(v)]
@@ -234,7 +315,9 @@ def _extract_agent_defs(content: str, filename: str) -> list[_PythonAgentDef]:
         model = model_m.group(1) if model_m else ""
 
         # Merge tools from decorators + call-site
-        all_tools = list(dict.fromkeys(tool_names + tools_in_call))
+        all_tools = _dedupe_detected_tools(
+            [(name, "decorator", "high") for name in tool_names] + [(name, "literal-tools-arg", "high") for name in tools_in_call]
+        )
 
         defs.append(
             _PythonAgentDef(
@@ -248,6 +331,141 @@ def _extract_agent_defs(content: str, filename: str) -> list[_PythonAgentDef]:
         )
 
     return defs
+
+
+def _extract_agent_defs(content: str, filename: str) -> list[_PythonAgentDef]:
+    """Extract agent definitions from Python source with AST heuristics."""
+    try:
+        tree = ast.parse(content, filename=filename)
+    except SyntaxError:
+        return _extract_agent_defs_regex(content, filename)
+
+    frameworks = _detect_frameworks_in_imports(tree)
+    framework = sorted(frameworks)[0] if frameworks else _framework_from_content(content)
+    env_refs = _extract_env_refs_from_ast(tree)
+
+    tool_values: dict[str, tuple[str, str, str]] = {}
+    tool_sets: dict[str, list[tuple[str, str, str]]] = {}
+
+    def resolve_tool_expr(node: ast.AST | None, depth: int = 0) -> list[tuple[str, str, str]]:
+        if node is None or depth > 6:
+            return []
+        if isinstance(node, ast.Name):
+            if node.id in tool_sets:
+                return tool_sets[node.id]
+            if node.id in tool_values:
+                return [tool_values[node.id]]
+            return [(node.id, "name-reference", "low")]
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return [(node.value, "literal-tool-name", "medium")]
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            items: list[tuple[str, str, str]] = []
+            for elt in node.elts:
+                items.extend(resolve_tool_expr(elt, depth + 1))
+            return _dedupe_detected_tools(items)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return _dedupe_detected_tools(resolve_tool_expr(node.left, depth + 1) + resolve_tool_expr(node.right, depth + 1))
+        if isinstance(node, ast.Call):
+            call_name = _call_name(node.func).split(".")[-1]
+            if call_name in {"Tool", "StructuredTool", "DynamicTool", "FunctionTool", "ToolWrapper", "tool"}:
+                name = _extract_string_literal(_keyword_value(node, "name"))
+                if not name and node.args:
+                    name = _extract_string_literal(node.args[0])
+                func_ref = _keyword_value(node, "func")
+                if not name and isinstance(func_ref, ast.Name):
+                    name = func_ref.id
+                if not name and node.args and isinstance(node.args[0], ast.Name):
+                    name = node.args[0].id
+                if not name and node.args and isinstance(node.args[-1], ast.Name):
+                    name = node.args[-1].id
+                return [(name or call_name, "tool-constructor", "medium")]
+            if call_name == "from_function":
+                name = _extract_string_literal(_keyword_value(node, "name"))
+                if not name and node.args and isinstance(node.args[0], ast.Name):
+                    name = node.args[0].id
+                return [(name or "from_function", "tool-from-function", "medium")]
+        return []
+
+    def record_assignment(target: ast.AST, value: ast.AST) -> None:
+        if not isinstance(target, ast.Name):
+            return
+        resolved = _dedupe_detected_tools(resolve_tool_expr(value))
+        if not resolved:
+            return
+        if isinstance(value, (ast.List, ast.Tuple, ast.Set, ast.BinOp)):
+            tool_sets[target.id] = resolved
+        elif len(resolved) == 1:
+            tool_values[target.id] = resolved[0]
+        else:
+            tool_sets[target.id] = resolved
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for decorator in node.decorator_list:
+                if is_agent_tool_decorator(_decorator_name(decorator)):
+                    tool_values[node.name] = (node.name, "decorator", "high")
+                    break
+
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                record_assignment(target, stmt.value)
+        elif isinstance(stmt, ast.AnnAssign):
+            if stmt.value is not None:
+                record_assignment(stmt.target, stmt.value)
+
+    defs: list[_PythonAgentDef] = []
+    candidate_calls = {"Agent", "AgentExecutor", "Crew", "create_react_agent", "initialize_agent"}
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        full_call_name = _call_name(node.func)
+        call_name = full_call_name.split(".")[-1]
+        if call_name not in candidate_calls and not call_name.endswith("Agent"):
+            continue
+
+        name = _extract_string_literal(_keyword_value(node, "name"))
+        if not name and call_name == "create_react_agent":
+            name = "react-agent"
+        if not name and call_name == "Agent":
+            name = _extract_string_literal(_keyword_value(node, "role"))
+        if not name and node.args:
+            name = _extract_string_literal(node.args[0])
+        if not name:
+            name = f"{Path(filename).stem}:{call_name.lower()}"
+
+        tools_node = _keyword_value(node, "tools")
+        tool_source = "keyword-tools-arg"
+        if tools_node is None and call_name == "create_react_agent" and len(node.args) >= 2:
+            tools_node = node.args[1]
+            tool_source = "positional-tools-arg"
+
+        all_tools = resolve_tool_expr(tools_node)
+        if tool_source == "positional-tools-arg":
+            all_tools = [(tool_name, f"{source}+{tool_source}", confidence) for tool_name, source, confidence in all_tools]
+
+        model = _extract_string_literal(_keyword_value(node, "model"))
+        if not model:
+            model = _extract_string_literal(_keyword_value(node, "llm"))
+        if not model and call_name == "create_react_agent" and node.args:
+            model = _extract_string_literal(node.args[0])
+
+        defs.append(
+            _PythonAgentDef(
+                name=name,
+                framework=framework,
+                tools=_dedupe_detected_tools(all_tools),
+                model=model,
+                env_refs=env_refs,
+                file=filename,
+            )
+        )
+
+    if defs:
+        return defs
+    return _extract_agent_defs_regex(content, filename)
 
 
 def _scan_python_files(project: Path) -> list[_PythonAgentDef]:
@@ -297,6 +515,48 @@ def _scan_python_files(project: Path) -> list[_PythonAgentDef]:
                 all_defs.append(d)
 
     return all_defs
+
+
+def _prompt_inventory_by_file(project: Path) -> dict[str, list[dict[str, Any]]]:
+    """Return bounded prompt inventory keyed by relative path and basename."""
+    try:
+        from agent_bom.ast_analyzer import analyze_project
+    except Exception:
+        return {}
+
+    try:
+        ast_result = analyze_project(project)
+    except Exception:
+        return {}
+
+    by_file: dict[str, list[dict[str, Any]]] = {}
+    for prompt in ast_result.prompts:
+        text = str(prompt.text or "")
+        item = {
+            "variable": prompt.variable_name,
+            "file": prompt.file_path,
+            "line": prompt.line_number,
+            "framework": prompt.framework,
+            "type": prompt.prompt_type,
+            "risk_flags": list(prompt.risk_flags),
+            "text_preview": text[:240],
+            "text_sha256": hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest(),
+        }
+        for key in {prompt.file_path, Path(prompt.file_path).name}:
+            by_file.setdefault(key, []).append(item)
+    return by_file
+
+
+def _attach_system_prompts(agent_defs: list[_PythonAgentDef], project: Path) -> list[_PythonAgentDef]:
+    """Attach AST-extracted prompt inventory to discovered Python agents."""
+    prompts_by_file = _prompt_inventory_by_file(project)
+    if not prompts_by_file:
+        return agent_defs
+    enriched: list[_PythonAgentDef] = []
+    for agent_def in agent_defs:
+        prompts = tuple(prompts_by_file.get(agent_def.file, []))
+        enriched.append(agent_def._replace(system_prompts=prompts))
+    return enriched
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -354,6 +614,8 @@ def scan_python_agents(project_path: str) -> tuple[list[Agent], list[str]]:
 
     # 3. Scan Python files for agent definitions
     agent_defs = _scan_python_files(project)
+    if agent_defs:
+        agent_defs = _attach_system_prompts(agent_defs, project)
 
     # If no agent definitions found but frameworks detected in requirements,
     # create one synthetic entry per framework so CVE scanning still runs
@@ -400,7 +662,15 @@ def scan_python_agents(project_path: str) -> tuple[list[Agent], list[str]]:
                 f"requirements files — version unknown, CVE scan may be incomplete"
             )
 
-        tools = [MCPTool(name=t, description="agent tool") for t in d.tools]
+        tools = [
+            MCPTool(
+                name=name,
+                description="agent tool",
+                discovery_source=source,
+                discovery_confidence=confidence,
+            )
+            for name, source, confidence in d.tools
+        ]
         if d.model:
             tools.append(MCPTool(name=d.model, description="LLM model"))
 
@@ -422,6 +692,13 @@ def scan_python_agents(project_path: str) -> tuple[list[Agent], list[str]]:
             config_path=str(project),
             mcp_servers=[server],
             source="python-agents",
+            metadata={
+                "system_prompts": d.system_prompts,
+                "system_prompt_count": len(d.system_prompts),
+                "system_prompt_risk_flags": sorted({flag for prompt in d.system_prompts for flag in prompt.get("risk_flags", [])}),
+            }
+            if d.system_prompts
+            else {},
         )
         agents.append(agent)
 

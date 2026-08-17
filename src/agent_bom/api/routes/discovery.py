@@ -10,101 +10,595 @@ Endpoints:
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Iterable
+from copy import deepcopy
+from dataclasses import asdict
+from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, HTTPException
+import anyio.to_thread
+from fastapi import APIRouter, HTTPException, Query, Request
 
+from agent_bom.api.mcp_observation_store import MCPObservation, merge_observations
 from agent_bom.api.models import JobStatus
-from agent_bom.api.stores import _get_store
-from agent_bom.security import sanitize_error
+from agent_bom.api.stores import _get_fleet_store, _get_mcp_observation_store, _get_store
+from agent_bom.api.tenancy import require_request_tenant_id
+from agent_bom.asset_provenance import agent_discovery_provenance, package_discovery_provenance, package_version_provenance
+from agent_bom.backpressure import BackpressureRejectedError, adaptive_backpressure
+from agent_bom.constants import is_credential_key
+from agent_bom.graph.severity import normalize_severity
+from agent_bom.mcp_blocklist import sanitize_security_intelligence_entry
+from agent_bom.security import (
+    sanitize_command_args,
+    sanitize_env_vars,
+    sanitize_error,
+    sanitize_security_warnings,
+    sanitize_text,
+    sanitize_url,
+)
+
+if TYPE_CHECKING:
+    from agent_bom.models import Agent
 
 router = APIRouter()
 _logger = logging.getLogger(__name__)
+_AGENTS_RESPONSE_CACHE_TTL_SECONDS = 30.0
+_agents_response_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
-@router.get("/v1/agents", tags=["discovery"])
-async def list_agents() -> dict:
+def _clear_agents_response_cache_for_tests() -> None:
+    _agents_response_cache.clear()
+
+
+def _tenant_id(request: Request) -> str:
+    return require_request_tenant_id(request)
+
+
+def _discover_agents_with_demo_fallback() -> list[Any]:
+    """Live local-disk discovery, plus the curated inventory in demo-estate mode.
+
+    This used to fall back only when live discovery found *nothing*, justified by
+    "on a hosted demo server there are no local agent configs to discover". That
+    assumption was wrong: the hosted image ships the ``mcp`` CLI at
+    ``/app/.venv/bin/mcp``, so discovery returned exactly ONE agent, the
+    ``if agents: return agents`` guard short-circuited, and the curated inventory
+    never loaded. ``/v1/agents/mesh`` then served a single unlinked node and the
+    Agent Topology page rendered a "trust mesh" of one dot on a 4,101-asset
+    estate. One incidental binary in the image defeated the whole demo estate.
+
+    In demo-estate mode the curated inventory IS the story, so it is always
+    included, merged with anything genuinely discovered (by agent name, live
+    discovery winning) rather than gated on discovery being empty.
+
+    Real deployments — env unset — still get live discovery only, including when
+    it finds nothing. Demo rows must never appear in a real tenant's topology.
+    """
+    from agent_bom.discovery import discover_all
+
+    agents = discover_all()
+
+    from agent_bom.demo_estate.bootstrap import demo_estate_enabled
+
+    if not demo_estate_enabled():
+        return agents
+
+    from agent_bom.cli._common import _build_agents_from_inventory
+    from agent_bom.demo import DEMO_INVENTORY
+
+    demo_agents = _build_agents_from_inventory(DEMO_INVENTORY, "agent-bom --demo")
+    discovered_names = {getattr(agent, "name", "") for agent in agents}
+    return [*agents, *(a for a in demo_agents if getattr(a, "name", "") not in discovered_names)]
+
+
+def _merge_strings(*values: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in values:
+        for value in group:
+            if value not in seen:
+                seen.add(value)
+                merged.append(value)
+    return merged
+
+
+def _merge_security_intelligence(*values: list[dict[str, object]]) -> list[dict[str, object]]:
+    merged: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for group in values:
+        for item in group:
+            if not isinstance(item, dict):
+                continue
+            safe_item = sanitize_security_intelligence_entry(item)
+            key = (str(safe_item.get("entry_id") or ""), str(safe_item.get("matched_value") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(safe_item)
+    return merged
+
+
+def _completed_jobs(tenant_id: str) -> list[Any]:
+    return [job for job in _get_store().list_all(tenant_id=tenant_id) if job.status == JobStatus.DONE and job.result]
+
+
+def _iter_report_servers(report: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    rows: list[tuple[str, dict[str, Any]]] = []
+    for agent in report.get("agents", []):
+        agent_name = str(agent.get("name") or agent.get("agent_name") or "").strip()
+        for server in agent.get("mcp_servers", []) or []:
+            if isinstance(server, dict):
+                rows.append((agent_name, server))
+        # Back-compat for older pushed reports and gateway discovery seed data.
+        for server in agent.get("servers", []) or []:
+            if isinstance(server, dict):
+                rows.append((agent_name, server))
+    return rows
+
+
+def _build_scan_history_index(tenant_id: str) -> dict[tuple[str, str], dict[str, Any]]:
+    index: dict[tuple[str, str], dict[str, Any]] = {}
+    for job in _completed_jobs(tenant_id):
+        report = job.result or {}
+        for report_agent_name, report_server in _iter_report_servers(report):
+            server_name = str(report_server.get("name") or "").strip()
+            if not report_agent_name or not server_name:
+                continue
+            key = (report_agent_name, server_name)
+            record = index.setdefault(
+                key,
+                {
+                    "scan_sources": set(),
+                    "first_seen": "",
+                    "last_seen": "",
+                },
+            )
+            for source in report.get("scan_sources", []) or []:
+                if source:
+                    record["scan_sources"].add(str(source))
+            created_at = str(job.created_at or "")
+            completed_at = str(job.completed_at or created_at)
+            if created_at and (not record["first_seen"] or created_at < record["first_seen"]):
+                record["first_seen"] = created_at
+            if completed_at and completed_at > record["last_seen"]:
+                record["last_seen"] = completed_at
+
+    return {
+        key: {
+            "present": True,
+            "scan_sources": sorted(value["scan_sources"]),
+            "first_seen": value["first_seen"] or None,
+            "last_seen": value["last_seen"] or None,
+        }
+        for key, value in index.items()
+    }
+
+
+def _build_gateway_index(tenant_id: str) -> dict[tuple[str, str], dict[str, Any]]:
+    index: dict[tuple[str, str], dict[str, Any]] = {}
+    for job in _completed_jobs(tenant_id):
+        for agent_name, report_server in _iter_report_servers(job.result or {}):
+            server_name = str(report_server.get("name") or "").strip()
+            server_url = str(report_server.get("url") or "").strip()
+            if not server_name or not server_url.startswith(("http://", "https://")):
+                continue
+            record = index.setdefault(
+                (server_name, server_url),
+                {
+                    "gateway_registered": True,
+                    "source_agents": set(),
+                },
+            )
+            if agent_name:
+                record["source_agents"].add(agent_name)
+    return {
+        key: {
+            "gateway_registered": value["gateway_registered"],
+            "source_agents": sorted(value["source_agents"]),
+        }
+        for key, value in index.items()
+    }
+
+
+def _observation_ids(agent: Any, server: Any) -> tuple[str, str | None]:
+    current = f"{agent.name}:{getattr(server, 'stable_id', server.name)}"
+    legacy = None
+    command = getattr(server, "command", "") or ""
+    if command:
+        legacy = f"{agent.name}:{server.name}:{command}"
+        if legacy == current:
+            legacy = None
+    return current, legacy
+
+
+def _agent_count_by_class(agents: Iterable[Agent]) -> dict[str, int]:
+    """Split discovered agents into AI clients vs background agents (additive).
+
+    Excludes synthetic SBOM/image wrappers. Lets clients render one authoritative
+    breakdown instead of each re-deriving from ``agent_type``.
+    """
+    from agent_bom.models import classify_agent_kind
+
+    counts = {"client": 0, "background": 0}
+    for agent in agents:
+        kind = classify_agent_kind(agent)
+        if kind in counts:
+            counts[kind] += 1
+    return counts
+
+
+def _serialize_agent(
+    agent: Agent,
+    *,
+    fleet_agent: dict[str, Any] | None = None,
+    scan_history_index: dict[tuple[str, str], dict[str, Any]] | None = None,
+    gateway_index: dict[tuple[str, str], dict[str, Any]] | None = None,
+    observation_index: dict[str, MCPObservation] | None = None,
+) -> dict:
+    payload = asdict(agent)
+    # Display-only class (AI client/host vs background/framework agent). Additive
+    # field; never renames agent_type or any existing key.
+    from agent_bom.models import classify_agent_kind
+
+    payload["agent_class"] = classify_agent_kind(agent)
+    agent_provenance = agent_discovery_provenance(agent)
+    payload["discovery_provenance"] = agent_provenance
+    payload["mcp_servers"] = []
+    for server in agent.mcp_servers:
+        server_payload = asdict(server)
+        credential_names = list(getattr(server, "credential_names", []) or [])
+        server_url = getattr(server, "url", None)
+        auth_mode = getattr(server, "auth_mode", None)
+        if auth_mode is None:
+            if credential_names:
+                auth_mode = "env-credentials"
+            elif server_url and "@" in server_url:
+                auth_mode = "url-embedded-credentials"
+            elif server_url:
+                auth_mode = "network-no-auth-observed"
+            else:
+                auth_mode = "local-stdio"
+        has_credentials = getattr(server, "has_credentials", None)
+        if has_credentials is None:
+            has_credentials = bool(credential_names)
+
+        server_payload["auth_mode"] = auth_mode
+        server_payload["has_credentials"] = has_credentials
+        server_payload["command"] = sanitize_text(getattr(server, "command", ""), max_len=200)
+        server_payload["env"] = sanitize_env_vars(dict(getattr(server, "env", {}) or {}))
+        server_payload["credential_env_vars"] = credential_names
+        server_payload["security_blocked"] = bool(getattr(server, "security_blocked", False))
+        server_payload["args"] = sanitize_command_args(list(getattr(server, "args", []) or []))
+        server_payload["url"] = sanitize_url(server_url)
+        server_payload.setdefault("config_path", getattr(server, "config_path", None))
+        server_payload["security_warnings"] = sanitize_security_warnings(list(getattr(server, "security_warnings", []) or []))
+        server_payload["security_intelligence"] = _merge_security_intelligence(list(getattr(server, "security_intelligence", []) or []))
+        for idx, package in enumerate(getattr(server, "packages", []) or []):
+            if idx < len(server_payload.get("packages", []) or []):
+                server_payload["packages"][idx]["version_provenance"] = package_version_provenance(
+                    package,
+                    inherited=agent_provenance,
+                )
+                server_payload["packages"][idx]["discovery_provenance"] = package_discovery_provenance(
+                    package,
+                    inherited=agent_provenance,
+                )
+        observation_id, legacy_observation_id = _observation_ids(agent, server)
+        stored_observation = (observation_index or {}).get(observation_id)
+        if stored_observation is None and legacy_observation_id:
+            stored_observation = (observation_index or {}).get(legacy_observation_id)
+        scan_history = (scan_history_index or {}).get(
+            (agent.name, server.name),
+            {"present": False, "scan_sources": [], "first_seen": None, "last_seen": None},
+        )
+        gateway_state = (gateway_index or {}).get(
+            (server.name, sanitize_url(server_url) or ""),
+            {"gateway_registered": False, "source_agents": []},
+        )
+        observed_via = ["local_discovery"]
+        observed_scopes = ["endpoint"]
+        if scan_history["present"]:
+            observed_via.append("scan_result")
+            observed_scopes.append("scan")
+        if fleet_agent is not None:
+            observed_via.append("fleet_sync")
+        if gateway_state["gateway_registered"]:
+            observed_via.append("gateway_discovery")
+            observed_scopes.append("gateway")
+        if stored_observation is not None:
+            server_payload["security_blocked"] = bool(server_payload["security_blocked"]) or stored_observation.security_blocked
+            server_payload["security_warnings"] = _merge_strings(
+                list(server_payload.get("security_warnings", []) or []),
+                sanitize_security_warnings(stored_observation.security_warnings),
+            )
+            server_payload["security_intelligence"] = _merge_security_intelligence(
+                list(server_payload.get("security_intelligence", []) or []),
+                stored_observation.security_intelligence,
+            )
+            observed_via = sorted(set(stored_observation.observed_via) | set(observed_via))
+            observed_scopes = sorted(set(stored_observation.observed_scopes) | set(observed_scopes))
+            scan_sources = sorted(set(stored_observation.scan_sources) | set(scan_history["scan_sources"]))
+            source_agents = sorted(set(stored_observation.source_agents) | set(gateway_state["source_agents"]))
+            configured_locally = stored_observation.configured_locally
+            fleet_present = stored_observation.fleet_present or fleet_agent is not None
+            gateway_registered = stored_observation.gateway_registered or gateway_state["gateway_registered"]
+            runtime_observed = stored_observation.runtime_observed
+            first_seen = stored_observation.first_seen or scan_history["first_seen"]
+            last_seen = stored_observation.last_seen or (fleet_agent.get("last_discovery") if fleet_agent else scan_history["last_seen"])
+            last_synced = stored_observation.last_synced or (fleet_agent.get("updated_at") if fleet_agent else None)
+        else:
+            scan_sources = scan_history["scan_sources"]
+            source_agents = gateway_state["source_agents"]
+            configured_locally = True
+            fleet_present = fleet_agent is not None
+            gateway_registered = gateway_state["gateway_registered"]
+            runtime_observed = False
+            first_seen = scan_history["first_seen"]
+            last_seen = fleet_agent.get("last_discovery") if fleet_agent else scan_history["last_seen"]
+            last_synced = fleet_agent.get("updated_at") if fleet_agent else None
+        payload["mcp_servers"].append(server_payload)
+        server_payload["provenance"] = {
+            "observed_via": observed_via,
+            "observed_scopes": observed_scopes,
+            "scan_sources": scan_sources,
+            "source_agents": source_agents,
+            "configured_locally": configured_locally,
+            "fleet_present": fleet_present,
+            "gateway_registered": gateway_registered,
+            # Runtime correlation for per-server MCP objects is not yet wired through
+            # a canonical store. Keep this explicit instead of inferring from alert volume.
+            "runtime_observed": runtime_observed,
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+            "last_synced": last_synced,
+        }
+    return payload
+
+
+def _observation_index(tenant_id: str) -> dict[str, MCPObservation]:
+    return {row.observation_id: row for row in _get_mcp_observation_store().list_by_tenant(tenant_id)}
+
+
+def _persist_agent_observations(
+    tenant_id: str,
+    agent: Any,
+    *,
+    fleet_agent: dict[str, Any] | None,
+    scan_history_index: dict[tuple[str, str], dict[str, Any]],
+    gateway_index: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    store = _get_mcp_observation_store()
+    for server in agent.mcp_servers:
+        server_url = getattr(server, "url", None)
+        scan_history = scan_history_index.get(
+            (agent.name, server.name),
+            {"present": False, "scan_sources": [], "first_seen": None, "last_seen": None},
+        )
+        gateway_state = gateway_index.get(
+            (server.name, server_url or ""),
+            {"gateway_registered": False, "source_agents": []},
+        )
+        observed_via = ["local_discovery"]
+        observed_scopes = ["endpoint"]
+        if scan_history["present"]:
+            observed_via.append("scan_result")
+            observed_scopes.append("scan")
+        if fleet_agent is not None:
+            observed_via.append("fleet_sync")
+        if gateway_state["gateway_registered"]:
+            observed_via.append("gateway_discovery")
+            observed_scopes.append("gateway")
+        credential_names = list(getattr(server, "credential_names", []) or [])
+        auth_mode = getattr(server, "auth_mode", None)
+        if auth_mode is None:
+            if credential_names:
+                auth_mode = "env-credentials"
+            elif server_url and "@" in server_url:
+                auth_mode = "url-embedded-credentials"
+            elif server_url:
+                auth_mode = "network-no-auth-observed"
+            else:
+                auth_mode = "local-stdio"
+        observation_id, legacy_observation_id = _observation_ids(agent, server)
+        candidate = MCPObservation(
+            tenant_id=tenant_id,
+            observation_id=observation_id,
+            server_stable_id=getattr(server, "stable_id", server.name),
+            server_fingerprint=getattr(server, "fingerprint", ""),
+            server_name=server.name,
+            agent_name=agent.name,
+            transport=getattr(getattr(server, "transport", ""), "value", getattr(server, "transport", "")) or "",
+            url=sanitize_url(server_url),
+            auth_mode=auth_mode,
+            command=sanitize_text(getattr(server, "command", ""), max_len=200),
+            args=sanitize_command_args(list(getattr(server, "args", []) or [])),
+            config_path=getattr(server, "config_path", None),
+            credential_env_vars=credential_names,
+            security_blocked=bool(getattr(server, "security_blocked", False)),
+            security_warnings=sanitize_security_warnings(list(getattr(server, "security_warnings", []) or [])),
+            security_intelligence=[
+                sanitize_security_intelligence_entry(item)
+                for item in (getattr(server, "security_intelligence", []) or [])
+                if isinstance(item, dict)
+            ],
+            observed_via=observed_via,
+            observed_scopes=observed_scopes,
+            scan_sources=scan_history["scan_sources"],
+            source_agents=gateway_state["source_agents"],
+            configured_locally=True,
+            fleet_present=fleet_agent is not None,
+            gateway_registered=gateway_state["gateway_registered"],
+            runtime_observed=False,
+            first_seen=scan_history["first_seen"],
+            last_seen=fleet_agent.get("last_discovery") if fleet_agent else scan_history["last_seen"],
+            last_synced=fleet_agent.get("updated_at") if fleet_agent else None,
+        )
+        existing = store.get(tenant_id, observation_id)
+        if existing is None and legacy_observation_id:
+            existing = store.get(tenant_id, legacy_observation_id)
+        store.put(merge_observations(existing, candidate))
+
+
+def _build_agents_response(tenant_id: str) -> dict[str, Any]:
+    from agent_bom.parsers import extract_packages
+
+    agents = _discover_agents_with_demo_fallback()
+    for agent in agents:
+        for server in agent.mcp_servers:
+            if not server.packages:
+                server.packages = extract_packages(server)
+    scan_history_index = _build_scan_history_index(tenant_id)
+    gateway_index = _build_gateway_index(tenant_id)
+    # Key by canonical_id so distinct FleetAgents that share a bare name
+    # (different source_ids) stay distinct; fall back to name only for legacy
+    # records that predate canonical-id backfill.
+    fleet_index = {(item.canonical_id or item.name): item.model_dump() for item in _get_fleet_store().list_by_tenant(tenant_id)}
+    for agent in agents:
+        _persist_agent_observations(
+            tenant_id,
+            agent,
+            fleet_agent=fleet_index.get(getattr(agent, "canonical_id", "") or agent.name),
+            scan_history_index=scan_history_index,
+            gateway_index=gateway_index,
+        )
+    observation_index = _observation_index(tenant_id)
+
+    return {
+        # Scope marker so callers never conflate this population with the
+        # scanned-estate roll-up at /v1/inventory. This endpoint is live
+        # local-disk discovery of AI-client configs on this host (no CVE scan);
+        # /v1/inventory aggregates agents from completed scan jobs (the estate).
+        "scope": "local_discovery",
+        "source": (
+            "Live local-disk discovery of AI-client agent configs on this host "
+            "(no CVE scan). For scanned-estate agents aggregated from completed "
+            "scan jobs, see /v1/inventory."
+        ),
+        "agents": [
+            _serialize_agent(
+                a,
+                fleet_agent=fleet_index.get(getattr(a, "canonical_id", "") or a.name),
+                scan_history_index=scan_history_index,
+                gateway_index=gateway_index,
+                observation_index=observation_index,
+            )
+            for a in agents
+        ],
+        "count": len(agents),
+        "count_by_class": _agent_count_by_class(agents),
+        "warnings": [],
+    }
+
+
+@router.get("/agents", tags=["discovery"])
+async def list_agents(
+    request: Request,
+    refresh: bool = Query(False, description="Bypass the sidebar cache and perform live local discovery"),
+) -> dict:
     """Quick auto-discovery of local AI agent configs (Claude Desktop, Cursor, Windsurf...).
     No CVE scan — instant results for the UI sidebar.
     """
     try:
-        from dataclasses import asdict
+        tenant_id = _tenant_id(request)
+        now = time.monotonic()
+        cached = _agents_response_cache.get(tenant_id)
+        if not refresh and cached is not None and now - cached[0] <= _AGENTS_RESPONSE_CACHE_TTL_SECONDS:
+            return deepcopy(cached[1])
 
-        from agent_bom.discovery import discover_all
-        from agent_bom.parsers import extract_packages
-
-        agents = discover_all()
-        for agent in agents:
-            for server in agent.mcp_servers:
-                if not server.packages:
-                    server.packages = extract_packages(server)
-
-        return {
-            "agents": [asdict(a) for a in agents],
-            "count": len(agents),
-            "warnings": [],
-        }
+        async with adaptive_backpressure("discovery"):
+            response = await anyio.to_thread.run_sync(_build_agents_response, tenant_id)
+        _agents_response_cache[tenant_id] = (now, deepcopy(response))
+        return response
+    except BackpressureRejectedError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=exc.to_dict(),
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
     except Exception as exc:  # noqa: BLE001
-        _logger.exception("Agent discovery failed")
+        _logger.warning("Agent discovery failed: %s", sanitize_error(exc, generic=True))
+        raise HTTPException(status_code=500, detail=sanitize_error(exc, generic=True)) from exc
+
+
+@router.get("/discovery/providers", tags=["discovery"])
+async def list_discovery_providers() -> dict:
+    """Return registered discovery provider capability and trust contracts."""
+
+    from agent_bom.cloud import provider_contracts
+
+    return provider_contracts()
+
+
+@router.get("/agents/mesh", tags=["discovery"], deprecated=True)
+async def get_agent_mesh(request: Request) -> dict:
+    """Get a ReactFlow-compatible mesh topology of all discovered agents.
+
+    Shows agents, their MCP servers, tools, and vulnerability overlay
+    as an interactive graph.
+
+    Soft-deprecated: no UI/CLI/MCP product consumer (#3666 Phase 2).
+
+    The synchronous discovery + store scans run in a worker thread so they
+    never block the event loop.
+    """
+    try:
+        return await anyio.to_thread.run_sync(_get_agent_mesh_impl, request)
+    except Exception as exc:  # noqa: BLE001
+        _logger.exception("Request failed")
         raise HTTPException(status_code=500, detail=sanitize_error(exc)) from exc
 
 
-@router.get("/v1/agents/{agent_name}", tags=["discovery"])
-async def get_agent_detail(agent_name: str) -> dict:
-    """Get detailed view of a single agent with cross-referenced scan data."""
-    try:
-        from dataclasses import asdict
+def _get_agent_mesh_impl(request: Request) -> dict:
+    from agent_bom.output.agent_mesh import build_agent_mesh
+    from agent_bom.parsers import extract_packages
 
-        from agent_bom.discovery import discover_all
-        from agent_bom.parsers import extract_packages
-
-        agents = discover_all()
-        agent = None
-        for a in agents:
-            if a.name == agent_name:
-                agent = a
-                break
-
-        if agent is None:
-            raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found")
-
+    agents = _discover_agents_with_demo_fallback()
+    for agent in agents:
         for server in agent.mcp_servers:
             if not server.packages:
                 server.packages = extract_packages(server)
 
-        # Cross-reference blast radii from completed scans
-        agent_blast: list[dict] = []
-        for job in _get_store().list_all():
-            if job.status != JobStatus.DONE or not job.result:
-                continue
-            for br in job.result.get("blast_radius", []):
-                if agent_name in br.get("affected_agents", []):
-                    agent_blast.append(br)
+    tenant_id = _tenant_id(request)
+    scan_history_index = _build_scan_history_index(tenant_id)
+    gateway_index = _build_gateway_index(tenant_id)
+    fleet_index = {(item.canonical_id or item.name): item.model_dump() for item in _get_fleet_store().list_by_tenant(tenant_id)}
+    for agent in agents:
+        _persist_agent_observations(
+            tenant_id,
+            agent,
+            fleet_agent=fleet_index.get(getattr(agent, "canonical_id", "") or agent.name),
+            scan_history_index=scan_history_index,
+            gateway_index=gateway_index,
+        )
+    observation_index = _observation_index(tenant_id)
+    agents_data = [
+        _serialize_agent(
+            a,
+            fleet_agent=fleet_index.get(getattr(a, "canonical_id", "") or a.name),
+            scan_history_index=scan_history_index,
+            gateway_index=gateway_index,
+            observation_index=observation_index,
+        )
+        for a in agents
+    ]
 
-        total_packages = sum(len(s.packages) for s in agent.mcp_servers)
-        total_tools = sum(len(s.tools) for s in agent.mcp_servers)
-        all_credentials: list[str] = []
-        for s in agent.mcp_servers:
-            all_credentials.extend(s.credential_names)
+    # Gather blast radius from completed scans for vuln overlay.
+    all_blast: list[dict] = []
+    for job in _get_store().list_all(tenant_id=_tenant_id(request)):
+        if job.status == JobStatus.DONE and job.result:
+            all_blast.extend(job.result.get("blast_radius", []))
 
-        severity_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
-        for br in agent_blast:
-            sev = (br.get("severity") or "").lower()
-            if sev in severity_counts:
-                severity_counts[sev] += 1
+    return build_agent_mesh(agents_data, all_blast)
 
-        return {
-            "agent": asdict(agent),
-            "summary": {
-                "total_servers": len(agent.mcp_servers),
-                "total_packages": total_packages,
-                "total_tools": total_tools,
-                "total_credentials": len(all_credentials),
-                "total_vulnerabilities": len(agent_blast),
-                "severity_breakdown": severity_counts,
-            },
-            "blast_radius": agent_blast,
-            "credentials": all_credentials,
-        }
+
+@router.get("/agents/{agent_name}", tags=["discovery"])
+async def get_agent_detail(request: Request, agent_name: str) -> dict:
+    """Get detailed view of a single agent with cross-referenced scan data.
+
+    The synchronous discovery + store scans run in a worker thread so they
+    never block the event loop.
+    """
+    try:
+        return await anyio.to_thread.run_sync(_get_agent_detail_impl, request, agent_name)
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -112,15 +606,96 @@ async def get_agent_detail(agent_name: str) -> dict:
         raise HTTPException(status_code=500, detail=sanitize_error(exc)) from exc
 
 
-@router.get("/v1/agents/{agent_name}/lifecycle", tags=["discovery"])
-async def get_agent_lifecycle(agent_name: str) -> dict:
+def _get_agent_detail_impl(request: Request, agent_name: str) -> dict:
+    from agent_bom.discovery import discover_all
+    from agent_bom.parsers import extract_packages
+
+    agents = discover_all()
+    agent = None
+    for a in agents:
+        if a.name == agent_name:
+            agent = a
+            break
+
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found")
+
+    for server in agent.mcp_servers:
+        if not server.packages:
+            server.packages = extract_packages(server)
+
+    # Cross-reference blast radii from completed scans
+    agent_blast: list[dict] = []
+    for job in _get_store().list_all(tenant_id=_tenant_id(request)):
+        if job.status != JobStatus.DONE or not job.result:
+            continue
+        for br in job.result.get("blast_radius", []):
+            if agent_name in br.get("affected_agents", []):
+                agent_blast.append(br)
+
+    total_packages = sum(len(s.packages) for s in agent.mcp_servers)
+    total_tools = sum(len(s.tools) for s in agent.mcp_servers)
+    all_credentials: list[str] = []
+    for s in agent.mcp_servers:
+        all_credentials.extend(s.credential_names)
+
+    # Every blast radius lands in exactly one bucket. Advisories with no CVSS
+    # vector normalise to ``unknown``; without an explicit bucket they fell out
+    # of the histogram entirely and the detail page rendered "N vulnerabilities"
+    # beside a 0/0/0/0 strip labelled Clean.
+    severity_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "unrated": 0}
+    for br in agent_blast:
+        sev = normalize_severity(br.get("severity"))
+        severity_counts[sev if sev in severity_counts else "unrated"] += 1
+
+    fleet_agent = None
+    tenant_id = _tenant_id(request)
+    for candidate in _get_fleet_store().list_by_tenant(tenant_id):
+        if candidate.name == agent_name:
+            fleet_agent = candidate.model_dump()
+            break
+    scan_history_index = _build_scan_history_index(tenant_id)
+    gateway_index = _build_gateway_index(tenant_id)
+    _persist_agent_observations(
+        tenant_id,
+        agent,
+        fleet_agent=fleet_agent,
+        scan_history_index=scan_history_index,
+        gateway_index=gateway_index,
+    )
+    observation_index = _observation_index(tenant_id)
+
+    return {
+        "agent": _serialize_agent(
+            agent,
+            fleet_agent=fleet_agent,
+            scan_history_index=scan_history_index,
+            gateway_index=gateway_index,
+            observation_index=observation_index,
+        ),
+        "summary": {
+            "total_servers": len(agent.mcp_servers),
+            "total_packages": total_packages,
+            "total_tools": total_tools,
+            "total_credentials": len(all_credentials),
+            "total_vulnerabilities": len(agent_blast),
+            "severity_breakdown": severity_counts,
+        },
+        "blast_radius": agent_blast,
+        "credentials": all_credentials,
+        "fleet": fleet_agent,
+    }
+
+
+@router.get("/agents/{agent_name}/lifecycle", tags=["discovery"])
+async def get_agent_lifecycle(request: Request, agent_name: str) -> dict:
     """Get React Flow nodes/edges for an agent's full lifecycle graph.
 
     Shows: Agent -> MCP Servers -> Tools/Credentials -> Packages -> CVEs
     """
     from agent_bom.output.attack_flow import _severity_color
 
-    detail = await get_agent_detail(agent_name)
+    detail = await get_agent_detail(request, agent_name)
     agent_data = detail["agent"]
 
     nodes: list[dict] = []
@@ -196,9 +771,7 @@ async def get_agent_lifecycle(agent_name: str) -> dict:
 
         # Credentials
         cy = ty + 10
-        env = srv.get("env", {})
-        _sens = ["key", "token", "secret", "password", "credential", "auth"]
-        cred_vars = [k for k in env if any(p in k.lower() for p in _sens)]
+        cred_vars = [k for k in srv.get("env", {}) if is_credential_key(k)]
         for cred in cred_vars:
             cid = f"cred:{cred}"
             if cid not in seen:
@@ -242,6 +815,8 @@ async def get_agent_lifecycle(agent_name: str) -> dict:
                             "version": pkg.get("version", ""),
                             "ecosystem": pkg.get("ecosystem", ""),
                             "vuln_count": len(vulns),
+                            "version_provenance": pkg.get("version_provenance"),
+                            "discovery_provenance": pkg.get("discovery_provenance"),
                         },
                     }
                 )
@@ -293,37 +868,3 @@ async def get_agent_lifecycle(agent_name: str) -> dict:
         y_offset = max(y_offset + 180, py_)
 
     return {"nodes": nodes, "edges": edges, "stats": detail["summary"]}
-
-
-@router.get("/v1/agents/mesh", tags=["discovery"])
-async def get_agent_mesh() -> dict:
-    """Get a ReactFlow-compatible mesh topology of all discovered agents.
-
-    Shows agents, their MCP servers, tools, and vulnerability overlay
-    as an interactive graph.
-    """
-    try:
-        from dataclasses import asdict
-
-        from agent_bom.discovery import discover_all
-        from agent_bom.output.agent_mesh import build_agent_mesh
-        from agent_bom.parsers import extract_packages
-
-        agents = discover_all()
-        for agent in agents:
-            for server in agent.mcp_servers:
-                if not server.packages:
-                    server.packages = extract_packages(server)
-
-        agents_data = [asdict(a) for a in agents]
-
-        # Gather blast radius from completed scans for vuln overlay
-        all_blast: list[dict] = []
-        for job in _get_store().list_all():
-            if job.status == JobStatus.DONE and job.result:
-                all_blast.extend(job.result.get("blast_radius", []))
-
-        return build_agent_mesh(agents_data, all_blast)
-    except Exception as exc:  # noqa: BLE001
-        _logger.exception("Request failed")
-        raise HTTPException(status_code=500, detail=sanitize_error(exc)) from exc

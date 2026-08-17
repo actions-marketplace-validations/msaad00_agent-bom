@@ -1,0 +1,1070 @@
+"""Tests for core REST API endpoints — health, version, scan CRUD, middleware headers."""
+
+from __future__ import annotations
+
+import json
+import uuid
+from pathlib import Path
+from unittest.mock import patch
+from urllib.parse import urlsplit
+
+import pytest
+from starlette.testclient import TestClient
+
+from agent_bom import __version__
+from agent_bom.api.server import (
+    JobStatus,
+    ScanJob,
+    ScanRequest,
+    _DashboardFile,
+    _jobs,
+    _validated_dashboard_file,
+    app,
+    set_job_store,
+)
+from agent_bom.api.store import InMemoryJobStore
+
+
+@pytest.fixture(autouse=True)
+def _mock_scan_pipeline(monkeypatch):
+    """Prevent real MCP discovery during scan CRUD tests.
+
+    The scan endpoint submits jobs to the API scan worker pool, which triggers
+    discover_all() scanning the local machine. Replace submission with a no-op
+    so these tests only exercise HTTP routing, not the full pipeline.
+    """
+    monkeypatch.setattr("agent_bom.api.routes.scan.submit_scan_job", lambda job: None)
+
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+
+def _fresh_client():
+    """Return a clean TestClient + InMemoryJobStore with no leftover state."""
+    store = InMemoryJobStore()
+    set_job_store(store)
+    _jobs.clear()
+    return TestClient(app, raise_server_exceptions=False), store
+
+
+# ---------------------------------------------------------------------------
+# 1. Health endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_brand_mark_svg_is_public() -> None:
+    client, _store = _fresh_client()
+    resp = client.get("/brand/mark.svg")
+    assert resp.status_code == 200
+    assert "image/svg" in resp.headers.get("content-type", "")
+    assert b"<svg" in resp.content
+    assert b"agent-bom" in resp.content or b"linearGradient" in resp.content
+
+
+def test_openapi_uses_brand_favicon() -> None:
+    client, _store = _fresh_client()
+    schema = client.get("/openapi.json").json()
+    assert schema["info"]["title"] == "agent-bom API"
+    docs = client.get("/docs")
+    assert docs.status_code == 200
+    assert "/brand/mark.svg" in docs.text
+
+
+def test_health_endpoint():
+    """Public liveness is minimal; authenticated status carries diagnostics."""
+    client, _ = _fresh_client()
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert "version" in body
+    assert "tracing" not in body
+    assert "analytics" not in body
+    assert "storage" not in body
+    assert "entitlements" not in body
+
+    resp = client.get("/v1/system/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["tracing"]["w3c_trace_context"] is True
+    assert body["tracing"]["w3c_tracestate"] is True
+    assert body["tracing"]["w3c_baggage"] is True
+    assert body["tracing"]["otlp_export"] in {"configured", "disabled", "missing_deps"}
+    assert body["analytics"]["backend"] in {"disabled", "clickhouse"}
+    assert isinstance(body["analytics"]["enabled"], bool)
+    assert isinstance(body["analytics"]["buffered"], bool)
+    assert body["storage"]["control_plane_backend"] in {"inmemory", "sqlite", "postgres", "snowflake"}
+    assert body["storage"]["job_store"] in {"inmemory", "sqlite", "postgres", "snowflake"}
+    assert body["storage"]["audit_log"] in {"inmemory", "sqlite", "postgres", "snowflake"}
+
+
+# ---------------------------------------------------------------------------
+# 2. Version endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_version_endpoint():
+    """GET /version returns 200 with version, api_version, python_package."""
+    client, _ = _fresh_client()
+    resp = client.get("/version")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["version"] == __version__
+    assert body["api_version"] == "v1"
+    assert body["python_package"] == "agent-bom"
+
+
+def test_framework_catalogs_endpoint():
+    """GET /v1/frameworks/catalogs returns active framework metadata."""
+    client, _ = _fresh_client()
+    resp = client.get("/v1/frameworks/catalogs")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "frameworks" in body
+    assert "mitre_attack" in body["frameworks"]
+    assert "attack_version" in body["frameworks"]["mitre_attack"]
+
+
+# ---------------------------------------------------------------------------
+# 3. Root redirect
+# ---------------------------------------------------------------------------
+
+
+def test_root_redirects_when_dashboard_is_not_bundled(monkeypatch):
+    """GET / falls back to API docs when the packaged dashboard is absent."""
+    monkeypatch.setattr("agent_bom.api.server._dashboard_index_file", lambda: None)
+    client, _ = _fresh_client()
+    resp = client.get("/", follow_redirects=False)
+    assert resp.status_code == 307
+    assert "/docs" in resp.headers.get("location", "")
+
+
+def test_root_serves_dashboard_when_bundled(tmp_path: Path, monkeypatch):
+    """GET / serves the packaged dashboard when UI assets are present."""
+    index_file = tmp_path / "index.html"
+    index_file.write_text("<html><body>agent-bom dashboard</body></html>", encoding="utf-8")
+    monkeypatch.setattr("agent_bom.api.server._dashboard_index_file", lambda: _DashboardFile(index_file, "index.html"))
+
+    client, _ = _fresh_client()
+    resp = client.get("/", follow_redirects=False)
+
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers.get("content-type", "")
+    assert "agent-bom dashboard" in resp.text
+
+
+def test_root_uses_dashboard_friendly_csp_when_bundled(tmp_path: Path, monkeypatch):
+    """Dashboard HTML keeps inline compatibility when no generated hash manifest exists."""
+    index_file = tmp_path / "index.html"
+    index_file.write_text("<html><body>agent-bom dashboard</body></html>", encoding="utf-8")
+    monkeypatch.setattr("agent_bom.api.server._dashboard_index_file", lambda: _DashboardFile(index_file, "index.html"))
+    monkeypatch.setenv("AGENT_BOM_DASHBOARD_CSP_HASH_MANIFEST", str(tmp_path / "missing-csp-hashes.json"))
+
+    client, _ = _fresh_client()
+    resp = client.get("/", follow_redirects=False)
+
+    assert resp.status_code == 200
+    csp = resp.headers.get("content-security-policy", "")
+    assert "script-src 'self' 'unsafe-inline'" in csp
+    assert "script-src-attr 'none'" in csp
+    assert "style-src 'self' 'unsafe-inline'" in csp
+    assert "frame-ancestors 'none'" in csp
+
+
+def test_root_strips_packaged_dashboard_csp_meta(tmp_path: Path, monkeypatch):
+    """The API owns dashboard CSP; stale exported meta tags should not reach browsers."""
+    index_file = tmp_path / "index.html"
+    index_file.write_text(
+        '<html><head><meta http-equiv="Content-Security-Policy" content="script-src sha256-bad"></head>'
+        "<body>agent-bom dashboard</body></html>",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("agent_bom.api.server._dashboard_index_file", lambda: _DashboardFile(index_file, "index.html"))
+
+    client, _ = _fresh_client()
+    resp = client.get("/", follow_redirects=False)
+
+    assert resp.status_code == 200
+    assert "content-security-policy" in resp.headers
+    assert "http-equiv" not in resp.text
+    assert "sha256-bad" not in resp.text
+
+
+def test_dashboard_file_validation_rejects_escaped_paths(tmp_path: Path):
+    ui_dist = tmp_path / "ui_dist"
+    ui_dist.mkdir()
+    (ui_dist / "index.html").write_text("<html><body>dashboard</body></html>", encoding="utf-8")
+    outside = tmp_path / "secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+
+    valid = _validated_dashboard_file(ui_dist, "index.html")
+
+    assert valid is not None
+    assert valid.path == (ui_dist / "index.html").resolve()
+    assert _validated_dashboard_file(ui_dist, "../secret.txt") is None
+    assert _validated_dashboard_file(ui_dist, "/index.html") is None
+    assert _validated_dashboard_file(ui_dist, str(outside)) is None
+
+
+def test_root_uses_hash_manifest_csp_when_bundled(tmp_path: Path, monkeypatch):
+    """Packaged dashboard HTML should remove script unsafe-inline when release hashes exist."""
+    index_file = tmp_path / "index.html"
+    index_file.write_text("<html><body>agent-bom dashboard</body></html>", encoding="utf-8")
+    manifest = tmp_path / "csp-hashes.json"
+    manifest.write_text(
+        json.dumps({"script_hashes": ["sha256-abc123"], "style_hashes": ["sha256-style123"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("agent_bom.api.server._dashboard_index_file", lambda: _DashboardFile(index_file, "index.html"))
+    monkeypatch.setenv("AGENT_BOM_DASHBOARD_CSP_HASH_MANIFEST", str(manifest))
+
+    client, _ = _fresh_client()
+    resp = client.get("/", follow_redirects=False)
+
+    assert resp.status_code == 200
+    csp = resp.headers.get("content-security-policy", "")
+    script_directive = csp.split("script-src ", 1)[1].split(";", 1)[0]
+    assert script_directive == "'self' 'sha256-abc123'"
+    assert "'unsafe-inline'" not in script_directive
+    assert "style-src 'self' 'unsafe-inline' 'sha256-style123'" in csp
+
+
+def test_direct_dashboard_html_static_file_strips_csp_meta(tmp_path: Path, monkeypatch):
+    """Direct static-export HTML files should use the same CSP stripping as SPA fallback."""
+    monkeypatch.delenv("AGENT_BOM_NO_UI", raising=False)
+
+    package_root = tmp_path / "agent_bom"
+    api_dir = package_root / "api"
+    api_dir.mkdir(parents=True)
+    server_file = api_dir / "server.py"
+    server_file.write_text("", encoding="utf-8")
+    ui_dist = package_root / "ui_dist"
+    nested = ui_dist / "agents"
+    nested.mkdir(parents=True)
+    (ui_dist / "index.html").write_text("<html><body>root</body></html>", encoding="utf-8")
+    (nested / "index.html").write_text(
+        '<html><head><meta http-equiv="Content-Security-Policy" content="script-src sha256-bad"></head><body>agents</body></html>',
+        encoding="utf-8",
+    )
+    from fastapi import FastAPI
+
+    import agent_bom.api.server as server_module
+    from agent_bom.api.server import _mount_dashboard
+
+    monkeypatch.setattr(server_module, "__file__", str(server_file))
+    test_app = FastAPI()
+    _mount_dashboard(test_app)
+    client = TestClient(test_app, raise_server_exceptions=False)
+    resp = client.get("/agents/index.html")
+
+    assert resp.status_code == 200
+    assert "http-equiv" not in resp.text
+    assert "sha256-bad" not in resp.text
+
+
+def test_dashboard_extensionless_route_serves_static_export_page(tmp_path: Path, monkeypatch):
+    """Next static-export routes such as /mesh should serve mesh.html, not index.html."""
+    monkeypatch.delenv("AGENT_BOM_NO_UI", raising=False)
+
+    package_root = tmp_path / "agent_bom"
+    api_dir = package_root / "api"
+    api_dir.mkdir(parents=True)
+    server_file = api_dir / "server.py"
+    server_file.write_text("", encoding="utf-8")
+    ui_dist = package_root / "ui_dist"
+    nested = ui_dist / "agents"
+    nested.mkdir(parents=True)
+    (ui_dist / "index.html").write_text("<html><body>root dashboard</body></html>", encoding="utf-8")
+    (ui_dist / "mesh.html").write_text("<html><body>agent mesh route</body></html>", encoding="utf-8")
+    (nested / "index.html").write_text("<html><body>agents route</body></html>", encoding="utf-8")
+
+    from fastapi import FastAPI
+
+    import agent_bom.api.server as server_module
+    from agent_bom.api.server import _mount_dashboard
+
+    monkeypatch.setattr(server_module, "__file__", str(server_file))
+    test_app = FastAPI()
+    _mount_dashboard(test_app)
+    client = TestClient(test_app, raise_server_exceptions=False)
+
+    mesh_resp = client.get("/mesh")
+    agents_resp = client.get("/agents")
+    root_resp = client.get("/")
+
+    assert mesh_resp.status_code == 200
+    assert "agent mesh route" in mesh_resp.text
+    assert "root dashboard" not in mesh_resp.text
+    assert agents_resp.status_code == 200
+    assert "agents route" in agents_resp.text
+    assert root_resp.status_code == 200
+    assert "root dashboard" in root_resp.text
+
+
+def test_dashboard_client_routes_fall_back_to_app_shell(tmp_path: Path, monkeypatch):
+    """Client-only dashboard routes such as /dashboard and /settings serve the SPA shell."""
+    monkeypatch.delenv("AGENT_BOM_NO_UI", raising=False)
+
+    package_root = tmp_path / "agent_bom"
+    api_dir = package_root / "api"
+    api_dir.mkdir(parents=True)
+    server_file = api_dir / "server.py"
+    server_file.write_text("", encoding="utf-8")
+    ui_dist = package_root / "ui_dist"
+    ui_dist.mkdir(parents=True)
+    (ui_dist / "index.html").write_text("<html><body>root dashboard</body></html>", encoding="utf-8")
+
+    from fastapi import FastAPI
+
+    import agent_bom.api.server as server_module
+    from agent_bom.api.server import _mount_dashboard
+
+    monkeypatch.setattr(server_module, "__file__", str(server_file))
+    test_app = FastAPI()
+    _mount_dashboard(test_app)
+    client = TestClient(test_app, raise_server_exceptions=False)
+
+    for route in ("/dashboard", "/settings"):
+        resp = client.get(route)
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers.get("content-type", "")
+        assert "root dashboard" in resp.text
+
+
+def test_hsts_preload_is_operator_opt_in(monkeypatch):
+    client, _ = _fresh_client()
+    resp = client.get("/health")
+    assert resp.headers["strict-transport-security"] == "max-age=31536000; includeSubDomains"
+
+    monkeypatch.setenv("AGENT_BOM_HSTS_PRELOAD", "1")
+    resp = client.get("/health")
+    assert resp.headers["strict-transport-security"] == "max-age=31536000; includeSubDomains; preload"
+
+
+def test_ui_csp_headers_do_not_allow_eval():
+    """Static and hosted UI headers should not permit eval-style script execution.
+
+    The CSP source was centralized to ui/lib/security-headers.mjs in #1954.
+    next.config.ts now imports from there; vercel.json is regenerated from
+    the same module by ui/scripts/sync-vercel-headers.mjs and verified by
+    the vitest sync test. The source-of-truth and the rendered output must
+    both forbid eval-style execution.
+    """
+    root = Path(__file__).resolve().parent.parent.parent
+    canonical = (root / "ui" / "lib" / "security-headers.mjs").read_text(encoding="utf-8")
+    vercel_config = (root / "ui" / "vercel.json").read_text(encoding="utf-8")
+
+    assert "'unsafe-eval'" not in canonical
+    assert "'unsafe-eval'" not in vercel_config
+    assert "script-src-attr 'none'" in canonical
+    assert "script-src-attr 'none'" in vercel_config
+
+    # SECURITY.md is read by buyers and auditors, so it must not overstate the
+    # policy it documents. Only the local dev server relaxes script-src.
+    security_md = (root / "SECURITY.md").read_text(encoding="utf-8")
+    for line in security_md.splitlines():
+        if "vercel.json" in line:
+            assert "unsafe-eval" not in line, f"SECURITY.md claims eval is allowed in vercel.json: {line!r}"
+    # Removing 'unsafe-inline' from script-src is a #1954 follow-up that
+    # needs a build-time hash collector for Next.js streaming inline scripts.
+    # The hash of THEME_BOOTSTRAP_SCRIPT is already inventoried in
+    # security-headers.mjs (INLINE_SCRIPT_HASHES) so the migration is a
+    # one-line CSP flip when the collector lands.
+
+
+def test_root_allows_head_when_dashboard_is_bundled(tmp_path: Path, monkeypatch):
+    """Packaged dashboard should answer HEAD like a normal static site root."""
+    index_file = tmp_path / "index.html"
+    index_file.write_text("<html><body>agent-bom dashboard</body></html>", encoding="utf-8")
+    monkeypatch.setattr("agent_bom.api.server._dashboard_index_file", lambda: _DashboardFile(index_file, "index.html"))
+
+    client, _ = _fresh_client()
+    resp = client.head("/", follow_redirects=False)
+
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers.get("content-type", "")
+
+
+def test_health_keeps_strict_api_csp():
+    """API JSON routes should keep the stricter default CSP."""
+    client, _ = _fresh_client()
+    resp = client.get("/health")
+
+    assert resp.status_code == 200
+    assert resp.headers.get("content-security-policy") == "default-src 'self'"
+
+
+def test_docs_csp_relaxation_is_exact_route_scoped():
+    """Only the real Swagger/ReDoc HTML routes should get CDN CSP relaxations."""
+    client, _ = _fresh_client()
+
+    docs_resp = client.get("/docs")
+    near_miss_resp = client.get("/docs-anything")
+
+    assert docs_resp.status_code == 200
+    csp = docs_resp.headers.get("content-security-policy", "")
+    directives = [directive.strip() for directive in csp.split(";") if directive.strip()]
+    script_src = next((directive for directive in directives if directive.startswith("script-src ")), "")
+    script_src_sources = script_src.split()[1:] if script_src else []
+    parsed_sources = [urlsplit(source) for source in script_src_sources]
+    assert any(source.scheme == "https" and source.netloc == ".".join(("cdn", "jsdelivr", "net")) for source in parsed_sources)
+    assert near_miss_resp.headers.get("content-security-policy") == "default-src 'self'"
+
+
+# ---------------------------------------------------------------------------
+# 4. Create scan — 202
+# ---------------------------------------------------------------------------
+
+
+def test_create_scan_returns_202():
+    """POST /v1/scan with empty body returns 202 Accepted."""
+    client, _ = _fresh_client()
+    resp = client.post("/v1/scan", json={})
+    assert resp.status_code == 202
+    body = resp.json()
+    assert "job_id" in body
+    assert body["triggered_by"] == "anonymous"
+    # Background thread may mutate the shared job object before serialisation,
+    # so the status can be either "pending" or "running" by the time we read it.
+    assert body["status"] in ("pending", "running")
+
+
+# ---------------------------------------------------------------------------
+# 5. Create scan with options
+# ---------------------------------------------------------------------------
+
+
+def test_create_scan_with_options():
+    """POST /v1/scan passes through non-path options (enrich, format)."""
+    client, _ = _fresh_client()
+    resp = client.post(
+        "/v1/scan",
+        json={
+            "images": ["redis:7"],
+            "enrich": True,
+            "format": "cyclonedx",
+        },
+    )
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["triggered_by"] == "anonymous"
+    assert body["request"]["images"] == ["redis:7"]
+    assert body["request"]["enrich"] is True
+    assert body["request"]["format"] == "cyclonedx"
+
+
+# ---------------------------------------------------------------------------
+# 5b. Scan path jail — primary POST /v1/scan is confined to the same jail
+#     the dedicated scan endpoints use (gate disabled by default).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"inventory": "/etc/hosts"},
+        {"filesystem_paths": ["/etc"]},
+        {"agent_projects": ["../../etc"]},
+        {"sbom": "/tmp/sbom.json"},
+        {"external_scan": "/etc/hosts"},
+        {"vex": "/etc/hosts"},
+        {"tf_dirs": ["/var"]},
+        {"gha_path": "/etc"},
+        {"jupyter_dirs": ["../secret"]},
+    ],
+)
+def test_create_scan_rejects_local_paths_by_default(monkeypatch, payload):
+    """Absolute and traversal local paths are rejected with 400 while the
+    local-path scan gate is disabled (default posture)."""
+    monkeypatch.delenv("AGENT_BOM_API_LOCAL_PATH_SCANS", raising=False)
+    monkeypatch.delenv("AGENT_BOM_ENABLE_LOCAL_PATH_SCANS", raising=False)
+    client, _ = _fresh_client()
+    resp = client.post("/v1/scan", json=payload)
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "Invalid scan path"
+
+
+def test_create_scan_non_path_targets_allowed_by_default(monkeypatch):
+    """Image / connector / k8s / repo scans do not require the path gate."""
+    monkeypatch.delenv("AGENT_BOM_API_LOCAL_PATH_SCANS", raising=False)
+    client, _ = _fresh_client()
+    for payload in ({"images": ["redis:7"]}, {"k8s": True}, {}, {"repo_url": "https://github.com/org/repo"}):
+        resp = client.post("/v1/scan", json=payload)
+        assert resp.status_code == 202, payload
+
+
+def test_create_scan_allows_valid_path_when_gate_enabled(monkeypatch, tmp_path):
+    """With the gate enabled and a scan root configured, a relative path under
+    the root resolves and the scan is accepted."""
+    root = tmp_path
+    (root / "proj").mkdir()
+    monkeypatch.setenv("AGENT_BOM_API_LOCAL_PATH_SCANS", "enabled")
+    monkeypatch.setenv("AGENT_BOM_API_SCAN_ROOT", str(root))
+    monkeypatch.setenv("AGENT_BOM_API_SCAN_ALLOW_FOREIGN_OWNER", "1")
+    client, _ = _fresh_client()
+    resp = client.post("/v1/scan", json={"agent_projects": ["proj"], "offline": True, "no_scan": True})
+    assert resp.status_code == 202
+
+    # Absolute paths outside the root are still rejected even with the gate on.
+    resp = client.post("/v1/scan", json={"agent_projects": ["/etc"]})
+    assert resp.status_code == 400
+
+
+def test_create_scan_rejects_invalid_enum_fields():
+    """format / min_severity are enum-constrained and reject junk with 422."""
+    client, _ = _fresh_client()
+    assert client.post("/v1/scan", json={"format": "exe"}).status_code == 422
+    assert client.post("/v1/scan", json={"min_severity": "spicy"}).status_code == 422
+    # Case-insensitive variants are normalized, not rejected.
+    resp = client.post("/v1/scan", json={"images": ["x:1"], "format": "SARIF", "min_severity": "High"})
+    assert resp.status_code == 202
+    assert resp.json()["request"]["format"] == "sarif"
+    assert resp.json()["request"]["min_severity"] == "high"
+
+
+def test_create_scan_rejects_unknown_fields():
+    """POST /v1/scan rejects typoed request fields instead of dropping them."""
+    client, _ = _fresh_client()
+    resp = client.post("/v1/scan", json={"project_path": "."})
+
+    assert resp.status_code == 422
+    body = resp.json()
+    assert "project_path" in str(body)
+    assert "extra_forbidden" in str(body)
+
+
+# ---------------------------------------------------------------------------
+# 6. GET scan — not found
+# ---------------------------------------------------------------------------
+
+
+def test_get_scan_not_found():
+    """GET /v1/scan/nonexistent returns 404."""
+    client, _ = _fresh_client()
+    resp = client.get("/v1/scan/nonexistent")
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 7. GET scan after create
+# ---------------------------------------------------------------------------
+
+
+def test_get_scan_after_create():
+    """Create a scan then GET it by job_id — should return the same job."""
+    client, _ = _fresh_client()
+    create_resp = client.post("/v1/scan", json={})
+    assert create_resp.status_code == 202
+    job_id = create_resp.json()["job_id"]
+
+    get_resp = client.get(f"/v1/scan/{job_id}")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["job_id"] == job_id
+
+
+def test_get_scan_status_omits_large_result_payload():
+    """Status polling should not serialize the full scan result on every tick."""
+    client, store = _fresh_client()
+    job = ScanJob(
+        job_id="job-large-result",
+        tenant_id="default",
+        status=JobStatus.DONE,
+        created_at="2026-01-01T00:00:00Z",
+        completed_at="2026-01-01T00:00:13Z",
+        request=ScanRequest(inventory="/tmp/agents.json"),
+        progress=["scan started", "scan complete"],
+        result={
+            "summary": {
+                "total_agents": 8,
+                "total_servers": 8,
+                "total_packages": 165,
+                "total_vulnerabilities": 28,
+            },
+            "agents": [{"name": "agent", "payload": "x" * 250_000}],
+            "blast_radius": [{"package": "pkg", "payload": "y" * 250_000}],
+            "scan_run": {
+                "outcome": "partial",
+                "issues": [{"message": "one collector unavailable"}],
+                "warning_count": 1,
+            },
+            "warnings": ["one collector unavailable"],
+        },
+    )
+    store.put(job)
+
+    full = client.get("/v1/scan/job-large-result")
+    status = client.get("/v1/scan/job-large-result/status")
+
+    assert full.status_code == 200
+    assert status.status_code == 200
+    body = status.json()
+    assert body["job_id"] == "job-large-result"
+    assert body["status"] == "done"
+    assert body["summary"]["total_packages"] == 165
+    assert body["request"]["inventory"] == "<path:agents.json>"
+    assert body["scan_outcome"] == "partial"
+    assert body["warning_count"] == 1
+    assert body["warnings_preview"] == ["one collector unavailable"]
+    assert "result" not in body
+    assert "progress" not in body
+    assert len(status.content) < len(full.content) / 100
+
+
+def test_get_scan_redacts_result_findings_replay_only_fields():
+    """Full scan job reads must not expose replay-only text in result.findings."""
+    client, store = _fresh_client()
+    job = ScanJob(
+        job_id="job-finding-redaction",
+        tenant_id="default",
+        status=JobStatus.DONE,
+        created_at="2026-01-01T00:00:00Z",
+        completed_at="2026-01-01T00:00:13Z",
+        request=ScanRequest(),
+        result={
+            "findings": [
+                {
+                    "id": "finding-1",
+                    "title": "Unsafe package",
+                    "description": "Copied workspace details",
+                    "remediation_guidance": "Patch using local runbook",
+                    "package": "pillow",
+                    "package_version": "10.0.0",
+                    "severity": "high",
+                }
+            ],
+        },
+    )
+    store.put(job)
+
+    response = client.get("/v1/scan/job-finding-redaction")
+
+    assert response.status_code == 200
+    finding = response.json()["result"]["findings"][0]
+    assert finding == {
+        "id": "finding-1",
+        "title": "Unsafe package",
+        "package": "pillow",
+        "package_version": "10.0.0",
+        "severity": "high",
+    }
+    assert store.get("job-finding-redaction", all_tenants=True).result["findings"][0]["description"] == "Copied workspace details"
+
+
+# ---------------------------------------------------------------------------
+# 8. DELETE scan
+# ---------------------------------------------------------------------------
+
+
+def test_delete_scan():
+    """Create a scan then DELETE it — should return 204."""
+    client, _ = _fresh_client()
+    create_resp = client.post("/v1/scan", json={})
+    job_id = create_resp.json()["job_id"]
+
+    del_resp = client.delete(f"/v1/scan/{job_id}")
+    assert del_resp.status_code == 204
+
+    # Confirm it's gone — 404 expected, but 200 is acceptable if the
+    # background scan thread completed and re-stored results between
+    # the DELETE and this GET (race condition on fast CI runners).
+    get_resp = client.get(f"/v1/scan/{job_id}")
+    assert get_resp.status_code in (404, 200)
+
+
+# ---------------------------------------------------------------------------
+# 9. DELETE scan — not found
+# ---------------------------------------------------------------------------
+
+
+def test_delete_scan_not_found():
+    """DELETE /v1/scan/nonexistent returns 404."""
+    client, _ = _fresh_client()
+    resp = client.delete("/v1/scan/nonexistent")
+    assert resp.status_code == 404
+
+
+def test_get_scan_passes_tenant_to_store():
+    import agent_bom.api.stores as api_stores
+
+    class RecordingJobStore:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str | None]] = []
+
+        def put(self, job) -> None:
+            raise NotImplementedError
+
+        def get(self, job_id: str, tenant_id: str | None = None):
+            self.calls.append((job_id, tenant_id))
+            return ScanJob(
+                job_id=job_id,
+                tenant_id=tenant_id or "default",
+                status=JobStatus.PENDING,
+                created_at="2026-01-01T00:00:00Z",
+                request=ScanRequest(),
+            )
+
+        def delete(self, job_id: str, tenant_id: str | None = None) -> bool:
+            raise NotImplementedError
+
+        def list_all(self, tenant_id: str | None = None):
+            return []
+
+        def list_summary(self, tenant_id: str | None = None):
+            return []
+
+        def cleanup_expired(self, ttl_seconds: int = 3600) -> int:
+            return 0
+
+    store = RecordingJobStore()
+    original = api_stores._store
+    try:
+        set_job_store(store)
+        _jobs.clear()
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.get("/v1/scan/job-tenant-check")
+
+        assert resp.status_code == 200
+        assert store.calls == [("job-tenant-check", "default")]
+    finally:
+        set_job_store(original)
+        _jobs.clear()
+
+
+def test_delete_scan_passes_tenant_to_store():
+    import agent_bom.api.stores as api_stores
+
+    class RecordingJobStore:
+        def __init__(self) -> None:
+            self.get_calls: list[tuple[str, str | None]] = []
+            self.delete_calls: list[tuple[str, str | None]] = []
+
+        def put(self, job) -> None:
+            raise NotImplementedError
+
+        def get(self, job_id: str, tenant_id: str | None = None):
+            self.get_calls.append((job_id, tenant_id))
+            return ScanJob(
+                job_id=job_id,
+                tenant_id=tenant_id or "default",
+                status=JobStatus.PENDING,
+                created_at="2026-01-01T00:00:00Z",
+                request=ScanRequest(),
+            )
+
+        def delete(self, job_id: str, tenant_id: str | None = None) -> bool:
+            self.delete_calls.append((job_id, tenant_id))
+            return True
+
+        def list_all(self, tenant_id: str | None = None):
+            return []
+
+        def list_summary(self, tenant_id: str | None = None):
+            return []
+
+        def cleanup_expired(self, ttl_seconds: int = 3600) -> int:
+            return 0
+
+    store = RecordingJobStore()
+    original = api_stores._store
+    try:
+        set_job_store(store)
+        _jobs.clear()
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.delete("/v1/scan/job-tenant-delete")
+
+        assert resp.status_code == 204
+        assert store.get_calls == [("job-tenant-delete", "default")]
+        assert store.delete_calls == [("job-tenant-delete", "default")]
+    finally:
+        set_job_store(original)
+        _jobs.clear()
+
+
+# ---------------------------------------------------------------------------
+# 10. Trust headers present
+# ---------------------------------------------------------------------------
+
+
+def test_trust_headers_present():
+    """Every response should include X-Agent-Bom-Read-Only header."""
+    client, _ = _fresh_client()
+    resp = client.get("/health")
+    assert resp.headers.get("x-agent-bom-read-only") == "true"
+    assert resp.headers.get("x-agent-bom-no-credential-storage") == "true"
+
+
+# ---------------------------------------------------------------------------
+# 11. Version header present
+# ---------------------------------------------------------------------------
+
+
+def test_version_header_present():
+    """Every response should include X-Agent-Bom-Version header."""
+    client, _ = _fresh_client()
+    resp = client.get("/health")
+    assert resp.headers.get("x-agent-bom-version") == __version__
+
+
+# ---------------------------------------------------------------------------
+# 12. Scan job starts as pending
+# ---------------------------------------------------------------------------
+
+
+def test_scan_job_has_pending_status():
+    """Newly created scan job should start as 'pending' (or 'running' if the
+    background executor is fast enough to mutate before serialisation)."""
+    client, _ = _fresh_client()
+    resp = client.post("/v1/scan", json={})
+    assert resp.status_code == 202
+    assert resp.json()["status"] in ("pending", "running")
+
+
+# ---------------------------------------------------------------------------
+# 13. Scan job has valid UUID job_id
+# ---------------------------------------------------------------------------
+
+
+def test_scan_job_has_job_id():
+    """Created job should have a valid UUID4 job_id."""
+    client, _ = _fresh_client()
+    resp = client.post("/v1/scan", json={})
+    job_id = resp.json()["job_id"]
+    # Validate it's a proper UUID
+    parsed = uuid.UUID(job_id, version=4)
+    assert str(parsed) == job_id
+
+
+# ---------------------------------------------------------------------------
+# 14. Health version matches __version__
+# ---------------------------------------------------------------------------
+
+
+def test_health_version_matches():
+    """Health endpoint version should match the package __version__."""
+    client, _ = _fresh_client()
+    resp = client.get("/health")
+    assert resp.json()["version"] == __version__
+
+
+# ---------------------------------------------------------------------------
+# 15. OpenAPI schema available
+# ---------------------------------------------------------------------------
+
+
+def test_openapi_schema_available():
+    """GET /openapi.json should return 200 with a valid OpenAPI schema."""
+    client, _ = _fresh_client()
+    resp = client.get("/openapi.json")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "openapi" in body
+    assert "paths" in body
+    assert body["info"]["title"] == "agent-bom API"
+    compliance_report = body["paths"]["/v1/compliance/{framework}/report"]["get"]["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ]
+    assert compliance_report["$ref"].endswith("/ComplianceReportBundle")
+
+
+def test_openapi_runtime_routes_do_not_404(monkeypatch):
+    """Routes advertised for core UI/API surfaces should resolve at runtime."""
+    client, store = _fresh_client()
+    previous = ScanJob(
+        job_id="job-prev",
+        status=JobStatus.DONE,
+        created_at="2026-04-20T00:00:00Z",
+        completed_at="2026-04-20T00:01:00Z",
+        request=ScanRequest(),
+        result={
+            "agents": [
+                {
+                    "name": "claude-desktop",
+                    "agent_type": "claude-desktop",
+                    "mcp_servers": [
+                        {
+                            "name": "filesystem",
+                            "packages": [
+                                {
+                                    "name": "requests",
+                                    "version": "2.31.0",
+                                    "ecosystem": "pypi",
+                                    "vulnerabilities": [{"id": "CVE-2026-0001", "severity": "high"}],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "blast_radius": [{"vulnerability_id": "CVE-2026-0001", "package": "requests@2.31.0", "severity": "high"}],
+        },
+    )
+    current = ScanJob(
+        job_id="job-current",
+        status=JobStatus.DONE,
+        created_at="2026-04-21T00:00:00Z",
+        completed_at="2026-04-21T00:01:00Z",
+        request=ScanRequest(),
+        result={"agents": previous.result["agents"], "blast_radius": []},
+    )
+    store.put(previous)
+    store.put(current)
+    monkeypatch.setattr("agent_bom.discovery.discover_all", lambda: [])
+
+    schema = client.get("/openapi.json").json()
+    expected_paths = {"/v1/agents/mesh", "/v1/findings", "/v1/inventory", "/v1/baseline/compare"}
+    assert expected_paths <= set(schema["paths"])
+
+    checks = [
+        ("GET", "/v1/agents/mesh"),
+        ("GET", "/v1/findings"),
+        ("GET", "/v1/inventory"),
+        ("POST", "/v1/baseline/compare?previous_job_id=job-prev&current_job_id=job-current"),
+    ]
+    for method, path in checks:
+        response = client.request(method, path)
+        assert response.status_code != 404, (method, path, response.text)
+
+
+def test_graph_export_mermaid_limit_zero_renders_full_graph():
+    """The API graph export should pass the full-render sentinel to Mermaid output."""
+    client, store = _fresh_client()
+    job = ScanJob(
+        job_id="job-graph-mermaid",
+        status=JobStatus.DONE,
+        created_at="2026-05-20T00:00:00Z",
+        completed_at="2026-05-20T00:00:01Z",
+        request=ScanRequest(),
+        result={
+            "agents": [
+                {
+                    "name": "claude-desktop",
+                    "agent_type": "claude-desktop",
+                    "mcp_servers": [{"name": "filesystem", "packages": []}],
+                }
+            ],
+        },
+    )
+    store.put(job)
+
+    with patch("agent_bom.output.graph_export.to_mermaid", return_value="flowchart LR") as mermaid_mock:
+        response = client.get("/v1/scan/job-graph-mermaid/graph-export?format=mermaid&mermaid_limit=0")
+
+    assert response.status_code == 200
+    assert response.text == "flowchart LR"
+    mermaid_mock.assert_called_once()
+    assert mermaid_mock.call_args.kwargs == {"max_nodes": None, "max_edges": None}
+
+
+def test_baseline_compare_requires_job_ids_without_404():
+    """A bare compare request should fail validation, not look like a missing route."""
+    client, _ = _fresh_client()
+    resp = client.post("/v1/baseline/compare")
+    assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# /v1/agents vs /v1/inventory scope labels (#3889)
+# ---------------------------------------------------------------------------
+
+
+def test_agents_endpoint_declares_local_discovery_scope():
+    """GET /v1/agents self-labels as local-disk discovery, distinct from the estate.
+
+    /v1/agents (live local-config discovery) and /v1/inventory (scanned-estate
+    roll-up) were disjoint with no marker telling clients which population each
+    represents. Each now declares a ``scope`` so the two never silently overlap.
+    """
+    client, _ = _fresh_client()
+    with patch("agent_bom.discovery.discover_all", return_value=[]):
+        from agent_bom.api.routes.discovery import _clear_agents_response_cache_for_tests
+
+        _clear_agents_response_cache_for_tests()
+        resp = client.get("/v1/agents")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["scope"] == "local_discovery"
+    assert body.get("source")
+    # Cross-reference the scanned-estate surface so consumers don't conflate them.
+    assert "/v1/inventory" in body["source"]
+
+
+def test_inventory_endpoint_declares_scanned_estate_scope():
+    """GET /v1/inventory self-labels as the scanned estate, distinct from discovery."""
+    client, _ = _fresh_client()
+    resp = client.get("/v1/inventory")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["scope"] == "scanned_estate"
+    assert body.get("source")
+    assert "/v1/agents" in body["source"]
+    assert body["limit"] == 500
+    assert body["offset"] == 0
+    assert body["has_more"] is False
+    assert body["package_total"] == 0
+    assert body["job_total"] == 0
+
+
+def test_inventory_endpoint_pages_agents_packages_and_jobs():
+    """GET /v1/inventory exposes fleet-style has_more and does not dump full packages."""
+    client, store = _fresh_client()
+    agents = []
+    for index in range(5):
+        agents.append(
+            {
+                "name": f"agent-{index}",
+                "mcp_servers": [
+                    {
+                        "name": f"server-{index}",
+                        "packages": [
+                            {"name": f"pkg-{index}-a", "version": "1.0.0", "ecosystem": "npm"},
+                            {"name": f"pkg-{index}-b", "version": "2.0.0", "ecosystem": "npm"},
+                        ],
+                    }
+                ],
+            }
+        )
+    store.put(
+        ScanJob(
+            job_id="job-inventory-page",
+            tenant_id="default",
+            status=JobStatus.DONE,
+            created_at="2026-01-01T00:00:00Z",
+            completed_at="2026-01-01T00:00:13Z",
+            request=ScanRequest(),
+            result={"agents": agents},
+        )
+    )
+
+    page = client.get("/v1/inventory", params={"limit": 2, "offset": 0})
+    assert page.status_code == 200
+    body = page.json()
+    assert body["total"] == 5
+    assert body["count"] == 2
+    assert body["limit"] == 2
+    assert body["offset"] == 0
+    assert body["has_more"] is True
+    assert [agent["name"] for agent in body["agents"]] == ["agent-0", "agent-1"]
+    assert body["package_total"] == 10
+    assert body["package_count"] == 2
+    assert len(body["packages"]) == 2
+    assert body["job_total"] == 1
+    assert body["job_count"] == 1
+
+    last = client.get("/v1/inventory", params={"limit": 2, "offset": 4})
+    assert last.status_code == 200
+    last_body = last.json()
+    assert last_body["count"] == 1
+    assert last_body["has_more"] is True  # packages still truncated at this offset
+    assert last_body["package_count"] == 2
+    assert last_body["job_count"] == 0
+
+    packages_done = client.get("/v1/inventory", params={"limit": 2, "offset": 10})
+    assert packages_done.status_code == 200
+    done_body = packages_done.json()
+    assert done_body["count"] == 0
+    assert done_body["package_count"] == 0
+    assert done_body["has_more"] is False

@@ -2,20 +2,51 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import agent_bom.resolver as resolver
 from agent_bom.models import Package
 from agent_bom.resolver import (
+    _NPM_LATEST_CACHE,
+    _NPM_LATEST_INFLIGHT,
+    _PYPI_INFO_CACHE,
+    _PYPI_INFO_INFLIGHT,
+    _get_npm_latest_doc,
+    _get_pypi_info_doc,
+    consume_performance_stats,
     enrich_licenses,
     enrich_supply_chain_metadata,
+    reset_performance_stats,
+    resolve_all_versions,
     resolve_npm_metadata,
     resolve_npm_supply_chain,
     resolve_package_version,
     resolve_pypi_metadata,
     resolve_pypi_supply_chain,
 )
+
+
+@pytest.fixture(autouse=True)
+def clear_registry_metadata_caches():
+    _NPM_LATEST_CACHE.clear()
+    _NPM_LATEST_INFLIGHT.clear()
+    _PYPI_INFO_CACHE.clear()
+    _PYPI_INFO_INFLIGHT.clear()
+    reset_performance_stats()
+
+    resolver._NPM_RATE_LIMIT_UNTIL = 0.0
+    resolver._NPM_RATE_LIMIT_HITS = 0
+    yield
+    _NPM_LATEST_CACHE.clear()
+    _NPM_LATEST_INFLIGHT.clear()
+    _PYPI_INFO_CACHE.clear()
+    _PYPI_INFO_INFLIGHT.clear()
+    reset_performance_stats()
+    resolver._NPM_RATE_LIMIT_UNTIL = 0.0
+    resolver._NPM_RATE_LIMIT_HITS = 0
 
 
 class TestResolveNpmMetadata:
@@ -49,6 +80,100 @@ class TestResolveNpmMetadata:
             version, lic = await resolve_npm_metadata("nonexistent", client)
             assert version is None
             assert lic is None
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_opens_cooldown_and_skips_followup_lookups(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 429
+        mock_response.headers = {"Retry-After": "7"}
+
+        with (
+            patch("agent_bom.resolver.request_with_retry", return_value=mock_response) as mock_request,
+            patch("agent_bom.resolver.time.monotonic", return_value=100.0),
+        ):
+            client = AsyncMock()
+            assert await _get_npm_latest_doc("first", client) is None
+            assert await _get_npm_latest_doc("second", client) is None
+
+        assert mock_request.call_count == 1
+        assert resolver._NPM_RATE_LIMIT_HITS == 1
+        assert resolver._NPM_RATE_LIMIT_UNTIL == 107.0
+
+    @pytest.mark.asyncio
+    async def test_caches_latest_doc_across_version_and_supply_chain(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "version": "1.2.3",
+            "license": "MIT",
+            "description": "Cached package",
+        }
+        pkg = Package(name="cached", version="1.2.3", ecosystem="npm")
+        with patch("agent_bom.resolver.request_with_retry", return_value=mock_response) as mock_request:
+            client = AsyncMock()
+            version, lic = await resolve_npm_metadata("cached", client)
+            await resolve_npm_supply_chain(pkg, client)
+        assert version == "1.2.3"
+        assert lic == "MIT"
+        assert pkg.description == "Cached package"
+        assert mock_request.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_registry_perf_tracks_cache_hits_and_misses(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"version": "1.2.3", "license": "MIT"}
+        with patch("agent_bom.resolver.request_with_retry", return_value=mock_response):
+            client = AsyncMock()
+            await _get_npm_latest_doc("cached", client)
+            await _get_npm_latest_doc("cached", client)
+
+        perf = consume_performance_stats()
+        assert perf["registry_metadata"]["cache_misses"] == 1
+        assert perf["registry_metadata"]["cache_hits"] == 1
+        assert perf["registry_metadata"]["network_requests"] == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_npm_latest_requests_share_inflight_lookup(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"version": "1.2.3", "license": "MIT"}
+
+        async def fake_request(*_args, **_kwargs):
+            await asyncio.sleep(0.01)
+            return mock_response
+
+        with patch("agent_bom.resolver.request_with_retry", side_effect=fake_request) as mock_request:
+            client = AsyncMock()
+            first, second = await asyncio.gather(
+                _get_npm_latest_doc("cached", client),
+                _get_npm_latest_doc("cached", client),
+            )
+
+        assert first == {"version": "1.2.3", "license": "MIT"}
+        assert second == first
+        assert mock_request.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_pypi_info_requests_share_inflight_lookup(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"info": {"version": "2.31.0", "license": "Apache-2.0"}}
+
+        async def fake_request(*_args, **_kwargs):
+            await asyncio.sleep(0.01)
+            return mock_response
+
+        with patch("agent_bom.resolver.request_with_retry", side_effect=fake_request) as mock_request:
+            client = AsyncMock()
+            first, second = await asyncio.gather(
+                _get_pypi_info_doc("requests", client),
+                _get_pypi_info_doc("requests", client),
+            )
+
+        assert first == {"version": "2.31.0", "license": "Apache-2.0"}
+        assert second == first
+        assert mock_request.call_count == 1
 
 
 class TestResolvePypiMetadata:
@@ -201,6 +326,114 @@ class TestResolvePackageVersion:
             result = await resolve_package_version(pkg, client)
             assert result is False
 
+    @pytest.mark.asyncio
+    async def test_uses_registry_fallback_when_live_lookup_fails(self):
+        pkg = Package(
+            name="example-mcp",
+            version="unknown",
+            ecosystem="npm",
+            registry_version="1.2.3",
+        )
+        with patch("agent_bom.resolver.resolve_npm_metadata", return_value=(None, None)):
+            client = AsyncMock()
+            result = await resolve_package_version(pkg, client)
+            assert result is True
+            assert pkg.version == "1.2.3"
+            assert pkg.version_source == "registry_fallback"
+            assert pkg.purl == "pkg:npm/example-mcp@1.2.3"
+
+
+class TestResolveAllVersions:
+    @pytest.mark.asyncio
+    async def test_duplicate_package_resolution_is_deduped_and_propagated(self):
+        packages = [
+            Package(name="dup", version="unknown", ecosystem="npm"),
+            Package(name="dup", version="unknown", ecosystem="npm"),
+        ]
+
+        async def fake_resolve(pkg, client):
+            pkg.version = "9.9.9"
+            pkg.purl = "pkg:npm/dup@9.9.9"
+            return True
+
+        client_cm = AsyncMock()
+        client_cm.__aenter__.return_value = AsyncMock()
+        client_cm.__aexit__.return_value = None
+
+        with (
+            patch("agent_bom.resolver.create_client", return_value=client_cm),
+            patch("agent_bom.resolver.resolve_package_version", side_effect=fake_resolve) as mock_resolve,
+            patch("agent_bom.resolver.enrich_licenses", return_value=0),
+        ):
+            resolved = await resolve_all_versions(packages, quiet=True, global_timeout=0.5)
+
+        assert resolved == 2
+        assert packages[0].version == "9.9.9"
+        assert packages[1].version == "9.9.9"
+        assert mock_resolve.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_timeout_preserves_completed_and_fallback_versions(self):
+        packages = [
+            Package(name="fast", version="unknown", ecosystem="npm", registry_version="1.0.0"),
+            Package(name="slow", version="unknown", ecosystem="npm", registry_version="2.0.0"),
+        ]
+
+        async def fake_resolve(pkg, client):
+            if pkg.name == "fast":
+                pkg.version = "1.0.1"
+                pkg.version_source = "registry_fallback"
+                pkg.purl = "pkg:npm/fast@1.0.1"
+                return True
+            await asyncio.sleep(0.2)
+            return False
+
+        client_cm = AsyncMock()
+        client_cm.__aenter__.return_value = AsyncMock()
+        client_cm.__aexit__.return_value = None
+
+        with (
+            patch("agent_bom.resolver.create_client", return_value=client_cm),
+            patch("agent_bom.resolver.resolve_package_version", side_effect=fake_resolve),
+            patch("agent_bom.resolver.enrich_licenses", return_value=0),
+        ):
+            resolved = await resolve_all_versions(packages, quiet=True, global_timeout=0.05)
+
+        assert resolved == 2
+        assert packages[0].version == "1.0.1"
+        assert packages[1].version == "2.0.0"
+        assert packages[1].version_source == "registry_fallback"
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_npm_uses_fallback_without_repeated_live_calls(self):
+        packages = [
+            Package(name="first", version="unknown", ecosystem="npm", registry_version="1.0.0"),
+            Package(name="second", version="unknown", ecosystem="npm", registry_version="2.0.0"),
+        ]
+
+        mock_response = MagicMock()
+        mock_response.status_code = 429
+        mock_response.headers = {"Retry-After": "5"}
+
+        client_cm = AsyncMock()
+        client_cm.__aenter__.return_value = AsyncMock()
+        client_cm.__aexit__.return_value = None
+
+        with (
+            patch("agent_bom.resolver.create_client", return_value=client_cm),
+            patch("agent_bom.resolver.request_with_retry", return_value=mock_response) as mock_request,
+            patch("agent_bom.resolver.time.monotonic", return_value=100.0),
+            patch("agent_bom.resolver.enrich_licenses", return_value=0),
+        ):
+            resolved = await resolve_all_versions(packages, quiet=True, global_timeout=0.5)
+
+        assert resolved == 2
+        assert packages[0].version == "1.0.0"
+        assert packages[1].version == "2.0.0"
+        assert packages[0].version_source == "registry_fallback"
+        assert packages[1].version_source == "registry_fallback"
+        assert mock_request.call_count == 1
+
 
 class TestEnrichLicenses:
     @pytest.mark.asyncio
@@ -227,6 +460,24 @@ class TestEnrichLicenses:
         count = await enrich_licenses([pkg], client)
         assert count == 0
 
+    @pytest.mark.asyncio
+    async def test_dedupes_duplicate_registry_license_lookups(self):
+        pkgs = [
+            Package(name="express", version="4.18.2", ecosystem="npm"),
+            Package(name="express", version="4.18.2", ecosystem="npm"),
+        ]
+        with patch("agent_bom.resolver.resolve_npm_metadata", return_value=(None, "MIT")) as mock_resolve:
+            client = AsyncMock()
+            count = await enrich_licenses(pkgs, client)
+
+        perf = consume_performance_stats()
+        assert count == 2
+        assert all(pkg.license == "MIT" for pkg in pkgs)
+        assert mock_resolve.call_count == 1
+        assert perf["license_enrichment"]["unique_lookups"] == 1
+        assert perf["license_enrichment"]["reused_entries"] == 1
+        assert perf["license_enrichment"]["enriched"] == 2
+
 
 class TestEnrichSupplyChainMetadata:
     @pytest.mark.asyncio
@@ -241,9 +492,57 @@ class TestEnrichSupplyChainMetadata:
             assert count == 1
 
     @pytest.mark.asyncio
+    async def test_falls_back_to_deps_dev_when_registry_metadata_missing(self):
+        pkg = Package(name="express", version="4.18.2", ecosystem="npm")
+        mock_response = MagicMock()
+        mock_response.status_code = 429
+        mock_response.headers = {}
+        deps_info = {
+            "description": "Fast web framework",
+            "links": [
+                {"label": "Homepage", "url": "https://expressjs.com"},
+                {"label": "Repository", "url": "https://github.com/expressjs/express"},
+            ],
+        }
+        with (
+            patch("agent_bom.resolver.request_with_retry", return_value=mock_response),
+            patch("agent_bom.deps_dev.get_package_info", return_value=deps_info),
+        ):
+            client = AsyncMock()
+            count = await enrich_supply_chain_metadata([pkg], client)
+            assert count == 1
+            assert pkg.homepage == "https://expressjs.com"
+            assert pkg.repository_url == "https://github.com/expressjs/express"
+
+    @pytest.mark.asyncio
     async def test_skips_packages_with_description(self):
         pkg = Package(name="express", version="4.18.2", ecosystem="npm")
         pkg.description = "Already described"
         client = AsyncMock()
         count = await enrich_supply_chain_metadata([pkg], client)
         assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_reuses_supply_chain_metadata_for_duplicate_packages(self):
+        pkgs = [
+            Package(name="requests", version="2.31.0", ecosystem="pypi"),
+            Package(name="requests", version="2.31.0", ecosystem="pypi"),
+        ]
+
+        async def fake_supply_chain(pkg, client):  # noqa: ARG001
+            pkg.description = "Python HTTP library"
+            pkg.homepage = "https://requests.readthedocs.io"
+            pkg.repository_url = "https://github.com/psf/requests"
+
+        with patch("agent_bom.resolver.resolve_pypi_supply_chain", side_effect=fake_supply_chain) as mock_supply:
+            client = AsyncMock()
+            count = await enrich_supply_chain_metadata(pkgs, client)
+
+        perf = consume_performance_stats()
+        assert count == 2
+        assert mock_supply.call_count == 1
+        assert all(pkg.description == "Python HTTP library" for pkg in pkgs)
+        assert all(pkg.repository_url == "https://github.com/psf/requests" for pkg in pkgs)
+        assert perf["supply_chain_enrichment"]["unique_lookups"] == 1
+        assert perf["supply_chain_enrichment"]["reused_entries"] == 1
+        assert perf["supply_chain_enrichment"]["enriched"] == 2

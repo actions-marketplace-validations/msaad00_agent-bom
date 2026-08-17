@@ -1,0 +1,41 @@
+{{- /*
+The static CPU/memory HPA is suppressed when KEDA-driven autoscaling is
+enabled — KEDA generates its own HPA under the hood, and stacking two
+HPAs against the same Deployment fights itself.
+*/ -}}
+{{- if and .Values.controlPlane.enabled .Values.controlPlane.api.enabled .Values.controlPlane.api.autoscaling.enabled (not .Values.controlPlane.api.autoscaling.keda.enabled) }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "agent-bom.name" . }}-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agent-bom.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "agent-bom.name" . }}-api
+  minReplicas: {{ .Values.controlPlane.api.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.controlPlane.api.autoscaling.maxReplicas }}
+  {{- with .Values.controlPlane.api.autoscaling.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.controlPlane.api.autoscaling.targetCPUUtilizationPercentage }}
+    {{- if .Values.controlPlane.api.autoscaling.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.controlPlane.api.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- end }}
+{{- end }}

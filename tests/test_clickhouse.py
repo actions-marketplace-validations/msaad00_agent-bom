@@ -1,16 +1,46 @@
 """Tests for ClickHouse analytics backend.
 
-All tests mock ``urllib.request.urlopen`` — no real ClickHouse instance needed.
+All tests mock ``agent_bom.http_client.sync_request_with_retry`` —
+no real ClickHouse instance needed.
 """
 
 from __future__ import annotations
 
-import io
 import json
 import os
-from unittest.mock import MagicMock, patch
+import re
+from pathlib import Path
+from unittest.mock import patch
 
+import httpx
 import pytest
+
+# ─── Helpers ───────────────────────────────────────────────────────────────
+
+
+def _mock_response(text: str = "", status_code: int = 200) -> httpx.Response:
+    """Create a mock httpx.Response."""
+    resp = httpx.Response(status_code=status_code, text=text)
+    return resp
+
+
+def _created_tables(sql: str) -> set[str]:
+    return {match.rsplit(".", 1)[-1] for match in re.findall(r"CREATE TABLE IF NOT EXISTS ([a-zA-Z0-9_.]+)", sql)}
+
+
+def _created_table_columns(sql: str) -> dict[str, set[str]]:
+    tables: dict[str, set[str]] = {}
+    pattern = re.compile(r"CREATE TABLE IF NOT EXISTS ([a-zA-Z0-9_.]+)\s*\((.*?)\)\s*ENGINE", re.DOTALL)
+    for table, body in pattern.findall(sql):
+        columns: set[str] = set()
+        for raw_line in body.splitlines():
+            line = raw_line.strip().rstrip(",")
+            if not line or line.startswith("--"):
+                continue
+            columns.add(line.split()[0].strip("`"))
+        tables[table.rsplit(".", 1)[-1]] = columns
+    return tables
+
 
 # ─── ClickHouseClient tests ─────────────────────────────────────────────────
 
@@ -21,10 +51,10 @@ class TestClickHouseClient:
     def test_init_from_args(self):
         from agent_bom.cloud.clickhouse import ClickHouseClient
 
-        c = ClickHouseClient(url="http://localhost:8123", user="admin", password="pw", database="test_db")
+        c = ClickHouseClient(url="http://localhost:8123", user="admin", access_token="tok", database="test_db")
         assert c.url == "http://localhost:8123"
         assert c.user == "admin"
-        assert c.password == "pw"
+        assert c.access_token == "tok"
         assert c.database == "test_db"
 
     def test_init_from_env(self):
@@ -33,13 +63,27 @@ class TestClickHouseClient:
         env = {
             "AGENT_BOM_CLICKHOUSE_URL": "http://ch.example.com:8123",
             "AGENT_BOM_CLICKHOUSE_USER": "myuser",
-            "AGENT_BOM_CLICKHOUSE_PASSWORD": "secret",
+            "AGENT_BOM_CLICKHOUSE_ACCESS_TOKEN": "env-token",
         }
         with patch.dict(os.environ, env, clear=False):
             c = ClickHouseClient()
             assert c.url == "http://ch.example.com:8123"
             assert c.user == "myuser"
-            assert c.password == "secret"
+            assert c.access_token == "env-token"
+
+    def test_no_password_kwarg(self):
+        """Policy: the client must not accept a password — only an access token."""
+        from agent_bom.cloud.clickhouse import ClickHouseClient
+
+        with pytest.raises(TypeError):
+            ClickHouseClient(url="http://localhost:8123", password="pw")  # type: ignore[call-arg]
+
+    def test_access_token_falls_back_to_empty(self):
+        from agent_bom.cloud.clickhouse import ClickHouseClient
+
+        with patch.dict(os.environ, {"AGENT_BOM_CLICKHOUSE_URL": "http://localhost:8123"}, clear=True):
+            c = ClickHouseClient()
+            assert c.access_token == ""
 
     def test_init_no_url_raises(self):
         from agent_bom.cloud.clickhouse import ClickHouseClient, ClickHouseError
@@ -56,98 +100,71 @@ class TestClickHouseClient:
 
     def test_auth_headers(self):
         """Verify X-ClickHouse-User / X-ClickHouse-Key headers are set."""
-        import urllib.request
-
         from agent_bom.cloud.clickhouse import ClickHouseClient
 
-        c = ClickHouseClient(url="http://localhost:8123", user="admin", password="pw")
+        c = ClickHouseClient(url="http://localhost:8123", user="admin", access_token="tok")
 
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = b"OK"
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-
-        with patch.object(urllib.request, "urlopen", return_value=mock_resp) as mock_open:
+        with patch("agent_bom.http_client.sync_request_with_retry", return_value=_mock_response("OK")) as mock_req:
             c.execute("SELECT 1")
-            req = mock_open.call_args[0][0]
-            assert req.get_header("X-clickhouse-user") == "admin"
-            assert req.get_header("X-clickhouse-key") == "pw"
-            assert req.get_header("X-clickhouse-database") == "agent_bom"
+            _, kwargs = mock_req.call_args[0], mock_req.call_args[1]
+            headers = kwargs.get("headers", {})
+            assert headers["X-ClickHouse-User"] == "admin"
+            assert headers["X-ClickHouse-Key"] == "tok"
+            assert headers["X-ClickHouse-Database"] == "agent_bom"
 
     def test_execute_sends_post(self):
-        import urllib.request
-
         from agent_bom.cloud.clickhouse import ClickHouseClient
 
         c = ClickHouseClient(url="http://localhost:8123")
 
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = b"result"
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-
-        with patch.object(urllib.request, "urlopen", return_value=mock_resp) as mock_open:
+        with patch("agent_bom.http_client.sync_request_with_retry", return_value=_mock_response("result")) as mock_req:
             result = c.execute("SELECT 1")
             assert result == "result"
-            req = mock_open.call_args[0][0]
-            assert req.method == "POST"
-            assert req.data == b"SELECT 1"
+            # Verify POST method
+            args = mock_req.call_args[0]
+            assert args[1] == "POST"  # method arg
 
     def test_execute_http_error(self):
-        import urllib.error
-        import urllib.request
-
         from agent_bom.cloud.clickhouse import ClickHouseClient, ClickHouseError
 
         c = ClickHouseClient(url="http://localhost:8123")
 
-        err = urllib.error.HTTPError("http://localhost:8123", 500, "Internal Server Error", {}, io.BytesIO(b"DB error"))
-        with patch.object(urllib.request, "urlopen", side_effect=err):
+        with patch(
+            "agent_bom.http_client.sync_request_with_retry",
+            return_value=_mock_response("DB error", status_code=500),
+        ):
             with pytest.raises(ClickHouseError, match="HTTP 500"):
                 c.execute("BAD QUERY")
 
     def test_execute_connection_error(self):
-        import urllib.error
-        import urllib.request
-
         from agent_bom.cloud.clickhouse import ClickHouseClient, ClickHouseError
 
         c = ClickHouseClient(url="http://localhost:8123")
 
-        err = urllib.error.URLError("Connection refused")
-        with patch.object(urllib.request, "urlopen", side_effect=err):
-            with pytest.raises(ClickHouseError, match="connection error"):
+        with patch("agent_bom.http_client.sync_request_with_retry", return_value=None):
+            with pytest.raises(ClickHouseError, match="timed out after retries"):
                 c.execute("SELECT 1")
 
     def test_execute_timeout(self):
-        import urllib.request
-
         from agent_bom.cloud.clickhouse import ClickHouseClient, ClickHouseError
 
         c = ClickHouseClient(url="http://localhost:8123", timeout=5)
 
-        with patch.object(urllib.request, "urlopen", side_effect=TimeoutError):
+        with patch("agent_bom.http_client.sync_request_with_retry", return_value=None):
             with pytest.raises(ClickHouseError, match="timed out"):
                 c.execute("SELECT 1")
 
     def test_insert_json_batching(self):
         """Verify JSONEachRow format is assembled correctly."""
-        import urllib.request
-
         from agent_bom.cloud.clickhouse import ClickHouseClient
 
         c = ClickHouseClient(url="http://localhost:8123")
 
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = b""
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-
         rows = [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]
-        with patch.object(urllib.request, "urlopen", return_value=mock_resp) as mock_open:
+        with patch("agent_bom.http_client.sync_request_with_retry", return_value=_mock_response("")) as mock_req:
             c.insert_json("test_table", rows)
-            req = mock_open.call_args[0][0]
-            body = req.data.decode("utf-8")
+            kwargs = mock_req.call_args[1]
+            body = kwargs["content"].decode("utf-8")
             assert body.startswith("INSERT INTO test_table FORMAT JSONEachRow\n")
             lines = body.split("\n")
             assert len(lines) == 3  # header + 2 JSON rows
@@ -164,58 +181,66 @@ class TestClickHouseClient:
 
     def test_query_json_parsing(self):
         """Verify response JSON is parsed to list[dict]."""
-        import urllib.request
-
         from agent_bom.cloud.clickhouse import ClickHouseClient
 
         c = ClickHouseClient(url="http://localhost:8123")
 
         response_data = {"data": [{"day": "2024-01-01", "cnt": 5}], "rows": 1}
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps(response_data).encode()
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-
-        with patch.object(urllib.request, "urlopen", return_value=mock_resp):
+        with patch(
+            "agent_bom.http_client.sync_request_with_retry",
+            return_value=_mock_response(json.dumps(response_data)),
+        ):
             result = c.query_json("SELECT day, count() AS cnt FROM t GROUP BY day")
             assert result == [{"day": "2024-01-01", "cnt": 5}]
 
     def test_query_json_appends_format(self):
         """Verify FORMAT JSON is appended if missing."""
-        import urllib.request
-
         from agent_bom.cloud.clickhouse import ClickHouseClient
 
         c = ClickHouseClient(url="http://localhost:8123")
 
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({"data": []}).encode()
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-
-        with patch.object(urllib.request, "urlopen", return_value=mock_resp) as mock_open:
+        with patch(
+            "agent_bom.http_client.sync_request_with_retry",
+            return_value=_mock_response(json.dumps({"data": []})),
+        ) as mock_req:
             c.query_json("SELECT 1")
-            req = mock_open.call_args[0][0]
-            body = req.data.decode("utf-8")
+            kwargs = mock_req.call_args[1]
+            body = kwargs["content"].decode("utf-8")
             assert body.endswith("FORMAT JSON")
 
     def test_ensure_tables_idempotent(self):
         """CREATE TABLE IF NOT EXISTS should not error on repeated calls."""
-        import urllib.request
-
-        from agent_bom.cloud.clickhouse import ClickHouseClient
+        from agent_bom.cloud.clickhouse import _TABLE_DDL, _TABLE_MIGRATIONS, ClickHouseClient
 
         c = ClickHouseClient(url="http://localhost:8123")
 
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = b""
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-
-        with patch.object(urllib.request, "urlopen", return_value=mock_resp) as mock_open:
+        with patch("agent_bom.http_client.sync_request_with_retry", return_value=_mock_response("")) as mock_req:
             c.ensure_tables()
-            # 1 CREATE DATABASE + 4 CREATE TABLE = 5 calls
-            assert mock_open.call_count == 5
+            # 1 CREATE DATABASE + N CREATE TABLE + M ALTER migrations + schema-version marker
+            expected = 1 + len(_TABLE_DDL) + len(_TABLE_MIGRATIONS) + 1
+            assert mock_req.call_count == expected
+
+    def test_supabase_init_schema_matches_runtime_tables(self):
+        """Supabase ClickHouse bootstrap must not lag runtime table DDL."""
+        from agent_bom.cloud.clickhouse import _TABLE_DDL
+
+        runtime_tables = _created_tables("\n".join(_TABLE_DDL))
+        init_sql = Path("deploy/supabase/clickhouse/init.sql").read_text(encoding="utf-8")
+        init_tables = _created_tables(init_sql)
+
+        assert init_tables == runtime_tables
+        assert "cis_benchmark_checks" in init_tables
+        assert "control_plane_schema_versions" in init_tables
+
+    def test_supabase_init_schema_columns_match_runtime_tables(self):
+        """Supabase ClickHouse bootstrap must include every runtime column."""
+        from agent_bom.cloud.clickhouse import _TABLE_DDL
+
+        runtime_columns = _created_table_columns("\n".join(_TABLE_DDL))
+        init_sql = Path("deploy/supabase/clickhouse/init.sql").read_text(encoding="utf-8")
+        init_columns = _created_table_columns(init_sql)
+
+        assert init_columns == runtime_columns
 
 
 # ─── NullAnalyticsStore tests ───────────────────────────────────────────────
@@ -229,433 +254,541 @@ class TestNullAnalyticsStore:
 
         store = NullAnalyticsStore()
         # Writes should not raise
-        store.record_scan("id", "agent", [{"cve_id": "CVE-2024-0001"}])
-        store.record_event({"type": "test"})
-        store.record_posture("agent", {"grade": "A"})
-        # Reads should return empty lists
+        store.record_scan("test-id", "test-agent", [])
+        store.record_event({})
+        store.record_posture("test-agent", {})
+        # Reads should return empty
         assert store.query_vuln_trends() == []
         assert store.query_top_cves() == []
         assert store.query_posture_history() == []
-        assert store.query_event_summary() == []
 
-    def test_implements_protocol(self):
-        from agent_bom.api.clickhouse_store import AnalyticsStore, NullAnalyticsStore
-
-        store = NullAnalyticsStore()
-        assert isinstance(store, AnalyticsStore)
-
-
-# ─── ClickHouseAnalyticsStore tests ─────────────────────────────────────────
-
-
-class TestClickHouseAnalyticsStore:
-    """Tests for the real ClickHouse-backed store (all HTTP mocked)."""
-
-    def _mock_urlopen(self):
-        """Return a mock that simulates successful ClickHouse responses."""
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = b""
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        return mock_resp
-
-    def _make_store(self, mock_resp=None):
-        import urllib.request
-
-        from agent_bom.api.clickhouse_store import ClickHouseAnalyticsStore
-
-        if mock_resp is None:
-            mock_resp = self._mock_urlopen()
-
-        with patch.object(urllib.request, "urlopen", return_value=mock_resp):
-            return ClickHouseAnalyticsStore(url="http://localhost:8123")
-
-    def test_record_scan_formatting(self):
-        """Vulns should be converted to insert rows."""
-        import urllib.request
-
-        store = self._make_store()
-        mock_resp = self._mock_urlopen()
-
-        vulns = [
-            {
-                "package": "requests",
-                "version": "2.28.0",
-                "ecosystem": "PyPI",
-                "cve_id": "CVE-2024-0001",
-                "cvss_score": 9.8,
-                "epss_score": 0.5,
-                "severity": "CRITICAL",
-                "source": "osv",
-            }
-        ]
-        with patch.object(urllib.request, "urlopen", return_value=mock_resp) as mock_open:
-            store.record_scan("scan-1", "test-agent", vulns)
-            req = mock_open.call_args[0][0]
-            body = req.data.decode("utf-8")
-            assert "INSERT INTO vulnerability_scans" in body
-            assert "requests" in body
-            assert "CVE-2024-0001" in body
-
-    def test_record_scan_empty(self):
-        """Empty vuln list should be a no-op."""
-        import urllib.request
-
-        store = self._make_store()
-        with patch.object(urllib.request, "urlopen") as mock_open:
-            store.record_scan("scan-1", "agent", [])
-            mock_open.assert_not_called()
-
-    def test_record_event_formatting(self):
-        import urllib.request
-
-        store = self._make_store()
-        mock_resp = self._mock_urlopen()
-
-        event = {
-            "event_type": "tool_blocked",
-            "detector": "injection",
-            "severity": "HIGH",
-            "tool_name": "exec",
-            "message": "Blocked command injection attempt",
-            "agent_name": "test-agent",
-        }
-        with patch.object(urllib.request, "urlopen", return_value=mock_resp) as mock_open:
-            store.record_event(event)
-            req = mock_open.call_args[0][0]
-            body = req.data.decode("utf-8")
-            assert "INSERT INTO runtime_events" in body
-            assert "tool_blocked" in body
-
-    def test_record_posture_snapshot(self):
-        import urllib.request
-
-        store = self._make_store()
-        mock_resp = self._mock_urlopen()
-
-        snapshot = {
-            "total_packages": 50,
-            "critical": 2,
-            "high": 5,
-            "medium": 10,
-            "grade": "C",
-            "risk_score": 7.5,
-            "compliance_score": 0.65,
-        }
-        with patch.object(urllib.request, "urlopen", return_value=mock_resp) as mock_open:
-            store.record_posture("test-agent", snapshot)
-            req = mock_open.call_args[0][0]
-            body = req.data.decode("utf-8")
-            assert "INSERT INTO posture_scores" in body
-            assert '"posture_grade": "C"' in body
-
-    def test_query_vuln_trends_sql(self):
-        """Verify correct GROUP BY day, severity."""
-        import urllib.request
-
-        store = self._make_store()
-        response_data = {"data": [{"day": "2024-01-01", "severity": "HIGH", "cnt": 3}]}
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps(response_data).encode()
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-
-        with patch.object(urllib.request, "urlopen", return_value=mock_resp) as mock_open:
-            result = store.query_vuln_trends(days=7)
-            req = mock_open.call_args[0][0]
-            body = req.data.decode("utf-8")
-            assert "GROUP BY day, severity" in body
-            assert "INTERVAL 7 DAY" in body
-            assert result == [{"day": "2024-01-01", "severity": "HIGH", "cnt": 3}]
-
-    def test_query_vuln_trends_with_agent(self):
-        import urllib.request
-
-        store = self._make_store()
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({"data": []}).encode()
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-
-        with patch.object(urllib.request, "urlopen", return_value=mock_resp) as mock_open:
-            store.query_vuln_trends(days=30, agent="my-agent")
-            req = mock_open.call_args[0][0]
-            body = req.data.decode("utf-8")
-            assert "agent_name = 'my-agent'" in body
-
-    def test_query_top_cves_sql(self):
-        import urllib.request
-
-        store = self._make_store()
-        response_data = {"data": [{"cve_id": "CVE-2024-0001", "cnt": 10, "max_cvss": 9.8}]}
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps(response_data).encode()
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-
-        with patch.object(urllib.request, "urlopen", return_value=mock_resp) as mock_open:
-            result = store.query_top_cves(limit=10)
-            req = mock_open.call_args[0][0]
-            body = req.data.decode("utf-8")
-            assert "ORDER BY cnt DESC LIMIT 10" in body
-            assert result[0]["cve_id"] == "CVE-2024-0001"
-
-    def test_query_posture_history_sql(self):
-        import urllib.request
-
-        store = self._make_store()
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({"data": []}).encode()
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-
-        with patch.object(urllib.request, "urlopen", return_value=mock_resp) as mock_open:
-            store.query_posture_history(days=90)
-            req = mock_open.call_args[0][0]
-            body = req.data.decode("utf-8")
-            assert "posture_scores" in body
-            assert "INTERVAL 90 DAY" in body
-
-    def test_query_event_summary_sql(self):
-        import urllib.request
-
-        store = self._make_store()
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({"data": []}).encode()
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-
-        with patch.object(urllib.request, "urlopen", return_value=mock_resp) as mock_open:
-            store.query_event_summary(hours=12)
-            req = mock_open.call_args[0][0]
-            body = req.data.decode("utf-8")
-            assert "runtime_events" in body
-            assert "INTERVAL 12 HOUR" in body
-
-
-# ─── Auto-detection tests ──────────────────────────────────────────────────
-
-
-class TestAutoDetection:
-    """Test analytics store auto-detection from env vars."""
-
-    def test_env_var_creates_clickhouse_store(self):
-        """AGENT_BOM_CLICKHOUSE_URL should create ClickHouseAnalyticsStore."""
-        import urllib.request
-
-        from agent_bom.api.clickhouse_store import ClickHouseAnalyticsStore
-
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = b""
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-
-        with patch.dict(os.environ, {"AGENT_BOM_CLICKHOUSE_URL": "http://localhost:8123"}):
-            with patch.object(urllib.request, "urlopen", return_value=mock_resp):
-                store = ClickHouseAnalyticsStore()
-                assert isinstance(store, ClickHouseAnalyticsStore)
-
-    def test_no_env_var_uses_null(self):
-        """No env var should use NullAnalyticsStore."""
+    def test_no_side_effects(self):
+        """NullAnalyticsStore methods should be safe to call repeatedly."""
         from agent_bom.api.clickhouse_store import NullAnalyticsStore
 
         store = NullAnalyticsStore()
+        for _ in range(3):
+            store.record_scan("id", "agent", [])
+            store.record_event({})
         assert store.query_vuln_trends() == []
 
 
-# ─── CLI tests ──────────────────────────────────────────────────────────────
-
-
-class TestAnalyticsCLI:
-    """Test the analytics CLI command."""
-
-    def test_analytics_help(self):
-        from click.testing import CliRunner
-
-        from agent_bom.cli import main
-
-        runner = CliRunner()
-        result = runner.invoke(main, ["analytics", "--help"])
-        assert result.exit_code == 0
-        assert "trends" in result.output
-        assert "posture" in result.output
-        assert "events" in result.output
-        assert "top-cves" in result.output
-
-    def test_analytics_no_url_exits(self):
-        from click.testing import CliRunner
-
-        from agent_bom.cli import main
-
-        runner = CliRunner()
-        with patch.dict(os.environ, {}, clear=False):
-            # Ensure env var is not set
-            env = os.environ.copy()
-            env.pop("AGENT_BOM_CLICKHOUSE_URL", None)
-            result = runner.invoke(main, ["analytics", "trends"], env=env)
-            assert result.exit_code != 0
-
-    def test_scan_clickhouse_url_option(self):
-        """--clickhouse-url should appear in scan help."""
-        from click.testing import CliRunner
-
-        from agent_bom.cli import main
-
-        runner = CliRunner()
-        result = runner.invoke(main, ["scan", "--help"])
-        assert "--clickhouse-url" in result.output
-
-
-# ─── ClickHouseChannel tests ───────────────────────────────────────────────
-
-
-class TestClickHouseChannel:
-    """Test the alert dispatcher ClickHouse channel."""
-
-    def test_channel_send_records_event(self):
-        import asyncio
-
-        from agent_bom.alerts.dispatcher import ClickHouseChannel
-
-        channel = ClickHouseChannel(url="http://localhost:8123")
-
-        mock_store = MagicMock()
-        channel._store = mock_store
-
-        alert = {"event_type": "tool_blocked", "severity": "HIGH", "message": "test"}
-        result = asyncio.run(channel.send(alert))
-        assert result is True
-        mock_store.record_event.assert_called_once_with(alert)
-
-    def test_channel_send_failure(self):
-        import asyncio
-
-        from agent_bom.alerts.dispatcher import ClickHouseChannel
-
-        channel = ClickHouseChannel(url="http://localhost:8123")
-
-        mock_store = MagicMock()
-        mock_store.record_event.side_effect = Exception("connection failed")
-        channel._store = mock_store
-
-        alert = {"event_type": "test", "severity": "LOW"}
-        result = asyncio.run(channel.send(alert))
-        assert result is False
-
-
-# ─── Escape function tests ──────────────────────────────────────────────────
-
-
-class TestEscape:
-    """Test SQL injection prevention."""
-
-    def test_escape_single_quote(self):
-        from agent_bom.api.clickhouse_store import _escape
-
-        assert _escape("it's") == "it\\'s"
-
-    def test_escape_backslash(self):
-        from agent_bom.api.clickhouse_store import _escape
-
-        assert _escape("a\\b") == "a\\\\b"
-
-    def test_escape_clean_string(self):
-        from agent_bom.api.clickhouse_store import _escape
-
-        assert _escape("my-agent") == "my-agent"
-
-
-# ─── Scan metadata tests ──────────────────────────────────────────────────
-
-
-class TestScanMetadata:
-    """Test scan_metadata table and recording."""
-
-    def test_scan_metadata_table_in_ddl(self):
-        from agent_bom.cloud.clickhouse import _TABLE_DDL
-
-        ddl_text = " ".join(_TABLE_DDL)
-        assert "scan_metadata" in ddl_text
-        assert "agent_count" in ddl_text
-        assert "posture_grade" in ddl_text
-
-    def test_null_store_record_scan_metadata(self):
-        from agent_bom.api.clickhouse_store import NullAnalyticsStore
-
-        store = NullAnalyticsStore()
-        store.record_scan_metadata({"scan_id": "test", "agent_count": 5})
-        # Should not raise
-
-    def test_clickhouse_store_record_scan_metadata(self):
-        import urllib.request
-
+class TestClickHouseAnalyticsStore:
+    def test_record_scan_splits_package_name_and_version(self):
         from agent_bom.api.clickhouse_store import ClickHouseAnalyticsStore
 
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = b""
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
+        inserted = {}
 
-        with patch.object(urllib.request, "urlopen", return_value=mock_resp) as mock_open:
+        class _Client:
+            def ensure_tables(self):
+                return None
+
+            def insert_json(self, table, rows):
+                inserted["table"] = table
+                inserted["rows"] = rows
+
+        with patch("agent_bom.cloud.clickhouse.ClickHouseClient", return_value=_Client()):
             store = ClickHouseAnalyticsStore(url="http://localhost:8123")
-            store.record_scan_metadata(
+            store.record_scan(
+                "scan-1",
+                "agent-1",
+                [
+                    {
+                        "package": "requests@2.33.0",
+                        "ecosystem": "pypi",
+                        "vulnerability_id": "CVE-2026-0001",
+                        "severity": "high",
+                    }
+                ],
+            )
+
+        assert inserted["table"] == "vulnerability_scans"
+        assert inserted["rows"][0]["package_name"] == "requests"
+        assert inserted["rows"][0]["package_version"] == "2.33.0"
+
+    def test_buffered_store_flushes_on_close(self):
+        from agent_bom.api.clickhouse_store import BufferedAnalyticsStore, ClickHouseAnalyticsStore
+
+        inserted: list[tuple[str, list[dict]]] = []
+
+        class _Client:
+            def ensure_tables(self):
+                return None
+
+            def insert_json(self, table, rows):
+                inserted.append((table, rows))
+
+        with patch("agent_bom.cloud.clickhouse.ClickHouseClient", return_value=_Client()):
+            store = ClickHouseAnalyticsStore(url="http://localhost:8123")
+            buffered = BufferedAnalyticsStore(store, max_batch=10, flush_interval=60.0)
+            buffered.record_event({"event_type": "tool_blocked", "severity": "high"})
+            buffered.record_scan_metadata({"scan_id": "scan-1", "vuln_count": 4})
+            buffered.record_fleet_snapshot({"agent_name": "agent-1", "trust_score": 42.0})
+            buffered.record_compliance_control({"framework": "owasp-llm-top10", "control_id": "LLM01"})
+            buffered.record_cis_benchmark_checks([{"scan_id": "scan-1", "cloud": "aws", "check_id": "1.5", "priority": 1}])
+            buffered.record_audit_event({"action": "auth.key_created", "actor": "system"})
+            buffered.close()
+
+        assert any(table == "runtime_events" for table, _rows in inserted)
+        assert any(table == "scan_metadata" for table, _rows in inserted)
+        assert any(table == "fleet_agents" for table, _rows in inserted)
+        assert any(table == "compliance_controls" for table, _rows in inserted)
+        assert any(table == "cis_benchmark_checks" for table, _rows in inserted)
+        assert any(table == "audit_events" for table, _rows in inserted)
+
+    def test_record_cis_benchmark_checks_normalizes_remediation(self):
+        from agent_bom.api.clickhouse_store import ClickHouseAnalyticsStore
+
+        inserted = {}
+
+        class _Client:
+            def ensure_tables(self):
+                return None
+
+            def insert_json(self, table, rows):
+                inserted["table"] = table
+                inserted["rows"] = rows
+
+        with patch("agent_bom.cloud.clickhouse.ClickHouseClient", return_value=_Client()):
+            store = ClickHouseAnalyticsStore(url="http://localhost:8123")
+            store.record_cis_benchmark_checks(
+                [
+                    {
+                        "scan_id": "scan-1",
+                        "cloud": "aws",
+                        "check_id": "1.5",
+                        "status": "fail",
+                        "priority": 1,
+                        "remediation": {
+                            "fix_cli": "aws kms enable-key-rotation --key-id <KMS_KEY_ID>",
+                            "fix_console": "AWS Console",
+                            "effort": "low",
+                            "priority": 1,
+                            "requires_human_review": False,
+                        },
+                        "fix_cli": "aws kms enable-key-rotation --key-id <KMS_KEY_ID>",
+                        "effort": "low",
+                        "requires_human_review": False,
+                    }
+                ],
+                tenant_id="tenant-alpha",
+            )
+
+        assert inserted["table"] == "cis_benchmark_checks"
+        row = inserted["rows"][0]
+        assert row["tenant_id"] == "tenant-alpha"
+        assert row["priority"] == 1
+        remediation = json.loads(row["remediation"])
+        assert remediation["priority"] == 1
+        assert remediation["fix_cli"] is None
+        assert remediation["effort"] == "manual"
+        assert remediation["requires_human_review"] is True
+        assert row["fix_cli"] == ""
+        assert row["effort"] == "manual"
+        assert row["requires_human_review"] == 1
+
+    def test_record_cis_benchmark_checks_preserves_verified_remediation(self):
+        from agent_bom.api.clickhouse_store import ClickHouseAnalyticsStore
+
+        inserted = {}
+        command = "aws cloudtrail update-trail --name <TRAIL_NAME_OR_ARN> --enable-log-file-validation"
+
+        class _Client:
+            def ensure_tables(self):
+                return None
+
+            def insert_json(self, table, rows):
+                inserted["table"] = table
+                inserted["rows"] = rows
+
+        with patch("agent_bom.cloud.clickhouse.ClickHouseClient", return_value=_Client()):
+            store = ClickHouseAnalyticsStore(url="http://localhost:8123")
+            store.record_cis_benchmark_checks(
+                [
+                    {
+                        "scan_id": "scan-verified",
+                        "cloud": "aws",
+                        "benchmark_version": "3.0",
+                        "check_id": "3.2",
+                        "title": "CloudTrail log file validation enabled",
+                        "cis_section": "3 - Logging",
+                        "status": "fail",
+                        "priority": 2,
+                        "remediation": {
+                            "fix_cli": command,
+                            "fix_console": "AWS Console → CloudTrail → Trails",
+                            "effort": "high",
+                            "docs": "https://untrusted.example/old-doc",
+                            "guardrails": ["logging-and-audit"],
+                            "requires_human_review": False,
+                        },
+                    }
+                ],
+                tenant_id="tenant-alpha",
+            )
+
+        assert inserted["table"] == "cis_benchmark_checks"
+        row = inserted["rows"][0]
+        remediation = json.loads(row["remediation"])
+        assert remediation["fix_cli"] == command
+        assert remediation["effort"] == "low"
+        assert remediation["docs"] == "https://docs.aws.amazon.com/cli/latest/reference/cloudtrail/update-trail.html"
+        assert remediation["requires_human_review"] is True
+        assert row["fix_cli"] == command
+        assert row["effort"] == "low"
+        assert row["requires_human_review"] == 1
+
+    def test_buffered_store_flushes_before_query(self):
+        from agent_bom.api.clickhouse_store import BufferedAnalyticsStore, ClickHouseAnalyticsStore
+
+        inserted: list[tuple[str, list[dict]]] = []
+
+        class _Client:
+            def ensure_tables(self):
+                return None
+
+            def insert_json(self, table, rows):
+                inserted.append((table, rows))
+
+            def query_json(self, _query):
+                return [{"day": "2026-04-05", "severity": "high", "cnt": 1}]
+
+        with patch("agent_bom.cloud.clickhouse.ClickHouseClient", return_value=_Client()):
+            store = ClickHouseAnalyticsStore(url="http://localhost:8123")
+            buffered = BufferedAnalyticsStore(store, max_batch=10, flush_interval=60.0)
+            buffered.record_scan("scan-1", "agent-1", [{"package": "requests@2.33.0", "severity": "high"}])
+            result = buffered.query_vuln_trends()
+            buffered.close()
+
+        assert result == [{"day": "2026-04-05", "severity": "high", "cnt": 1}]
+        assert any(table == "vulnerability_scans" for table, _rows in inserted)
+
+    def test_record_events_batches_runtime_rows(self):
+        from agent_bom.api.clickhouse_store import ClickHouseAnalyticsStore
+
+        inserted = {}
+
+        class _Client:
+            def ensure_tables(self):
+                return None
+
+            def insert_json(self, table, rows):
+                inserted["table"] = table
+                inserted["rows"] = rows
+
+        with patch("agent_bom.cloud.clickhouse.ClickHouseClient", return_value=_Client()):
+            store = ClickHouseAnalyticsStore(url="http://localhost:8123")
+            store.record_events(
+                [
+                    {"event_type": "vulnerable_tool_call", "severity": "high", "tool_name": "read_file", "message": "flagged"},
+                    {"event_type": "vulnerable_tool_call", "severity": "medium", "tool_name": "exec_sql", "message": "flagged"},
+                ]
+            )
+
+        assert inserted["table"] == "runtime_events"
+        assert len(inserted["rows"]) == 2
+        assert inserted["rows"][0]["event_type"] == "vulnerable_tool_call"
+
+    def test_event_row_derives_deterministic_id_for_idless_events(self):
+        from agent_bom.api.clickhouse_store import ClickHouseAnalyticsStore
+
+        rows: list[dict] = []
+
+        class _Client:
+            def ensure_tables(self):
+                return None
+
+            def insert_json(self, table, batch):
+                rows.extend(batch)
+
+        event = {
+            "event_type": "ocsf_network_activity",
+            "severity": "low",
+            "tool_name": "proxy-relay",
+            "message": "Outbound MCP request observed",
+            "source_id": "datadog",
+            "event_timestamp": "2026-04-20T12:00:01Z",
+        }
+        with patch("agent_bom.cloud.clickhouse.ClickHouseClient", return_value=_Client()):
+            store = ClickHouseAnalyticsStore(url="http://localhost:8123")
+            store.record_event(dict(event), tenant_id="tenant-alpha")
+            store.record_event(dict(event), tenant_id="tenant-alpha")
+
+        assert rows[0]["event_id"]
+        assert rows[0]["event_id"] == rows[1]["event_id"]
+
+    def test_audit_and_runtime_rows_preserve_correlation_fields(self):
+        from agent_bom.api.clickhouse_store import ClickHouseAnalyticsStore
+
+        inserted: list[tuple[str, list[dict]]] = []
+
+        class _Client:
+            def ensure_tables(self):
+                return None
+
+            def insert_json(self, table, rows):
+                inserted.append((table, rows))
+
+        with patch("agent_bom.cloud.clickhouse.ClickHouseClient", return_value=_Client()):
+            store = ClickHouseAnalyticsStore(url="http://localhost:8123")
+            store.record_event(
                 {
-                    "scan_id": "abc-123",
-                    "agent_count": 10,
-                    "package_count": 50,
-                    "vuln_count": 3,
-                    "critical_count": 1,
-                    "high_count": 2,
-                    "posture_grade": "B",
-                    "scan_duration_ms": 1500,
-                    "source": "cli",
+                    "event_type": "runtime_alert",
+                    "session_id": "sess-1",
+                    "trace_id": "trace-1",
+                    "request_id": "req-1",
+                    "source_id": "proxy-a",
+                    "timestamp": "2026-04-20T12:00:01Z",
+                },
+                tenant_id="tenant-alpha",
+            )
+            store.record_audit_event(
+                {
+                    "action": "proxy.audit_ingested",
+                    "tenant_id": "tenant-alpha",
+                    "session_id": "sess-1",
+                    "trace_id": "trace-1",
+                    "request_id": "req-1",
+                    "timestamp": "2026-04-20T12:00:02Z",
                 }
             )
-            # Find the insert call (contains INSERT INTO scan_metadata)
-            insert_calls = [c for c in mock_open.call_args_list if b"INSERT INTO scan_metadata" in c[0][0].data]
-            assert len(insert_calls) == 1
-            body = insert_calls[0][0][0].data.decode("utf-8")
-            assert "abc-123" in body
+
+        runtime_row = next(rows[0] for table, rows in inserted if table == "runtime_events")
+        audit_row = next(rows[0] for table, rows in inserted if table == "audit_events")
+        assert runtime_row["session_id"] == "sess-1"
+        assert runtime_row["trace_id"] == "trace-1"
+        assert runtime_row["request_id"] == "req-1"
+        assert runtime_row["source_id"] == "proxy-a"
+        assert audit_row["session_id"] == "sess-1"
+        assert audit_row["trace_id"] == "trace-1"
+        assert audit_row["request_id"] == "req-1"
+
+    def test_scan_finding_key_stable_on_retry(self):
+        from agent_bom.api.clickhouse_store import ClickHouseAnalyticsStore
+
+        rows: list[dict] = []
+
+        class _Client:
+            def ensure_tables(self):
+                return None
+
+            def insert_json(self, table, batch):
+                rows.extend(batch)
+
+        vuln = {
+            "package": "requests@2.33.0",
+            "ecosystem": "pypi",
+            "cve_id": "CVE-2026-0001",
+            "severity": "high",
+        }
+        with patch("agent_bom.cloud.clickhouse.ClickHouseClient", return_value=_Client()):
+            store = ClickHouseAnalyticsStore(url="http://localhost:8123")
+            store.record_scan("scan-dedup", "agent-1", [vuln], tenant_id="tenant-alpha")
+            store.record_scan("scan-dedup", "agent-1", [vuln], tenant_id="tenant-alpha")
+
+        assert len(rows) == 2
+        assert rows[0]["finding_key"]
+        assert rows[0]["finding_key"] == rows[1]["finding_key"]
+        assert rows[0]["updated_at"]
+
+    def test_audit_row_derives_deterministic_entry_id(self):
+        from agent_bom.api.clickhouse_store import ClickHouseAnalyticsStore
+
+        rows: list[dict] = []
+
+        class _Client:
+            def ensure_tables(self):
+                return None
+
+            def insert_json(self, table, batch):
+                rows.extend(batch)
+
+        event = {
+            "action": "auth.key_created",
+            "actor": "system",
+            "resource": "api_key",
+            "timestamp": "2026-04-20T12:00:02Z",
+            "tenant_id": "tenant-alpha",
+        }
+        with patch("agent_bom.cloud.clickhouse.ClickHouseClient", return_value=_Client()):
+            store = ClickHouseAnalyticsStore(url="http://localhost:8123")
+            store.record_audit_event(dict(event))
+            store.record_audit_event(dict(event))
+
+        assert len(rows) == 2
+        assert rows[0]["entry_id"] == rows[1]["entry_id"]
+
+    def test_buffered_flush_requeues_on_insert_failure(self):
+        from agent_bom.api.clickhouse_store import BufferedAnalyticsStore, ClickHouseAnalyticsStore
+
+        attempts = {"count": 0}
+
+        class _Client:
+            def ensure_tables(self):
+                return None
+
+            def insert_json(self, table, rows):
+                attempts["count"] += 1
+                if attempts["count"] == 1:
+                    raise RuntimeError("transient clickhouse outage")
+
+        with patch("agent_bom.cloud.clickhouse.ClickHouseClient", return_value=_Client()):
+            store = ClickHouseAnalyticsStore(url="http://localhost:8123")
+            buffered = BufferedAnalyticsStore(store, max_batch=10, flush_interval=60.0)
+            buffered.record_event({"event_type": "tool_blocked", "severity": "high", "event_id": "evt-retry-1"})
+            buffered._flush_pending()
+            assert attempts["count"] == 1
+            buffered._flush_pending()
+            assert attempts["count"] == 2
+            buffered.close()
+
+    def test_buffered_queue_drops_oldest_without_exceeding_capacity(self):
+        from agent_bom.api.clickhouse_store import BufferedAnalyticsStore, ClickHouseAnalyticsStore
+
+        class _Client:
+            def ensure_tables(self):
+                return None
+
+            def insert_json(self, table, rows):
+                return None
+
+        with patch("agent_bom.cloud.clickhouse.ClickHouseClient", return_value=_Client()):
+            store = ClickHouseAnalyticsStore(url="http://localhost:8123")
+            buffered = BufferedAnalyticsStore(store, max_batch=10, max_queue=2, flush_interval=60.0)
+            buffered.record_event({"event_id": "oldest"})
+            buffered.record_event({"event_id": "middle"})
+            buffered.record_event({"event_id": "newest"})
+
+            assert buffered.queue_capacity == 2
+            assert buffered.queue_depth == 2
+            assert buffered.dropped_count == 1
+            drained = buffered._drain()
+            assert [item[1][0]["event_id"] for item in drained] == ["middle", "newest"]
+            buffered.close()
+
+    def test_failed_flush_requeue_remains_bounded_and_preserves_new_arrivals(self):
+        from agent_bom.api.clickhouse_store import BufferedAnalyticsStore, ClickHouseAnalyticsStore
+
+        class _Client:
+            def ensure_tables(self):
+                return None
+
+            def insert_json(self, table, rows):
+                buffered.record_event({"event_id": "during-outage"})
+                raise RuntimeError("clickhouse unavailable")
+
+        with patch("agent_bom.cloud.clickhouse.ClickHouseClient", return_value=_Client()):
+            store = ClickHouseAnalyticsStore(url="http://localhost:8123")
+            buffered = BufferedAnalyticsStore(store, max_batch=2, max_queue=2, flush_interval=60.0)
+            buffered.record_event({"event_id": "retry-1"})
+            buffered.record_event({"event_id": "retry-2"})
+
+            buffered._flush_pending()
+
+            assert buffered.queue_depth == 2
+            assert buffered.queue_depth <= buffered.queue_capacity
+            assert buffered.dropped_count == 1
+            assert any(item[1][0]["event_id"] == "during-outage" for item in buffered._drain())
+            buffered.close()
 
 
-# ─── Grafana infrastructure tests ──────────────────────────────────────────
+def test_clickhouse_escape_strips_control_chars_and_quotes():
+    from agent_bom.api.clickhouse_store import _escape
+
+    escaped = _escape("bad\x00name'\n\t\u2028\\test")
+
+    assert "\x00" not in escaped
+    assert "\u2028" not in escaped
+    assert "\\'" in escaped
+    assert "\\\\" in escaped
 
 
-class TestGrafanaInfra:
-    """Verify ClickHouse + Grafana infra files exist and are valid."""
+def test_build_scan_analytics_payload_splits_findings_by_agent():
+    from agent_bom.analytics_contract import build_scan_analytics_payload
+    from agent_bom.models import Agent, AgentType, AIBOMReport, BlastRadius, MCPServer, Package, Severity, Vulnerability
 
-    def test_docker_compose_exists(self):
-        from pathlib import Path
+    shared_pkg = Package(name="requests", version="2.33.0", ecosystem="pypi")
+    vuln = Vulnerability(
+        id="CVE-2026-9999",
+        summary="shared vuln",
+        severity=Severity.CRITICAL,
+        cvss_score=9.8,
+        advisory_sources=["osv", "ghsa", "nvd"],
+    )
+    shared_pkg.vulnerabilities = [vuln]
+    server = MCPServer(name="filesystem", packages=[shared_pkg])
+    agent_a = Agent(name="alpha", agent_type=AgentType.CUSTOM, config_path="alpha.json", mcp_servers=[server])
+    agent_b = Agent(name="beta", agent_type=AgentType.CUSTOM, config_path="beta.json", mcp_servers=[server])
+    br = BlastRadius(
+        vulnerability=vuln,
+        package=shared_pkg,
+        affected_servers=[server],
+        affected_agents=[agent_a, agent_b],
+        exposed_credentials=[],
+        exposed_tools=[],
+    )
+    br.calculate_risk_score()
+    report = AIBOMReport(agents=[agent_a, agent_b], blast_radii=[br], scan_id="scan-xyz")
 
-        p = Path(__file__).parent.parent / "deploy" / "supabase" / "clickhouse" / "docker-compose.yml"
-        assert p.exists()
-        content = p.read_text()
-        assert "clickhouse" in content
-        assert "grafana" in content
+    payload = build_scan_analytics_payload(report, source="api")
 
-    def test_init_sql_has_all_tables(self):
-        from pathlib import Path
+    assert payload.scan_id == "scan-xyz"
+    assert payload.scan_metadata["source"] == "api"
+    assert payload.scan_metadata["vuln_count"] == 2
+    assert payload.agent_findings["alpha"][0]["source"] == "osv"
+    assert payload.agent_findings["beta"][0]["cve_id"] == "CVE-2026-9999"
+    assert payload.posture_snapshots["alpha"]["critical"] == 1
+    assert payload.posture_snapshots["beta"]["critical"] == 1
+    assert payload.fleet_snapshots[0]["lifecycle_state"] == "discovered"
+    assert any(row["framework"] == "owasp-llm-top10" for row in payload.compliance_controls)
 
-        p = Path(__file__).parent.parent / "deploy" / "supabase" / "clickhouse" / "init.sql"
-        assert p.exists()
-        content = p.read_text()
-        assert "vulnerability_scans" in content
-        assert "runtime_events" in content
-        assert "posture_scores" in content
-        assert "scan_metadata" in content
 
-    def test_grafana_dashboard_valid_json(self):
-        from pathlib import Path
+def test_build_scan_analytics_payload_extracts_cis_checks():
+    from agent_bom.analytics_contract import build_scan_analytics_payload
+    from agent_bom.models import AIBOMReport
 
-        p = Path(__file__).parent.parent / "deploy" / "supabase" / "clickhouse" / "grafana-dashboard.json"
-        assert p.exists()
-        data = json.loads(p.read_text())
-        assert data["title"] == "agent-bom Security Analytics"
-        assert len(data["panels"]) >= 10
+    report = AIBOMReport(scan_id="scan-cis")
+    report.cis_benchmark_data = {
+        "checks": [
+            {
+                "check_id": "1.5",
+                "title": "Root MFA",
+                "status": "fail",
+                "severity": "high",
+                "remediation": {"priority": 1, "guardrails": ["identity"]},
+            }
+        ]
+    }
 
-    def test_grafana_datasource_provisioning(self):
-        from pathlib import Path
+    payload = build_scan_analytics_payload(report, source="api")
 
-        p = Path(__file__).parent.parent / "deploy" / "supabase" / "clickhouse" / "grafana-provisioning" / "datasources" / "clickhouse.yml"
-        assert p.exists()
-        assert "grafana-clickhouse-datasource" in p.read_text()
+    assert payload.cis_benchmark_checks[0]["cloud"] == "aws"
+    assert payload.cis_benchmark_checks[0]["priority"] == 1
+    assert payload.cis_benchmark_checks[0]["guardrails"] == ["identity"]
+
+
+def test_clickhouse_store_queries_fleet_and_compliance():
+    from agent_bom.api.clickhouse_store import ClickHouseAnalyticsStore
+
+    queries: list[str] = []
+
+    class _Client:
+        def ensure_tables(self):
+            return None
+
+        def query_json(self, query):
+            queries.append(query)
+            return [{"ok": True}]
+
+    with patch("agent_bom.cloud.clickhouse.ClickHouseClient", return_value=_Client()):
+        store = ClickHouseAnalyticsStore(url="http://localhost:8123")
+        assert store.query_top_riskiest_agents(limit=5) == [{"ok": True}]
+        assert store.query_compliance_heatmap(days=7) == [{"ok": True}]
+        assert store.query_cis_benchmark_checks(cloud="aws", status="fail", priority=1, tenant_id="tenant-a") == [{"ok": True}]
+
+    assert "FROM fleet_agents" in queries[0]
+    assert "LIMIT 5" in queries[0]
+    assert "FROM compliance_controls" in queries[1]
+    assert "FROM cis_benchmark_checks" in queries[2]
+    assert "tenant_id = 'tenant-a'" in queries[2]
+    assert "INTERVAL 7 DAY" in queries[1]

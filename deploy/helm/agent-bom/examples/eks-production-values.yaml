@@ -1,0 +1,284 @@
+controlPlane:
+  enabled: true
+  postgresSecrets:
+    enabled: true
+    appSecretRef:
+      name: agent-bom-control-plane-db
+    maintenanceSecretRef:
+      name: agent-bom-control-plane-maintenance
+    adminSecretRef:
+      name: agent-bom-control-plane-admin
+  observability:
+    grafanaDashboard:
+      enabled: true
+    prometheusRule:
+      enabled: true
+  podAntiAffinity:
+    enabled: true
+  priorityClass:
+    create: true
+    name: agent-bom-control-plane
+  api:
+    replicas: 2
+    env:
+      - name: AGENT_BOM_REQUIRE_SHARED_RATE_LIMIT
+        value: "1"
+      - name: AGENT_BOM_DISABLE_DOCS
+        value: "1"
+      - name: AGENT_BOM_API_LOCAL_PATH_SCANS
+        value: "disabled"
+      - name: AGENT_BOM_POSTGRES_POOL_MIN_SIZE
+        value: "5"
+      - name: AGENT_BOM_POSTGRES_POOL_MAX_SIZE
+        value: "20"
+      - name: AGENT_BOM_POSTGRES_CONNECT_TIMEOUT_SECONDS
+        value: "5"
+      - name: AGENT_BOM_POSTGRES_STATEMENT_TIMEOUT_MS
+        value: "15000"
+      - name: AGENT_BOM_API_MAX_ACTIVE_SCAN_JOBS_PER_TENANT
+        value: "25"
+      - name: AGENT_BOM_API_MAX_RETAINED_JOBS_PER_TENANT
+        value: "1000"
+      - name: AGENT_BOM_API_MAX_FLEET_AGENTS_PER_TENANT
+        value: "5000"
+      - name: AGENT_BOM_API_MAX_SCHEDULES_PER_TENANT
+        value: "250"
+      - name: AGENT_BOM_REQUIRE_SHARED_SCIM_STORE
+        value: "1"
+      - name: AGENT_BOM_SECRET_PROVIDER
+        value: "aws_secrets_manager"
+      - name: AGENT_BOM_EXTERNAL_SECRETS_ENABLED
+        value: "1"
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+    envFrom:
+      - secretRef:
+          name: agent-bom-control-plane-auth
+  ui:
+    replicas: 2
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 4
+      targetCPUUtilizationPercentage: 70
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+    env:
+      - name: NEXT_PUBLIC_API_URL
+        value: ""
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-internal
+    hosts:
+      - host: agent-bom.internal.example.com
+        apiPaths:
+          - path: /v1
+            pathType: Prefix
+          - path: /scim
+            pathType: Prefix
+          - path: /health
+            pathType: Prefix
+          - path: /docs
+            pathType: Prefix
+          - path: /redoc
+            pathType: Prefix
+          - path: /openapi.json
+            pathType: Prefix
+          - path: /ws
+            pathType: Prefix
+        uiPaths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - hosts:
+          - agent-bom.internal.example.com
+        secretName: agent-bom-control-plane-tls
+  externalSecrets:
+    # The workload release consumes pre-created target Secrets. Synchronize
+    # them first with this file plus eks-production-secret-sync-values.yaml;
+    # keeping ExternalSecrets out of this release prevents its pre-install
+    # migration Job from racing normal resources.
+    enabled: false
+    syncOnly: false
+    secretStoreRef:
+      kind: ClusterSecretStore
+      name: aws-secrets-manager
+    secrets:
+      - nameSuffix: control-plane-db
+        refreshInterval: 1h
+        target:
+          name: agent-bom-control-plane-db
+        data:
+          - secretKey: AGENT_BOM_POSTGRES_URL
+            remoteRef:
+              key: REPLACE_ME_DB_SECRET_PATH
+              property: REPLACE_ME_POSTGRES_URL_PROPERTY
+      - nameSuffix: control-plane-maintenance
+        refreshInterval: 1h
+        target:
+          name: agent-bom-control-plane-maintenance
+        data:
+          - secretKey: AGENT_BOM_POSTGRES_MAINTENANCE_URL
+            remoteRef:
+              key: REPLACE_ME_MAINTENANCE_SECRET_PATH
+              property: REPLACE_ME_POSTGRES_MAINTENANCE_URL_PROPERTY
+      - nameSuffix: control-plane-admin
+        refreshInterval: 1h
+        target:
+          name: agent-bom-control-plane-admin
+        data:
+          - secretKey: ALEMBIC_DATABASE_URL
+            remoteRef:
+              key: REPLACE_ME_ADMIN_SECRET_PATH
+              property: REPLACE_ME_ALEMBIC_DATABASE_URL_PROPERTY
+      - nameSuffix: control-plane-auth
+        refreshInterval: 5m
+        target:
+          name: agent-bom-control-plane-auth
+        data:
+          - secretKey: AGENT_BOM_OIDC_ISSUER
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_OIDC_ISSUER_PROPERTY
+          - secretKey: AGENT_BOM_OIDC_AUDIENCE
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_OIDC_AUDIENCE_PROPERTY
+          - secretKey: AGENT_BOM_SCIM_BEARER_TOKEN
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_SCIM_BEARER_TOKEN_PROPERTY
+          - secretKey: AGENT_BOM_SCIM_BEARER_TOKEN_LAST_ROTATED
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_SCIM_BEARER_TOKEN_LAST_ROTATED_PROPERTY
+          - secretKey: AGENT_BOM_SCIM_TENANT_ID
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_SCIM_TENANT_ID_PROPERTY
+          - secretKey: AGENT_BOM_BROWSER_SESSION_SIGNING_KEY
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_BROWSER_SESSION_SIGNING_KEY_PROPERTY
+          - secretKey: AGENT_BOM_BROWSER_SESSION_SIGNING_KEY_LAST_ROTATED
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_BROWSER_SESSION_SIGNING_KEY_LAST_ROTATED_PROPERTY
+          - secretKey: AGENT_BOM_RATE_LIMIT_KEY
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_RATE_LIMIT_KEY_PROPERTY
+          - secretKey: AGENT_BOM_RATE_LIMIT_KEY_LAST_ROTATED
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_RATE_LIMIT_KEY_LAST_ROTATED_PROPERTY
+          - secretKey: AGENT_BOM_TRUST_PROXY_AUTH_SECRET
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_TRUST_PROXY_AUTH_SECRET_PROPERTY
+          - secretKey: AGENT_BOM_TRUST_PROXY_AUTH_ISSUER
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_TRUST_PROXY_AUTH_ISSUER_PROPERTY
+          - secretKey: AGENT_BOM_SAML_IDP_ENTITY_ID
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_SAML_IDP_ENTITY_ID_PROPERTY
+          - secretKey: AGENT_BOM_SAML_IDP_SSO_URL
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_SAML_IDP_SSO_URL_PROPERTY
+          - secretKey: AGENT_BOM_SAML_IDP_X509_CERT
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_SAML_IDP_X509_CERT_PROPERTY
+          - secretKey: AGENT_BOM_SAML_SP_ENTITY_ID
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_SAML_SP_ENTITY_ID_PROPERTY
+          - secretKey: AGENT_BOM_SAML_SP_ACS_URL
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_SAML_SP_ACS_URL_PROPERTY
+          - secretKey: AGENT_BOM_AUDIT_HMAC_KEY
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_AUDIT_HMAC_KEY_PROPERTY
+          - secretKey: AGENT_BOM_REQUIRE_AUDIT_HMAC
+            remoteRef:
+              key: REPLACE_ME_AUTH_SECRET_PATH
+              property: REPLACE_ME_REQUIRE_AUDIT_HMAC_PROPERTY
+  backup:
+    enabled: true
+    schedule: "0 3 * * *"
+    serviceAccount:
+      annotations:
+        eks.amazonaws.com/role-arn: arn:aws:iam::REPLACE_ME_ACCOUNT_ID:role/REPLACE_ME_AGENT_BOM_BACKUP_ROLE
+    destination:
+      bucket: agent-bom-prod-backups
+      prefix: agent-bom/postgres
+      bucketRegion: REPLACE_ME_BUCKET_REGION
+      encryption:
+        enabled: true
+        mode: aws:kms
+        kmsKeyId: alias/agent-bom-backups
+
+scanner:
+  enabled: true
+  allNamespaces: true
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::REPLACE_ME_ACCOUNT_ID:role/REPLACE_ME_AGENT_BOM_DISCOVERY_ROLE
+  extraArgs:
+    - --k8s-mcp
+    - --k8s-all-namespaces
+    - --introspect
+    - --enforce
+    - --preset
+    - enterprise
+
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::REPLACE_ME_ACCOUNT_ID:role/REPLACE_ME_AGENT_BOM_DISCOVERY_ROLE
+
+monitor:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+
+topologySpread:
+  enabled: true
+
+networkPolicy:
+  enabled: true
+  restrictIngress: true
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: agent-bom
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: controller
+      ports:
+        - protocol: TCP
+          port: 8422
+        - protocol: TCP
+          port: 3000
+
+pdb:
+  enabled: true
+  minAvailable: 1

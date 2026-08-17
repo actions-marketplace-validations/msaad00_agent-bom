@@ -1,0 +1,89 @@
+# ── Profile: PILOT ───────────────────────────────────────────────────────────
+# agent-bom packaged pilot — single-workstation evaluation only.
+# One product, two deployable images:
+#   - agentbom/agent-bom     = API, scanner, jobs, gateway, proxy runtimes
+#   - agentbom/agent-bom-ui  = browser dashboard
+#
+# Local pilot only:
+#   - binds to 127.0.0.1 only
+#   - uses SQLite persistence in a named Docker volume
+#   - allows no-auth browser access only because both API/UI ports are
+#     loopback-bound for fast evaluation on one workstation
+#   - scopes CORS to local UI origins; do not add public origins here
+#
+# For a multi-developer dev stack, see docker-compose.fullstack.yml.
+# For a production-shaped deployment, see docker-compose.platform.yml.
+#
+# Usage:
+#   docker compose -f docker-compose.pilot.yml up -d
+#   open http://localhost:3000
+
+services:
+  api:
+    image: agentbom/agent-bom:0.101.0
+    container_name: agent-bom-pilot-api
+    restart: unless-stopped
+    command: >
+      api
+      --host 0.0.0.0
+      --port 8422
+      --persist /home/abom/.agent-bom/jobs.db
+      --cors-origins http://localhost:3000,http://127.0.0.1:3000
+      --allow-insecure-no-auth
+    environment:
+      AGENT_BOM_DB_PATH: /home/abom/.agent-bom/vulns.db
+      AGENT_BOM_DEPLOYMENT_ENV: pilot-loopback
+      AGENT_BOM_DEMO_ESTATE: ${AGENT_BOM_DEMO_ESTATE:-0}
+      AGENT_BOM_SKIP_UPDATE_CHECK: "1"
+      # Local no-auth pilots resolve to a role. Default to analyst so a first-run
+      # operator can connect a cloud + run a scan (viewer is read-only and would
+      # 403 on create/scan). DEMO_ESTATE still clamps to viewer for public demos.
+      AGENT_BOM_NO_AUTH_ROLE: ${AGENT_BOM_NO_AUTH_ROLE:-analyst}
+      # Recurring connection scans stay OFF here: they run brokered scans
+      # against the operator's real cloud account, so a pilot opts in rather
+      # than inherits them. Set AGENT_BOM_CONNECTIONS_SCHEDULER=1 (plus a
+      # per-connection scan_interval_minutes) to enable. Same default as Helm
+      # controlPlane.connectionsScheduler.enabled. See docs/CLOUD_CONNECT.md
+      # Practical enable path.
+      AGENT_BOM_CONNECTIONS_SCHEDULER: ${AGENT_BOM_CONNECTIONS_SCHEDULER:-0}
+      # Connection-secret at-rest key is auto-seeded to /home/abom/.agent-bom/
+      # connections.key on first run (persisted in the data volume) so creating a
+      # cloud connection does not 503. Set AGENT_BOM_CONNECTIONS_KEY / a managed
+      # provider to bring your own; AGENT_BOM_NO_AUTO_CONNECTIONS_KEY=1 disables it.
+    ports:
+      - "127.0.0.1:8422:8422"
+    volumes:
+      - agent-bom-pilot-data:/home/abom/.agent-bom
+    healthcheck:
+      # /health is the documented public readiness endpoint; /healthz is an
+      # alias kept for legacy callers. Keep parity with the rest of the
+      # compose set.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8422/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  ui:
+    image: agentbom/agent-bom-ui:0.101.0
+    container_name: agent-bom-pilot-ui
+    restart: unless-stopped
+    environment:
+      # The browser same-origins to this UI; the UI's Node server proxies
+      # /v1,/health,/ws to NEXT_PUBLIC_API_URL, which must be the API
+      # container's in-network DNS name — not the browser's localhost.
+      NEXT_PUBLIC_API_URL: http://api:8422
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3000/', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  agent-bom-pilot-data:

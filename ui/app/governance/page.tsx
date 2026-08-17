@@ -10,6 +10,7 @@ import {
   Eye,
   ChevronDown,
   ChevronUp,
+  Loader2,
 } from "lucide-react";
 import {
   api,
@@ -18,7 +19,8 @@ import {
   formatDate,
 } from "@/lib/api";
 import type { GovernanceReport, GovernanceFinding } from "@/lib/api";
-import { ErrorBanner } from "@/components/empty-state";
+import { useChartTheme } from "@/lib/theme-colors";
+import { IntegrationRequiredState } from "@/components/integration-required-state";
 import {
   ResponsiveContainer,
   BarChart,
@@ -31,6 +33,7 @@ import {
 } from "recharts";
 
 export default function GovernancePage() {
+  const chart = useChartTheme();
   const [report, setReport] = useState<GovernanceReport | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -48,21 +51,35 @@ export default function GovernancePage() {
       .finally(() => setLoading(false));
   };
 
-  useEffect(() => { load(); }, [days]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      load();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [days]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-64 text-zinc-500">
-        <div className="animate-pulse">Loading governance report...</div>
+      <div className="flex items-center justify-center py-20 text-[var(--text-secondary)]">
+        <Loader2 className="h-6 w-6 animate-spin mr-2" />
+        Loading governance report...
       </div>
     );
   }
 
   if (error) {
     return (
-      <ErrorBanner
-        message={error}
-        hint="Governance requires SNOWFLAKE_ACCOUNT env var on the API server."
+      <IntegrationRequiredState
+        title="Governance integration is not configured"
+        summary="This page mines access history, grants, data classifications, and agent usage from a cloud telemetry source. Core agent-bom scans do not depend on it. The current backend integration for this page uses Snowflake."
+        requirement="Cloud governance integration on the API host"
+        command={"pip install 'agent-bom[cloud]'\nexport SNOWFLAKE_ACCOUNT=...\nagent-bom api"}
+        capabilities={[
+          "Access-history review across users, roles, and objects",
+          "Privilege and classification findings with severity filters",
+          "Cortex agent usage and governance-focused summaries",
+        ]}
+        detail={error}
         onRetry={load}
       />
     );
@@ -79,20 +96,20 @@ export default function GovernancePage() {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-zinc-100 flex items-center gap-2">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <h1 className="text-2xl font-bold text-[var(--foreground)] flex items-center gap-2">
             <Eye className="w-6 h-6 text-emerald-400" />
             Governance Posture
           </h1>
-          <p className="text-sm text-zinc-500 mt-1">
+          <p className="mt-1 break-words text-sm text-[var(--text-tertiary)]">
             Account: {report.account} | Discovered: {formatDate(report.discovered_at)}
           </p>
         </div>
         <select
           value={days}
           onChange={(e) => setDays(Number(e.target.value))}
-          className="bg-zinc-900 border border-zinc-700 rounded-md px-3 py-1.5 text-sm text-zinc-300"
+          className="bg-[var(--surface)] border border-[var(--border-subtle)] rounded-md px-3 py-1.5 text-sm text-[var(--text-secondary)]"
         >
           <option value={7}>Last 7 days</option>
           <option value={30}>Last 30 days</option>
@@ -137,9 +154,9 @@ export default function GovernancePage() {
 
       {/* Findings severity bar chart */}
       {report.findings.length > 0 && (() => {
-        const sevColors: Record<string, string> = { critical: "#ef4444", high: "#f97316", medium: "#eab308", low: "#3b82f6" };
+        const sevColors: Record<string, string> = { critical: chart.severity.critical, high: chart.severity.high, medium: chart.severity.medium, low: chart.severity.low };
         const cats = ["access", "privilege", "data_classification", "agent_usage"];
-        const chartData = cats.map((cat) => {
+        const chartData = cats?.map((cat) => {
           const fs = report.findings.filter((f) => f.category === cat);
           return {
             category: cat.replace("_", " "),
@@ -151,23 +168,23 @@ export default function GovernancePage() {
         }).filter((d) => d.critical + d.high + d.medium + d.low > 0);
         if (chartData.length === 0) return null;
         return (
-          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
-            <h3 className="text-sm font-semibold text-zinc-300 mb-1">Findings by Category & Severity</h3>
-            <p className="text-[10px] text-zinc-600 mb-4">Stacked count of findings per governance category</p>
+          <div className="bg-[var(--surface)] border border-[var(--border-subtle)] rounded-xl p-5">
+            <h3 className="text-sm font-semibold text-[var(--text-secondary)] mb-1">Findings by Category & Severity</h3>
+            <p className="text-[10px] text-[var(--text-tertiary)] mb-4">Stacked count of findings per governance category</p>
             <div className="h-44">
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={chartData} margin={{ top: 4, right: 8, bottom: 4, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
-                  <XAxis dataKey="category" tick={{ fontSize: 10, fill: "#71717a" }} tickLine={false} axisLine={{ stroke: "#27272a" }} />
-                  <YAxis tick={{ fontSize: 10, fill: "#71717a" }} tickLine={false} axisLine={false} allowDecimals={false} width={28} />
+                  <CartesianGrid strokeDasharray="3 3" stroke={chart.grid} vertical={false} />
+                  <XAxis dataKey="category" tick={{ fontSize: 10, fill: chart.text }} tickLine={false} axisLine={{ stroke: chart.border }} />
+                  <YAxis tick={{ fontSize: 10, fill: chart.text }} tickLine={false} axisLine={false} allowDecimals={false} width={28} />
                   <Tooltip
-                    contentStyle={{ background: "#09090b", border: "1px solid #27272a", borderRadius: 8, fontSize: 12 }}
-                    itemStyle={{ color: "#e4e4e7" }}
-                    labelStyle={{ color: "#71717a", marginBottom: 4 }}
+                    contentStyle={{ background: chart.tooltip.bg, border: `1px solid ${chart.tooltip.border}`, borderRadius: 8, fontSize: 12 }}
+                    itemStyle={{ color: chart.tooltip.text }}
+                    labelStyle={{ color: chart.text, marginBottom: 4 }}
                   />
                   {(["critical", "high", "medium", "low"] as const).map((sev) => (
                     <Bar key={sev} dataKey={sev} stackId="a" fill={sevColors[sev]} fillOpacity={0.8} radius={sev === "critical" ? [4, 4, 0, 0] : [0, 0, 0, 0]}>
-                      {chartData.map((_, i) => <Cell key={i} />)}
+                      {chartData?.map((_, i) => <Cell key={i} />)}
                     </Bar>
                   ))}
                 </BarChart>
@@ -181,7 +198,7 @@ export default function GovernancePage() {
       {report.warnings.length > 0 && (
         <div className="rounded-lg border border-yellow-800/50 bg-yellow-950/20 p-4">
           <p className="text-xs font-medium text-yellow-400 mb-2">Warnings</p>
-          {report.warnings.map((w, i) => (
+          {report.warnings?.map((w, i) => (
             <p key={i} className="text-xs text-yellow-300/70">{w}</p>
           ))}
         </div>
@@ -202,7 +219,7 @@ export default function GovernancePage() {
             onClick={() => setCategoryFilter(cat)}
           />
         ))}
-        <span className="w-px bg-zinc-700 mx-1" />
+        <span className="w-px bg-[var(--surface-muted)] mx-1" />
         <FilterButton
           label="All Severities"
           active={severityFilter === null}
@@ -220,13 +237,13 @@ export default function GovernancePage() {
 
       {/* Findings */}
       <div className="space-y-3">
-        <h2 className="text-lg font-semibold text-zinc-200">
+        <h2 className="text-lg font-semibold text-[var(--foreground)]">
           Findings ({filteredFindings.length})
         </h2>
         {filteredFindings.length === 0 ? (
-          <p className="text-sm text-zinc-500">No findings match the current filters.</p>
+          <p className="text-sm text-[var(--text-tertiary)]">No findings match the current filters.</p>
         ) : (
-          filteredFindings.map((f, i) => <FindingCard key={i} finding={f} />)
+          filteredFindings?.map((f, i) => <FindingCard key={i} finding={f} />)
         )}
       </div>
 
@@ -234,15 +251,15 @@ export default function GovernancePage() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Elevated Privileges */}
         {report.privilege_grants.filter((g) => g.is_elevated).length > 0 && (
-          <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-4">
-            <h3 className="text-sm font-semibold text-zinc-300 mb-3 flex items-center gap-2">
+          <div className="rounded-lg border border-[var(--border-subtle)] bg-[var(--surface)]/50 p-4">
+            <h3 className="text-sm font-semibold text-[var(--text-secondary)] mb-3 flex items-center gap-2">
               <Lock className="w-4 h-4 text-purple-400" />
               Elevated Privileges
             </h3>
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
                 <thead>
-                  <tr className="text-zinc-500 border-b border-zinc-800">
+                  <tr className="text-[var(--text-tertiary)] border-b border-[var(--border-subtle)]">
                     <th className="text-left py-1.5 pr-3">Role</th>
                     <th className="text-left py-1.5 pr-3">Privilege</th>
                     <th className="text-left py-1.5">Object</th>
@@ -253,10 +270,10 @@ export default function GovernancePage() {
                     .filter((g) => g.is_elevated)
                     .slice(0, 20)
                     .map((g, i) => (
-                      <tr key={i} className="border-b border-zinc-800/50">
-                        <td className="py-1.5 pr-3 text-zinc-300 font-mono">{g.grantee}</td>
+                      <tr key={i} className="border-b border-[var(--border-subtle)]/50">
+                        <td className="py-1.5 pr-3 text-[var(--text-secondary)] font-mono">{g.grantee}</td>
                         <td className="py-1.5 pr-3 text-red-400">{g.privilege}</td>
-                        <td className="py-1.5 text-zinc-500 font-mono truncate max-w-[200px]">
+                        <td className="py-1.5 text-[var(--text-tertiary)] font-mono truncate max-w-[200px]">
                           {g.object_name}
                         </td>
                       </tr>
@@ -269,15 +286,15 @@ export default function GovernancePage() {
 
         {/* Data Classifications */}
         {report.data_classifications.length > 0 && (
-          <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-4">
-            <h3 className="text-sm font-semibold text-zinc-300 mb-3 flex items-center gap-2">
+          <div className="rounded-lg border border-[var(--border-subtle)] bg-[var(--surface)]/50 p-4">
+            <h3 className="text-sm font-semibold text-[var(--text-secondary)] mb-3 flex items-center gap-2">
               <Database className="w-4 h-4 text-blue-400" />
               Data Classifications
             </h3>
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
                 <thead>
-                  <tr className="text-zinc-500 border-b border-zinc-800">
+                  <tr className="text-[var(--text-tertiary)] border-b border-[var(--border-subtle)]">
                     <th className="text-left py-1.5 pr-3">Object</th>
                     <th className="text-left py-1.5 pr-3">Tag</th>
                     <th className="text-left py-1.5">Value</th>
@@ -285,15 +302,15 @@ export default function GovernancePage() {
                 </thead>
                 <tbody>
                   {report.data_classifications.slice(0, 20).map((d, i) => (
-                    <tr key={i} className="border-b border-zinc-800/50">
-                      <td className="py-1.5 pr-3 text-zinc-300 font-mono truncate max-w-[200px]">
+                    <tr key={i} className="border-b border-[var(--border-subtle)]/50">
+                      <td className="py-1.5 pr-3 text-[var(--text-secondary)] font-mono truncate max-w-[200px]">
                         {d.object_name}
                         {d.column_name && (
-                          <span className="text-zinc-500">.{d.column_name}</span>
+                          <span className="text-[var(--text-tertiary)]">.{d.column_name}</span>
                         )}
                       </td>
                       <td className="py-1.5 pr-3 text-amber-400">{d.tag_name}</td>
-                      <td className="py-1.5 text-zinc-500">{d.tag_value}</td>
+                      <td className="py-1.5 text-[var(--text-tertiary)]">{d.tag_value}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -318,12 +335,12 @@ function StatCard({
   color: string;
 }) {
   return (
-    <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-4">
+    <div className="rounded-lg border border-[var(--border-subtle)] bg-[var(--surface)]/50 p-4">
       <div className="flex items-center gap-2 mb-1">
         <Icon className={`w-4 h-4 ${color}`} />
-        <span className="text-xs text-zinc-500">{label}</span>
+        <span className="text-xs text-[var(--text-tertiary)]">{label}</span>
       </div>
-      <p className="text-2xl font-bold text-zinc-100">{value.toLocaleString()}</p>
+      <p className="text-2xl font-bold text-[var(--foreground)]">{value.toLocaleString()}</p>
     </div>
   );
 }
@@ -342,8 +359,8 @@ function FilterButton({
       onClick={onClick}
       className={`px-3 py-1 rounded-md text-xs font-medium capitalize transition-colors ${
         active
-          ? "bg-zinc-700 text-zinc-100"
-          : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-300"
+          ? "bg-[var(--surface-muted)] text-[var(--foreground)]"
+          : "bg-[var(--surface)] text-[var(--text-secondary)] hover:bg-[var(--surface-elevated)] hover:text-[var(--text-secondary)]"
       }`}
     >
       {label}
@@ -356,24 +373,24 @@ function FindingCard({ finding }: { finding: GovernanceFinding }) {
 
   return (
     <div
-      className={`rounded-lg border p-4 cursor-pointer transition-colors ${severityColor(finding.severity)}`}
+      className={`cursor-pointer rounded-lg border p-4 transition-colors ${severityColor(finding.severity)}`}
       onClick={() => setExpanded(!expanded)}
     >
-      <div className="flex items-start justify-between">
-        <div className="flex items-start gap-3">
-          <span className={`w-2 h-2 rounded-full mt-1.5 ${severityDot(finding.severity)}`} />
-          <div>
-            <p className="text-sm font-medium text-zinc-100">{finding.title}</p>
-            <p className="text-xs text-zinc-400 mt-0.5">{finding.description}</p>
-            <div className="flex gap-2 mt-2">
-              <span className="px-2 py-0.5 rounded text-xs bg-zinc-800 text-zinc-400 capitalize">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-3">
+          <span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${severityDot(finding.severity)}`} />
+          <div className="min-w-0">
+            <p className="break-words text-sm font-medium text-[var(--foreground)]">{finding.title}</p>
+            <p className="mt-0.5 break-words text-xs text-[var(--text-secondary)]">{finding.description}</p>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <span className="px-2 py-0.5 rounded text-xs bg-[var(--surface-elevated)] text-[var(--text-secondary)] capitalize">
                 {finding.category.replace("_", " ")}
               </span>
-              <span className="px-2 py-0.5 rounded text-xs bg-zinc-800 text-zinc-400 capitalize">
+              <span className="px-2 py-0.5 rounded text-xs bg-[var(--surface-elevated)] text-[var(--text-secondary)] capitalize">
                 {finding.severity}
               </span>
               {finding.agent_or_role && (
-                <span className="px-2 py-0.5 rounded text-xs bg-zinc-800 text-zinc-400 font-mono">
+                <span className="max-w-full break-all rounded bg-[var(--surface-elevated)] px-2 py-0.5 font-mono text-xs text-[var(--text-secondary)]">
                   {finding.agent_or_role}
                 </span>
               )}
@@ -381,14 +398,14 @@ function FindingCard({ finding }: { finding: GovernanceFinding }) {
           </div>
         </div>
         {expanded ? (
-          <ChevronUp className="w-4 h-4 text-zinc-500 flex-shrink-0" />
+          <ChevronUp className="w-4 h-4 text-[var(--text-tertiary)] flex-shrink-0" />
         ) : (
-          <ChevronDown className="w-4 h-4 text-zinc-500 flex-shrink-0" />
+          <ChevronDown className="w-4 h-4 text-[var(--text-tertiary)] flex-shrink-0" />
         )}
       </div>
       {expanded && Object.keys(finding.details).length > 0 && (
-        <div className="mt-3 pl-5 border-t border-zinc-800 pt-3">
-          <pre className="text-xs text-zinc-400 whitespace-pre-wrap break-words">
+        <div className="mt-3 pl-5 border-t border-[var(--border-subtle)] pt-3">
+          <pre className="text-xs text-[var(--text-secondary)] whitespace-pre-wrap break-words">
             {JSON.stringify(finding.details, null, 2)}
           </pre>
         </div>

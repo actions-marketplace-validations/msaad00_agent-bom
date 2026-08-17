@@ -1,0 +1,139 @@
+{{- if and .Values.controlPlane.enabled .Values.controlPlane.backup.enabled }}
+{{- $backup := .Values.controlPlane.backup }}
+{{- $postgresSecrets := .Values.controlPlane.postgresSecrets }}
+{{- if $postgresSecrets.enabled }}
+{{- $appSecret := required "controlPlane.postgresSecrets.appSecretRef.name is required" $postgresSecrets.appSecretRef.name }}
+{{- $maintenanceSecret := required "controlPlane.postgresSecrets.maintenanceSecretRef.name is required" $postgresSecrets.maintenanceSecretRef.name }}
+{{- $adminSecret := required "controlPlane.postgresSecrets.adminSecretRef.name is required" $postgresSecrets.adminSecretRef.name }}
+{{- if ne (len (uniq (list $appSecret $maintenanceSecret $adminSecret))) 3 }}
+{{- fail "controlPlane.postgresSecrets app, maintenance, and admin Secret names must be distinct" }}
+{{- end }}
+{{- if $backup.envFrom }}
+{{- fail "controlPlane.backup.envFrom cannot be combined with canonical Postgres Secrets" }}
+{{- end }}
+{{- range $entry := $backup.env }}
+{{- if has (get $entry "name") (list "AGENT_BOM_POSTGRES_URL" "AGENT_BOM_POSTGRES_MAINTENANCE_URL" "ALEMBIC_DATABASE_URL") }}
+{{- fail "controlPlane.backup.env cannot override canonical Postgres identity variables when controlPlane.postgresSecrets.enabled=true" }}
+{{- end }}
+{{- end }}
+{{- else }}
+{{- $hasMaintenanceEnv := false }}
+{{- range $entry := $backup.env }}
+{{- if eq (get $entry "name") "AGENT_BOM_POSTGRES_MAINTENANCE_URL" }}
+{{- $hasMaintenanceEnv = true }}
+{{- end }}
+{{- end }}
+{{- if not $hasMaintenanceEnv }}
+{{- fail "controlPlane.backup requires canonical controlPlane.postgresSecrets or an explicit AGENT_BOM_POSTGRES_MAINTENANCE_URL env reference; generic envFrom cannot prove a maintenance identity" }}
+{{- end }}
+{{- end }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "agent-bom.name" . }}-control-plane-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agent-bom.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane-backup
+spec:
+  schedule: {{ .Values.controlPlane.backup.schedule | quote }}
+  suspend: {{ .Values.controlPlane.backup.suspend }}
+  successfulJobsHistoryLimit: {{ .Values.controlPlane.backup.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.controlPlane.backup.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      # Fail loud: one pod failure marks the Job Failed (no silent retries).
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            {{- include "agent-bom.labels" . | nindent 12 }}
+            app.kubernetes.io/component: control-plane-backup
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "agent-bom.controlPlaneBackupServiceAccountName" . }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: dump
+              image: "{{ .Values.controlPlane.backup.image.dumpRepository }}:{{ .Values.controlPlane.backup.image.dumpTag }}"
+              imagePullPolicy: {{ .Values.controlPlane.backup.image.pullPolicy }}
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+                  out="/backup/agent-bom-${ts}.dump"
+                  pg_dump "$AGENT_BOM_POSTGRES_MAINTENANCE_URL" \
+                    --enable-row-security --format=custom --file "$out"
+                  echo "$out" > /backup/latest-path
+              env:
+                - name: PGCONNECT_TIMEOUT
+                  value: "10"
+                # pg_dump is a deliberate cross-tenant maintenance operation.
+                # The database helper requires both this scoped flag and the
+                # marker-role membership of agent_bom_maintenance.
+                - name: PGOPTIONS
+                  value: "-c app.bypass_rls=1"
+                {{- with .Values.controlPlane.backup.env }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+                {{- if $postgresSecrets.enabled }}
+                - name: AGENT_BOM_POSTGRES_MAINTENANCE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $postgresSecrets.maintenanceSecretRef.name | quote }}
+                      key: AGENT_BOM_POSTGRES_MAINTENANCE_URL
+                {{- end }}
+              {{- with .Values.controlPlane.backup.envFrom }}
+              envFrom:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              volumeMounts:
+                - name: backup-data
+                  mountPath: /backup
+              resources:
+                {{- toYaml .Values.controlPlane.backup.resources.dump | nindent 16 }}
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+            - name: upload
+              image: "{{ .Values.controlPlane.backup.image.uploadRepository }}:{{ .Values.controlPlane.backup.image.uploadTag }}"
+              imagePullPolicy: {{ .Values.controlPlane.backup.image.pullPolicy }}
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  for _ in $(seq 1 180); do
+                    if [ -s /backup/latest-path ]; then
+                      break
+                    fi
+                    sleep 2
+                  done
+                  dump_path="$(cat /backup/latest-path)"
+                  test -f "$dump_path"
+                  key="{{ trimSuffix "/" .Values.controlPlane.backup.destination.prefix }}/$(basename "$dump_path")"
+                  set -- s3 cp "$dump_path" "s3://{{ .Values.controlPlane.backup.destination.bucket }}/$key" --region "{{ default .Values.controlPlane.backup.destination.region .Values.controlPlane.backup.destination.bucketRegion }}"
+                  {{- if .Values.controlPlane.backup.destination.endpoint }}
+                  set -- "$@" --endpoint-url "{{ .Values.controlPlane.backup.destination.endpoint }}"
+                  {{- end }}
+                  {{- if .Values.controlPlane.backup.destination.encryption.enabled }}
+                  set -- "$@" --sse "{{ .Values.controlPlane.backup.destination.encryption.mode }}"
+                  {{- if .Values.controlPlane.backup.destination.encryption.kmsKeyId }}
+                  set -- "$@" --sse-kms-key-id "{{ .Values.controlPlane.backup.destination.encryption.kmsKeyId }}"
+                  {{- end }}
+                  {{- end }}
+                  {{- range .Values.controlPlane.backup.destination.extraArgs }}
+                  set -- "$@" "{{ . }}"
+                  {{- end }}
+                  aws "$@"
+              volumeMounts:
+                - name: backup-data
+                  mountPath: /backup
+              resources:
+                {{- toYaml .Values.controlPlane.backup.resources.upload | nindent 16 }}
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+          volumes:
+            - name: backup-data
+              emptyDir: {}
+{{- end }}

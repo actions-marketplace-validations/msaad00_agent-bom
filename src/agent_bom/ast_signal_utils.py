@@ -1,0 +1,113 @@
+"""Shared prompt, guardrail, and source-scanning helpers for AST analyzers."""
+
+from __future__ import annotations
+
+import re
+
+
+def _line_number_from_index(source: str, index: int) -> int:
+    return source[:index].count("\n") + 1
+
+
+def _balanced_segment(source: str, open_index: int, *, open_char: str, close_char: str) -> tuple[str, int] | None:
+    if open_index < 0 or open_index >= len(source) or source[open_index] != open_char:
+        return None
+    depth = 0
+    in_quote = ""
+    escaped = False
+    for index in range(open_index, len(source)):
+        char = source[index]
+        if in_quote:
+            if char == "\\" and not escaped:
+                escaped = True
+                continue
+            if char == in_quote and not escaped:
+                in_quote = ""
+            escaped = False
+            continue
+        if char in {'"', "'"}:
+            in_quote = char
+            escaped = False
+            continue
+        if char == open_char:
+            depth += 1
+        elif char == close_char:
+            depth -= 1
+            if depth == 0:
+                return source[open_index : index + 1], index + 1
+    return None
+
+
+_GUARDRAIL_CALL_PATTERNS = re.compile(
+    r"\b(?:content_filter|safety_check|moderate|moderation|validate_input|"
+    r"validate_output|check_toxicity|check_bias|filter_response|sanitize|"
+    r"guard|guardrail|rate_limit|throttle|pii_detect|anonymize|redact)\b",
+    re.IGNORECASE,
+)
+
+_PROMPT_RISK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("credential_in_prompt", re.compile(r"(?:api[_-]?key|password|secret|token)\s*[=:]\s*\S+", re.IGNORECASE)),
+    ("unrestricted_access", re.compile(r"\b(?:full\s+access|no\s+restrictions?|unrestricted|admin\s+privileges?)\b", re.IGNORECASE)),
+    ("code_execution", re.compile(r"\b(?:execute|run|eval|exec)\s+(?:any|all|arbitrary)\s+(?:code|command|script)\b", re.IGNORECASE)),
+    ("data_exfil_instruction", re.compile(r"\b(?:send|forward|transmit|upload)\s+(?:data|results|output|findings)\s+to\b", re.IGNORECASE)),
+    ("no_safety", re.compile(r"\b(?:bypass|skip|ignore|disable)\s+(?:safety|security|guardrail|filter|moderation)\b", re.IGNORECASE)),
+]
+
+
+# Decorator name segments that actually register a function as an agent tool.
+# Matched per dotted segment so ``@mcp.tool``, ``@agent.tool_plain`` and
+# ``@FunctionTool.from_defaults`` resolve, while ``@action`` (Django REST) and
+# ``@transaction.atomic`` — which a substring test on "tool"/"action" used to
+# accept — do not.
+AGENT_TOOL_DECORATOR_SEGMENTS: frozenset[str] = frozenset(
+    {
+        "tool",
+        "tools",
+        "tool_plain",
+        "agent_tool",
+        "agenttool",
+        "function_tool",
+        "functiontool",
+        "structuredtool",
+        "basetool",
+        "tool_plugin",
+        "toolnode",
+        "kernel_function",
+        "ai_function",
+        "openai_function",
+        "skill",
+    }
+)
+
+
+def is_agent_tool_decorator(decorator_name: str) -> bool:
+    """Return True when *decorator_name* marks a function as an agent tool."""
+    for segment in decorator_name.lower().split("."):
+        if segment in AGENT_TOOL_DECORATOR_SEGMENTS or segment.endswith("_tool"):
+            return True
+    return False
+
+
+def check_prompt_risks(text: str) -> list[str]:
+    """Check a prompt for security risk patterns."""
+    flags = []
+    for flag_name, pattern in _PROMPT_RISK_PATTERNS:
+        if pattern.search(text):
+            flags.append(flag_name)
+    return flags
+
+
+def classify_prompt_type(var_name: str) -> str:
+    """Classify prompt type from variable/parameter name."""
+    name = var_name.lower()
+    if "system" in name:
+        return "system_prompt"
+    if "instruct" in name:
+        return "instructions"
+    if "template" in name:
+        return "template"
+    if "prefix" in name or "preamble" in name:
+        return "prefix"
+    if "backstory" in name or "persona" in name or "role" in name:
+        return "persona"
+    return "prompt"

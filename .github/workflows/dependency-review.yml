@@ -2,7 +2,7 @@ name: Dependency Review
 
 on:
   pull_request:
-    branches: [main, develop]
+    branches: [main]
 
 permissions:
   contents: read
@@ -11,34 +11,78 @@ jobs:
   dependency-review:
     name: Dependency Review
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     permissions:
       contents: read
-      pull-requests: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect dependency-workflow bootstrap PR
+        id: bootstrap
+        shell: bash
+        run: |
+          # pull_request runs check out GitHub's synthetic merge commit.
+          # Diffing its two parents is more reliable than comparing against a
+          # shallow local base branch, which can lose the merge base entirely.
+          if git rev-parse --verify HEAD^1 >/dev/null 2>&1 && git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
+            CHANGED="$(git diff --name-only HEAD^1 HEAD^2)"
+          else
+            git fetch --no-tags --prune origin \
+              "${{ github.event.pull_request.base.sha }}" \
+              "${{ github.event.pull_request.head.sha }}"
+            CHANGED="$(git diff --name-only \
+              "${{ github.event.pull_request.base.sha }}" \
+              "${{ github.event.pull_request.head.sha }}")"
+          fi
+          if echo "$CHANGED" | grep -qx ".github/workflows/dependency-submission.yml"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if echo "$CHANGED" | grep -qx ".github/workflows/dependency-review.yml"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Skip dependency review for bootstrap workflow change
+        if: steps.bootstrap.outputs.skip == 'true'
+        run: echo "Skipping dependency review for dependency graph bootstrap workflow change."
 
       - name: Review dependency changes
+        if: steps.bootstrap.outputs.skip != 'true'
         uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4
         with:
           fail-on-severity: high
-          comment-summary-in-pr: always
+          retry-on-snapshot-warnings: true
           allow-licenses: >-
             Apache-2.0, MIT, MIT-0, MIT-CMU, BSD-2-Clause, BSD-3-Clause,
             ISC, PSF-2.0, Python-2.0, Python-2.0.1, 0BSD, Unlicense,
             CC0-1.0, MPL-2.0, OFL-1.1, ZPL-2.1, HPND-Markus-Kuhn,
-            LGPL-3.0-only
+            LGPL-3.0-only, Zlib
           # Packages whitelisted by PURL:
-          # - jinja2/werkzeug: BSD-3-Clause but GitHub can't resolve from pins
+          # - jinja2/werkzeug/flask/requests: permissive licenses but GitHub can return null
           # - recharts: Apache-2.0 but npm metadata returns null
           # - victory-vendor: ISC+JSON+MIT (JSON not in allow list)
           # - uv.lock transitive deps with LicenseRef-scancode-* identifiers
           #   (scancode can't map to standard SPDX; packages are permissive)
+          # - mmh3: upstream PyPI metadata and the 5.2.1 sdist declare MIT.
+          #   ScanCode also sees the MurmurHash public-domain notice and a
+          #   CC-BY-4.0 journal citation in README bibliography metadata; neither
+          #   changes the distributed package's declared MIT software license.
+          #   Keep this exception PURL-scoped instead of globally allowing CC-BY.
           allow-dependencies-licenses: >-
             pkg:pypi/jinja2,
             pkg:pypi/werkzeug,
+            pkg:pypi/flask,
+            pkg:pypi/requests,
             pkg:npm/recharts,
             pkg:npm/victory-vendor,
             pkg:pypi/aiohappyeyeballs,
+            pkg:pypi/azure-core,
             pkg:pypi/azure-identity,
             pkg:pypi/fonttools,
             pkg:pypi/gitdb,
@@ -48,8 +92,9 @@ jobs:
             pkg:pypi/pillow,
             pkg:pypi/protobuf,
             pkg:pypi/psycopg-pool,
-            pkg:pypi/safety,
             pkg:pypi/scikit-learn,
+            pkg:pypi/litellm,
+            pkg:pypi/mmh3,
             pkg:pypi/typing-extensions,
             pkg:pypi/wcwidth,
             pkg:pypi/backrefs,

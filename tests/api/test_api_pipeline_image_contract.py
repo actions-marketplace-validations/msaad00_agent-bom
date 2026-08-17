@@ -1,0 +1,484 @@
+from __future__ import annotations
+
+import json
+
+from agent_bom.api.models import JobStatus, ScanJob, ScanRequest
+from agent_bom.api.pipeline import _run_scan_sync
+from agent_bom.models import Agent, AgentType, BlastRadius, MCPServer, Package, Severity, TransportType, Vulnerability
+
+
+class _DummyStore:
+    # Mirror the real InMemoryJobStore semantics: store and caller share the
+    # same job object reference, so the pipeline must skip in-place result
+    # compaction (which would strip `agents`/`blast_radius` from the very
+    # object the caller is asserting on).
+    retains_job_objects_in_memory = True
+
+    def __init__(self) -> None:
+        self.jobs: list[ScanJob] = []
+
+    def put(self, job: ScanJob) -> None:
+        self.jobs.append(job)
+
+
+def _agent_with_package() -> Agent:
+    return Agent(
+        name="api-agent",
+        agent_type=AgentType.CUSTOM,
+        config_path="/tmp/api-agent",
+        mcp_servers=[
+            MCPServer(
+                name="api-server",
+                command="npx",
+                args=[],
+                env={},
+                transport=TransportType.STDIO,
+                packages=[Package(name="express", version="4.18.2", ecosystem="npm")],
+            )
+        ],
+    )
+
+
+def test_api_pipeline_image_scan_uses_container_surface(monkeypatch):
+    store = _DummyStore()
+    job = ScanJob(
+        job_id="img-123",
+        created_at="2026-03-25T12:00:00Z",
+        request=ScanRequest(images=["agentbom/agent-bom:latest"], enrich=False),
+    )
+
+    monkeypatch.setattr("agent_bom.api.pipeline._get_store", lambda: store)
+    monkeypatch.setattr("agent_bom.api.pipeline._sync_scan_agents_to_fleet", lambda _agents, tenant_id="default": None)
+    monkeypatch.setattr("agent_bom.discovery.discover_all", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "agent_bom.image.scan_image",
+        lambda image_ref: ([Package(name="openssl", version="3.0.16", ecosystem="deb")], "native"),
+    )
+    monkeypatch.setattr("agent_bom.scanners.scan_agents_sync", lambda agents, enable_enrichment=False, **kwargs: [])
+
+    _run_scan_sync(job)
+
+    assert job.status == JobStatus.DONE
+    assert store.jobs[-1].job_id == "img-123"
+    assert job.result is not None
+    assert job.result["summary"]["total_agents"] == 1
+    assert job.result["agents"][0]["source"] == "image"
+    assert job.result["agents"][0]["mcp_servers"][0]["surface"] == "container-image"
+
+
+def test_api_pipeline_requested_image_failure_has_failed_scan_outcome(monkeypatch):
+    store = _DummyStore()
+    job = ScanJob(
+        job_id="img-failed-123",
+        created_at="2026-03-25T12:00:00Z",
+        request=ScanRequest(images=["missing.invalid/image:latest"], enrich=False),
+    )
+
+    monkeypatch.setattr("agent_bom.api.pipeline._get_store", lambda: store)
+    monkeypatch.setattr("agent_bom.discovery.discover_all", lambda *args, **kwargs: [])
+    monkeypatch.setattr("agent_bom.image.scan_image", lambda _image: (_ for _ in ()).throw(RuntimeError("registry token=secret")))
+
+    _run_scan_sync(job)
+
+    assert job.status == JobStatus.DONE
+    assert job.result is not None
+    assert job.result["scan_run"]["outcome"] == "failed"
+    assert job.result["scan_run"]["issues"][0]["code"] == "collector_failed"
+    assert "secret" not in json.dumps(job.result)
+
+
+def test_api_pipeline_ai_enrichment_inherits_env_and_serializes_typed_provenance(monkeypatch):
+    from agent_bom import config
+    from agent_bom.ai_enrich import AI_PROVIDER_DESCRIPTORS, AIProviderResolution
+
+    store = _DummyStore()
+    job = ScanJob(
+        job_id="ai-api-123",
+        created_at="2026-07-17T12:00:00Z",
+        request=ScanRequest(ai_enrich=True, ai_model="ollama/fake", offline=True, discover_host=True),
+    )
+    agent = _agent_with_package()
+    package = agent.mcp_servers[0].packages[0]
+    blast_radius = BlastRadius(
+        vulnerability=Vulnerability(
+            id="CVE-2026-3206",
+            summary="Fake provider API smoke vulnerability",
+            severity=Severity.HIGH,
+        ),
+        package=package,
+        affected_agents=[agent],
+        affected_servers=agent.mcp_servers,
+        exposed_credentials=[],
+        exposed_tools=[],
+    )
+    resolution = AIProviderResolution(
+        requested_model="ollama/fake",
+        model="ollama/fake",
+        provider=AI_PROVIDER_DESCRIPTORS["ollama"],
+        available=True,
+        status="active",
+    )
+    provider_prompts: list[str] = []
+
+    async def fake_provider(prompt, model, max_tokens=500, **kwargs):
+        provider_prompts.append(prompt)
+        if "Classify and triage" in prompt:
+            findings = json.loads(prompt.split("\nFindings:\n", maxsplit=1)[1])
+            finding_id = findings[0]["finding_id"]
+            return json.dumps(
+                {
+                    "assessments": [
+                        {
+                            "finding_id": finding_id,
+                            "classification": "needs_review",
+                            "confidence": "high",
+                            "false_positive_likelihood": "low",
+                            "rationale": "Bounded fake-provider assessment.",
+                            "suggested_controls": [],
+                        }
+                    ]
+                }
+            )
+        if "MCP Server Configurations" in prompt:
+            return json.dumps({"overall_risk": "Low", "summary": "Fake provider.", "findings": []})
+        return "Fake provider narrative."
+
+    monkeypatch.setattr(config, "AI_DETERMINISTIC", True)
+    monkeypatch.setattr("agent_bom.api.pipeline._get_store", lambda: store)
+    monkeypatch.setattr("agent_bom.api.pipeline._sync_scan_agents_to_fleet", lambda _agents, tenant_id="default": None)
+    monkeypatch.setattr("agent_bom.discovery.discover_all", lambda *args, **kwargs: [agent])
+    monkeypatch.setattr("agent_bom.scanners.scan_agents_sync", lambda *args, **kwargs: [blast_radius])
+    monkeypatch.setattr("agent_bom.ai_enrich._resolve_ai_provider", lambda model="ollama/fake": resolution)
+    monkeypatch.setattr("agent_bom.ai_enrich._call_llm", fake_provider)
+
+    _run_scan_sync(job)
+
+    assert job.status == JobStatus.DONE
+    assert job.result is not None
+    assert job.result["ai_enrichment_metadata"]["deterministic"] is True
+    assert any("Classify and triage" in prompt for prompt in provider_prompts), job.result
+    assessment = job.result["ai_finding_assessments"][0]
+    assert assessment["schema_version"] == "ai.finding-assessment.v1"
+    assert assessment["provenance"]["provider"] == "ollama"
+    assert len(assessment["provenance"]["prompt_sha256"]) == 64
+
+
+def test_api_pipeline_dry_run_skips_discovery_scan_and_side_effects(monkeypatch):
+    store = _DummyStore()
+    job = ScanJob(
+        job_id="dry-run-123",
+        created_at="2026-03-25T12:00:00Z",
+        request=ScanRequest(images=["agentbom/agent-bom:latest"], dry_run=True, auto_update_db=True),
+    )
+
+    def _unexpected(*_args, **_kwargs):
+        raise AssertionError("dry-run must not reach discovery, scan, DB sync, or persistence hooks")
+
+    monkeypatch.setattr("agent_bom.api.pipeline._get_store", lambda: store)
+    monkeypatch.setattr("agent_bom.discovery.discover_all", _unexpected)
+    monkeypatch.setattr("agent_bom.scanners.scan_agents_sync", _unexpected)
+    monkeypatch.setattr("agent_bom.db.sync.sync_db", _unexpected)
+    monkeypatch.setattr("agent_bom.api.pipeline._persist_graph_snapshot", _unexpected)
+    monkeypatch.setattr("agent_bom.api.pipeline._sync_scan_agents_to_fleet", _unexpected)
+    monkeypatch.setattr("agent_bom.api.pipeline._get_analytics_store", _unexpected)
+
+    _run_scan_sync(job)
+
+    assert job.status == JobStatus.DONE
+    assert job.result is not None
+    assert job.result["dry_run"] is True
+    assert job.result["side_effects"] == "skipped"
+    assert store.jobs[-1].job_id == "dry-run-123"
+
+
+def test_api_pipeline_persistence_failure_is_surfaced_not_silent_success(monkeypatch):
+    """A store.put() failure must not be reported as a clean success.
+
+    The result only ever lived in this process's memory; if persistence
+    raises, the job the caller polls must reflect the failure (so the result
+    does not silently evaporate on restart or go missing from durable reads).
+    """
+
+    class _FailingStore:
+        retains_job_objects_in_memory = True
+
+        def put(self, _job: ScanJob) -> None:
+            raise RuntimeError("postgres unavailable")
+
+    store = _FailingStore()
+    job = ScanJob(
+        job_id="persist-fail-123",
+        created_at="2026-03-25T12:00:00Z",
+        request=ScanRequest(images=["agentbom/agent-bom:latest"], dry_run=True),
+    )
+    monkeypatch.setattr("agent_bom.api.pipeline._get_store", lambda: store)
+
+    _run_scan_sync(job)
+
+    assert job.status == JobStatus.FAILED
+    assert job.error is not None and "not persisted" in job.error
+    assert any("Persistence failed" in line for line in job.progress)
+
+
+def test_api_pipeline_no_scan_skips_vulnerability_scan_and_result_side_effects(monkeypatch):
+    from agent_bom.scanners import record_coverage_warning
+
+    store = _DummyStore()
+    job = ScanJob(
+        job_id="no-scan-123",
+        created_at="2026-03-25T12:00:00Z",
+        request=ScanRequest(no_scan=True, auto_update_db=True, discover_host=True),
+    )
+
+    def _unexpected(*_args, **_kwargs):
+        raise AssertionError("no_scan must not reach vulnerability scan, DB sync, or result side-effect hooks")
+
+    monkeypatch.setattr("agent_bom.api.pipeline._get_store", lambda: store)
+    monkeypatch.setattr("agent_bom.discovery.discover_all", lambda *args, **kwargs: [_agent_with_package()])
+    monkeypatch.setattr("agent_bom.scanners.scan_agents_sync", _unexpected)
+    monkeypatch.setattr("agent_bom.db.sync.sync_db", _unexpected)
+    monkeypatch.setattr("agent_bom.api.pipeline._persist_graph_snapshot", _unexpected)
+    monkeypatch.setattr("agent_bom.api.pipeline._sync_scan_agents_to_fleet", _unexpected)
+    monkeypatch.setattr("agent_bom.api.pipeline._get_analytics_store", _unexpected)
+
+    # API scan workers are reused. A coverage warning left by an earlier job on
+    # the same thread must not downgrade this intentionally unscanned request.
+    record_coverage_warning(
+        {
+            "kind": "offline_release_gap",
+            "release": "debian:10",
+            "ecosystems": ["deb"],
+            "package_count": 1,
+            "detail": "stale warning from an earlier API job",
+        }
+    )
+
+    _run_scan_sync(job)
+
+    assert job.status == JobStatus.DONE
+    assert job.result is not None
+    assert job.result["summary"]["total_agents"] == 1
+    assert job.result["summary"]["total_vulnerabilities"] == 0
+    assert "Vulnerability scanning skipped by request" in job.result["warnings"]
+    assert job.result["scan_run"]["outcome"] == "complete"
+
+
+def test_api_pipeline_offline_scan_never_retries_online(monkeypatch):
+    store = _DummyStore()
+    job = ScanJob(
+        job_id="offline-123",
+        created_at="2026-03-25T12:00:00Z",
+        request=ScanRequest(offline=True, enrich=True, discover_host=True),
+    )
+    seen_offline: list[bool | None] = []
+
+    monkeypatch.setattr("agent_bom.api.pipeline._get_store", lambda: store)
+    monkeypatch.setattr("agent_bom.api.pipeline._sync_scan_agents_to_fleet", lambda _agents, tenant_id="default": None)
+    monkeypatch.setattr("agent_bom.api.pipeline._persist_graph_snapshot", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("agent_bom.discovery.discover_all", lambda *args, **kwargs: [_agent_with_package()])
+
+    def _offline_scan(_agents, enable_enrichment=False, **kwargs):
+        seen_offline.append(kwargs.get("offline"))
+        assert enable_enrichment is False
+        assert kwargs.get("offline") is True
+        raise RuntimeError("local DB missing")
+
+    monkeypatch.setattr("agent_bom.scanners.scan_agents_sync", _offline_scan)
+
+    _run_scan_sync(job)
+
+    assert job.status == JobStatus.DONE
+    assert seen_offline == [True]
+    assert job.result is not None
+    assert "Offline CVE scanning failed: local DB missing" in job.result["warnings"]
+    assert "Enrichment skipped because offline mode was requested" in job.result["warnings"]
+    assert job.result["scan_run"]["outcome"] == "partial"
+
+
+def test_api_pipeline_persists_clickhouse_analytics(monkeypatch):
+    store = _DummyStore()
+    job = ScanJob(
+        job_id="clickhouse-123",
+        tenant_id="tenant-blue",
+        created_at="2026-03-25T12:00:00Z",
+        request=ScanRequest(images=["agentbom/agent-bom:latest"], enrich=False),
+    )
+
+    class _AnalyticsStore:
+        def __init__(self) -> None:
+            self.scan_calls: list[tuple[str, str, list[dict], str]] = []
+            self.metadata_calls: list[tuple[dict, str]] = []
+            self.posture_calls: list[tuple[str, dict, str]] = []
+            self.fleet_calls: list[dict] = []
+            self.compliance_calls: list[tuple[dict, str]] = []
+            self.cis_check_calls: list[tuple[list[dict], str]] = []
+
+        def record_scan(
+            self,
+            scan_id: str,
+            agent_name: str,
+            findings: list[dict],
+            *,
+            tenant_id: str = "default",
+        ) -> None:
+            self.scan_calls.append((scan_id, agent_name, findings, tenant_id))
+
+        def record_scan_metadata(self, metadata: dict, *, tenant_id: str = "default") -> None:
+            self.metadata_calls.append((metadata, tenant_id))
+
+        def record_posture(self, agent_name: str, snapshot: dict, *, tenant_id: str = "default") -> None:
+            self.posture_calls.append((agent_name, snapshot, tenant_id))
+
+        def record_fleet_snapshot(self, snapshot: dict) -> None:
+            self.fleet_calls.append(snapshot)
+
+        def record_compliance_control(self, control: dict, *, tenant_id: str = "default") -> None:
+            self.compliance_calls.append((control, tenant_id))
+
+        def record_cis_benchmark_checks(self, checks: list[dict], *, tenant_id: str = "default") -> None:
+            self.cis_check_calls.append((checks, tenant_id))
+
+    analytics = _AnalyticsStore()
+
+    monkeypatch.setattr("agent_bom.api.pipeline._get_store", lambda: store)
+    monkeypatch.setattr("agent_bom.api.pipeline._get_analytics_store", lambda: analytics)
+    monkeypatch.setattr("agent_bom.api.pipeline._sync_scan_agents_to_fleet", lambda _agents, tenant_id="default": None)
+    monkeypatch.setattr("agent_bom.discovery.discover_all", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "agent_bom.image.scan_image",
+        lambda image_ref: ([Package(name="openssl", version="3.0.16", ecosystem="deb")], "native"),
+    )
+
+    def _fake_scan(agents, enable_enrichment=False, **kwargs):
+        assert kwargs.get("offline") is False
+        agent = agents[0]
+        server = agent.mcp_servers[0]
+        pkg = server.packages[0]
+        vuln = Vulnerability(
+            id="CVE-2026-0001",
+            summary="test vuln",
+            severity=Severity.HIGH,
+            cvss_score=8.1,
+            epss_score=0.42,
+            advisory_sources=["osv", "nvd"],
+        )
+        pkg.vulnerabilities = [vuln]
+        br = BlastRadius(
+            vulnerability=vuln,
+            package=pkg,
+            affected_servers=[server],
+            affected_agents=[agent],
+            exposed_credentials=[],
+            exposed_tools=[],
+            cmmc_tags=["RA.L2-3.11.2"],
+        )
+        br.calculate_risk_score()
+        return [br]
+
+    monkeypatch.setattr("agent_bom.scanners.scan_agents_sync", _fake_scan)
+
+    _run_scan_sync(job)
+
+    assert job.status == JobStatus.DONE
+    assert analytics.scan_calls
+    assert analytics.metadata_calls
+    assert analytics.posture_calls
+    assert analytics.fleet_calls
+    assert analytics.compliance_calls
+
+    scan_id, agent_name, findings, scan_tenant = analytics.scan_calls[0]
+    assert scan_id == "clickhouse-123"
+    assert agent_name == "image:agentbom/agent-bom:latest"
+    assert findings[0]["package_name"] == "openssl"
+    assert findings[0]["source"] == "osv"
+    assert scan_tenant == "tenant-blue"
+
+    metadata, metadata_tenant = analytics.metadata_calls[0]
+    assert metadata["scan_id"] == "clickhouse-123"
+    assert metadata["source"] == "api"
+    assert metadata["agent_count"] == 1
+    assert metadata["vuln_count"] == 1
+    assert metadata_tenant == "tenant-blue"
+
+    posture_agent, snapshot, posture_tenant = analytics.posture_calls[0]
+    assert posture_agent == "image:agentbom/agent-bom:latest"
+    assert snapshot["high"] == 1
+    assert snapshot["total_packages"] == 1
+    assert posture_tenant == "tenant-blue"
+
+    # Compliance controls also carry the scan tenant through to the store
+    for _, control_tenant in analytics.compliance_calls:
+        assert control_tenant == "tenant-blue"
+
+    assert analytics.fleet_calls[0]["agent_name"] == "image:agentbom/agent-bom:latest"
+    assert analytics.fleet_calls[0]["lifecycle_state"] == "discovered"
+    assert analytics.fleet_calls[0]["tenant_id"] == "tenant-blue"
+    assert any(control["framework"] == "owasp-llm-top10" for control, _ in analytics.compliance_calls)
+
+
+def test_api_pipeline_persists_unified_graph_snapshot(monkeypatch):
+    store = _DummyStore()
+    job = ScanJob(
+        job_id="graph-123",
+        tenant_id="tenant-blue",
+        created_at="2026-03-25T12:00:00Z",
+        request=ScanRequest(images=["agentbom/agent-bom:latest"], enrich=False),
+    )
+    persisted: list[tuple[str, str]] = []
+
+    monkeypatch.setattr("agent_bom.api.pipeline._get_store", lambda: store)
+    monkeypatch.setattr("agent_bom.api.pipeline._sync_scan_agents_to_fleet", lambda _agents, tenant_id="default": None)
+    monkeypatch.setattr(
+        "agent_bom.api.pipeline._persist_graph_snapshot",
+        lambda j, report_json, lock=None: persisted.append((j.tenant_id, report_json["scan_id"])),
+    )
+    monkeypatch.setattr("agent_bom.discovery.discover_all", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "agent_bom.image.scan_image",
+        lambda image_ref: ([Package(name="openssl", version="3.0.16", ecosystem="deb")], "native"),
+    )
+    monkeypatch.setattr("agent_bom.scanners.scan_agents_sync", lambda agents, enable_enrichment=False, **kwargs: [])
+
+    _run_scan_sync(job)
+
+    assert job.status == JobStatus.DONE
+    assert persisted == [("tenant-blue", "graph-123")]
+
+
+def test_api_pipeline_reports_enrichment_as_part_of_scanning(monkeypatch):
+    store = _DummyStore()
+    job = ScanJob(
+        job_id="enrich-123",
+        tenant_id="tenant-blue",
+        created_at="2026-03-25T12:00:00Z",
+        request=ScanRequest(images=["agentbom/agent-bom:latest"], enrich=True),
+    )
+
+    monkeypatch.setattr("agent_bom.api.pipeline._get_store", lambda: store)
+    monkeypatch.setattr("agent_bom.api.pipeline._sync_scan_agents_to_fleet", lambda _agents, tenant_id="default": None)
+    monkeypatch.setattr("agent_bom.api.pipeline._persist_graph_snapshot", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("agent_bom.discovery.discover_all", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "agent_bom.image.scan_image",
+        lambda image_ref: ([Package(name="openssl", version="3.0.16", ecosystem="deb")], "native"),
+    )
+
+    def _fake_scan(agents, enable_enrichment=False, **kwargs):
+        assert enable_enrichment is True
+        assert kwargs.get("offline") is False
+        return []
+
+    monkeypatch.setattr("agent_bom.scanners.scan_agents_sync", _fake_scan)
+
+    _run_scan_sync(job)
+
+    events = [json.loads(line) for line in job.progress if line.startswith("{")]
+    enrichment_events = [event for event in events if event["step_id"] == "enrichment"]
+    scanning_events = [event for event in events if event["step_id"] == "scanning"]
+
+    assert job.status == JobStatus.DONE
+    assert not any(event["status"] == "running" for event in enrichment_events)
+    assert enrichment_events[-1]["status"] == "done"
+    assert enrichment_events[-1]["message"] == "Enrichment completed during scanning"
+    assert enrichment_events[-1]["stats"]["executed_in_step"] == "scanning"
+    assert any("with vulnerability enrichment" in event["message"] for event in scanning_events)

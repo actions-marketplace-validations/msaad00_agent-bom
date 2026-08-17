@@ -3,9 +3,48 @@
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
+from typing import Any
 
-from agent_bom.models import AIBOMReport, BlastRadius
+from agent_bom.asset_provenance import (
+    agent_discovery_provenance,
+    package_discovery_provenance,
+    package_version_provenance,
+    sanitize_discovery_provenance,
+)
+from agent_bom.canonical_ids import CANONICAL_ID_SCHEMA_VERSION
+from agent_bom.compliance_utils import effective_blast_radius_tags, framework_qualified_blast_radius_tags
+from agent_bom.exploitability import fused_triage_priority
+from agent_bom.finding import FINDING_SCHEMA_VERSION, Finding, _forward_fixed_version
+from agent_bom.mcp_blocklist import sanitize_security_intelligence_entry
+from agent_bom.models import AIBOMReport, BlastRadius, Severity
+from agent_bom.output.exposure_path import exposure_path_for_report_finding
+from agent_bom.output.finding_views import cve_findings
+from agent_bom.security import (
+    sanitize_command_args,
+    sanitize_path_label,
+    sanitize_security_warnings,
+    sanitize_sensitive_payload,
+    sanitize_text,
+    sanitize_url,
+)
+
+SCAN_REPORT_SCHEMA_VERSION = "1.0"
+SCAN_RUN_SCHEMA_VERSION = "1"
+BLAST_RADIUS_SCHEMA_VERSION = "1"
+INVENTORY_SNAPSHOT_SCHEMA_VERSION = "1"
+_FINDING_SEVERITIES = ("critical", "high", "medium", "low", "unknown")
+
+
+def _severity_state(severity: Severity) -> str:
+    """Stable severity-state label for structured consumers."""
+    return "pending" if severity == Severity.UNKNOWN else "scored"
+
+
+def _severity_label(severity: Severity) -> str:
+    """Human-friendly label that distinguishes advisory-only findings."""
+    return "advisory" if severity == Severity.UNKNOWN else severity.value
 
 
 def _risk_narrative(item: dict) -> str:
@@ -24,18 +63,146 @@ def _risk_narrative(item: dict) -> str:
     return " ".join(parts) + "."
 
 
+def _package_occurrence_to_dict(occurrence) -> dict[str, object]:
+    """Serialize package provenance observations without importing parser internals."""
+    if hasattr(occurrence, "to_dict"):
+        return occurrence.to_dict()
+    return {
+        "layer_index": getattr(occurrence, "layer_index", None),
+        "layer_id": getattr(occurrence, "layer_id", None),
+        "layer_path": getattr(occurrence, "layer_path", None),
+        "package_path": getattr(occurrence, "package_path", None),
+        "created_by": getattr(occurrence, "created_by", None),
+        "dockerfile_instruction": getattr(occurrence, "dockerfile_instruction", None),
+    }
+
+
+def _stable_report_finding_id(*parts: object) -> str:
+    raw = ":".join(str(part or "") for part in parts)
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"agent-bom:finding:{raw}"))
+
+
+def _build_finding_summary(findings: list[dict[str, object]]) -> dict[str, Any]:
+    """Summarize the unified finding stream, independent of package CVE counts."""
+    by_severity = dict.fromkeys(_FINDING_SEVERITIES, 0)
+    by_type: dict[str, int] = {}
+    by_source: dict[str, int] = {}
+    for finding in findings:
+        severity = str(finding.get("effective_severity") or finding.get("severity") or "unknown").lower()
+        if severity not in by_severity:
+            severity = "unknown"
+        by_severity[severity] += 1
+        finding_type = str(finding.get("finding_type") or "UNKNOWN")
+        source = str(finding.get("source") or "UNKNOWN")
+        by_type[finding_type] = by_type.get(finding_type, 0) + 1
+        by_source[source] = by_source.get(source, 0) + 1
+    return {
+        "total": len(findings),
+        "by_severity": by_severity,
+        "by_type": dict(sorted(by_type.items())),
+        "by_source": dict(sorted(by_source.items())),
+    }
+
+
+def _prompt_scan_findings(prompt_scan: dict) -> list[dict[str, object]]:
+    findings: list[dict[str, object]] = []
+    for item in prompt_scan.get("findings") or []:
+        if not isinstance(item, dict):
+            continue
+        source_file = str(item.get("source_file") or "")
+        line_number = item.get("line_number")
+        title = str(item.get("title") or "Prompt security finding")
+        category = str(item.get("category") or "prompt_security")
+        severity = str(item.get("severity") or "unknown").lower()
+        findings.append(
+            {
+                "schema_version": FINDING_SCHEMA_VERSION,
+                "id": _stable_report_finding_id("prompt_scan", source_file, line_number, title, item.get("matched_text")),
+                "canonical_id": _stable_report_finding_id("prompt_scan", source_file, line_number, title, item.get("matched_text")),
+                "finding_type": "PROMPT_SECURITY",
+                "source": "PROMPT_SCAN",
+                "asset": {
+                    "name": Path(source_file).name if source_file else "prompt",
+                    "asset_type": "prompt_template",
+                    "identifier": source_file or None,
+                    "location": source_file or None,
+                    "stable_id": _stable_report_finding_id("prompt_asset", source_file),
+                    "canonical_id": _stable_report_finding_id("prompt_asset", source_file),
+                },
+                "severity": severity,
+                "effective_severity": severity,
+                "title": title,
+                "description": item.get("detail") or title,
+                "category": category,
+                "line_number": line_number,
+                "matched_text": item.get("matched_text"),
+                "remediation_guidance": item.get("recommendation"),
+                "scan_sources": ["prompt_scan"],
+            }
+        )
+    return findings
+
+
+def _browser_extension_findings(browser_extensions: dict) -> list[dict[str, object]]:
+    findings: list[dict[str, object]] = []
+    for item in browser_extensions.get("extensions") or []:
+        if not isinstance(item, dict):
+            continue
+        risk_reasons = [str(reason) for reason in item.get("risk_reasons") or []]
+        extension_id = str(item.get("id") or item.get("name") or "unknown")
+        browser = str(item.get("browser") or "browser")
+        name = str(item.get("name") or extension_id)
+        severity = str(item.get("risk_level") or "unknown").lower()
+        findings.append(
+            {
+                "schema_version": FINDING_SCHEMA_VERSION,
+                "id": _stable_report_finding_id("browser_extension", browser, extension_id, item.get("version")),
+                "canonical_id": _stable_report_finding_id("browser_extension", browser, extension_id, item.get("version")),
+                "finding_type": "BROWSER_EXTENSION_RISK",
+                "source": "BROWSER_EXTENSION_SCAN",
+                "asset": {
+                    "name": name,
+                    "asset_type": "browser_extension",
+                    "identifier": extension_id,
+                    "location": item.get("path"),
+                    "stable_id": _stable_report_finding_id("browser_extension_asset", browser, extension_id),
+                    "canonical_id": _stable_report_finding_id("browser_extension_asset", browser, extension_id),
+                },
+                "severity": severity,
+                "effective_severity": severity,
+                "title": f"{name} browser extension risk",
+                "description": "; ".join(risk_reasons) if risk_reasons else f"{name} has {severity} browser-extension risk",
+                "browser": browser,
+                "version": item.get("version"),
+                "permissions": item.get("permissions") or [],
+                "host_permissions": item.get("host_permissions") or [],
+                "risk_reasons": risk_reasons,
+                "remediation_guidance": "Review extension permissions and remove or restrict the extension if it is not required.",
+                "scan_sources": ["browser_extensions"],
+            }
+        )
+    return findings
+
+
 def _build_remediation_json(report: AIBOMReport) -> list[dict]:
     """Build JSON-serializable remediation plan with named assets and percentages."""
     from agent_bom.output import build_remediation_plan
+    from agent_bom.output.finding_views import cve_findings
 
-    plan = build_remediation_plan(report.blast_radii)
+    # The CLI/API dual-write path already materializes CVE ``Finding`` objects
+    # on ``report.findings``.  Reuse that projection instead of converting every
+    # BlastRadius again while building JSON remediation output.  Besides doing
+    # redundant sanitization, the legacy conversion walks nested dataclasses and
+    # can trigger an expensive repr of transitive server/package data at scale.
+    cve_rows = cve_findings(report)
+    plan = build_remediation_plan(cve_rows)
     total_agents = report.total_agents or 1
 
     all_creds: set[str] = set()
     all_tools: set[str] = set()
-    for br in report.blast_radii:
-        all_creds.update(br.exposed_credentials)
-        all_tools.update(t.name for t in br.exposed_tools)
+    for finding in cve_rows:
+        all_creds.update(finding.exposed_credentials)
+        all_tools.update(finding.exposed_tools)
     total_creds = len(all_creds) or 1
     total_tools = len(all_tools) or 1
 
@@ -53,6 +220,14 @@ def _build_remediation_json(report: AIBOMReport) -> list[dict]:
                 "severity": item["max_severity"].value,
                 "is_kev": item["has_kev"],
                 "impact_score": item["impact"],
+                "priority": item["priority"],
+                "ranking_score": item.get("ranking_score", item["impact"]),
+                "ranking_reasons": item.get("ranking_reasons", []),
+                "ranking_rationale": item.get("ranking_rationale", ""),
+                "action": item["action"],
+                "reason": item.get("reason"),
+                "command": item.get("command"),
+                "verify_command": item.get("verify_command"),
                 "vulnerabilities": item["vulns"],
                 "affected_agents": item["agents"],
                 "agents_pct": round(n_agents / total_agents * 100),
@@ -103,25 +278,26 @@ def _build_framework_summary(blast_radii: list[BlastRadius]) -> dict:
     soc2_counts: Counter[str] = Counter()
     cis_counts: Counter[str] = Counter()
     for br in blast_radii:
-        for tag in br.owasp_tags:
+        tags = effective_blast_radius_tags(br)
+        for tag in tags["owasp_tags"]:
             owasp_counts[tag] += 1
-        for tag in br.atlas_tags:
+        for tag in tags["atlas_tags"]:
             atlas_counts[tag] += 1
-        for tag in br.nist_ai_rmf_tags:
+        for tag in tags["nist_ai_rmf_tags"]:
             nist_counts[tag] += 1
-        for tag in br.owasp_mcp_tags:
+        for tag in tags["owasp_mcp_tags"]:
             owasp_mcp_counts[tag] += 1
-        for tag in br.owasp_agentic_tags:
+        for tag in tags["owasp_agentic_tags"]:
             owasp_agentic_counts[tag] += 1
-        for tag in br.eu_ai_act_tags:
+        for tag in tags["eu_ai_act_tags"]:
             eu_ai_act_counts[tag] += 1
-        for tag in br.nist_csf_tags:
+        for tag in tags["nist_csf_tags"]:
             nist_csf_counts[tag] += 1
-        for tag in br.iso_27001_tags:
+        for tag in tags["iso_27001_tags"]:
             iso_27001_counts[tag] += 1
-        for tag in br.soc2_tags:
+        for tag in tags["soc2_tags"]:
             soc2_counts[tag] += 1
-        for tag in br.cis_tags:
+        for tag in tags["cis_tags"]:
             cis_counts[tag] += 1
 
     return {
@@ -228,54 +404,776 @@ def _build_framework_summary(blast_radii: list[BlastRadius]) -> dict:
     }
 
 
+def _build_ai_bom_entities_snapshot(report: AIBOMReport) -> dict:
+    """Build a deterministic inventory snapshot for diffing and BOM operations."""
+    agents: list[dict] = []
+    servers: dict[str, dict] = {}
+    tools: dict[str, dict] = {}
+    resources: dict[str, dict] = {}
+    prompts: dict[str, dict] = {}
+    packages: dict[str, dict] = {}
+    relationships: list[dict] = []
+
+    for agent in report.agents:
+        server_ids: list[str] = []
+        agent_provenance = agent_discovery_provenance(agent)
+        agents.append(
+            {
+                "id": agent.stable_id,
+                "canonical_id": agent.canonical_id,
+                "previous_canonical_ids": agent.previous_canonical_ids,
+                "name": agent.name,
+                "agent_type": agent.agent_type.value,
+                "type": agent.agent_type.value,
+                "status": agent.status.value,
+                "discovered_at": agent.discovered_at,
+                "last_seen": agent.last_seen,
+                "config_path": sanitize_path_label(agent.config_path) if agent.config_path else "",
+                "discovery_provenance": agent_provenance,
+                "server_ids": server_ids,
+            }
+        )
+
+        for server in agent.mcp_servers:
+            server_ids.append(server.stable_id)
+            if server.stable_id not in servers:
+                servers[server.stable_id] = {
+                    "id": server.stable_id,
+                    "canonical_id": server.canonical_id,
+                    "name": server.name,
+                    "surface": server.surface.value,
+                    "fingerprint": server.fingerprint,
+                    "auth_mode": server.auth_mode,
+                    "transport": server.transport.value,
+                    "command": sanitize_text(server.command),
+                    "url": sanitize_url(server.url),
+                    "tool_ids": [],
+                    "resource_ids": [],
+                    "prompt_ids": [],
+                    "package_ids": [],
+                    "discovery_provenance": sanitize_discovery_provenance(
+                        getattr(server, "discovery_provenance", None),
+                        defaults=agent_provenance,
+                    ),
+                }
+            relationships.append({"from": agent.stable_id, "to": server.stable_id, "type": "uses"})
+
+            for tool in server.tools:
+                if tool.stable_id not in tools:
+                    tools[tool.stable_id] = {
+                        "id": tool.stable_id,
+                        "canonical_id": tool.canonical_id,
+                        "name": tool.name,
+                        "fingerprint": tool.fingerprint,
+                        "description": tool.description,
+                        "discovery_source": tool.discovery_source,
+                        "discovery_confidence": tool.discovery_confidence,
+                        "schema_findings": tool.schema_findings,
+                        "schema_rule_findings": tool.schema_rule_findings,
+                        "risk_score": tool.risk_score,
+                    }
+                if tool.stable_id not in servers[server.stable_id]["tool_ids"]:
+                    servers[server.stable_id]["tool_ids"].append(tool.stable_id)
+                relationships.append({"from": server.stable_id, "to": tool.stable_id, "type": "exposes_tool"})
+
+            for resource in server.resources:
+                if resource.stable_id not in resources:
+                    resources[resource.stable_id] = {
+                        "id": resource.stable_id,
+                        "canonical_id": resource.canonical_id,
+                        "uri": resource.uri,
+                        "name": resource.name,
+                        "fingerprint": resource.fingerprint,
+                        "mime_type": resource.mime_type,
+                        "content_findings": resource.content_findings,
+                        "risk_score": resource.risk_score,
+                    }
+                if resource.stable_id not in servers[server.stable_id]["resource_ids"]:
+                    servers[server.stable_id]["resource_ids"].append(resource.stable_id)
+                relationships.append({"from": server.stable_id, "to": resource.stable_id, "type": "exposes_resource"})
+
+            for prompt in server.prompts:
+                if prompt.stable_id not in prompts:
+                    prompts[prompt.stable_id] = {
+                        "id": prompt.stable_id,
+                        "canonical_id": prompt.canonical_id,
+                        "name": prompt.name,
+                        "fingerprint": prompt.fingerprint,
+                        "description": prompt.description,
+                        "arguments": prompt.arguments,
+                        "content_findings": prompt.content_findings,
+                        "risk_score": prompt.risk_score,
+                    }
+                if prompt.stable_id not in servers[server.stable_id]["prompt_ids"]:
+                    servers[server.stable_id]["prompt_ids"].append(prompt.stable_id)
+                relationships.append({"from": server.stable_id, "to": prompt.stable_id, "type": "exposes_prompt"})
+
+            for pkg in server.packages:
+                if pkg.stable_id not in packages:
+                    packages[pkg.stable_id] = {
+                        "id": pkg.stable_id,
+                        "canonical_id": pkg.canonical_id,
+                        "name": pkg.name,
+                        "version": pkg.version,
+                        "ecosystem": pkg.ecosystem,
+                        "purl": pkg.purl,
+                        "source_package": pkg.source_package,
+                        "distro_name": pkg.distro_name,
+                        "distro_version": pkg.distro_version,
+                        "floating_reference": pkg.floating_reference,
+                        "floating_reference_reason": pkg.floating_reference_reason,
+                        "is_malicious": pkg.is_malicious,
+                        "malicious_reason": pkg.malicious_reason,
+                        "version_provenance": package_version_provenance(pkg, inherited=agent_provenance),
+                        "discovery_provenance": package_discovery_provenance(pkg, inherited=agent_provenance),
+                        "occurrence_count": len(pkg.occurrences),
+                        "occurrences": [_package_occurrence_to_dict(occ) for occ in pkg.occurrences],
+                        "vulnerability_count": len(pkg.vulnerabilities),
+                    }
+                if pkg.stable_id not in servers[server.stable_id]["package_ids"]:
+                    servers[server.stable_id]["package_ids"].append(pkg.stable_id)
+                relationships.append({"from": server.stable_id, "to": pkg.stable_id, "type": "depends_on"})
+
+    return {
+        "summary": {
+            "agents": len(agents),
+            "servers": len(servers),
+            "tools": len(tools),
+            "resources": len(resources),
+            "prompts": len(prompts),
+            "packages": len(packages),
+            "relationships": len(relationships),
+        },
+        "agents": agents,
+        "servers": sorted(servers.values(), key=lambda x: x["id"]),
+        "tools": sorted(tools.values(), key=lambda x: x["id"]),
+        "resources": sorted(resources.values(), key=lambda x: x["id"]),
+        "prompts": sorted(prompts.values(), key=lambda x: x["id"]),
+        "packages": sorted(packages.values(), key=lambda x: x["id"]),
+        "relationships": relationships,
+    }
+
+
+_INVENTORY_SCHEMA_AGENT_TYPES = {"claude-desktop", "claude-code", "cursor", "windsurf", "cline", "custom"}
+_INVENTORY_SCHEMA_ECOSYSTEMS = {"npm", "pypi", "go", "cargo", "maven", "nuget", "hex", "pub", "unknown"}
+_INVENTORY_SCHEMA_TRANSPORTS = {"stdio", "sse", "streamable-http"}
+_SECURITY_INTELLIGENCE_SCHEMA_FIELDS = {
+    "entry_id",
+    "title",
+    "severity",
+    "confidence",
+    "default_recommendation",
+    "source_type",
+    "source",
+    "match_type",
+    "matched_value",
+    "ecosystem",
+    "package",
+    "affected_versions",
+    "first_seen",
+    "last_verified",
+    "references",
+    "remediation_actions",
+}
+_DISCOVERY_PROVENANCE_SCHEMA_FIELDS = {
+    "source_type",
+    "observed_via",
+    "source",
+    "collector",
+    "provider",
+    "service",
+    "resource_type",
+    "resource_id",
+    "resource_name",
+    "location",
+    "confidence",
+    "resolved_from_registry",
+    "version_source",
+    "version_provenance",
+}
+_VERSION_PROVENANCE_SCHEMA_FIELDS = {
+    "declared_name",
+    "declared_version",
+    "resolved_version",
+    "version_source",
+    "confidence",
+    "observed_at",
+    "version_resolved_at",
+    "resolved_from_registry",
+    "floating_reference",
+    "floating_reference_reason",
+    "evidence",
+    "version_conflicts",
+}
+
+
+def _drop_empty(value: dict[str, object | None]) -> dict[str, object]:
+    """Drop optional empty values so inventory output validates with strict schema."""
+    return {key: item for key, item in value.items() if item not in (None, "", [], {})}
+
+
+def _schema_agent_type(value: str) -> str:
+    return value if value in _INVENTORY_SCHEMA_AGENT_TYPES else "custom"
+
+
+def _schema_ecosystem(value: str | None) -> str:
+    normalized = (value or "unknown").lower()
+    return normalized if normalized in _INVENTORY_SCHEMA_ECOSYSTEMS else "unknown"
+
+
+def _schema_transport(value: str) -> str | None:
+    return value if value in _INVENTORY_SCHEMA_TRANSPORTS else None
+
+
+def _schema_security_intelligence(entry: dict[str, object]) -> dict[str, object]:
+    sanitized = sanitize_security_intelligence_entry(entry)
+    return {key: value for key, value in sanitized.items() if key in _SECURITY_INTELLIGENCE_SCHEMA_FIELDS}
+
+
+def _schema_version_provenance(value: dict[str, object] | None) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    filtered = {key: item for key, item in value.items() if key in _VERSION_PROVENANCE_SCHEMA_FIELDS}
+    return _drop_empty(filtered)
+
+
+def _schema_discovery_provenance(value: dict[str, object] | None) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    filtered: dict[str, object | None] = {key: item for key, item in value.items() if key in _DISCOVERY_PROVENANCE_SCHEMA_FIELDS}
+    version_provenance = value.get("version_provenance")
+    filtered["version_provenance"] = _schema_version_provenance(version_provenance if isinstance(version_provenance, dict) else None)
+    return _drop_empty(filtered)
+
+
+def _schema_package(pkg, *, inherited_provenance: dict | None = None) -> dict[str, object]:
+    provenance = _schema_discovery_provenance(package_discovery_provenance(pkg, inherited=inherited_provenance))
+    package = _drop_empty(
+        {
+            "name": sanitize_text(pkg.name),
+            "version": sanitize_text(pkg.version or "unknown"),
+            "ecosystem": _schema_ecosystem(pkg.ecosystem),
+            "purl": sanitize_text(pkg.purl) if pkg.purl else None,
+            "discovery_provenance": provenance,
+        }
+    )
+    return package
+
+
+def _schema_tool(tool) -> dict[str, object]:
+    return _drop_empty(
+        {
+            "name": sanitize_text(tool.name),
+            "description": sanitize_text(tool.description),
+            "input_schema": sanitize_sensitive_payload(tool.input_schema or {}),
+        }
+    )
+
+
+def _schema_server(server, *, inherited_provenance: dict | None = None) -> dict[str, object]:
+    raw_intel = getattr(server, "security_intelligence", []) or []
+    security_intelligence = [
+        item
+        for item in (_schema_security_intelligence(entry) for entry in raw_intel if isinstance(entry, dict))
+        if item.get("entry_id") and item.get("title") and item.get("confidence") and item.get("default_recommendation")
+    ]
+    server_payload = _drop_empty(
+        {
+            "name": sanitize_text(server.name),
+            "command": sanitize_text(server.command),
+            "args": sanitize_command_args(server.args),
+            "transport": _schema_transport(server.transport.value),
+            "url": sanitize_url(server.url) if server.url else None,
+            "mcp_version": sanitize_text(server.mcp_version) if server.mcp_version else None,
+            "working_dir": sanitize_path_label(server.working_dir) if server.working_dir else None,
+            "tools": [_schema_tool(tool) for tool in server.tools],
+            "packages": [_schema_package(pkg, inherited_provenance=inherited_provenance) for pkg in server.packages],
+            "config_path": sanitize_path_label(server.config_path) if server.config_path else None,
+            "security_blocked": server.security_blocked if server.security_blocked else None,
+            "security_warnings": sanitize_security_warnings(server.security_warnings),
+            "security_intelligence": security_intelligence,
+            "discovery_provenance": _schema_discovery_provenance(
+                sanitize_discovery_provenance(
+                    getattr(server, "discovery_provenance", None),
+                    defaults=inherited_provenance,
+                )
+            ),
+        }
+    )
+    return server_payload
+
+
+def _build_inventory_snapshot(report: AIBOMReport) -> dict:
+    """Build a strict inventory-schema payload suitable for --inventory reuse."""
+    agents: list[dict[str, object]] = []
+    packages: list[dict[str, object]] = []
+    for agent in report.agents:
+        agent_provenance = _schema_discovery_provenance(agent_discovery_provenance(agent))
+        agents.append(
+            _drop_empty(
+                {
+                    "name": sanitize_text(agent.name),
+                    "agent_type": _schema_agent_type(agent.agent_type.value),
+                    "version": sanitize_text(agent.version) if agent.version else None,
+                    "config_path": sanitize_path_label(agent.config_path) if agent.config_path else None,
+                    "source": sanitize_text(agent.source) if agent.source else None,
+                    "metadata": sanitize_sensitive_payload(agent.metadata) if agent.metadata else None,
+                    "discovered_at": agent.discovered_at,
+                    "last_seen": agent.last_seen,
+                    "mcp_servers": [_schema_server(server, inherited_provenance=agent_provenance) for server in agent.mcp_servers],
+                    "discovery_provenance": agent_provenance,
+                }
+            )
+        )
+        for server in agent.mcp_servers:
+            packages.extend(_schema_package(pkg, inherited_provenance=agent_provenance) for pkg in server.packages)
+
+    return {
+        "schema_version": INVENTORY_SNAPSHOT_SCHEMA_VERSION,
+        "generated_at": report.generated_at.isoformat(),
+        "packages": packages,
+        "agents": agents,
+    }
+
+
+def _build_asset_inventory(findings: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Materialize unique finding assets for cross-surface joins.
+
+    Findings may repeat the same package, cloud resource, or MCP server. Keep
+    one stable asset record and attach the finding IDs that reference it so the
+    UI/control plane can navigate from inventory to evidence without treating
+    repeated finding rows as duplicate assets.
+    """
+    assets: dict[str, dict[str, object]] = {}
+    for finding in findings:
+        raw_asset = finding.get("asset")
+        if not isinstance(raw_asset, dict):
+            continue
+        stable_id = str(raw_asset.get("stable_id") or raw_asset.get("canonical_id") or "").strip()
+        if not stable_id:
+            continue
+        asset = assets.setdefault(
+            stable_id,
+            {
+                "schema_version": "1",
+                "stable_id": stable_id,
+                "canonical_id": str(raw_asset.get("canonical_id") or stable_id),
+                "name": raw_asset.get("name"),
+                "asset_type": raw_asset.get("asset_type"),
+                "identifier": raw_asset.get("identifier"),
+                "location": raw_asset.get("location"),
+                "provider": raw_asset.get("provider"),
+                "account_ref": raw_asset.get("account_ref"),
+                "region": raw_asset.get("region"),
+                "environment": raw_asset.get("environment"),
+                "finding_ids": [],
+            },
+        )
+        finding_id = str(finding.get("canonical_id") or finding.get("id") or "").strip()
+        finding_ids = asset["finding_ids"]
+        if isinstance(finding_ids, list) and finding_id and finding_id not in finding_ids:
+            finding_ids.append(finding_id)
+    for asset in assets.values():
+        finding_ids = asset["finding_ids"]
+        if isinstance(finding_ids, list):
+            asset["finding_ids"] = sorted(str(item) for item in finding_ids)
+    return [assets[key] for key in sorted(assets)]
+
+
+def _build_mcp_runtime_diff(report: AIBOMReport) -> dict | None:
+    """Compare configured servers against observed/runtime evidence."""
+    introspection_results = {
+        item.get("server_name"): item for item in (report.introspection_data or {}).get("results", []) if item.get("server_name")
+    }
+    runtime_used: dict[str, set[str]] = {}
+    for finding in (report.runtime_correlation or {}).get("correlated_findings", []):
+        server_name = finding.get("server_name")
+        tool_name = finding.get("tool_name")
+        if server_name and tool_name:
+            runtime_used.setdefault(server_name, set()).add(tool_name)
+
+    if not introspection_results and not runtime_used:
+        return None
+
+    server_diffs: list[dict] = []
+    for agent in report.agents:
+        for server in agent.mcp_servers:
+            if not server.is_mcp_surface:
+                continue
+            intro = introspection_results.get(server.name, {})
+            observed_tools = {tool.name for tool in server.tools}
+            used_tools = sorted(runtime_used.get(server.name, set()))
+            server_diffs.append(
+                {
+                    "agent_name": agent.name,
+                    "agent_stable_id": agent.stable_id,
+                    "server_name": server.name,
+                    "server_stable_id": server.stable_id,
+                    "transport": server.transport.value,
+                    "auth_mode": intro.get("auth_mode", server.auth_mode),
+                    "configured_fingerprint": intro.get("configured_fingerprint", server.fingerprint),
+                    "runtime_fingerprint": intro.get("runtime_fingerprint"),
+                    "configured_tool_count": intro.get("configured_tool_count", len(server.tools)),
+                    "observed_tool_count": intro.get("tool_count", len(server.tools)),
+                    "configured_resource_count": intro.get("configured_resource_count", len(server.resources)),
+                    "observed_resource_count": intro.get("resource_count", len(server.resources)),
+                    "configured_prompt_count": intro.get("configured_prompt_count", len(server.prompts)),
+                    "observed_prompt_count": intro.get("prompt_count", len(server.prompts)),
+                    "tools_added": intro.get("tools_added", []),
+                    "tools_removed": intro.get("tools_removed", []),
+                    "resources_added": intro.get("resources_added", []),
+                    "resources_removed": intro.get("resources_removed", []),
+                    "prompts_added": intro.get("prompts_added", []),
+                    "prompts_removed": intro.get("prompts_removed", []),
+                    "capability_risk_score": intro.get("capability_risk_score", 0.0),
+                    "capability_risk_level": intro.get("capability_risk_level", "low"),
+                    "capability_counts": intro.get("capability_counts", {}),
+                    "capability_tools": intro.get("capability_tools", {}),
+                    "dangerous_combinations": intro.get("dangerous_combinations", []),
+                    "risk_justification": intro.get("risk_justification", ""),
+                    "tool_risk_profiles": intro.get("tool_risk_profiles", []),
+                    "tool_schema_findings": intro.get(
+                        "tool_schema_findings",
+                        sorted({finding for tool in server.tools for finding in tool.schema_findings}),
+                    ),
+                    "tool_schema_rule_findings": intro.get(
+                        "tool_schema_rule_findings",
+                        [finding for tool in server.tools for finding in tool.schema_rule_findings],
+                    ),
+                    "resource_findings": intro.get(
+                        "resource_findings",
+                        sorted({finding for resource in server.resources for finding in resource.content_findings}),
+                    ),
+                    "prompt_findings": intro.get(
+                        "prompt_findings",
+                        sorted({finding for prompt in server.prompts for finding in prompt.content_findings}),
+                    ),
+                    "max_tool_risk_score": max(
+                        [item.get("risk_score", 0) for item in intro.get("tool_risk_profiles", [])]
+                        or [tool.risk_score for tool in server.tools]
+                        or [0]
+                    ),
+                    "max_resource_risk_score": max((resource.risk_score for resource in server.resources), default=0),
+                    "max_prompt_risk_score": max((prompt.risk_score for prompt in server.prompts), default=0),
+                    "runtime_used_tools": used_tools,
+                    "observed_not_used_tools": sorted(observed_tools - set(used_tools)),
+                    "configured_vs_observed_changed": bool(
+                        intro.get("has_drift")
+                        or intro.get("configured_fingerprint")
+                        and intro.get("runtime_fingerprint")
+                        and intro.get("configured_fingerprint") != intro.get("runtime_fingerprint")
+                    ),
+                    "observed_vs_runtime_gap": bool(observed_tools - set(used_tools)),
+                    "has_runtime_usage": bool(used_tools),
+                }
+            )
+
+    return {
+        "summary": {
+            "servers_with_introspection": sum(1 for diff in server_diffs if diff["runtime_fingerprint"]),
+            "servers_changed": sum(1 for diff in server_diffs if diff["configured_vs_observed_changed"]),
+            "servers_with_runtime_usage": sum(1 for diff in server_diffs if diff["has_runtime_usage"]),
+            "runtime_used_tools": sum(len(diff["runtime_used_tools"]) for diff in server_diffs),
+        },
+        "servers": server_diffs,
+    }
+
+
+def _blast_radius_json_entry(
+    br: BlastRadius,
+    finding: Finding,
+    rank: int,
+    exposure_path: dict[str, Any],
+) -> dict[str, Any]:
+    """Build one blast_radius JSON row from a unified Finding plus legacy BlastRadius fields."""
+    return {
+        "schema_version": BLAST_RADIUS_SCHEMA_VERSION,
+        "exposure_path": exposure_path,
+        **({"package_name": br.package.name, "package_version": br.package.version, "package_stable_id": br.package.stable_id}),
+        "package_canonical_id": br.package.canonical_id,
+        **effective_blast_radius_tags(br),
+        "risk_score": br.risk_score,
+        "reachability": br.reachability,
+        "actionable": br.is_actionable,
+        "vulnerability_id": finding.cve_id or br.vulnerability.id,
+        "severity": br.vulnerability.severity.value,
+        "severity_label": _severity_label(br.vulnerability.severity),
+        "severity_state": _severity_state(br.vulnerability.severity),
+        "advisory_sources": br.vulnerability.all_advisory_sources,
+        "primary_advisory_source": (br.vulnerability.all_advisory_sources[0] if br.vulnerability.all_advisory_sources else None),
+        "advisory_coverage_state": br.vulnerability.advisory_coverage_state,
+        "match_confidence_tier": br.vulnerability.match_confidence_tier,
+        "cvss_score": br.vulnerability.cvss_score,
+        "epss_score": br.vulnerability.epss_score,
+        "is_kev": br.vulnerability.is_kev,
+        "exploit_likelihood": br.vulnerability.exploit_likelihood,
+        "published_at": br.vulnerability.published_at,
+        "modified_at": br.vulnerability.modified_at,
+        "nvd_status": br.vulnerability.nvd_status,
+        "vex_status": br.vulnerability.vex_status,
+        "vex_justification": br.vulnerability.vex_justification,
+        "vex_suppressed": br.risk_score == 0.0 and br.vulnerability.vex_status in {"not_affected", "fixed"},
+        "suppressed": getattr(br, "suppressed", False),
+        "suppression_id": getattr(br, "suppression_id", None),
+        "suppression_state": getattr(br, "suppression_state", None),
+        "suppression_reason": getattr(br, "suppression_reason", None),
+        "unsuppressed_risk_score": getattr(br, "unsuppressed_risk_score", None),
+        "compliance_tags": br.vulnerability.compliance_tags,
+        "package": f"{br.package.name}@{br.package.version}",
+        "ecosystem": br.package.ecosystem,
+        "layer_attribution": [_package_occurrence_to_dict(occ) for occ in br.layer_attribution],
+        "introduced_in_layer": (_package_occurrence_to_dict(br.package.primary_occurrence) if br.package.primary_occurrence else None),
+        "package_discovery_provenance": package_discovery_provenance(br.package),
+        "package_version_provenance": package_version_provenance(br.package),
+        "is_malicious": br.package.is_malicious,
+        "malicious_reason": br.package.malicious_reason,
+        "scorecard_score": br.package.scorecard_score,
+        "scorecard_repo": br.package.scorecard_repo,
+        "scorecard_lookup_state": br.package.scorecard_lookup_state,
+        "affected_agents": [a.name for a in br.affected_agents],
+        "affected_servers": [s.name for s in br.affected_servers],
+        "exposed_credentials": br.exposed_credentials,
+        "exposed_tools": [t.name for t in br.exposed_tools],
+        "phantom_tools": [t.name for t in getattr(br, "phantom_tools", []) or []],
+        "framework_tags": framework_qualified_blast_radius_tags(br),
+        "impact_category": getattr(br, "impact_category", "code-execution"),
+        "cvss_vector": getattr(br.vulnerability, "cvss_vector", None),
+        "attack_vector": getattr(br.vulnerability, "attack_vector", None),
+        "attack_complexity": getattr(br.vulnerability, "attack_complexity", None),
+        "privileges_required": getattr(br.vulnerability, "privileges_required", None),
+        "user_interaction": getattr(br.vulnerability, "user_interaction", None),
+        "network_exploitable": getattr(br.vulnerability, "network_exploitable", False),
+        "triage_priority": fused_triage_priority(
+            severity=(br.vulnerability.severity.value if hasattr(br.vulnerability.severity, "value") else str(br.vulnerability.severity)),
+            is_kev=bool(br.vulnerability.is_kev),
+            epss_score=getattr(br.vulnerability, "epss_score", None),
+            network_exploitable=bool(getattr(br.vulnerability, "network_exploitable", False)),
+            impact_category=getattr(br, "impact_category", None),
+            reachable=getattr(br, "graph_reachable", None),
+            exposed_credential_count=len(br.exposed_credentials),
+            exposed_tool_count=len(br.exposed_tools),
+        ),
+        "all_server_credentials": getattr(br, "all_server_credentials", []),
+        "attack_vector_summary": getattr(br, "attack_vector_summary", None),
+        "fixed_version": _forward_fixed_version(br.vulnerability.fixed_version, br.package.version, br.package.ecosystem),
+        "vendor_severity": getattr(br.vulnerability, "vendor_severity", None),
+        "cvss_severity": getattr(br.vulnerability, "cvss_severity", None),
+        "ai_risk_context": br.ai_risk_context,
+        "ai_summary": br.ai_summary,
+        "hop_depth": getattr(br, "hop_depth", 1),
+        "delegation_chain": getattr(br, "delegation_chain", []),
+        "transitive_agents": getattr(br, "transitive_agents", []),
+        "transitive_credentials": getattr(br, "transitive_credentials", []),
+        "transitive_risk_score": getattr(br, "transitive_risk_score", 0.0),
+        "graph_reachable": getattr(br, "graph_reachable", None),
+        "graph_min_hop_distance": getattr(br, "graph_min_hop_distance", None),
+        "graph_reachable_from_agents": getattr(br, "graph_reachable_from_agents", []),
+        "symbol_reachability": getattr(br, "symbol_reachability", None),
+        "reachable_affected_symbols": getattr(br, "reachable_affected_symbols", []),
+    }
+
+
 def to_json(report: AIBOMReport) -> dict:
     """Convert report to JSON-serializable dict."""
+    ai_bom_entities = _build_ai_bom_entities_snapshot(report)
+    inventory_snapshot = _build_inventory_snapshot(report)
+    mcp_runtime_diff = _build_mcp_runtime_diff(report)
+    from agent_bom.mitre_fetch import get_catalog_metadata
+    from agent_bom.scorecard import summarize_scorecard_coverage
+
+    all_packages = [pkg for agent in report.agents for server in agent.mcp_servers for pkg in server.packages]
+    cve_pairs = list(zip(cve_findings(report, report.blast_radii), report.blast_radii, strict=True)) if report.blast_radii else []
+    exposure_paths = [exposure_path_for_report_finding(finding, br=br, rank=rank) for rank, (finding, br) in enumerate(cve_pairs, start=1)]
+    from agent_bom.output.finding_views import apply_workload_runtime_evidence_for_export
+
+    export_findings = apply_workload_runtime_evidence_for_export(list(report.to_findings()))
+    # Anchor the remediation SLA window: scan completion is the authoritative
+    # first-observation time for a fresh scan's findings, so stamp it when the
+    # finding does not already carry a first-seen history. to_dict() then derives
+    # ``sla_due_at`` from this anchor (with the KEV override) — one source of
+    # truth for the report, the API job result, and every export.
+    scan_observed_at = report.generated_at.isoformat()
+    for finding in export_findings:
+        if not finding.first_seen:
+            finding.first_seen = scan_observed_at
+    unified_findings = [finding.to_dict() for finding in export_findings]
+    asset_inventory = _build_asset_inventory(unified_findings)
+    finding_summary = _build_finding_summary(unified_findings)
+    from agent_bom.evidence.scan_run import effective_scan_run
+
+    scan_run = effective_scan_run(report)
     result = {
+        "schema_version": SCAN_REPORT_SCHEMA_VERSION,
+        "canonical_id_schema_version": CANONICAL_ID_SCHEMA_VERSION,
         "document_type": "AI-BOM",
-        "spec_version": "1.0",
+        "spec_version": SCAN_REPORT_SCHEMA_VERSION,
+        "scan_id": report.scan_id,
         "ai_bom_version": report.tool_version,
         "generated_at": report.generated_at.isoformat(),
+        "scan_run": {
+            "schema_version": SCAN_RUN_SCHEMA_VERSION,
+            "scan_id": report.scan_id,
+            "generated_at": report.generated_at.isoformat(),
+            "source_count": len(report.scan_sources),
+            **scan_run.to_dict(),
+        },
+        "warnings": scan_run.warnings,
         "scan_sources": report.scan_sources,
         "has_mcp_context": report.has_mcp_context,
         "has_agent_context": report.has_agent_context,
+        "framework_catalogs": {
+            "mitre_attack": get_catalog_metadata(),
+        },
+        "ai_bom_entities": {
+            "schema_version": "1.0",
+            **ai_bom_entities,
+        },
+        "packages": ai_bom_entities.get("packages", []),
         "summary": {
             "total_agents": report.total_agents,
             "total_mcp_servers": report.total_servers,
             "total_packages": report.total_packages,
+            "unique_packages": len(ai_bom_entities.get("packages", [])),
             "total_vulnerabilities": report.total_vulnerabilities,
             "critical_findings": len(report.critical_vulns),
+            "total_findings": finding_summary["total"],
+            "unique_assets": len(asset_inventory),
+            "critical_unified_findings": finding_summary["by_severity"]["critical"],
+            "high_unified_findings": finding_summary["by_severity"]["high"],
+            "coverage_warnings": list(report.coverage_warnings),
         },
+        "finding_summary": finding_summary,
+        "assets": asset_inventory,
+        "coverage_warnings": list(report.coverage_warnings),
+        "inventory_snapshot": inventory_snapshot,
         "agents": [
             {
                 "name": agent.name,
+                "stable_id": agent.stable_id,
+                "canonical_id": agent.canonical_id,
+                "previous_canonical_ids": agent.previous_canonical_ids,
+                "agent_type": agent.agent_type.value,
                 "type": agent.agent_type.value,
-                "config_path": agent.config_path,
+                "config_path": sanitize_path_label(agent.config_path) if agent.config_path else "",
                 "source": agent.source,
                 "status": agent.status.value,
+                "discovered_at": agent.discovered_at,
+                "last_seen": agent.last_seen,
+                "discovery_provenance": agent_discovery_provenance(agent),
+                "metadata": agent.metadata,
+                "automation_settings": agent.automation_settings,
                 "mcp_servers": [
                     {
                         "name": server.name,
+                        "stable_id": server.stable_id,
+                        "canonical_id": server.canonical_id,
+                        "surface": server.surface.value,
+                        "fingerprint": server.fingerprint,
                         "command": server.command,
-                        "args": server.args,
+                        "args": sanitize_command_args(server.args),
                         "transport": server.transport.value,
-                        "url": server.url,
+                        "url": sanitize_url(server.url),
+                        "auth_mode": server.auth_mode,
                         "mcp_version": server.mcp_version,
                         "has_credentials": server.has_credentials,
                         "credential_env_vars": server.credential_names,
+                        "registry_verified": server.registry_verified,
+                        "registry_badge": "verified" if server.registry_verified else "unknown",
                         "security_blocked": server.security_blocked,
-                        "security_warnings": server.security_warnings,
-                        "tools": [{"name": t.name, "description": t.description} for t in server.tools],
+                        "security_warnings": sanitize_security_warnings(server.security_warnings),
+                        "security_intelligence": [
+                            sanitize_security_intelligence_entry(item)
+                            for item in (server.security_intelligence or [])
+                            if isinstance(item, dict)
+                        ],
+                        "discovery_sources": server.discovery_sources,
+                        "discovery_provenance": sanitize_discovery_provenance(
+                            server.discovery_provenance,
+                            defaults=agent_discovery_provenance(agent),
+                        ),
+                        "tools": [
+                            {
+                                "name": t.name,
+                                "stable_id": t.stable_id,
+                                "canonical_id": t.canonical_id,
+                                "fingerprint": t.fingerprint,
+                                "description": t.description,
+                                "discovery_source": t.discovery_source,
+                                "discovery_confidence": t.discovery_confidence,
+                                "schema_findings": t.schema_findings,
+                                "schema_rule_findings": t.schema_rule_findings,
+                                "risk_score": t.risk_score,
+                            }
+                            for t in server.tools
+                        ],
+                        "resources": [
+                            {
+                                "uri": r.uri,
+                                "stable_id": r.stable_id,
+                                "canonical_id": r.canonical_id,
+                                "fingerprint": r.fingerprint,
+                                "name": r.name,
+                                "description": r.description,
+                                "mime_type": r.mime_type,
+                                "content_findings": r.content_findings,
+                                "risk_score": r.risk_score,
+                            }
+                            for r in server.resources
+                        ],
+                        "prompts": [
+                            {
+                                "name": p.name,
+                                "stable_id": p.stable_id,
+                                "canonical_id": p.canonical_id,
+                                "fingerprint": p.fingerprint,
+                                "description": p.description,
+                                "arguments": p.arguments,
+                                "content_findings": p.content_findings,
+                                "risk_score": p.risk_score,
+                            }
+                            for p in server.prompts
+                        ],
                         "packages": [
                             {
                                 "name": pkg.name,
+                                "stable_id": pkg.stable_id,
+                                "canonical_id": pkg.canonical_id,
                                 "version": pkg.version,
                                 "ecosystem": pkg.ecosystem,
                                 "purl": pkg.purl,
+                                "source_package": pkg.source_package,
+                                "distro_name": pkg.distro_name,
+                                "distro_version": pkg.distro_version,
+                                "occurrence_count": len(pkg.occurrences),
+                                "occurrences": [_package_occurrence_to_dict(occ) for occ in pkg.occurrences],
+                                "introduced_in_layer": (
+                                    _package_occurrence_to_dict(pkg.primary_occurrence) if pkg.primary_occurrence else None
+                                ),
                                 "is_direct": pkg.is_direct,
                                 "parent_package": pkg.parent_package,
                                 "dependency_depth": pkg.dependency_depth,
+                                "dependency_scope": pkg.dependency_scope,
+                                "reachability_evidence": pkg.reachability_evidence,
                                 "resolved_from_registry": pkg.resolved_from_registry,
                                 "version_source": pkg.version_source,
+                                "declared_version": pkg.declared_version,
+                                "resolved_version": pkg.resolved_version,
+                                "version_confidence": pkg.version_confidence,
+                                "version_resolved_at": pkg.version_resolved_at,
+                                "version_evidence": pkg.version_evidence or None,
+                                "version_conflicts": pkg.version_conflicts or None,
+                                "version_provenance": package_version_provenance(
+                                    pkg,
+                                    inherited=agent_discovery_provenance(agent),
+                                ),
+                                "discovery_provenance": package_discovery_provenance(
+                                    pkg,
+                                    inherited=agent_discovery_provenance(agent),
+                                ),
+                                "floating_reference": pkg.floating_reference,
+                                "floating_reference_reason": pkg.floating_reference_reason,
+                                "is_malicious": pkg.is_malicious,
+                                "malicious_reason": pkg.malicious_reason,
                                 "registry_version": pkg.registry_version,
                                 "license": pkg.license,
                                 "license_expression": pkg.license_expression,
@@ -287,18 +1185,45 @@ def to_json(report: AIBOMReport) -> dict:
                                 "download_url": pkg.download_url,
                                 "copyright_text": pkg.copyright_text,
                                 "deps_dev_resolved": pkg.deps_dev_resolved,
+                                # --verify-integrity verdict; null means the
+                                # check never ran (not "ran and failed").
+                                "integrity_verified": pkg.integrity_verified,
+                                "provenance_attested": pkg.provenance_attested,
+                                "provenance_source": pkg.provenance_source,
+                                # Why the verdict is what it is. "unavailable"
+                                # means the registry never answered — not that
+                                # the attestation is missing.
+                                "provenance_status": pkg.provenance_status,
                                 "scorecard_score": pkg.scorecard_score,
                                 "scorecard_checks": pkg.scorecard_checks or None,
+                                "scorecard_repo": pkg.scorecard_repo,
+                                "scorecard_lookup_state": pkg.scorecard_lookup_state,
+                                "scorecard_lookup_reason": pkg.scorecard_lookup_reason,
+                                "vulnerability_count": len(pkg.vulnerabilities),
                                 "vulnerabilities": [
                                     {
                                         "id": v.id,
                                         "summary": v.summary,
                                         "severity": v.severity.value,
+                                        "severity_label": _severity_label(v.severity),
+                                        "severity_state": _severity_state(v.severity),
+                                        "severity_source": v.severity_source,
+                                        "advisory_sources": v.all_advisory_sources,
+                                        "primary_advisory_source": v.all_advisory_sources[0] if v.all_advisory_sources else None,
+                                        "advisory_coverage_state": v.advisory_coverage_state,
+                                        "match_confidence_tier": v.match_confidence_tier,
+                                        "confidence": v.confidence,
                                         "cvss_score": v.cvss_score,
                                         "epss_score": v.epss_score,
                                         "epss_percentile": v.epss_percentile,
                                         "is_kev": v.is_kev,
                                         "kev_date_added": v.kev_date_added,
+                                        "kev_due_date": v.kev_due_date,
+                                        "exploit_likelihood": v.exploit_likelihood,
+                                        "published_at": v.published_at,
+                                        "modified_at": v.modified_at,
+                                        "aliases": v.aliases,
+                                        "exploitability": v.exploitability,
                                         "cwe_ids": v.cwe_ids,
                                         "fixed_version": v.fixed_version,
                                         "references": v.references,
@@ -335,49 +1260,17 @@ def to_json(report: AIBOMReport) -> dict:
             for agent in report.agents
         ],
         "blast_radius": [
-            {
-                "risk_score": br.risk_score,
-                "vulnerability_id": br.vulnerability.id,
-                "severity": br.vulnerability.severity.value,
-                "cvss_score": br.vulnerability.cvss_score,
-                "epss_score": br.vulnerability.epss_score,
-                "is_kev": br.vulnerability.is_kev,
-                "nvd_status": br.vulnerability.nvd_status,
-                "compliance_tags": br.vulnerability.compliance_tags,
-                "package": f"{br.package.name}@{br.package.version}",
-                "ecosystem": br.package.ecosystem,
-                "is_malicious": br.package.is_malicious,
-                "malicious_reason": br.package.malicious_reason,
-                "scorecard_score": br.package.scorecard_score,
-                "affected_agents": [a.name for a in br.affected_agents],
-                "affected_servers": [s.name for s in br.affected_servers],
-                "exposed_credentials": br.exposed_credentials,
-                "exposed_tools": [t.name for t in br.exposed_tools],
-                "fixed_version": br.vulnerability.fixed_version,
-                "vendor_severity": getattr(br.vulnerability, "vendor_severity", None),
-                "cvss_severity": getattr(br.vulnerability, "cvss_severity", None),
-                "ai_risk_context": br.ai_risk_context,
-                "ai_summary": br.ai_summary,
-                "owasp_tags": br.owasp_tags,
-                "atlas_tags": br.atlas_tags,
-                "attack_tags": getattr(br, "attack_tags", []),
-                "nist_ai_rmf_tags": br.nist_ai_rmf_tags,
-                "owasp_mcp_tags": br.owasp_mcp_tags,
-                "owasp_agentic_tags": br.owasp_agentic_tags,
-                "eu_ai_act_tags": br.eu_ai_act_tags,
-                "nist_csf_tags": br.nist_csf_tags,
-                "iso_27001_tags": br.iso_27001_tags,
-                "soc2_tags": br.soc2_tags,
-                "cis_tags": br.cis_tags,
-                "hop_depth": getattr(br, "hop_depth", 1),
-                "delegation_chain": getattr(br, "delegation_chain", []),
-                "transitive_agents": getattr(br, "transitive_agents", []),
-                "transitive_credentials": getattr(br, "transitive_credentials", []),
-                "transitive_risk_score": getattr(br, "transitive_risk_score", 0.0),
-            }
-            for br in report.blast_radii
+            _blast_radius_json_entry(br, finding, rank, exposure_paths[rank - 1]) for rank, (finding, br) in enumerate(cve_pairs, start=1)
         ],
+        "exposure_paths": {
+            "schema_version": "1",
+            "source": "blast_radius_output",
+            "path_count": len(exposure_paths),
+            "paths": exposure_paths,
+        },
+        "findings": unified_findings,
         "threat_framework_summary": _build_framework_summary(report.blast_radii),
+        "scorecard_summary": summarize_scorecard_coverage(all_packages).to_dict(),
         "remediation_plan": _build_remediation_json(report),
     }
 
@@ -388,6 +1281,10 @@ def to_json(report: AIBOMReport) -> dict:
         result["ai_threat_chains"] = report.ai_threat_chains
     if report.mcp_config_analysis:
         result["mcp_config_analysis"] = report.mcp_config_analysis
+    if report.ai_enrichment_metadata:
+        result["ai_enrichment_metadata"] = report.ai_enrichment_metadata
+    if report.ai_finding_assessments:
+        result["ai_finding_assessments"] = [assessment.model_dump(mode="json") for assessment in report.ai_finding_assessments]
 
     # Skill security audit (only when skill files were scanned)
     if report.skill_audit_data:
@@ -399,12 +1296,27 @@ def to_json(report: AIBOMReport) -> dict:
 
     if report.prompt_scan_data:
         result["prompt_scan"] = report.prompt_scan_data
+        findings = result.get("findings")
+        has_unified_prompt_findings = isinstance(findings, list) and any(
+            isinstance(finding, dict) and finding.get("source") == "PROMPT_SCAN" for finding in findings
+        )
+        if isinstance(findings, list) and not has_unified_prompt_findings:
+            findings.extend(_prompt_scan_findings(report.prompt_scan_data))
 
     if report.model_files:
         result["model_files"] = report.model_files
 
+    if report.model_manifests:
+        result["model_manifests"] = report.model_manifests
+
     if report.model_provenance:
         result["model_provenance"] = report.model_provenance
+
+    if report.model_hash_verification_data:
+        result["model_hash_verification"] = report.model_hash_verification_data
+
+    if report.model_supply_chain_data:
+        result["model_supply_chain"] = report.model_supply_chain_data
 
     if report.enforcement_data:
         result["enforcement"] = report.enforcement_data
@@ -427,20 +1339,103 @@ def to_json(report: AIBOMReport) -> dict:
     if report.sast_data:
         result["sast"] = report.sast_data
 
+    if report.iac_findings_data:
+        result["iac_findings"] = report.iac_findings_data
+
+    if report.cloud_inventory_data:
+        result["cloud_inventory"] = report.cloud_inventory_data
+
+    if report.aws_organization_data:
+        result["aws_organization"] = report.aws_organization_data
+
+    if report.identity_discovery_data:
+        result["identity_discovery"] = report.identity_discovery_data
+
+    if report.cloud_audit_trail_data:
+        result["cloud_audit_trail"] = report.cloud_audit_trail_data
+
     if report.cis_benchmark_data:
-        result["cis_benchmark"] = report.cis_benchmark_data
+        from agent_bom.cloud.cis_remediation import fail_closed_cis_bundle
+
+        result["cis_benchmark"] = fail_closed_cis_bundle(report.cis_benchmark_data, cloud="aws")
 
     if report.snowflake_cis_benchmark_data:
-        result["snowflake_cis_benchmark"] = report.snowflake_cis_benchmark_data
+        from agent_bom.cloud.cis_remediation import fail_closed_cis_bundle
+
+        result["snowflake_cis_benchmark"] = fail_closed_cis_bundle(report.snowflake_cis_benchmark_data, cloud="snowflake")
+    if report.snowflake_object_graph_data:
+        result["snowflake_object_graph"] = report.snowflake_object_graph_data
+    if report.snowflake_login_anomalies_data:
+        result["snowflake_login_anomalies"] = report.snowflake_login_anomalies_data
+    if report.snowflake_exfil_graph_data:
+        result["snowflake_exfil_graph"] = report.snowflake_exfil_graph_data
+    if report.snowflake_auth_posture_data:
+        result["snowflake_auth_posture"] = report.snowflake_auth_posture_data
+    if report.snowflake_services_data:
+        result["snowflake_services"] = report.snowflake_services_data
+    if report.snowflake_pipeline_data:
+        result["snowflake_pipeline"] = report.snowflake_pipeline_data
+    if report.snowflake_integrations_data:
+        result["snowflake_integrations"] = report.snowflake_integrations_data
+    if report.snowflake_external_data_data:
+        result["snowflake_external_data"] = report.snowflake_external_data_data
+    if report.snowflake_governance_data:
+        result["snowflake_governance"] = report.snowflake_governance_data
+    if report.snowflake_activity_data:
+        result["snowflake_activity"] = report.snowflake_activity_data
 
     if report.azure_cis_benchmark_data:
-        result["azure_cis_benchmark"] = report.azure_cis_benchmark_data
+        from agent_bom.cloud.cis_remediation import fail_closed_cis_bundle
+
+        result["azure_cis_benchmark"] = fail_closed_cis_bundle(report.azure_cis_benchmark_data, cloud="azure")
 
     if report.gcp_cis_benchmark_data:
-        result["gcp_cis_benchmark"] = report.gcp_cis_benchmark_data
+        from agent_bom.cloud.cis_remediation import fail_closed_cis_bundle
 
-    if report.databricks_cis_benchmark_data:
-        result["databricks_cis_benchmark"] = report.databricks_cis_benchmark_data
+        result["gcp_cis_benchmark"] = fail_closed_cis_bundle(report.gcp_cis_benchmark_data, cloud="gcp")
+
+    if report.databricks_security_data:
+        # Canonical vendor-best-practice key; Databricks has no official CIS
+        # benchmark. ``databricks_cis_benchmark`` is retained as a deprecated
+        # alias (identical payload) for existing CIS-named consumers.
+        result["databricks_security"] = report.databricks_security_data
+        result["databricks_cis_benchmark"] = report.databricks_security_data
+
+    if report.aisvs_benchmark_data:
+        result["aisvs_benchmark"] = report.aisvs_benchmark_data
+
+    # Graph toxic-combination findings (also folded into the unified ``findings``
+    # block above); surfaced here as a standalone block for discoverability.
+    if report.toxic_combination_findings_data:
+        result["toxic_combinations_graph"] = {
+            "schema_version": "1",
+            "source": "graph-toxic-combination",
+            "count": len(report.toxic_combination_findings_data),
+            "findings": report.toxic_combination_findings_data,
+        }
+
+    # CIEM over-privilege right-sizing (also folded into the unified ``findings``
+    # block above); surfaced standalone for discoverability by the exec read.
+    if report.ciem_over_privilege_findings_data:
+        result["ciem_over_privilege"] = {
+            "schema_version": "1",
+            "source": "graph-ciem-rightsizing",
+            "count": len(report.ciem_over_privilege_findings_data),
+            "findings": report.ciem_over_privilege_findings_data,
+        }
+
+    if report.runtime_correlation:
+        result["runtime_correlation"] = report.runtime_correlation
+    if report.delta_data:
+        result["delta"] = report.delta_data
+    if report.scan_performance_data:
+        result["scan_performance"] = report.scan_performance_data
+    if report.vuln_data_freshness:
+        result["vuln_data_freshness"] = report.vuln_data_freshness
+    if report.runtime_session_graph:
+        result["runtime_session_graph"] = report.runtime_session_graph
+    if mcp_runtime_diff:
+        result["mcp_runtime_diff"] = mcp_runtime_diff
 
     # Training pipeline lineage + dataset cards
     if report.training_pipelines:
@@ -451,8 +1446,33 @@ def to_json(report: AIBOMReport) -> dict:
         result["serving_configs"] = report.serving_configs
     if report.browser_extensions:
         result["browser_extensions"] = report.browser_extensions
+        findings = result.get("findings")
+        if isinstance(findings, list):
+            findings.extend(_browser_extension_findings(report.browser_extensions))
+    if report.endpoint_inventory_data:
+        result["endpoint_inventory"] = report.endpoint_inventory_data
     if report.ai_inventory_data:
         result["ai_inventory"] = report.ai_inventory_data
+    if report.project_inventory_data:
+        result["project_inventory"] = report.project_inventory_data
+    if report.repo_trust_data:
+        result["repo_trust"] = report.repo_trust_data
+        # Convenience: nest under project_inventory when both are present so the
+        # graph overlay and UI can discover trust next to the folder tree.
+        inventory = result.get("project_inventory")
+        if isinstance(inventory, dict) and "repo_trust" not in inventory:
+            inventory = dict(inventory)
+            inventory["repo_trust"] = report.repo_trust_data
+            result["project_inventory"] = inventory
+    if report.introspection_data:
+        result["introspection"] = report.introspection_data
+    if report.health_check_data:
+        result["health_check"] = report.health_check_data
+
+    if report.vector_db_scan_data:
+        result["vector_db_scan"] = report.vector_db_scan_data
+    if report.gpu_infra_data:
+        result["gpu_infra"] = report.gpu_infra_data
 
     # Posture scorecard
     from agent_bom.posture import (
@@ -463,13 +1483,24 @@ def to_json(report: AIBOMReport) -> dict:
 
     scorecard = compute_posture_scorecard(report)
     result["posture_scorecard"] = scorecard.to_dict()
+    result["posture_grade"] = scorecard.grade
     result["credential_risk_ranking"] = compute_credential_risk_ranking(report)
     result["incident_correlation"] = compute_incident_correlation(report)
 
     return result
 
 
+def to_redacted_json(report: AIBOMReport) -> dict[str, Any]:
+    """Return a JSON report payload safe for stdout and on-disk export."""
+    data = sanitize_sensitive_payload(to_json(report))
+    if isinstance(data, dict):
+        return data
+    return {"document_type": "AI-BOM", "redaction_error": "report sanitizer returned a non-object payload"}
+
+
 def export_json(report: AIBOMReport, output_path: str) -> None:
     """Export report as JSON file."""
-    data = to_json(report)
-    Path(output_path).write_text(json.dumps(data, indent=2))
+    data = to_redacted_json(report)
+    with Path(output_path).open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")

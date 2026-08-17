@@ -36,7 +36,7 @@ Declarative policy-as-code for security gates and enforcement.
 
 ```bash
 # CLI — evaluate scan results against policy
-agent-bom scan --policy policy.json
+agent-bom agents --policy policy.json
 
 # MCP tool
 policy_check(policy_file="policy.json")
@@ -49,7 +49,7 @@ agent-bom proxy --policy policy.json --block-undeclared -- ...
 
 ```yaml
 - name: Security gate
-  uses: msaad00/agent-bom@v0
+  uses: msaad00/agent-bom@v0.101.0
   with:
     policy: policy.json
     fail-on-violation: true

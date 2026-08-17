@@ -1,0 +1,512 @@
+"""PostgreSQL-backed access control and exception stores."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from agent_bom.api.auth import ApiKey, Role, verify_api_key
+from agent_bom.api.exception_store import ExceptionStatus, VulnException
+from agent_bom.api.storage_schema import ensure_postgres_schema_version
+
+from .postgres_common import (
+    Connection,
+    ConnectionPool,
+    _ensure_tenant_rls,
+    _get_pool,
+    _maintenance_connection,
+    _tenant_connection,
+    bypass_tenant_rls,
+    reset_current_tenant,
+    set_current_tenant,
+)
+
+_INSERT_API_KEY_SQL = """INSERT INTO api_keys
+    (
+      key_id, key_hash, key_salt, key_prefix, name, role, team_id, scopes,
+      created_at, expires_at, revoked_at, rotation_overlap_until, replacement_key_id,
+      scim_subject_id, owner, principal_id, revoked
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
+"""
+
+_UPSERT_API_KEY_SQL = """INSERT INTO api_keys
+    (
+      key_id, key_hash, key_salt, key_prefix, name, role, team_id, scopes,
+      created_at, expires_at, revoked_at, rotation_overlap_until, replacement_key_id,
+      scim_subject_id, owner, principal_id, revoked
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
+    ON CONFLICT (key_id) DO UPDATE SET
+      key_hash = EXCLUDED.key_hash,
+      key_salt = EXCLUDED.key_salt,
+      key_prefix = EXCLUDED.key_prefix,
+      name = EXCLUDED.name,
+      role = EXCLUDED.role,
+      team_id = EXCLUDED.team_id,
+      scopes = EXCLUDED.scopes,
+      created_at = EXCLUDED.created_at,
+      expires_at = EXCLUDED.expires_at,
+      revoked_at = EXCLUDED.revoked_at,
+      rotation_overlap_until = EXCLUDED.rotation_overlap_until,
+      replacement_key_id = EXCLUDED.replacement_key_id,
+      scim_subject_id = EXCLUDED.scim_subject_id,
+      owner = EXCLUDED.owner,
+      principal_id = EXCLUDED.principal_id,
+      revoked = FALSE
+"""
+
+
+class PostgresKeyStore:
+    """PostgreSQL-backed API key storage with tenant RLS."""
+
+    def __init__(
+        self,
+        pool: ConnectionPool | None = None,
+        maintenance_pool: ConnectionPool | None = None,
+    ) -> None:
+        self._pool = pool or _get_pool()
+        self._maintenance_pool = maintenance_pool
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        with self._pool.connection() as conn:
+            if not ensure_postgres_schema_version(conn, "api_keys"):
+                return
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS api_keys (
+                    key_id TEXT PRIMARY KEY,
+                    key_hash TEXT NOT NULL,
+                    key_salt TEXT NOT NULL,
+                    key_prefix TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    team_id TEXT NOT NULL DEFAULT 'default',
+                    scopes JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    created_by TEXT,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT,
+                    last_used TEXT,
+                    revoked_at TEXT,
+                    rotation_overlap_until TEXT,
+                    replacement_key_id TEXT,
+                    revoked BOOLEAN NOT NULL DEFAULT FALSE
+                )
+            """)
+            conn.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'api_keys' AND column_name = 'team_id'
+                    ) THEN
+                        ALTER TABLE api_keys ADD COLUMN team_id TEXT NOT NULL DEFAULT 'default';
+                    END IF;
+                END
+                $$;
+            """)
+            conn.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'api_keys' AND column_name = 'revoked_at'
+                    ) THEN
+                        ALTER TABLE api_keys ADD COLUMN revoked_at TEXT;
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'api_keys' AND column_name = 'rotation_overlap_until'
+                    ) THEN
+                        ALTER TABLE api_keys ADD COLUMN rotation_overlap_until TEXT;
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'api_keys' AND column_name = 'replacement_key_id'
+                    ) THEN
+                        ALTER TABLE api_keys ADD COLUMN replacement_key_id TEXT;
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'api_keys' AND column_name = 'scim_subject_id'
+                    ) THEN
+                        ALTER TABLE api_keys ADD COLUMN scim_subject_id TEXT;
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'api_keys' AND column_name = 'owner'
+                    ) THEN
+                        ALTER TABLE api_keys ADD COLUMN owner TEXT;
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'api_keys' AND column_name = 'principal_id'
+                    ) THEN
+                        ALTER TABLE api_keys ADD COLUMN principal_id TEXT;
+                    END IF;
+                END
+                $$;
+            """)
+            # Backfill the stable binding for pre-existing rows: COALESCE mirrors
+            # create_api_key_record's precedence (scim_subject_id → owner).
+            # Idempotent — only touches rows not yet backfilled.
+            conn.execute(
+                "UPDATE api_keys SET principal_id = COALESCE(NULLIF(scim_subject_id, ''), NULLIF(owner, '')) WHERE principal_id IS NULL"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_scim_subject ON api_keys(team_id, scim_subject_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_owner ON api_keys(team_id, owner)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_principal ON api_keys(team_id, principal_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_team ON api_keys(team_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys(team_id, revoked)")
+            _ensure_tenant_rls(conn, "api_keys", "team_id")
+            conn.commit()
+
+    @staticmethod
+    def _row_to_key(row: tuple[Any, ...]) -> ApiKey:
+        scopes = row[7] if isinstance(row[7], list) else json.loads(row[7] or "[]")
+        return ApiKey(
+            key_id=row[0],
+            key_hash=row[1],
+            key_salt=row[2],
+            key_prefix=row[3],
+            name=row[4],
+            role=Role(row[5]),
+            tenant_id=row[6],
+            scopes=scopes,
+            created_at=row[8],
+            expires_at=row[9],
+            revoked_at=row[10],
+            rotation_overlap_until=row[11],
+            replacement_key_id=row[12],
+            scim_subject_id=row[13] if len(row) > 13 else None,
+            owner=row[14] if len(row) > 14 else None,
+            principal_id=row[15] if len(row) > 15 else None,
+        )
+
+    @staticmethod
+    def _insert_key(conn: Connection, key: ApiKey, *, update_existing: bool) -> None:
+        statement = _UPSERT_API_KEY_SQL if update_existing else _INSERT_API_KEY_SQL
+        conn.execute(
+            statement,
+            (
+                key.key_id,
+                key.key_hash,
+                key.key_salt,
+                key.key_prefix,
+                key.name,
+                key.role.value,
+                key.tenant_id,
+                json.dumps(key.scopes),
+                key.created_at,
+                key.expires_at,
+                key.revoked_at,
+                key.rotation_overlap_until,
+                key.replacement_key_id,
+                key.scim_subject_id,
+                key.owner,
+                key.principal_id,
+            ),
+        )
+
+    def add(self, key: ApiKey) -> None:
+        with _tenant_connection(self._pool) as conn:
+            self._insert_key(conn, key, update_existing=True)
+            conn.commit()
+
+    def provision_tenant_key(self, key: ApiKey, *, team_name: str) -> None:
+        """Create a tenant FK root and its first key in one RLS-scoped transaction.
+
+        The invitation request begins under the operator tenant. Temporarily
+        binding the new tenant lets the ``api_keys`` FORCE-RLS ``WITH CHECK``
+        policy authorize only that tenant's key without enabling the global RLS
+        bypass. A key-id conflict is deliberately not upserted: the exception
+        rolls back the preceding team insert instead of moving an existing key
+        across tenants.
+        """
+        tenant_id = key.tenant_id
+        token = set_current_tenant(tenant_id)
+        try:
+            with _tenant_connection(self._pool) as conn:
+                conn.execute(
+                    "INSERT INTO teams (team_id, name, slug) VALUES (%s, %s, %s)",
+                    (tenant_id, team_name.strip() or tenant_id, tenant_id),
+                )
+                self._insert_key(conn, key, update_existing=False)
+                conn.commit()
+        finally:
+            reset_current_tenant(token)
+
+    def remove(self, key_id: str) -> bool:
+        with _tenant_connection(self._pool) as conn:
+            cursor = conn.execute(
+                """UPDATE api_keys
+                   SET revoked = TRUE,
+                       revoked_at = NOW()::text,
+                       rotation_overlap_until = NULL
+                   WHERE key_id = %s AND revoked = FALSE""",
+                (key_id,),
+            )
+            conn.commit()
+            return bool(cursor.rowcount > 0)
+
+    def revoke_by_principal_id(self, principal_id: str, tenant_id: str | None = None) -> list[str]:
+        """Revoke every active key bound to ``principal_id`` (indexed UPDATE).
+
+        Uses the ``idx_api_keys_principal`` index. RLS already scopes the write to
+        the connection's tenant; ``tenant_id`` narrows it further when the caller
+        holds a wider context. Returns the ids revoked so the caller can audit
+        exactly which credentials a deprovision retired.
+        """
+        if not principal_id:
+            return []
+        query = (
+            "UPDATE api_keys SET revoked = TRUE, revoked_at = NOW()::text, rotation_overlap_until = NULL "
+            "WHERE principal_id = %s AND revoked = FALSE"
+        )
+        params: tuple[object, ...] = (principal_id,)
+        if tenant_id is not None:
+            query += " AND team_id = %s"
+            params = (principal_id, tenant_id)
+        query += " RETURNING key_id"
+        with _tenant_connection(self._pool) as conn:
+            rows = conn.execute(query, params).fetchall()
+            conn.commit()
+            return [row[0] for row in rows]
+
+    def mark_rotating(self, key_id: str, *, replacement_key_id: str, overlap_until: str) -> bool:
+        with _tenant_connection(self._pool) as conn:
+            cursor = conn.execute(
+                """UPDATE api_keys
+                   SET replacement_key_id = %s,
+                       rotation_overlap_until = %s
+                   WHERE key_id = %s AND revoked = FALSE""",
+                (replacement_key_id, overlap_until, key_id),
+            )
+            conn.commit()
+            return bool(cursor.rowcount > 0)
+
+    def get(self, key_id: str) -> ApiKey | None:
+        with _tenant_connection(self._pool) as conn:
+            row = conn.execute(
+                """SELECT
+                       key_id, key_hash, key_salt, key_prefix, name, role, team_id, scopes,
+                       created_at, expires_at, revoked_at, rotation_overlap_until, replacement_key_id,
+                       scim_subject_id, owner, principal_id
+                   FROM api_keys
+                   WHERE key_id = %s""",
+                (key_id,),
+            ).fetchone()
+            return self._row_to_key(row) if row else None
+
+    def list_keys(self, tenant_id: str | None = None) -> list[ApiKey]:
+        query = """
+            SELECT
+                key_id, key_hash, key_salt, key_prefix, name, role, team_id, scopes,
+                created_at, expires_at, revoked_at, rotation_overlap_until, replacement_key_id,
+                scim_subject_id, owner, principal_id
+            FROM api_keys
+            WHERE TRUE
+        """
+        params: tuple[object, ...] = ()
+        if tenant_id is not None:
+            query += " AND team_id = %s"
+            params = (tenant_id,)
+        query += " ORDER BY created_at DESC"
+        with _tenant_connection(self._pool) as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [self._row_to_key(row) for row in rows]
+
+    def delete_tenant(self, tenant_id: str) -> int:
+        """Permanently remove keys after an explicitly confirmed tenant purge."""
+        with _tenant_connection(self._pool) as conn:
+            cursor = conn.execute("DELETE FROM api_keys WHERE team_id = %s", (tenant_id,))
+            conn.commit()
+            return int(cursor.rowcount)
+
+    def verify(self, raw_key: str) -> ApiKey | None:
+        prefix = raw_key[:12]
+        # Verification is on the hot path for every API-key-authenticated
+        # request. The auth middleware records the request outcome separately;
+        # avoid a stack walk, warning, and signed maintenance-scope audit record
+        # for every prefix lookup while retaining the role-gated DB boundary.
+        with bypass_tenant_rls(audit=False, warn=False):
+            with _maintenance_connection(self._maintenance_pool) as conn:
+                rows = conn.execute(
+                    """SELECT
+                           key_id, key_hash, key_salt, key_prefix, name, role, team_id, scopes,
+                           created_at, expires_at, revoked_at, rotation_overlap_until, replacement_key_id,
+                           scim_subject_id, owner, principal_id
+                       FROM api_keys
+                       WHERE key_prefix = %s""",
+                    (prefix,),
+                ).fetchall()
+        return verify_api_key(raw_key, [self._row_to_key(row) for row in rows])
+
+    def has_keys(self) -> bool:
+        with bypass_tenant_rls():
+            with _maintenance_connection(self._maintenance_pool) as conn:
+                row = conn.execute("SELECT COUNT(*) FROM api_keys WHERE revoked = FALSE").fetchone()
+                return bool(row and row[0] > 0)
+
+
+class PostgresExceptionStore:
+    """PostgreSQL-backed vulnerability exception storage with tenant RLS."""
+
+    def __init__(self, pool: ConnectionPool | None = None) -> None:
+        self._pool = pool or _get_pool()
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        with self._pool.connection() as conn:
+            if not ensure_postgres_schema_version(conn, "exceptions"):
+                return
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS exceptions (
+                    exception_id TEXT PRIMARY KEY,
+                    vuln_id TEXT NOT NULL,
+                    package_name TEXT NOT NULL,
+                    server_name TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    requested_by TEXT NOT NULL DEFAULT '',
+                    approved_by TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL DEFAULT '',
+                    approved_at TEXT NOT NULL DEFAULT '',
+                    revoked_at TEXT NOT NULL DEFAULT '',
+                    team_id TEXT NOT NULL DEFAULT 'default'
+                )
+            """)
+            conn.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'exceptions' AND column_name = 'team_id'
+                    ) THEN
+                        ALTER TABLE exceptions ADD COLUMN team_id TEXT NOT NULL DEFAULT 'default';
+                    END IF;
+                END
+                $$;
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_exc_status ON exceptions(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_exc_team ON exceptions(team_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_exc_vuln ON exceptions(vuln_id)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_exc_team_status_match ON exceptions(team_id, status, vuln_id, package_name, server_name)"
+            )
+            _ensure_tenant_rls(conn, "exceptions", "team_id")
+            conn.commit()
+
+    @staticmethod
+    def _row_to_exception(row: tuple[Any, ...]) -> VulnException:
+        return VulnException(
+            exception_id=row[0],
+            vuln_id=row[1],
+            package_name=row[2],
+            server_name=row[3],
+            reason=row[4],
+            requested_by=row[5],
+            approved_by=row[6],
+            status=ExceptionStatus(row[7]),
+            created_at=row[8],
+            expires_at=row[9],
+            approved_at=row[10],
+            revoked_at=row[11],
+            tenant_id=row[12],
+        )
+
+    def put(self, exc: VulnException) -> None:
+        with _tenant_connection(self._pool) as conn:
+            conn.execute(
+                """INSERT INTO exceptions
+                   (exception_id, vuln_id, package_name, server_name, reason, requested_by, approved_by, status,
+                    created_at, expires_at, approved_at, revoked_at, team_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (exception_id) DO UPDATE SET
+                     vuln_id = EXCLUDED.vuln_id,
+                     package_name = EXCLUDED.package_name,
+                     server_name = EXCLUDED.server_name,
+                     reason = EXCLUDED.reason,
+                     requested_by = EXCLUDED.requested_by,
+                     approved_by = EXCLUDED.approved_by,
+                     status = EXCLUDED.status,
+                     created_at = EXCLUDED.created_at,
+                     expires_at = EXCLUDED.expires_at,
+                     approved_at = EXCLUDED.approved_at,
+                     revoked_at = EXCLUDED.revoked_at,
+                     team_id = EXCLUDED.team_id""",
+                (
+                    exc.exception_id,
+                    exc.vuln_id,
+                    exc.package_name,
+                    exc.server_name,
+                    exc.reason,
+                    exc.requested_by,
+                    exc.approved_by,
+                    exc.status.value,
+                    exc.created_at,
+                    exc.expires_at,
+                    exc.approved_at,
+                    exc.revoked_at,
+                    exc.tenant_id,
+                ),
+            )
+            conn.commit()
+
+    def get(self, exception_id: str, tenant_id: str | None = None) -> VulnException | None:
+        with _tenant_connection(self._pool) as conn:
+            if tenant_id is None:
+                row = conn.execute(
+                    """SELECT exception_id, vuln_id, package_name, server_name, reason, requested_by, approved_by,
+                              status, created_at, expires_at, approved_at, revoked_at, team_id
+                       FROM exceptions
+                       WHERE exception_id = %s""",
+                    (exception_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """SELECT exception_id, vuln_id, package_name, server_name, reason, requested_by, approved_by,
+                              status, created_at, expires_at, approved_at, revoked_at, team_id
+                       FROM exceptions
+                       WHERE exception_id = %s AND team_id = %s""",
+                    (exception_id, tenant_id),
+                ).fetchone()
+            return self._row_to_exception(row) if row else None
+
+    def delete(self, exception_id: str, tenant_id: str | None = None) -> bool:
+        with _tenant_connection(self._pool) as conn:
+            if tenant_id is None:
+                cursor = conn.execute("DELETE FROM exceptions WHERE exception_id = %s", (exception_id,))
+            else:
+                cursor = conn.execute(
+                    "DELETE FROM exceptions WHERE exception_id = %s AND team_id = %s",
+                    (exception_id, tenant_id),
+                )
+            conn.commit()
+            return bool(cursor.rowcount > 0)
+
+    def list_all(self, status: str | None = None, tenant_id: str = "default") -> list[VulnException]:
+        query = """
+            SELECT exception_id, vuln_id, package_name, server_name, reason, requested_by, approved_by,
+                   status, created_at, expires_at, approved_at, revoked_at, team_id
+            FROM exceptions
+            WHERE team_id = %s
+        """
+        params: list[object] = [tenant_id]
+        if status:
+            query += " AND status = %s"
+            params.append(status)
+        query += " ORDER BY created_at DESC"
+        with _tenant_connection(self._pool) as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+            return [self._row_to_exception(row) for row in rows]
+
+    def find_matching(self, vuln_id: str, package_name: str, server_name: str = "", tenant_id: str = "default") -> VulnException | None:
+        active = self.list_all(status="active", tenant_id=tenant_id)
+        approved = self.list_all(status="approved", tenant_id=tenant_id)
+        for exc in active + approved:
+            if exc.matches(vuln_id, package_name, server_name):
+                return exc
+        return None

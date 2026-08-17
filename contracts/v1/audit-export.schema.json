@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-bom.dev/contracts/v1/audit-export.schema.json",
+  "title": "agent-bom audit export v1",
+  "type": "object",
+  "required": ["tenant_id", "exported_at", "filters", "entries", "integrity"],
+  "properties": {
+    "tenant_id": { "type": "string", "minLength": 1 },
+    "exported_at": { "type": "string", "format": "date-time" },
+    "filters": {
+      "type": "object",
+      "properties": {
+        "action": { "type": ["string", "null"] },
+        "resource": { "type": ["string", "null"] },
+        "since": { "type": ["string", "null"] },
+        "limit": { "type": "integer", "minimum": 0 },
+        "offset": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["entry_id", "timestamp", "action", "actor", "resource", "details", "prev_signature", "hmac_signature"],
+        "properties": {
+          "entry_id": { "type": "string", "minLength": 1 },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "action": { "type": "string", "minLength": 1 },
+          "actor": { "type": "string" },
+          "resource": { "type": "string" },
+          "details": { "type": "object" },
+          "prev_signature": { "type": "string", "pattern": "^$|^[a-f0-9]{64}$" },
+          "hmac_signature": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "integrity": {
+      "type": "object",
+      "required": ["verified", "tampered", "checked"],
+      "properties": {
+        "verified": { "type": "integer", "minimum": 0 },
+        "tampered": { "type": "integer", "minimum": 0 },
+        "checked": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

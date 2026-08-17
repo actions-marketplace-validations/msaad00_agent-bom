@@ -1,4 +1,4 @@
-"""SAST scanning via Semgrep — static analysis for source code.
+"""SAST scanning via Semgrep or SARIF import for source code.
 
 Runs Semgrep with SARIF output, normalizes findings into the agent-bom
 data model (Package + Vulnerability objects), and provides structured
@@ -12,7 +12,8 @@ Usage::
     from agent_bom.sast import scan_code, SASTScanError
     packages, sast_result = scan_code("/path/to/project")
 
-If Semgrep is not installed, raises SASTScanError with install guidance.
+If Semgrep is not installed, direct scans raise SASTScanError with install
+guidance. Existing SARIF files can be imported without Semgrep.
 """
 
 from __future__ import annotations
@@ -23,16 +24,50 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
 from agent_bom.models import Package, Severity, Vulnerability
+from agent_bom.parsers.sarif import SarifValidationError, normalize_sarif_document
 
 _logger = logging.getLogger(__name__)
 
+_LOCAL_SAST_CONFIG_CANDIDATES = (
+    ".agent-bom/rules",
+    ".agent-bom/rules.yaml",
+    ".agent-bom/rules.yml",
+    ".agent-bom/sast-rules",
+    ".agent-bom/sast-rules.yaml",
+    ".agent-bom/sast-rules.yml",
+    ".semgrep",
+    ".semgrep.yaml",
+    ".semgrep.yml",
+)
+
+
+class SASTExecutionStatus(str, Enum):
+    """Typed outcome persisted for every SAST execution attempt."""
+
+    FINDINGS = "findings"
+    CLEAN = "clean"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
 
 class SASTScanError(Exception):
-    """Raised when SAST scanning fails."""
+    """Raised when SAST scanning cannot produce a complete result."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        execution_status: SASTExecutionStatus = SASTExecutionStatus.FAILED,
+        reason_code: str = "scan_failed",
+    ) -> None:
+        super().__init__(message)
+        self.execution_status = execution_status
+        self.reason_code = reason_code
 
 
 # ── Data models ─────────────────────────────────────────────────────────────
@@ -54,6 +89,10 @@ class SASTFinding:
     owasp_ids: list[str] = field(default_factory=list)
     rule_url: Optional[str] = None
     snippet: Optional[str] = None
+    tool_name: str = "external"
+    security_severity: float | None = None
+    fingerprints: dict[str, str] = field(default_factory=dict)
+    partial_fingerprints: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -66,6 +105,10 @@ class SASTResult:
     scan_time_seconds: float = 0.0
     semgrep_version: Optional[str] = None
     config_used: str = "auto"
+    execution_status: SASTExecutionStatus | None = None
+    status_reason: str | None = None
+    status_detail: str | None = None
+    scanner_driver_id: str = "sast-semgrep"
 
     @property
     def total_findings(self) -> int:
@@ -81,7 +124,12 @@ class SASTResult:
 
     def to_dict(self) -> dict:
         """Serialize for AIBOMReport.sast_data."""
+        execution_status = self.execution_status or (SASTExecutionStatus.FINDINGS if self.findings else SASTExecutionStatus.CLEAN)
         return {
+            "scanner_driver_id": self.scanner_driver_id,
+            "execution_status": execution_status.value,
+            "status_reason": self.status_reason,
+            "status_detail": self.status_detail,
             "total_findings": self.total_findings,
             "files_scanned": self.files_scanned,
             "rules_loaded": self.rules_loaded,
@@ -106,6 +154,10 @@ class SASTResult:
                     "owasp_ids": f.owasp_ids,
                     "rule_url": f.rule_url,
                     "snippet": f.snippet,
+                    "tool_name": f.tool_name,
+                    "security_severity": f.security_severity,
+                    "fingerprints": f.fingerprints,
+                    "partial_fingerprints": f.partial_fingerprints,
                 }
                 for f in self.findings
             ],
@@ -129,6 +181,11 @@ def _semgrep_available() -> bool:
     return shutil.which("semgrep") is not None
 
 
+def _is_sarif_input(path: Path) -> bool:
+    name = path.name.lower()
+    return name.endswith(".sarif") or name.endswith(".sarif.json")
+
+
 def _get_semgrep_version() -> Optional[str]:
     try:
         result = subprocess.run(
@@ -138,75 +195,146 @@ def _get_semgrep_version() -> Optional[str]:
             timeout=10,
         )
         return result.stdout.strip() if result.returncode == 0 else None
-    except Exception as exc:  # noqa: BLE001
-        _logger.debug("Could not determine semgrep version: %s", exc)
+    except Exception:  # noqa: BLE001
+        _logger.debug("Could not determine Semgrep version")
         return None
 
 
+def _discover_local_sast_configs(scan_root: Path) -> list[str]:
+    search_roots = [scan_root]
+    home_root = Path.home()
+    if home_root not in search_roots:
+        search_roots.append(home_root)
+
+    discovered: list[str] = []
+    seen: set[Path] = set()
+    for root in search_roots:
+        for candidate in _LOCAL_SAST_CONFIG_CANDIDATES:
+            path = (root / candidate).expanduser()
+            if not path.exists():
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            discovered.append(str(resolved))
+    return discovered
+
+
+def _offline_config_error(*, no_local_config: bool = False) -> SASTScanError:
+    reason_code = "offline_no_local_config" if no_local_config else "offline_remote_config"
+    return SASTScanError(
+        "Offline SAST requires an explicit local Semgrep rule file or directory.",
+        execution_status=SASTExecutionStatus.SKIPPED,
+        reason_code=reason_code,
+    )
+
+
+def _resolve_sast_configs(scan_target: Path, config: str, *, offline: bool = False) -> list[str]:
+    project_root = scan_target if scan_target.is_dir() else scan_target.parent
+    normalized = config.strip()
+
+    if normalized in {"default", ""}:
+        local_configs = _discover_local_sast_configs(project_root)
+        if offline:
+            if not local_configs:
+                raise _offline_config_error(no_local_config=True)
+            return local_configs
+        return [*local_configs, "auto"] if local_configs else ["auto"]
+    if normalized == "auto":
+        if offline:
+            raise _offline_config_error()
+        return ["auto"]
+
+    resolved_configs: list[str] = []
+    for raw_part in normalized.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if part.startswith(("http://", "https://", "ftp://")):
+            raise SASTScanError(
+                "Remote semgrep config URLs are not allowed. Use 'auto', 'default', "
+                "'p/<ruleset>', a local file path, or ~/.agent-bom/rules/."
+            )
+        if part == "default":
+            resolved_configs.extend(_resolve_sast_configs(scan_target, "default", offline=offline))
+            continue
+        if part == "auto" or part.startswith("p/"):
+            if offline:
+                raise _offline_config_error()
+            resolved_configs.append(part)
+            continue
+
+        config_path = Path(part).expanduser()
+        if not config_path.is_absolute():
+            project_relative = (project_root / config_path).resolve()
+            cwd_relative = (Path.cwd() / config_path).resolve()
+            if project_relative.exists():
+                config_path = project_relative
+            elif cwd_relative.exists():
+                config_path = cwd_relative
+        if config_path.exists():
+            resolved_configs.append(str(config_path.resolve()))
+            continue
+
+        raise SASTScanError(f"SAST config does not exist: {part}")
+
+    deduped: list[str] = []
+    seen_parts: set[str] = set()
+    for part in resolved_configs:
+        if part in seen_parts:
+            continue
+        seen_parts.add(part)
+        deduped.append(part)
+    if not deduped and offline:
+        raise _offline_config_error(no_local_config=True)
+    return deduped or ["auto"]
+
+
 def _parse_sarif_findings(sarif: dict) -> tuple[list[SASTFinding], int, int]:
-    """Parse Semgrep SARIF output into SASTFinding objects.
+    """Project canonical SARIF records into SASTFinding objects.
 
     Returns (findings, rules_loaded, files_scanned).
     """
+    document = normalize_sarif_document(sarif)
     findings: list[SASTFinding] = []
-    files_seen: set[str] = set()
-    rules_loaded = 0
-
-    for run in sarif.get("runs", []):
-        driver = run.get("tool", {}).get("driver", {})
-        rules = {r["id"]: r for r in driver.get("rules", [])}
-        rules_loaded = max(rules_loaded, len(rules))
-
-        for result in run.get("results", []):
-            rule_id = result.get("ruleId", "unknown")
-            level = result.get("level", "warning")
-            message = result.get("message", {}).get("text", "")
-
-            # Extract location
-            locations = result.get("locations", [])
-            if not locations:
-                continue
-            loc = locations[0].get("physicalLocation", {})
-            artifact = loc.get("artifactLocation", {}).get("uri", "")
-            region = loc.get("region", {})
-            start_line = region.get("startLine", 0)
-            end_line = region.get("endLine", start_line)
-            start_col = region.get("startColumn", 0)
-            end_col = region.get("endColumn", 0)
-            snippet_obj = region.get("snippet", {})
-            snippet = snippet_obj.get("text") if snippet_obj else None
-
-            files_seen.add(artifact)
-
-            severity = _SARIF_LEVEL_MAP.get(level, Severity.UNKNOWN)
-
-            # Extract CWE IDs and OWASP tags from rule metadata
-            rule_meta = rules.get(rule_id, {})
-            rule_props = rule_meta.get("properties", {})
-            tags = rule_props.get("tags", [])
-            cwe_ids = [t for t in tags if t.upper().startswith("CWE-")]
-            owasp_ids = [t for t in tags if ":" in t and t[0] == "A"]
-
-            rule_url = rule_meta.get("helpUri")
-
-            findings.append(
-                SASTFinding(
-                    rule_id=rule_id,
-                    message=message[:500],
-                    severity=severity,
-                    file_path=artifact,
-                    start_line=start_line,
-                    end_line=end_line,
-                    start_col=start_col,
-                    end_col=end_col,
-                    cwe_ids=cwe_ids,
-                    owasp_ids=owasp_ids,
-                    rule_url=rule_url,
-                    snippet=snippet[:200] if snippet else None,
-                )
+    for result in document.results:
+        location = result.location
+        level_severity = _SARIF_LEVEL_MAP.get(result.level or "warning", Severity.UNKNOWN)
+        if result.security_severity is None:
+            severity = level_severity
+        elif result.security_severity >= 9.0:
+            severity = Severity.CRITICAL
+        elif result.security_severity >= 7.0:
+            severity = Severity.HIGH
+        elif result.security_severity >= 4.0:
+            severity = Severity.MEDIUM
+        elif result.security_severity > 0:
+            severity = Severity.LOW
+        else:
+            severity = Severity.NONE
+        findings.append(
+            SASTFinding(
+                rule_id=result.rule_id or "unknown",
+                message=(result.message or result.rule_full_description or result.rule_short_description)[:500],
+                severity=severity,
+                file_path=location.uri if location is not None else "unknown",
+                start_line=location.start_line if location is not None else 0,
+                end_line=location.end_line if location is not None else 0,
+                start_col=location.start_column if location is not None else 0,
+                end_col=location.end_column if location is not None else 0,
+                cwe_ids=[tag for tag in result.rule_tags if tag.upper().startswith("CWE-")],
+                owasp_ids=[tag for tag in result.rule_tags if ":" in tag and tag.startswith("A")],
+                rule_url=result.rule_url,
+                snippet=(location.snippet[:200] if location and location.snippet else None),
+                tool_name=result.tool_name,
+                security_severity=result.security_severity,
+                fingerprints=dict(result.fingerprints),
+                partial_fingerprints=dict(result.partial_fingerprints),
             )
+        )
 
-    return findings, rules_loaded, len(files_seen)
+    return findings, document.rules_loaded, document.files_scanned
 
 
 def _findings_to_packages(findings: list[SASTFinding]) -> list[Package]:
@@ -226,7 +354,7 @@ def _findings_to_packages(findings: list[SASTFinding]) -> list[Package]:
         vulns: list[Vulnerability] = []
         seen_ids: set[str] = set()
         for finding in file_finds:
-            vid = f"{finding.rule_id}:{finding.start_line}"
+            vid = f"{finding.tool_name}:{finding.rule_id}:{finding.start_line}"
             if vid in seen_ids:
                 continue
             seen_ids.add(vid)
@@ -237,6 +365,7 @@ def _findings_to_packages(findings: list[SASTFinding]) -> list[Package]:
                     summary=finding.message,
                     severity=finding.severity,
                     cwe_ids=finding.cwe_ids,
+                    cvss_score=finding.security_severity,
                     references=[finding.rule_url] if finding.rule_url else [],
                 )
             )
@@ -255,6 +384,37 @@ def _findings_to_packages(findings: list[SASTFinding]) -> list[Package]:
     return packages
 
 
+def _import_sarif(path: Path) -> tuple[list[Package], SASTResult]:
+    start = time.monotonic()
+    try:
+        sarif = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise SASTScanError(f"could not read SARIF file {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SASTScanError(f"invalid SARIF file {path}") from exc
+
+    try:
+        findings, rules_loaded, files_scanned = _parse_sarif_findings(sarif)
+    except SarifValidationError as exc:
+        raise SASTScanError(f"invalid SARIF file {path}") from exc
+    packages = _findings_to_packages(findings)
+    result = SASTResult(
+        findings=findings,
+        files_scanned=files_scanned,
+        rules_loaded=rules_loaded,
+        scan_time_seconds=round(time.monotonic() - start, 2),
+        semgrep_version=None,
+        config_used="sarif-import",
+    )
+    _logger.info(
+        "Imported SARIF SAST results: %d finding(s) in %d file(s) from %s",
+        result.total_findings,
+        files_scanned,
+        path,
+    )
+    return packages, result
+
+
 # ── Public API ──────────────────────────────────────────────────────────────
 
 
@@ -262,14 +422,20 @@ def scan_code(
     path: str,
     config: str = "auto",
     timeout: int = 600,
+    *,
+    offline: bool = False,
 ) -> tuple[list[Package], SASTResult]:
-    """Run Semgrep SAST scan on source code.
+    """Run Semgrep SAST scan on source code or import a SARIF file.
 
     Args:
-        path: Directory or file to scan.
-        config: Semgrep config (default ``"auto"`` = Semgrep Registry).
-                Can be a path to custom rules YAML or registry string.
+        path: Directory or file to scan, or an existing ``.sarif`` / ``.sarif.json`` file.
+        config: Semgrep config selection. ``"auto"`` uses the Semgrep registry.
+                ``"default"`` prefers local rule bundles when present and falls
+                back to ``auto``. Can also be a local file/directory, a
+                ``p/<ruleset>`` registry ref, or a comma-separated list.
         timeout: Subprocess timeout in seconds.
+        offline: Require local Semgrep rules and prohibit registry-backed
+                 ``auto`` / ``p/<ruleset>`` configurations.
 
     Returns:
         Tuple of (packages_with_vulns, structured_sast_result).
@@ -277,29 +443,30 @@ def scan_code(
     Raises:
         SASTScanError: If Semgrep is not installed or scan fails.
     """
+    resolved = Path(path).resolve()
+    if _is_sarif_input(resolved):
+        if not resolved.exists():
+            raise SASTScanError(f"Path does not exist: {path}")
+        return _import_sarif(resolved)
+
     if not _semgrep_available():
         raise SASTScanError(
-            "semgrep not found on PATH. Install with: pip install semgrep (or see https://semgrep.dev/docs/getting-started/)"
+            "semgrep not found on PATH. Install with: pip install semgrep (or see https://semgrep.dev/docs/getting-started/)",
+            execution_status=SASTExecutionStatus.SKIPPED,
+            reason_code="semgrep_unavailable",
         )
 
-    resolved = Path(path).resolve()
     if not resolved.exists():
         raise SASTScanError(f"Path does not exist: {path}")
 
-    # Validate config: only allow safe values (no URLs that could exfiltrate code)
-    if config.startswith(("http://", "https://", "ftp://")):
-        raise SASTScanError("Remote semgrep config URLs are not allowed. Use 'auto', 'p/<ruleset>', or a local file path.")
+    resolved_configs = _resolve_sast_configs(resolved, config, offline=offline)
 
     start = time.monotonic()
 
-    cmd = [
-        "semgrep",
-        "--sarif",
-        "--config",
-        config,
-        "--quiet",
-        str(resolved),
-    ]
+    cmd = ["semgrep", "--sarif"]
+    for resolved_config in resolved_configs:
+        cmd.extend(["--config", resolved_config])
+    cmd.extend(["--quiet", str(resolved)])
 
     _logger.info("Running SAST scan: %s", " ".join(cmd))
 
@@ -318,17 +485,29 @@ def scan_code(
     # Semgrep exit codes: 0 = clean, 1 = findings found (both are success)
     # Exit code 2+ = actual error
     if result.returncode > 1:
-        stderr = result.stderr.strip()
-        raise SASTScanError(f"semgrep exited {result.returncode}: {stderr[:300]}")
+        _logger.warning("Semgrep exited with a scanner error (code %d)", result.returncode)
+        raise SASTScanError(
+            f"semgrep exited {result.returncode}",
+            reason_code="semgrep_failed",
+        )
 
     try:
         sarif = json.loads(result.stdout)
-    except json.JSONDecodeError as e:
-        raise SASTScanError(f"semgrep produced invalid SARIF output: {e}")
+    except json.JSONDecodeError as exc:
+        raise SASTScanError(
+            "semgrep produced invalid SARIF output",
+            reason_code="invalid_semgrep_output",
+        ) from exc
 
     elapsed = time.monotonic() - start
 
-    findings, rules_loaded, files_scanned = _parse_sarif_findings(sarif)
+    try:
+        findings, rules_loaded, files_scanned = _parse_sarif_findings(sarif)
+    except SarifValidationError as exc:
+        raise SASTScanError(
+            "semgrep produced structurally invalid SARIF output",
+            reason_code="invalid_semgrep_output",
+        ) from exc
     packages = _findings_to_packages(findings)
 
     sast_result = SASTResult(
@@ -337,7 +516,7 @@ def scan_code(
         rules_loaded=rules_loaded,
         scan_time_seconds=round(elapsed, 2),
         semgrep_version=_get_semgrep_version(),
-        config_used=config,
+        config_used=",".join(resolved_configs),
     )
 
     _logger.info(

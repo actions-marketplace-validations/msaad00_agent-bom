@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import json
 from unittest.mock import MagicMock
 
 import pytest
+from rich.console import Console
 
 from agent_bom.policy import (
     _rule_matches,
@@ -114,6 +116,16 @@ def test_load_policy_invalid_json(tmp_path):
         load_policy(str(path))
 
 
+def test_load_policy_invalid_yaml(tmp_path):
+    """Malformed YAML raises ValueError instead of leaking a parser exception."""
+    pytest.importorskip("yaml")
+    path = tmp_path / "bad.yaml"
+    path.write_text("rules:\n  - id: [unterminated\n")
+
+    with pytest.raises(ValueError, match="Invalid YAML"):
+        load_policy(str(path))
+
+
 # ---------------------------------------------------------------------------
 # _validate_policy
 # ---------------------------------------------------------------------------
@@ -192,6 +204,36 @@ def test_validate_policy_valid_fields_pass():
                     "max_epss_score": 0.7,
                     "ecosystem": "pypi",
                     "is_kev": True,
+                }
+            ]
+        }
+    )
+
+
+def test_validate_policy_rejects_unknown_expression_field():
+    """A misspelled expression field must fail at load time, never disable a rule."""
+    with pytest.raises(ValueError, match="Unknown field.*graph_rechable"):
+        _validate_policy(
+            {
+                "rules": [
+                    {
+                        "id": "reachable-critical",
+                        "condition": "graph_rechable == true",
+                        "action": "fail",
+                    }
+                ]
+            }
+        )
+
+
+def test_validate_policy_accepts_graph_reachability_condition():
+    _validate_policy(
+        {
+            "rules": [
+                {
+                    "id": "reachable-critical",
+                    "condition": "graph_reachable == true and severity >= HIGH",
+                    "action": "fail",
                 }
             ]
         }
@@ -373,6 +415,64 @@ def test_evaluate_policy_warnings_and_passed():
     assert result["warnings"][0]["rule_id"] == "warn-medium"
     assert result["warnings"][0]["severity"] == "high"
     assert result["warnings"][0]["package"] == "example-pkg@1.0.0"
+
+
+def test_policy_fail_action_sets_scan_exit_code(tmp_path):
+    """A matching action=fail policy must make the scan gate fail."""
+    from agent_bom.cli.agents._context import ScanContext
+    from agent_bom.cli.agents._post import compute_exit_code, run_integrations
+
+    policy = tmp_path / "policy.json"
+    policy.write_text(
+        json.dumps({"rules": [{"id": "fail-high", "severity_gte": "HIGH", "action": "fail"}]}),
+        encoding="utf-8",
+    )
+    br = _make_blast_radius(severity="high")
+    ctx = ScanContext(
+        con=Console(file=io.StringIO(), force_terminal=False),
+        blast_radii=[br],
+        report=None,
+    )
+
+    run_integrations(
+        ctx,
+        quiet=True,
+        jira_url=None,
+        jira_user=None,
+        jira_token=None,
+        jira_project=None,
+        slack_webhook=None,
+        jira_discover=False,
+        servicenow_flag=False,
+        servicenow_instance=None,
+        servicenow_token=None,
+        slack_discover=False,
+        slack_bot_token=None,
+        vanta_token=None,
+        drata_token=None,
+        siem_type=None,
+        siem_url=None,
+        siem_token=None,
+        siem_index=None,
+        siem_format="json",
+        clickhouse_url=None,
+        policy=str(policy),
+    )
+
+    assert ctx.policy_passed is False
+    assert (
+        compute_exit_code(
+            ctx,
+            fail_on_severity=None,
+            warn_on_severity=None,
+            fail_on_kev=False,
+            fail_if_ai_risk=False,
+            push_url=None,
+            push_api_key=None,
+            quiet=True,
+        )
+        == 1
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -563,8 +663,15 @@ class TestExpressionInRuleMatches:
         br2.risk_score = 3.0
         assert _rule_matches(rule, br2) is False
 
-    def test_invalid_expression_fails_safe(self):
+    def test_invalid_expression_cannot_silently_disable_rule(self):
         rule = {"id": "test", "condition": "@@invalid@@", "action": "fail"}
         br = _make_blast_radius()
-        # Invalid expression = doesn't match (fail-safe, not fail-open)
-        assert _rule_matches(rule, br) is False
+        with pytest.raises(ValueError, match="Invalid token"):
+            _rule_matches(rule, br)
+
+    @pytest.mark.parametrize(("reachable", "expected"), [(True, True), (False, False), (None, False)])
+    def test_graph_reachable_condition(self, reachable, expected):
+        rule = {"id": "reachable", "condition": "graph_reachable == true", "action": "fail"}
+        br = _make_blast_radius()
+        br.graph_reachable = reachable
+        assert _rule_matches(rule, br) is expected

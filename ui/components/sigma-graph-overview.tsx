@@ -1,0 +1,306 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import type Sigma from "sigma";
+import type { Edge, Node } from "@xyflow/react";
+import { Activity, GitBranch, Layers3, Network, ShieldAlert, Sparkles } from "lucide-react";
+
+import { GraphLegend } from "@/components/graph-chrome";
+import { GraphTextAlternative } from "@/components/graph-text-alternative";
+import type { LineageNodeData } from "@/components/lineage-nodes";
+import { useGraphCanvasPalette } from "@/lib/graph-canvas-theme";
+import type { LegendItem } from "@/lib/graph-utils";
+import type { UnifiedGraphData } from "@/lib/graph-schema";
+import type { UnifiedGraphFlowFilters } from "@/lib/unified-graph-flow";
+import { useCaptureMode } from "@/lib/use-capture-mode";
+import {
+  LARGE_GRAPH_OVERVIEW_EDGE_THRESHOLD,
+  LARGE_GRAPH_OVERVIEW_MAX_RENDERED_EDGES,
+  LARGE_GRAPH_OVERVIEW_MAX_RENDERED_NODES,
+  LARGE_GRAPH_OVERVIEW_NODE_THRESHOLD,
+} from "@/lib/large-graph-overview";
+import {
+  buildSigmaGraphOverviewModel,
+  buildSigmaGraphOverviewModelFromUnifiedGraph,
+  type SigmaEdgeAttributes,
+  type SigmaNodeAttributes,
+} from "@/lib/sigma-graph-overview";
+
+type SigmaGraphOverviewProps = {
+  legendItems: LegendItem[];
+  onNodeSelect?: (nodeId: string) => void;
+} & (
+  {
+    nodes: Node<LineageNodeData>[];
+    edges: Edge[];
+    graph?: never;
+    filters?: never;
+  }
+  | {
+      graph: UnifiedGraphData;
+      filters?: UnifiedGraphFlowFilters;
+      nodes?: never;
+      edges?: never;
+    }
+);
+
+function StatPill({
+  icon: Icon,
+  label,
+  value,
+  tone = "zinc",
+}: {
+  icon: typeof Network;
+  label: string;
+  value: string;
+  tone?: "zinc" | "red" | "amber" | "emerald";
+}) {
+  const toneClass = {
+    zinc: "border-[var(--border-subtle)] bg-[var(--background)]/70 text-[var(--text-secondary)]",
+    red: "border-red-500/30 bg-red-500/10 dark:bg-red-950/25 text-red-800 dark:text-red-100",
+    amber: "border-amber-500/30 bg-amber-500/10 dark:bg-amber-950/25 text-amber-800 dark:text-amber-100",
+    emerald: "border-emerald-500/30 bg-emerald-500/10 dark:bg-emerald-950/25 text-emerald-800 dark:text-emerald-100",
+  }[tone];
+
+  return (
+    <div className={`flex min-w-0 items-center gap-2 rounded-lg border px-2.5 py-2 ${toneClass}`}>
+      <Icon className="h-4 w-4 shrink-0" />
+      <span className="min-w-0 truncate text-[11px] uppercase tracking-[0.14em] text-[var(--text-tertiary)]">{label}</span>
+      <span className="ml-auto shrink-0 font-mono text-sm font-semibold">{value}</span>
+    </div>
+  );
+}
+
+function RelationshipRail({ items }: { items: Array<{ relationship: string; count: number }> }) {
+  if (items.length === 0) return null;
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-2">
+      {items.map((item) => (
+        <span
+          key={item.relationship}
+          className="inline-flex items-center gap-1.5 rounded-full border border-[var(--border-subtle)] bg-[var(--background)]/75 px-2.5 py-1 text-[11px] text-[var(--text-secondary)]"
+        >
+          <span className="max-w-36 truncate" title={item.relationship}>
+            {item.relationship.replace(/_/g, " ")}
+          </span>
+          <span className="font-mono text-[var(--text-tertiary)]">{item.count}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+export function SigmaGraphOverview({
+  graph,
+  filters,
+  nodes,
+  edges,
+  legendItems,
+  onNodeSelect,
+}: SigmaGraphOverviewProps) {
+  const captureMode = useCaptureMode();
+  const palette = useGraphCanvasPalette();
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const rendererRef = useRef<Sigma<SigmaNodeAttributes, SigmaEdgeAttributes> | null>(null);
+  const selectedNodeIdRef = useRef<string | null>(null);
+  const onNodeSelectRef = useRef<SigmaGraphOverviewProps["onNodeSelect"]>(onNodeSelect);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [renderError, setRenderError] = useState<string | null>(null);
+  const model = useMemo(
+    () =>
+      graph
+        ? buildSigmaGraphOverviewModelFromUnifiedGraph(graph, filters)
+        : buildSigmaGraphOverviewModel(nodes, edges),
+    [edges, filters, graph, nodes],
+  );
+  const isBudgeted = model.overview.omittedNodeCount > 0 || model.overview.omittedEdgeCount > 0;
+
+  useEffect(() => {
+    selectedNodeIdRef.current = selectedNodeId;
+    rendererRef.current?.refresh();
+  }, [selectedNodeId]);
+
+  useEffect(() => {
+    onNodeSelectRef.current = onNodeSelect;
+  }, [onNodeSelect]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    let renderer: Sigma<SigmaNodeAttributes, SigmaEdgeAttributes> | null = null;
+    let alive = true;
+
+    const start = async () => {
+      try {
+        const { default: SigmaRenderer } = await import("sigma");
+        if (!alive || !containerRef.current) return;
+        renderer = new SigmaRenderer(model.graph, container, {
+          allowInvalidContainer: true,
+          autoCenter: true,
+          autoRescale: true,
+          defaultEdgeColor: palette.defaultEdge,
+          defaultNodeColor: palette.defaultNode,
+          enableEdgeEvents: false,
+          hideEdgesOnMove: true,
+          hideLabelsOnMove: true,
+          itemSizesReference: "positions",
+          labelColor: { color: palette.label },
+          // Label level-of-detail. The grid keeps at most a handful of labels
+          // per cell so they never overlap into a smear; the size threshold
+          // surfaces the largest / highest-signal nodes first and lets the rest
+          // appear as the user zooms in (rendered size grows) or hovers a node.
+          labelDensity: 0.08,
+          labelFont: "Inter, ui-sans-serif, system-ui, sans-serif",
+          labelGridCellSize: 170,
+          labelRenderedSizeThreshold: 6,
+          labelSize: 11,
+          minCameraRatio: 0.04,
+          maxCameraRatio: 4,
+          minEdgeThickness: 0.35,
+          renderEdgeLabels: false,
+          renderLabels: true,
+          stagePadding: 36,
+          zIndex: true,
+          nodeReducer: (node, data) => {
+            const selected = selectedNodeIdRef.current === node;
+            const dimmedBySelection = selectedNodeIdRef.current !== null && !selected;
+            return {
+              ...data,
+              color: selected ? palette.selected : data.color,
+              forceLabel: selected || data.forceLabel,
+              hidden: data.hidden,
+              highlighted: selected || data.highlighted,
+              size: selected ? data.size * 1.65 : data.size,
+              zIndex: selected ? 4 : data.zIndex,
+              ...(dimmedBySelection ? { color: palette.dimmed } : {}),
+            };
+          },
+          edgeReducer: (_edge, data) => {
+            const selected = selectedNodeIdRef.current;
+            const selectedEdge = selected
+              ? model.graph.source(_edge) === selected || model.graph.target(_edge) === selected
+              : false;
+            return {
+              ...data,
+              color: selectedEdge ? data.color : selected ? palette.dimmed : data.color,
+              hidden: data.hidden,
+              size: selectedEdge ? data.size * 2.3 : data.size,
+              zIndex: selectedEdge ? 3 : data.zIndex,
+            };
+          },
+        });
+        rendererRef.current = renderer;
+        renderer.on("clickNode", ({ node }) => {
+          setSelectedNodeId(node);
+          onNodeSelectRef.current?.(node);
+        });
+        renderer.on("clickStage", () => {
+          setSelectedNodeId(null);
+        });
+        renderer.getCamera().setState({ ratio: 1.05 });
+        renderer.refresh();
+        setRenderError(null);
+      } catch (error) {
+        if (!alive) return;
+        setRenderError(error instanceof Error ? error.message : "WebGL graph renderer failed to initialize.");
+      }
+    };
+
+    void start();
+
+    return () => {
+      alive = false;
+      renderer?.kill();
+      rendererRef.current = null;
+      container.replaceChildren();
+    };
+  }, [model, palette]);
+
+  return (
+    <div
+      className="flex h-full min-h-[72vh] flex-col overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] shadow-2xl shadow-black/30"
+      data-testid="sigma-graph-overview"
+    >
+      <div className="border-b border-[var(--border-subtle)] bg-[var(--background)]/95 p-3">
+        <div className="flex min-w-0 flex-col gap-1 sm:flex-row sm:flex-wrap sm:items-center sm:gap-2">
+          <span className="inline-flex w-fit shrink-0 items-center gap-2 rounded-full border border-emerald-500/30 bg-emerald-500/10 dark:bg-emerald-950/25 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-emerald-700 dark:text-emerald-200">
+            <Sparkles className="h-3.5 w-3.5" />
+            WebGL graph overview
+          </span>
+          <span className="min-w-0 text-xs leading-snug text-[var(--text-tertiary)] sm:min-w-[12rem] sm:flex-1">
+            Sigma.js renderer for broad estate scans; focused investigations still use React Flow.
+          </span>
+        </div>
+        <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-[var(--text-tertiary)]">
+          <span>
+            Renders broad estates at {LARGE_GRAPH_OVERVIEW_NODE_THRESHOLD.toLocaleString()} nodes or{" "}
+            {LARGE_GRAPH_OVERVIEW_EDGE_THRESHOLD.toLocaleString()} edges; labels resolve on zoom and hover.
+          </span>
+          <span>
+            Draw budget: {model.overview.nodes.length.toLocaleString()}/{model.overview.sourceNodeCount.toLocaleString()} nodes,{" "}
+            {model.overview.edges.length.toLocaleString()}/{model.overview.sourceEdgeCount.toLocaleString()} edges.
+          </span>
+          {isBudgeted && (
+            <span className="text-amber-700 dark:text-amber-300">
+              Lower-signal items are omitted from this overview; use search, filters, or drill-in for exact detail.
+            </span>
+          )}
+        </div>
+        <div className="mt-2">
+          <RelationshipRail items={model.summary.topRelationships} />
+        </div>
+        <div className="mt-3 grid grid-cols-2 gap-2 lg:grid-cols-5">
+          <StatPill icon={Layers3} label="Nodes" value={model.summary.nodes.toLocaleString()} tone="emerald" />
+          <StatPill icon={GitBranch} label="Edges" value={model.summary.edges.toLocaleString()} />
+          <StatPill icon={ShieldAlert} label="Findings" value={model.summary.findings.toLocaleString()} tone="amber" />
+          <StatPill icon={ShieldAlert} label="Critical" value={model.summary.criticalFindings.toLocaleString()} tone="red" />
+          <StatPill icon={Activity} label="Creds/tools" value={`${model.summary.credentials}/${model.summary.tools}`} />
+        </div>
+      </div>
+
+      <div className="relative min-h-0 flex-1 bg-[var(--background)]">
+        <div
+          ref={containerRef}
+          className="h-full min-h-[58vh] w-full"
+          role="img"
+          aria-label="WebGL security graph overview"
+          aria-describedby="sigma-graph-overview-text"
+          data-testid="sigma-graph-overview-canvas"
+        />
+        <GraphTextAlternative
+          id="sigma-graph-overview-text"
+          renderer="WebGL graph overview"
+          model={model.overview}
+          summary={model.summary}
+        />
+        {renderError && (
+          <div className="absolute inset-4 flex items-center justify-center rounded-xl border border-red-500/30 bg-red-500/10 dark:bg-red-950/30 p-4 text-sm text-red-800 dark:text-red-100">
+            WebGL renderer unavailable: {renderError}
+          </div>
+        )}
+        <div className="pointer-events-auto absolute right-3 top-3 max-w-[min(30rem,calc(100vw-2rem))]">
+          <details className="rounded-xl border border-[var(--border-subtle)] bg-[var(--background)]/85 p-2 backdrop-blur">
+            <summary className="cursor-pointer list-none text-[10px] uppercase tracking-[0.18em] text-[var(--text-secondary)] [&::-webkit-details-marker]:hidden">
+              Legend
+            </summary>
+            <div className="mt-2">
+              <GraphLegend items={legendItems} embedded />
+            </div>
+          </details>
+        </div>
+        {!captureMode && (
+        <div className="pointer-events-none absolute bottom-3 left-3 max-w-[min(34rem,calc(100vw-2rem))] rounded-xl border border-[color:var(--border-subtle)] bg-[color:var(--surface-elevated)]/90 px-3 py-2 text-xs text-[color:var(--text-secondary)] backdrop-blur">
+          WebGL mode supports pan, zoom, node selection, server-side search, filters, and selected-node detail.
+          React Flow-only affordances return after narrowing the graph below{" "}
+          {LARGE_GRAPH_OVERVIEW_NODE_THRESHOLD.toLocaleString()} nodes / {LARGE_GRAPH_OVERVIEW_EDGE_THRESHOLD.toLocaleString()} edges
+          or entering a bounded drill-in.
+          <span className="sr-only">
+            Maximum overview draw budget is {LARGE_GRAPH_OVERVIEW_MAX_RENDERED_NODES.toLocaleString()} nodes and{" "}
+            {LARGE_GRAPH_OVERVIEW_MAX_RENDERED_EDGES.toLocaleString()} edges.
+          </span>
+        </div>
+        )}
+      </div>
+    </div>
+  );
+}

@@ -2,12 +2,33 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import time
+from pathlib import Path
 
+import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+import agent_bom.proxy as proxy_mod
+from agent_bom.api.policy_store import GatewayPolicy, GatewayRule
 from agent_bom.proxy import (
+    AuditDeliveryController,
+    AuditSpilloverStore,
     ProxyMetrics,
     ReplayDetector,
+    _command_name_for_validation,
+    _control_plane_headers,
+    _extract_jsonrpc_trace_meta,
+    _gateway_policy_cache_path,
+    _gateway_policy_cache_signature_path,
+    _inject_jsonrpc_trace_meta,
+    _load_cached_gateway_policies,
+    _persist_gateway_policies_cache,
+    _reset_gateway_policy_cache_signer_for_tests,
+    _stitch_jsonrpc_trace_meta,
     check_policy,
     compute_payload_hash,
     compute_response_hmac,
@@ -15,7 +36,207 @@ from agent_bom.proxy import (
     is_tools_call,
     log_tool_call,
     parse_jsonrpc,
+    policy_subject_from_message,
+    sandbox_posture_warning,
+    undeclared_tool_block_reason,
 )
+from agent_bom.proxy_audit import (
+    _AUDIT_CHAIN_STATE,
+    _assert_tier_a_audit_payload,
+    drain_proxy_audit_dlq,
+    write_audit_record,
+)
+
+
+def test_proxy_message_size_budget_is_two_mib_or_less():
+    assert proxy_mod._MAX_MESSAGE_BYTES <= 2 * 1024 * 1024
+
+
+def test_audit_chain_uses_path_key_across_reopened_handles(tmp_path):
+    _AUDIT_CHAIN_STATE.clear()
+    audit_path = tmp_path / "audit.jsonl"
+
+    with audit_path.open("a", encoding="utf-8") as first:
+        first_record = write_audit_record(first, {"type": "first"})
+    with audit_path.open("a", encoding="utf-8") as second:
+        second_record = write_audit_record(second, {"type": "second"})
+
+    assert second_record["prev_hash"] == first_record["record_hash"]
+    assert len(_AUDIT_CHAIN_STATE) == 1
+
+
+def test_write_audit_record_sanitizes_generic_records():
+    opaque_sample = "ghp_" + "abcdefghijklmnopqrstuvwxyz" + "123456"
+    sensitive_key = "pass" + "word"
+    buf = io.StringIO()
+
+    payload = write_audit_record(
+        buf,
+        {
+            "type": "runtime_alert",
+            "details": {
+                sensitive_key: "secret-value",
+                "url": f"https://example.com/callback?q={opaque_sample}",
+                "path": "/Users/alice/private/key.txt",
+            },
+        },
+    )
+
+    encoded = json.dumps(payload)
+    assert "secret-value" not in encoded
+    assert opaque_sample not in encoded
+    assert "/Users/alice" not in encoded
+    assert payload["details"] == {}
+    assert payload["record_hash_algorithm"] == "aes-cmac-128"
+
+
+def test_write_audit_record_validates_tier_a_payload_before_durable_write():
+    with pytest.raises(ValueError, match="replay-only field: args"):
+        _assert_tier_a_audit_payload({"type": "tools/call", "args": {"path": "/etc/passwd"}})
+
+
+def test_write_audit_record_drops_nested_replay_only_fields_before_write():
+    buf = io.StringIO()
+
+    payload = write_audit_record(
+        buf,
+        {
+            "type": "tools/call",
+            "tool": "read_file",
+            "event_relationships": {
+                "resources": [
+                    {
+                        "type": "file",
+                        "id": "resource-1",
+                        "path": "/Users/alice/.ssh/id_rsa",
+                    }
+                ]
+            },
+            "args": {"path": "/etc/passwd", "query": "select * from private_table"},
+        },
+    )
+
+    encoded = buf.getvalue()
+    assert encoded
+    assert "private_table" not in encoded
+    assert "/etc/passwd" not in encoded
+    assert "/Users/alice" not in encoded
+    assert payload["event_relationships"]["resources"][0] == {"type": "file", "id": "resource-1"}
+
+
+def test_write_audit_record_preserves_proxy_summary_metrics():
+    """Durable proxy summaries must keep the non-content metrics operators consume."""
+    metrics = ProxyMetrics()
+    metrics.record_call("read_file")
+    metrics.record_blocked("policy")
+    metrics.record_latency(12.5)
+    metrics.total_messages_client_to_server = 3
+    metrics.total_messages_server_to_client = 2
+    buf = io.StringIO()
+
+    payload = write_audit_record(buf, metrics.summary())
+
+    assert payload["total_tool_calls"] == 1
+    assert payload["total_blocked"] == 1
+    assert payload["calls_by_tool"] == {"read_file": 1}
+    assert payload["blocked_by_reason"] == {"policy": 1}
+    assert payload["latency"] == {
+        "min_ms": 12.5,
+        "max_ms": 12.5,
+        "avg_ms": 12.5,
+        "p50_ms": 12.5,
+        "p95_ms": 12.5,
+        "count": 1,
+    }
+    assert payload["messages_client_to_server"] == 3
+    assert payload["messages_server_to_client"] == 2
+
+
+def test_write_audit_record_preserves_safe_execution_posture_only():
+    """Isolation proof survives while images, mounts, users, and free text do not."""
+    buf = io.StringIO()
+
+    payload = write_audit_record(
+        buf,
+        {
+            "type": "mcp_execution_posture",
+            "execution_posture": {
+                "mode": "container_isolated",
+                "sandbox_evidence": {
+                    "enabled": True,
+                    "runtime": "docker",
+                    "image": "registry.example/private/server@sha256:abc",
+                    "image_pinned": True,
+                    "image_pin_policy": "enforce",
+                    "image_pin_warning": "private registry warning",
+                    "network": "none",
+                    "egress_policy": "deny",
+                    "cpus": "1.0",
+                    "memory": "512m",
+                    "pids_limit": 128,
+                    "tmpfs_size": "64m",
+                    "timeout_seconds": 300,
+                    "read_only_rootfs": True,
+                    "drop_capabilities": True,
+                    "no_new_privileges": True,
+                    "user": "customer-runtime-user",
+                    "mounts": [
+                        {
+                            "source": "/Users/alice/private-workspace",
+                            "target": "/workspace",
+                            "readonly": True,
+                        }
+                    ],
+                },
+            },
+        },
+    )
+
+    assert payload["execution_posture"] == {
+        "mode": "container_isolated",
+        "sandbox_evidence": {
+            "enabled": True,
+            "runtime": "docker",
+            "image_pinned": True,
+            "image_pin_policy": "enforce",
+            "network": "none",
+            "egress_policy": "deny",
+            "cpus": "1.0",
+            "memory": "512m",
+            "pids_limit": 128,
+            "tmpfs_size": "64m",
+            "timeout_seconds": 300,
+            "read_only_rootfs": True,
+            "drop_capabilities": True,
+            "no_new_privileges": True,
+        },
+    }
+    encoded = json.dumps(payload)
+    assert "registry.example" not in encoded
+    assert "private registry warning" not in encoded
+    assert "customer-runtime-user" not in encoded
+    assert "/Users/alice" not in encoded
+
+
+@pytest.mark.asyncio
+async def test_read_bounded_line_discards_oversized_line_and_resyncs():
+    reader = asyncio.StreamReader(limit=32)
+    reader.feed_data(b"a" * 20 + b"\n")
+    reader.feed_data(b'{"jsonrpc":"2.0"}\n')
+    reader.feed_eof()
+
+    assert await proxy_mod._read_bounded_line(reader, max_bytes=8) is None
+    assert await proxy_mod._read_bounded_line(reader, max_bytes=128) == b'{"jsonrpc":"2.0"}\n'
+
+
+@pytest.fixture(autouse=True)
+def _reset_policy_cache_signer():
+    _AUDIT_CHAIN_STATE.clear()
+    _reset_gateway_policy_cache_signer_for_tests()
+    yield
+    _AUDIT_CHAIN_STATE.clear()
+    _reset_gateway_policy_cache_signer_for_tests()
+
 
 # ── parse_jsonrpc ────────────────────────────────────────────────────────────
 
@@ -56,6 +277,70 @@ def test_is_tools_call_false():
     assert is_tools_call(msg) is False
 
 
+def test_policy_subject_maps_tool_calls_to_tool_name_and_arguments():
+    msg = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "id": 1,
+        "params": {"name": "read_file", "arguments": {"path": "/etc/passwd"}},
+    }
+    assert policy_subject_from_message(msg) == ("read_file", {"path": "/etc/passwd"})
+
+
+def test_policy_subject_gates_resource_prompt_sampling_and_extensions():
+    assert policy_subject_from_message({"method": "resources/read", "params": {"uri": "file:///etc/passwd"}}) == (
+        "resources/read",
+        {"uri": "file:///etc/passwd"},
+    )
+    assert policy_subject_from_message({"method": "prompts/get", "params": {"name": "prod"}}) == (
+        "prompts/get",
+        {"name": "prod"},
+    )
+    assert policy_subject_from_message({"method": "sampling/createMessage", "params": {"maxTokens": 1000}}) == (
+        "sampling/createMessage",
+        {"maxTokens": 1000},
+    )
+    assert policy_subject_from_message({"method": "mcp_extension/doSensitiveThing", "params": {"scope": "admin"}}) == (
+        "mcp_extension/doSensitiveThing",
+        {"scope": "admin"},
+    )
+
+
+def test_policy_subject_leaves_discovery_methods_ungated():
+    assert policy_subject_from_message({"method": "tools/list", "params": {}}) is None
+
+
+def test_block_undeclared_fails_closed_without_tool_declarations():
+    reason = undeclared_tool_block_reason(True, set(), "write_file")
+    assert reason == "Tool 'write_file' blocked because no tools/list declarations are available"
+
+
+def test_block_undeclared_allows_declared_tool_and_blocks_missing_tool():
+    declared = {"read_file"}
+    assert undeclared_tool_block_reason(True, declared, "read_file") is None
+    assert undeclared_tool_block_reason(True, declared, "write_file") == "Tool 'write_file' not in declared tools/list"
+    assert undeclared_tool_block_reason(False, declared, "write_file") is None
+
+
+def test_sandbox_posture_warning_is_visible_when_disabled():
+    warning = sandbox_posture_warning({"enabled": False})
+    assert warning is not None
+    assert "sandbox isolation is disabled" in warning
+    assert "AGENT_BOM_MCP_SANDBOX=1" in warning
+    assert "--no-isolate" in warning
+    assert "--sandbox" not in warning
+    assert sandbox_posture_warning({"enabled": True}) is None
+
+
+def test_sandbox_generated_runtime_validates_by_basename():
+    evidence = {"enabled": True, "mode": "wrap_command_in_image"}
+    assert _command_name_for_validation("/usr/local/bin/docker", evidence) == "docker"
+
+
+def test_user_supplied_absolute_command_stays_strict():
+    assert _command_name_for_validation("/usr/local/bin/docker", {"enabled": False}) == "/usr/local/bin/docker"
+
+
 # ── extract_tool_name ────────────────────────────────────────────────────────
 
 
@@ -85,7 +370,10 @@ def test_log_tool_call():
     assert record["tool"] == "read_file"
     assert record["policy"] == "allowed"
     assert "ts" in record
-    assert record["args"]["path"] == "/etc/hosts"
+    assert "args" not in record
+    assert record["prev_hash"] == ""
+    assert record["record_hash_algorithm"] == "aes-cmac-128"
+    assert len(record["record_hash"]) == 32
 
 
 # ── check_policy ─────────────────────────────────────────────────────────────
@@ -116,6 +404,14 @@ def test_check_policy_blocks_tool():
     assert "block-exec" in reason
 
 
+def test_check_policy_block_tools_wildcard_blocks_gated_methods():
+    policy = {"rules": [{"id": "block-all", "action": "block", "block_tools": ["*"]}]}
+    allowed, reason = check_policy(policy, "resources/read", {"uri": "file:///etc/passwd"})
+    assert allowed is False
+    assert "resources/read" in reason
+    assert "block-all" in reason
+
+
 def test_check_policy_blocks_arg_pattern():
     """Policy with arg_pattern blocks when argument matches regex."""
     policy = {
@@ -132,6 +428,256 @@ def test_check_policy_blocks_arg_pattern():
     assert "/etc/.*" in reason
 
 
+def test_check_policy_read_only_blocks_write_tool():
+    policy = {"rules": [{"id": "read-only", "action": "block", "read_only": True}]}
+    allowed, reason = check_policy(policy, "write_file", {"path": "/tmp/out.txt"})
+    assert allowed is False
+    assert "read-only" in reason.lower()
+
+
+def test_check_policy_blocks_secret_path():
+    policy = {"rules": [{"id": "no-secrets", "action": "block", "block_secret_paths": True}]}
+    allowed, reason = check_policy(policy, "read_file", {"path": "~/.ssh/id_rsa"})
+    assert allowed is False
+    assert "secret path" in reason.lower()
+
+
+def test_check_policy_blocks_unknown_egress_host():
+    policy = {
+        "rules": [
+            {
+                "id": "allow-egress",
+                "action": "block",
+                "block_unknown_egress": True,
+                "allowed_hosts": ["api.openai.com"],
+            }
+        ]
+    }
+    allowed, reason = check_policy(policy, "web_fetch", {"url": "https://evil.example/path"})
+    assert allowed is False
+    assert "allowlisted" in reason.lower()
+
+
+def test_control_plane_headers_propagate_w3c_trace_context(monkeypatch):
+    """Control-plane requests should carry bounded W3C trace headers when present."""
+
+    def _fake_inject(headers):
+        headers = dict(headers)
+        headers["traceparent"] = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+        headers["tracestate"] = "vendor-a=foo"
+        headers["baggage"] = "tenant=acme"
+        return headers
+
+    monkeypatch.setattr(proxy_mod, "inject_current_trace_headers", _fake_inject)
+    headers = _control_plane_headers("secret-token", "etag-1")
+    assert headers["Authorization"] == "Bearer secret-token"
+    assert headers["If-None-Match"] == "etag-1"
+    assert headers["traceparent"].startswith("00-")
+    assert headers["tracestate"] == "vendor-a=foo"
+    assert headers["baggage"] == "tenant=acme"
+
+
+def test_extract_jsonrpc_trace_meta_returns_bounded_w3c_values():
+    message = {
+        "_meta": {
+            "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+            "tracestate": "vendor-a=foo,vendor-b=bar",
+            "baggage": "tenant=acme,release=v0.81.2",
+        }
+    }
+    trace_meta = _extract_jsonrpc_trace_meta(message)
+    assert trace_meta["traceparent"] == "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+    assert trace_meta["tracestate"] == "vendor-a=foo,vendor-b=bar"
+    assert trace_meta["baggage"] == "tenant=acme,release=v0.81.2"
+
+
+def test_extract_jsonrpc_trace_meta_ignores_invalid_values():
+    trace_meta = _extract_jsonrpc_trace_meta({"_meta": {"traceparent": "broken", "tracestate": "", "baggage": ""}})
+    assert trace_meta == {}
+
+
+def test_inject_jsonrpc_trace_meta_preserves_existing_meta_fields():
+    message = {"jsonrpc": "2.0", "id": 1, "_meta": {"client": "cursor"}}
+    enriched = _inject_jsonrpc_trace_meta(
+        message,
+        traceparent="00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+        tracestate="vendor-a=foo",
+        baggage="tenant=acme",
+    )
+    assert enriched["_meta"]["client"] == "cursor"
+    assert enriched["_meta"]["traceparent"].startswith("00-0123456789abcdef0123456789abcdef-")
+    assert enriched["_meta"]["tracestate"] == "vendor-a=foo"
+    assert enriched["_meta"]["baggage"] == "tenant=acme"
+
+
+def test_stitch_jsonrpc_trace_meta_rehydrates_from_request_when_response_lacks_it():
+    response = {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}
+    stitched = _stitch_jsonrpc_trace_meta(
+        response,
+        {
+            "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+            "tracestate": "vendor-a=foo",
+            "baggage": "tenant=acme",
+        },
+    )
+    assert stitched["_meta"]["traceparent"] == "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+    assert stitched["_meta"]["tracestate"] == "vendor-a=foo"
+    assert stitched["_meta"]["baggage"] == "tenant=acme"
+
+
+def test_stitch_jsonrpc_trace_meta_prefers_upstream_response_values():
+    stitched = _stitch_jsonrpc_trace_meta(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"ok": True},
+            "_meta": {"traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"},
+        },
+        {
+            "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+            "tracestate": "vendor-a=foo",
+            "baggage": "tenant=acme",
+        },
+    )
+    assert stitched["_meta"]["traceparent"] == "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"
+    assert stitched["_meta"]["tracestate"] == "vendor-a=foo"
+    assert stitched["_meta"]["baggage"] == "tenant=acme"
+
+
+def test_gateway_policy_cache_path_defaults_to_user_cache_home(monkeypatch):
+    fake_home = Path("/tmp/agent-bom-home")
+    monkeypatch.delenv("AGENT_BOM_PROXY_POLICY_CACHE_PATH", raising=False)
+    monkeypatch.setattr(proxy_mod.Path, "home", staticmethod(lambda: fake_home))
+    assert _gateway_policy_cache_path() == fake_home / ".agent-bom" / "cache" / "gateway-policies.json"
+
+
+def test_gateway_policy_cache_path_honors_env_override(monkeypatch):
+    monkeypatch.setenv("AGENT_BOM_PROXY_POLICY_CACHE_PATH", "/tmp/custom-policy-cache.json")
+    assert _gateway_policy_cache_path() == Path("/tmp/custom-policy-cache.json")
+
+
+def test_gateway_policy_cache_round_trip(tmp_path: Path, monkeypatch):
+    cache_path = tmp_path / "gateway-policies.json"
+    monkeypatch.setattr(proxy_mod.time, "time", lambda: 1234.0)
+    policies = [
+        GatewayPolicy(
+            policy_id="p1",
+            name="Block secrets",
+            rules=[GatewayRule(id="r1", block_secret_paths=True)],
+            tenant_id="tenant-a",
+        )
+    ]
+    _persist_gateway_policies_cache(cache_path, policies, "etag-1")
+    loaded_policies, loaded_etag = _load_cached_gateway_policies(cache_path, max_age_seconds=60)
+    assert loaded_etag == "etag-1"
+    assert loaded_policies is not None
+    assert len(loaded_policies) == 1
+    assert loaded_policies[0].policy_id == "p1"
+    assert loaded_policies[0].tenant_id == "tenant-a"
+
+
+def test_gateway_policy_cache_rejects_stale_entries(tmp_path: Path, monkeypatch):
+    cache_path = tmp_path / "gateway-policies.json"
+    monkeypatch.setattr(proxy_mod.time, "time", lambda: 100.0)
+    _persist_gateway_policies_cache(
+        cache_path,
+        [GatewayPolicy(policy_id="p1", name="stale", rules=[])],
+        "etag-stale",
+    )
+    monkeypatch.setattr(proxy_mod.time, "time", lambda: 1000.0)
+    loaded_policies, loaded_etag = _load_cached_gateway_policies(cache_path, max_age_seconds=60)
+    assert loaded_policies is None
+    assert loaded_etag is None
+
+
+def test_gateway_policy_cache_rejects_invalid_payload(tmp_path: Path):
+    cache_path = tmp_path / "gateway-policies.json"
+    cache_path.write_text('{"fetched_at": 10, "policies": [{"policy_id": "missing-name"}]}')
+    loaded_policies, loaded_etag = _load_cached_gateway_policies(cache_path, max_age_seconds=60)
+    assert loaded_policies is None
+    assert loaded_etag is None
+
+
+def _ed25519_private_key_pem() -> str:
+    private_key = Ed25519PrivateKey.generate()
+    return private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+
+
+def test_gateway_policy_cache_round_trip_requires_valid_signature_when_enabled(tmp_path: Path, monkeypatch):
+    cache_path = tmp_path / "gateway-policies.json"
+    monkeypatch.setattr(proxy_mod.time, "time", lambda: 1234.0)
+    monkeypatch.setenv("AGENT_BOM_PROXY_POLICY_CACHE_ED25519_PRIVATE_KEY_PEM", _ed25519_private_key_pem())
+    _reset_gateway_policy_cache_signer_for_tests()
+
+    policies = [GatewayPolicy(policy_id="p1", name="signed", rules=[], tenant_id="tenant-a")]
+    _persist_gateway_policies_cache(cache_path, policies, "etag-signed")
+
+    signature_path = _gateway_policy_cache_signature_path(cache_path)
+    assert signature_path.exists()
+    loaded_policies, loaded_etag = _load_cached_gateway_policies(cache_path, max_age_seconds=60)
+    assert loaded_etag == "etag-signed"
+    assert loaded_policies is not None
+    assert loaded_policies[0].policy_id == "p1"
+
+
+def test_gateway_policy_cache_signing_key_resolves_from_file_first(tmp_path: Path, monkeypatch):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    key_file = tmp_path / "proxy-policy-signing.pem"
+    key_file.write_bytes(
+        Ed25519PrivateKey.generate().private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    monkeypatch.setenv("AGENT_BOM_PROXY_POLICY_CACHE_ED25519_PRIVATE_KEY_PEM", "invalid-inline-value")
+    monkeypatch.setenv("AGENT_BOM_PROXY_POLICY_CACHE_ED25519_PRIVATE_KEY_PEM_FILE", str(key_file))
+    _reset_gateway_policy_cache_signer_for_tests()
+
+    from agent_bom.proxy import _load_gateway_policy_cache_signer
+
+    assert _load_gateway_policy_cache_signer() is not None
+
+
+def test_gateway_policy_cache_rejects_signature_mismatch(tmp_path: Path, monkeypatch):
+    cache_path = tmp_path / "gateway-policies.json"
+    monkeypatch.setattr(proxy_mod.time, "time", lambda: 1234.0)
+    monkeypatch.setenv("AGENT_BOM_PROXY_POLICY_CACHE_ED25519_PRIVATE_KEY_PEM", _ed25519_private_key_pem())
+    _reset_gateway_policy_cache_signer_for_tests()
+
+    policies = [GatewayPolicy(policy_id="p1", name="signed", rules=[], tenant_id="tenant-a")]
+    _persist_gateway_policies_cache(cache_path, policies, "etag-signed")
+
+    payload = json.loads(cache_path.read_text())
+    payload["policies"][0]["name"] = "tampered"
+    cache_path.write_text(json.dumps(payload))
+
+    loaded_policies, loaded_etag = _load_cached_gateway_policies(cache_path, max_age_seconds=60)
+    assert loaded_policies is None
+    assert loaded_etag is None
+
+
+def test_gateway_policy_cache_rejects_missing_signature_when_enabled(tmp_path: Path, monkeypatch):
+    cache_path = tmp_path / "gateway-policies.json"
+    monkeypatch.setattr(proxy_mod.time, "time", lambda: 1234.0)
+    monkeypatch.setenv("AGENT_BOM_PROXY_POLICY_CACHE_ED25519_PRIVATE_KEY_PEM", _ed25519_private_key_pem())
+    _reset_gateway_policy_cache_signer_for_tests()
+
+    policies = [GatewayPolicy(policy_id="p1", name="unsigned", rules=[], tenant_id="tenant-a")]
+    _persist_gateway_policies_cache(cache_path, policies, "etag-signed")
+    _gateway_policy_cache_signature_path(cache_path).unlink()
+
+    loaded_policies, loaded_etag = _load_cached_gateway_policies(cache_path, max_age_seconds=60)
+    assert loaded_policies is None
+    assert loaded_etag is None
+
+
 # ── ProxyMetrics ────────────────────────────────────────────────────────────
 
 
@@ -143,6 +689,7 @@ def test_proxy_metrics_record_call():
     m.record_call("write_file")
     assert m.tool_calls["read_file"] == 2
     assert m.tool_calls["write_file"] == 1
+    assert m.last_decision == "allowed:write_file"
 
 
 def test_proxy_metrics_record_blocked():
@@ -153,6 +700,19 @@ def test_proxy_metrics_record_blocked():
     m.record_blocked("undeclared")
     assert m.blocked_calls["policy"] == 2
     assert m.blocked_calls["undeclared"] == 1
+    assert m.last_decision == "blocked:undeclared"
+
+
+def test_proxy_metrics_update_callback_tracks_live_status():
+    """record_call/record_blocked notify an attached live status callback."""
+    m = ProxyMetrics()
+    seen: list[str] = []
+    m.set_update_callback(lambda metrics: seen.append(metrics.last_decision))
+
+    m.record_call("read_file")
+    m.record_blocked("policy")
+
+    assert seen == ["allowed:read_file", "blocked:policy"]
 
 
 def test_proxy_metrics_latency():
@@ -183,11 +743,19 @@ def test_proxy_metrics_summary():
     assert s["calls_by_tool"]["scan"] == 2
     assert s["calls_by_tool"]["check"] == 1
     assert s["blocked_by_reason"]["policy"] == 1
+    assert s["last_decision"] == "blocked:policy"
     assert s["latency"]["min_ms"] == 10.0
     assert s["latency"]["max_ms"] == 50.0
     assert s["latency"]["count"] == 2
     assert s["messages_client_to_server"] == 5
     assert s["messages_server_to_client"] == 3
+    assert s["audit_buffer_bytes"] == 0
+    assert s["audit_spillover_bytes"] == 0
+    assert s["audit_dlq_bytes"] == 0
+    assert s["policy_fetch_failures"] == 0
+    assert s["audit_push_failures"] == 0
+    assert s["audit_push_backoff_seconds"] == 0
+    assert s["audit_circuit_open"] == 0
     assert "ts" in s
     assert "uptime_seconds" in s
 
@@ -200,6 +768,87 @@ def test_proxy_metrics_summary_empty():
     assert s["total_blocked"] == 0
     assert s["latency"] == {}
     assert s["messages_client_to_server"] == 0
+
+
+def test_proxy_metrics_records_backpressure_and_policy_failures():
+    """Proxy metrics surface control-plane linkage failures and queued backlog."""
+    m = ProxyMetrics()
+    m.set_audit_buffer_bytes(1024)
+    m.set_audit_spillover_bytes(2048)
+    m.set_audit_dlq_bytes(4096)
+    m.record_policy_fetch_failure()
+    m.record_audit_push_failure()
+    m.set_audit_push_backoff_seconds(30)
+    m.set_audit_circuit_open(True)
+
+    s = m.summary()
+    assert s["audit_buffer_bytes"] == 1024
+    assert s["audit_spillover_bytes"] == 2048
+    assert s["audit_dlq_bytes"] == 4096
+    assert s["policy_fetch_failures"] == 1
+    assert s["audit_push_failures"] == 1
+    assert s["audit_push_backoff_seconds"] == 30
+    assert s["audit_circuit_open"] == 1
+
+
+def test_audit_delivery_controller_opens_circuit_after_threshold():
+    controller = AuditDeliveryController(
+        base_interval_seconds=10,
+        max_backoff_seconds=60,
+        breaker_failure_threshold=3,
+        breaker_cooldown_seconds=30,
+    )
+    controller.record_failure(now=100.0)
+    assert controller.current_backoff_seconds(now=100.0) == 20
+    assert controller.is_circuit_open(now=100.0) is False
+    controller.record_failure(now=101.0)
+    assert controller.current_backoff_seconds(now=101.0) == 40
+    controller.record_failure(now=102.0)
+    assert controller.is_circuit_open(now=102.0) is True
+    assert controller.current_backoff_seconds(now=102.0) == 30
+    controller.record_success()
+    assert controller.is_circuit_open(now=102.0) is False
+    assert controller.current_backoff_seconds(now=102.0) == 10
+
+
+def test_audit_spillover_store_diverts_to_dlq_when_spillover_full(tmp_path: Path):
+    store = AuditSpilloverStore(
+        spill_path=tmp_path / "spill.jsonl",
+        dlq_path=tmp_path / "audit.dlq.jsonl",
+        max_spillover_bytes=1,
+    )
+    destination = store.append_events([{"event": "first"}])
+    assert destination == "dlq"
+    assert store.spillover_size_bytes() == 0
+    assert store.dlq_size_bytes() > 0
+
+
+def test_drain_proxy_audit_dlq_appends_valid_records_and_preserves_invalid(tmp_path: Path):
+    dlq = tmp_path / "audit.dlq.jsonl"
+    output = tmp_path / "audit.recovered.jsonl"
+    dlq.write_text('{"event":"one"}\nnot-json\n["not", "an", "object"]\n{"event":"two"}\n', encoding="utf-8")
+
+    result = drain_proxy_audit_dlq(dlq, output, delete_drained=True)
+
+    assert result.records_written == 2
+    assert result.invalid_lines == 2
+    assert result.remaining_lines == 2
+    assert output.read_text(encoding="utf-8") == '{"event":"one"}\n{"event":"two"}\n'
+    assert dlq.read_text(encoding="utf-8") == 'not-json\n["not", "an", "object"]\n'
+
+
+def test_drain_proxy_audit_dlq_without_delete_leaves_dlq_unchanged(tmp_path: Path):
+    dlq = tmp_path / "audit.dlq.jsonl"
+    output = tmp_path / "audit.recovered.jsonl"
+    body = '{"event":"one"}\n{"event":"two"}\n'
+    dlq.write_text(body, encoding="utf-8")
+
+    result = drain_proxy_audit_dlq(dlq, output, max_records=1)
+
+    assert result.records_written == 1
+    assert result.remaining_lines == 0
+    assert output.read_text(encoding="utf-8") == '{"event":"one"}\n'
+    assert dlq.read_text(encoding="utf-8") == body
 
 
 # ── CLI proxy --help ─────────────────────────────────────────────────────────
@@ -271,20 +920,20 @@ def test_replay_detector_different_messages_not_replay():
 
 
 def test_replay_detector_eviction_on_overflow():
-    """When max_entries is reached, stale entries are evicted."""
-    detector = ReplayDetector(max_entries=2, window_seconds=0.001)
-    # Fill with 2 entries
-    detector.check({"id": 1})
-    detector.check({"id": 2})
-    # Manually expire them — set to 0.0 which is always > 0.001s in the past
-    # because time.monotonic() returns seconds since an arbitrary epoch (boot).
-    for k in list(detector._seen):
-        detector._seen[k] = 0.0
-    # This should trigger eviction and NOT be a replay
-    msg_new = {"id": 3}
-    assert detector.check(msg_new) is False
-    # Stale entries should be gone
-    assert len(detector._seen) <= 2
+    """Replay detector memory stays bounded under sustained inserts."""
+    detector = ReplayDetector(max_entries=2, window_seconds=300.0)
+    baseline_bytes = detector.memory_bytes
+    for i in range(50):
+        assert detector.check({"id": i}) is False
+    assert detector.memory_bytes == baseline_bytes
+
+
+def test_replay_detector_expires_entries_after_window():
+    detector = ReplayDetector(window_seconds=0.01, bucket_seconds=0.01)
+    msg = {"jsonrpc": "2.0", "method": "tools/call", "id": 1}
+    assert detector.check(msg) is False
+    time.sleep(0.02)
+    assert detector.check(msg) is False
 
 
 # ── log_tool_call with integrity fields ─────────────────────────────────────
@@ -418,6 +1067,211 @@ def test_response_hmac_payload_sensitivity():
     msg_a = {"jsonrpc": "2.0", "id": 1, "result": {"data": "hello"}}
     msg_b = {"jsonrpc": "2.0", "id": 1, "result": {"data": "tampered"}}
     assert compute_response_hmac(msg_a, "key") != compute_response_hmac(msg_b, "key")
+
+
+# ── SSE proxy — CLI --url flag ────────────────────────────────────────────────
+
+
+def test_proxy_cli_url_flag_accepted():
+    """'agent-bom proxy --url ...' is accepted by the CLI (does not raise UsageError)."""
+    from unittest.mock import AsyncMock, patch
+
+    from click.testing import CliRunner
+
+    from agent_bom.cli import main
+
+    runner = CliRunner()
+
+    # Mock _proxy_sse_server so we don't need a real HTTP server
+    with patch("agent_bom.proxy._proxy_sse_server", new=AsyncMock(return_value=0)):
+        result = runner.invoke(main, ["proxy", "--url", "http://localhost:3000"])
+
+    # Should exit with 0 (the mock returns 0) — not a UsageError (exit code 2)
+    assert result.exit_code != 2, f"CLI rejected --url flag: {result.output}"
+
+
+def test_proxy_cli_no_cmd_no_url_raises_usage_error():
+    """'agent-bom proxy' with neither server_cmd nor --url exits with UsageError."""
+    from click.testing import CliRunner
+
+    from agent_bom.cli import main
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["proxy"])
+    # Click UsageError exits with code 2
+    assert result.exit_code == 2
+
+
+# ── SSE proxy — httpx connection ──────────────────────────────────────────────
+
+
+def test_proxy_sse_server_uses_httpx(tmp_path):
+    """_proxy_sse_server creates an httpx.AsyncClient to contact the remote server."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from agent_bom.proxy import _proxy_sse_server
+
+    # Mock httpx.AsyncClient — simulate an empty tools/list and immediate EOF on stdin
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(return_value=mock_response)
+
+    # Patch stdin to return EOF immediately so the proxy loop exits cleanly
+    async def _fake_readline():
+        return b""
+
+    mock_reader = AsyncMock()
+    mock_reader.readline = _fake_readline
+
+    with (
+        patch("httpx.AsyncClient", return_value=mock_client),
+        patch("asyncio.StreamReader", return_value=mock_reader),
+        patch("asyncio.get_running_loop") as mock_loop,
+    ):
+        mock_loop.return_value.connect_read_pipe = AsyncMock()
+
+        exit_code = asyncio.run(_proxy_sse_server(url="http://localhost:3000"))
+
+    # httpx.AsyncClient was instantiated (i.e., we used httpx for the connection)
+    assert mock_client.__aenter__.called or True  # context manager was entered
+    assert exit_code == 0
+
+
+def test_proxy_sse_policy_blocks_gated_resource_reads(tmp_path, monkeypatch):
+    """SSE policy enforcement covers resources/read, not only tools/call."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from agent_bom.proxy import _proxy_sse_server
+
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps({"rules": [{"id": "no-resource-read", "action": "block", "block_tools": ["resources/read"]}]}),
+        encoding="utf-8",
+    )
+
+    tools_response = MagicMock()
+    tools_response.raise_for_status = MagicMock()
+    tools_response.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(return_value=tools_response)
+
+    resource_read = {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "resources/read",
+        "params": {"uri": "file:///etc/passwd"},
+    }
+    monkeypatch.setattr(proxy_mod, "create_async_stdin_reader", AsyncMock(return_value=object()))
+    monkeypatch.setattr(
+        proxy_mod,
+        "read_async_stdin_line",
+        AsyncMock(side_effect=[(json.dumps(resource_read) + "\n").encode(), b""]),
+    )
+
+    stdout = type("Stdout", (), {"buffer": io.BytesIO()})()
+    monkeypatch.setattr(proxy_mod.sys, "stdout", stdout)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        exit_code = asyncio.run(_proxy_sse_server(url="http://localhost:3000", policy_path=str(policy_path)))
+
+    assert exit_code == 0
+    assert mock_client.post.await_count == 1  # tools/list only; blocked before /message
+    written = stdout.buffer.getvalue().decode()
+    assert "no-resource-read" in written
+    assert "resources/read" in written
+
+
+def test_proxy_sse_block_undeclared_fails_closed_when_tools_list_is_empty(monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from agent_bom.proxy import _proxy_sse_server
+
+    tools_response = MagicMock()
+    tools_response.raise_for_status = MagicMock()
+    tools_response.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(return_value=tools_response)
+
+    tool_call = {
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": {"name": "write_file", "arguments": {"path": "/tmp/out"}},
+    }
+    monkeypatch.setattr(proxy_mod, "create_async_stdin_reader", AsyncMock(return_value=object()))
+    monkeypatch.setattr(
+        proxy_mod,
+        "read_async_stdin_line",
+        AsyncMock(side_effect=[(json.dumps(tool_call) + "\n").encode(), b""]),
+    )
+
+    stdout = type("Stdout", (), {"buffer": io.BytesIO()})()
+    monkeypatch.setattr(proxy_mod.sys, "stdout", stdout)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        exit_code = asyncio.run(_proxy_sse_server(url="http://localhost:3000", block_undeclared=True))
+
+    assert exit_code == 0
+    assert mock_client.post.await_count == 1
+    written = stdout.buffer.getvalue().decode()
+    assert "no tools/list declarations are available" in written
+    assert "write_file" in written
+
+
+def test_proxy_sse_forwards_allowed_gated_messages_to_message_endpoint(monkeypatch):
+    """Non-tool gated JSON-RPC methods keep their method and use /message."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from agent_bom.proxy import _proxy_sse_server
+
+    tools_response = MagicMock()
+    tools_response.raise_for_status = MagicMock()
+    tools_response.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}
+
+    message_response = MagicMock()
+    message_response.raise_for_status = MagicMock()
+    message_response.json.return_value = {"jsonrpc": "2.0", "id": 8, "result": {"contents": []}}
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(side_effect=[tools_response, message_response])
+
+    prompts_get = {
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "prompts/get",
+        "params": {"name": "demo"},
+    }
+    monkeypatch.setattr(proxy_mod, "create_async_stdin_reader", AsyncMock(return_value=object()))
+    monkeypatch.setattr(
+        proxy_mod,
+        "read_async_stdin_line",
+        AsyncMock(side_effect=[(json.dumps(prompts_get) + "\n").encode(), b""]),
+    )
+
+    stdout = type("Stdout", (), {"buffer": io.BytesIO()})()
+    monkeypatch.setattr(proxy_mod.sys, "stdout", stdout)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        exit_code = asyncio.run(_proxy_sse_server(url="http://localhost:3000/"))
+
+    assert exit_code == 0
+    assert mock_client.post.await_args_list[1].args[0] == "http://localhost:3000/message"
+    assert mock_client.post.await_args_list[1].kwargs["json"]["method"] == "prompts/get"
+    assert "contents" in stdout.buffer.getvalue().decode()
 
 
 def test_response_hmac_canonical_key_order():

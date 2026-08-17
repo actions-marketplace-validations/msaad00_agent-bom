@@ -93,6 +93,8 @@ class ToolCallTrace:
     trace_id: str
     span_id: str
     tool_name: str
+    server_name: str = ""
+    package_name: str = ""
     parameters: dict = field(default_factory=dict)
     duration_ms: float = 0.0
     status: str = "ok"
@@ -105,7 +107,10 @@ class FlaggedCall:
     trace: ToolCallTrace
     reason: str
     severity: str = "medium"  # medium or high
+    server: str = ""
+    package_name: str = ""
     matched_cve: str = ""
+    matched_cves: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -123,6 +128,10 @@ class LLMAPICall:
     output_tokens: int
     duration_ms: float
     status: str  # "ok" | "error"
+    # Calling agent, when the span says so. This is the join key that attributes
+    # spend to a graph node — without it every cost row buckets as "unknown".
+    # Defaulted and last so existing positional construction keeps working.
+    agent: str = ""
 
 
 @dataclass
@@ -178,11 +187,27 @@ def _is_ml_span(span: dict, scope_name: str) -> bool:
     return False
 
 
+def _require_object_array(value: object, path: str) -> list[dict]:
+    """Return ``value`` as a list of JSON objects or raise ``ValueError``.
+
+    Key presence alone is not enough: the parsers below call ``.get()`` on every
+    element, so an array of strings used to escape validation and surface as a
+    bare ``AttributeError`` deep inside the parser.
+    """
+    if not isinstance(value, list):
+        raise ValueError(f"'{path}' must be a JSON array, got: {type(value).__name__}")
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"'{path}[{index}]' must be a JSON object, got: {type(item).__name__}")
+    return value
+
+
 def validate_otel_schema(trace_data: dict) -> None:
     """Validate that trace_data conforms to OTLP JSON structure.
 
-    Raises ``ValueError`` with a clear path if the required structure is absent.
-    Accepts both ``resourceSpans`` (OTLP standard) and flat ``spans`` arrays.
+    Raises ``ValueError`` with a clear path if the required structure is absent
+    or an array holds anything other than JSON objects. Accepts both
+    ``resourceSpans`` (OTLP standard) and flat ``spans`` arrays.
     """
     if not isinstance(trace_data, dict):
         raise ValueError("OTel trace must be a JSON object, got: " + type(trace_data).__name__)
@@ -196,8 +221,19 @@ def validate_otel_schema(trace_data: dict) -> None:
             "Ensure the file is a valid OTel JSON export."
         )
 
-    if has_resource_spans and not isinstance(trace_data["resourceSpans"], list):
-        raise ValueError("'resourceSpans' must be a JSON array")
+    if has_flat_spans:
+        _require_object_array(trace_data["spans"], "spans")
+
+    if has_resource_spans:
+        for rs_index, resource_span in enumerate(_require_object_array(trace_data["resourceSpans"], "resourceSpans")):
+            rs_path = f"resourceSpans[{rs_index}]"
+            if "scopeSpans" not in resource_span:
+                continue
+            scope_spans = _require_object_array(resource_span["scopeSpans"], f"{rs_path}.scopeSpans")
+            for ss_index, scope_span in enumerate(scope_spans):
+                if "spans" not in scope_span:
+                    continue
+                _require_object_array(scope_span["spans"], f"{rs_path}.scopeSpans[{ss_index}].spans")
 
 
 def parse_otel_traces(trace_data: dict) -> list[ToolCallTrace]:
@@ -238,9 +274,17 @@ def parse_otel_traces(trace_data: dict) -> list[ToolCallTrace]:
         if not tool_name:
             continue
 
-        # Extract parameters from attributes
+        # Extract parameters and common correlation attributes from span attrs.
+        attrs = span.get("attributes", [])
         params = {}
-        for attr in span.get("attributes", []):
+        server_name = _extract_attr(attrs, "mcp.server") or _extract_attr(attrs, "server.name") or _extract_attr(attrs, "tool.server")
+        package_name = (
+            _extract_attr(attrs, "package.name")
+            or _extract_attr(attrs, "tool.package")
+            or _extract_attr(attrs, "dependency.package")
+            or _extract_attr(attrs, "package")
+        )
+        for attr in attrs:
             key = attr.get("key", "")
             if key.startswith("tool.input."):
                 param_name = key[len("tool.input.") :]
@@ -261,6 +305,8 @@ def parse_otel_traces(trace_data: dict) -> list[ToolCallTrace]:
                 trace_id=span.get("traceId", ""),
                 span_id=span.get("spanId", ""),
                 tool_name=tool_name,
+                server_name=server_name,
+                package_name=package_name,
                 parameters=params,
                 duration_ms=duration_ms,
                 status=status,
@@ -284,6 +330,7 @@ def parse_ml_api_spans(trace_data: dict) -> list[LLMAPICall]:
     calls: list[LLMAPICall] = []
 
     for rs in trace_data.get("resourceSpans", []):
+        resource_attrs = rs.get("resource", {}).get("attributes", [])
         for ss in rs.get("scopeSpans", []):
             scope_name = ss.get("scope", {}).get("name", "")
             for span in ss.get("spans", []):
@@ -291,6 +338,15 @@ def parse_ml_api_spans(trace_data: dict) -> list[LLMAPICall]:
                     continue
 
                 attrs = span.get("attributes", [])
+                # Span-level attribution beats resource-level: one service can run
+                # several agents, so service.name is the fallback, not the answer.
+                agent = (
+                    _extract_attr(attrs, "gen_ai.agent.name")
+                    or _extract_attr(attrs, "agent.name")
+                    or _extract_attr(attrs, "gen_ai.agent.id")
+                    or _extract_attr(attrs, "agent.id")
+                    or _extract_attr(resource_attrs, "service.name")
+                )
 
                 # Provider: gen_ai.system (OTel convention) or infer from scope
                 provider = _extract_attr(attrs, "gen_ai.system")
@@ -356,10 +412,150 @@ def parse_ml_api_spans(trace_data: dict) -> list[LLMAPICall]:
                         output_tokens=output_tokens,
                         duration_ms=duration_ms,
                         status=status,
+                        agent=agent,
                     )
                 )
 
     return calls
+
+
+@dataclass
+class SpanContent:
+    """Free-text content carried by a span (tool output, model completion, …).
+
+    Content extraction is deliberately *separate* from ``parse_otel_traces`` /
+    ``parse_ml_api_spans`` (which read metadata only for privacy). It is opt-in
+    and only invoked when trace-content screening is explicitly enabled.
+    """
+
+    trace_id: str
+    span_id: str
+    tool_name: str
+    channel: str  # "output" | "input" | "prompt" | "completion"
+    content: str
+
+
+# Attribute keys that carry free-text span content, grouped by channel. Response
+# channels ("output"/"completion") are what Shield.check_response screens for
+# credential leak / PII / injection / cloaking on production traces.
+_CONTENT_ATTR_KEYS: dict[str, tuple[str, ...]] = {
+    "output": (
+        "tool.output",
+        "tool.result",
+        "mcp.tool.result",
+        "output.value",
+        "llm.output",
+        "traceloop.entity.output",
+    ),
+    "completion": (
+        "gen_ai.completion",
+        "gen_ai.response.content",
+        "gen_ai.completion.0.content",
+        "llm.completions",
+    ),
+    "prompt": (
+        "gen_ai.prompt",
+        "gen_ai.prompt.0.content",
+        "llm.prompts",
+    ),
+    "input": (
+        "tool.input",
+        "input.value",
+        "traceloop.entity.input",
+    ),
+}
+
+# Response-side channels — the ones Shield.check_response is meaningful over.
+RESPONSE_CONTENT_CHANNELS: frozenset[str] = frozenset({"output", "completion"})
+
+# Cap per-span content so an adversarial trace can't drive Shield OOM.
+_MAX_CONTENT_CHARS = 200_000
+
+
+def _span_content_tool_name(span: dict) -> str:
+    name = span.get("name", "")
+    m = _ADK_TOOL_RE.match(name)
+    if m:
+        return m.group(1)
+    for attr in span.get("attributes", []):
+        if attr.get("key") == "tool.name":
+            return attr.get("value", {}).get("stringValue", "") or name
+    return name
+
+
+def extract_span_content(
+    trace_data: dict,
+    *,
+    channels: frozenset[str] | set[str] | None = None,
+) -> list[SpanContent]:
+    """Extract free-text span content for opt-in trace-content screening.
+
+    Reuses the same OTLP span walk as ``parse_otel_traces`` but reads
+    content-bearing attributes (and ``gen_ai`` content span events) instead of
+    metadata. Off the default ingest path — callers gate this behind an explicit
+    opt-in so the metadata-only privacy posture is preserved by default.
+
+    Args:
+        trace_data: OTLP JSON (resourceSpans or flat spans).
+        channels: Restrict to these content channels; defaults to response-side
+            channels (``output``/``completion``) that Shield screens.
+    """
+    validate_otel_schema(trace_data)
+    wanted = frozenset(channels) if channels else RESPONSE_CONTENT_CHANNELS
+
+    spans: list[dict] = []
+    for rs in trace_data.get("resourceSpans", []):
+        for ss in rs.get("scopeSpans", []):
+            spans.extend(ss.get("spans", []))
+    if not spans:
+        spans = trace_data.get("spans", [])
+
+    contents: list[SpanContent] = []
+    for span in spans:
+        if not isinstance(span, dict):
+            continue
+        attrs = span.get("attributes", [])
+        trace_id = span.get("traceId", "")
+        span_id = span.get("spanId", "")
+        tool_name = _span_content_tool_name(span)
+        for channel, keys in _CONTENT_ATTR_KEYS.items():
+            if channel not in wanted:
+                continue
+            for key in keys:
+                value = _extract_attr(attrs, key)
+                if value:
+                    contents.append(
+                        SpanContent(
+                            trace_id=trace_id,
+                            span_id=span_id,
+                            tool_name=tool_name,
+                            channel=channel,
+                            content=value[:_MAX_CONTENT_CHARS],
+                        )
+                    )
+        # OTel GenAI content is also emitted as span events with a body attr.
+        if "completion" in wanted or "prompt" in wanted:
+            for event in span.get("events", []) or []:
+                if not isinstance(event, dict):
+                    continue
+                ev_name = str(event.get("name", ""))
+                channel = "completion" if "completion" in ev_name else "prompt" if "prompt" in ev_name else ""
+                if channel not in wanted:
+                    continue
+                body = _extract_attr(event.get("attributes", []), "content") or _extract_attr(
+                    event.get("attributes", []), "gen_ai.event.content"
+                )
+                if body:
+                    contents.append(
+                        SpanContent(
+                            trace_id=trace_id,
+                            span_id=span_id,
+                            tool_name=tool_name,
+                            channel=channel,
+                            content=body[:_MAX_CONTENT_CHARS],
+                        )
+                    )
+    return contents
 
 
 def flag_deprecated_models(calls: list[LLMAPICall]) -> list[FlaggedMLCall]:
@@ -388,44 +584,70 @@ def flag_deprecated_models(calls: list[LLMAPICall]) -> list[FlaggedMLCall]:
 def flag_vulnerable_tool_calls(
     traces: list[ToolCallTrace],
     vuln_packages: dict[str, list[str]] | None = None,
-    vuln_servers: set[str] | None = None,
+    vuln_servers: dict[str, list[str]] | set[str] | None = None,
 ) -> list[FlaggedCall]:
     """Cross-reference tool calls against known-vulnerable packages/servers.
 
     Args:
         traces: Parsed tool call traces.
         vuln_packages: Map of package name → list of CVE IDs.
-        vuln_servers: Set of server/tool names with known vulnerabilities.
+        vuln_servers: Mapping of server/tool name → CVE IDs, or a simple set.
     """
     flagged: list[FlaggedCall] = []
     vuln_packages = vuln_packages or {}
-    vuln_servers = vuln_servers or set()
+    vuln_server_map: dict[str, list[str]]
+    if isinstance(vuln_servers, set):
+        vuln_server_map = {name: [] for name in vuln_servers}
+    else:
+        vuln_server_map = vuln_servers or {}
+
+    def _lookup_name(mapping: dict[str, list[str]], candidate: str) -> tuple[str, list[str]] | None:
+        lowered = candidate.lower()
+        for name, cves in mapping.items():
+            if name.lower() == lowered:
+                return name, cves
+        return None
 
     for trace in traces:
         tool_lower = trace.tool_name.lower()
+        server_match = None
+        package_match = None
+        matched_cves: list[str] = []
 
-        # Check against vulnerable server/tool names
-        if tool_lower in vuln_servers or trace.tool_name in vuln_servers:
+        for candidate in (trace.server_name, trace.tool_name):
+            if not candidate:
+                continue
+            server_match = _lookup_name(vuln_server_map, candidate)
+            if server_match:
+                matched_cves.extend(server_match[1])
+                break
+
+        # Check against vulnerable package names (prefer explicit package attr, then fuzzy tool-name match)
+        for pkg_name, cves in vuln_packages.items():
+            explicit_match = trace.package_name and trace.package_name.lower() == pkg_name.lower()
+            fuzzy_match = pkg_name.lower() in tool_lower or tool_lower in pkg_name.lower()
+            if explicit_match or fuzzy_match:
+                package_match = pkg_name
+                matched_cves.extend(cves)
+                break
+
+        if server_match or package_match:
+            deduped_cves = list(dict.fromkeys(cve for cve in matched_cves if cve))
+            reason_parts = []
+            if server_match:
+                reason_parts.append(f"server '{server_match[0]}' has known vulnerabilities")
+            if package_match:
+                reason_parts.append(f"package '{package_match}' is vulnerable")
             flagged.append(
                 FlaggedCall(
                     trace=trace,
-                    reason=f"Tool '{trace.tool_name}' belongs to a server with known vulnerabilities",
-                    severity="high",
+                    reason="; ".join(reason_parts),
+                    severity="high" if server_match else "medium",
+                    server=server_match[0] if server_match else trace.server_name,
+                    package_name=package_match or trace.package_name,
+                    matched_cve=deduped_cves[0] if deduped_cves else "",
+                    matched_cves=deduped_cves,
                 )
             )
-            continue
-
-        # Check against vulnerable package names (fuzzy: tool name contains package)
-        for pkg_name, cves in vuln_packages.items():
-            if pkg_name.lower() in tool_lower or tool_lower in pkg_name.lower():
-                flagged.append(
-                    FlaggedCall(
-                        trace=trace,
-                        reason=f"Tool '{trace.tool_name}' may be associated with vulnerable package '{pkg_name}'",
-                        severity="medium",
-                        matched_cve=cves[0] if cves else "",
-                    )
-                )
-                break
 
     return flagged

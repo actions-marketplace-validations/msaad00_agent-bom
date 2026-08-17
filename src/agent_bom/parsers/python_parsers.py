@@ -13,8 +13,99 @@ import subprocess
 from pathlib import Path
 
 from agent_bom.models import Package
+from agent_bom.parsers.file_limits import read_json_limited, read_text_limited
+from agent_bom.version_utils import strip_pip_extras
 
 logger = logging.getLogger(__name__)
+
+# PEP 508 direct-URL git reference (``flask @ git+https://…/flask.git@<sha>``)
+# and the legacy ``git+https://…#egg=name`` form.
+_GIT_DIRECT_URL_RE = re.compile(r"^(?P<name>[a-zA-Z0-9_.-]+)\s*@\s*(?P<url>\S+)$")
+_GIT_EGG_RE = re.compile(r"[#&]egg=(?P<name>[a-zA-Z0-9_.-]+)")
+
+_GIT_REF_FLOATING_REASON = (
+    "declared as a git URL/SHA reference — a pinned git ref is not a released "
+    "version, so any reported version is resolved from the installed host "
+    "package, not the pinned ref"
+)
+
+
+#: Operators that pin an exact installed version. Everything else (``>=``,
+#: ``<``, ``~=``, ``!=`` or a ``==x.*`` wildcard) is a range/constraint and does
+#: not identify the installed version.
+_EXACT_OPERATORS = {"==", "==="}
+
+
+def _looks_like_git_requirement(url: str) -> bool:
+    lowered = url.lower()
+    return lowered.startswith(("git+", "git@", "git://")) or "git+" in lowered
+
+
+def _requirement_package(name: str, operator: str, version: str, *, is_direct: bool) -> Package:
+    """Build a Package for a ``name<op>version`` declaration line.
+
+    An exact ``==`` pin is reported as the installed version. A range/inequality
+    (``>=``/``<``/``~=``/``!=`` or a ``==x.*`` wildcard) does NOT identify an
+    installed version — the named bound is a constraint the resolved version may
+    even exclude (``<2.3`` excludes 2.3). Emitting ``pkg@<bound>`` as an exact pin
+    is a fabricated fact, so a range is recorded as a floating declaration
+    reference with lowered confidence instead. Packages come from a declaration
+    manifest (no runtime/import proof), so reachability is ``declaration_only``.
+    """
+    if operator in _EXACT_OPERATORS and "*" not in version:
+        return Package(
+            name=name,
+            version=version,
+            ecosystem="pypi",
+            purl=f"pkg:pypi/{name}@{version}",
+            is_direct=is_direct,
+            reachability_evidence="declaration_only",
+        )
+    return Package(
+        name=name,
+        version="unknown",
+        ecosystem="pypi",
+        is_direct=is_direct,
+        declared_version=f"{operator}{version}",
+        floating_reference=True,
+        floating_reference_reason=(
+            f"declared as a version constraint ({operator}{version}), not an exact "
+            "pin — the installed version is unknown and may differ from the bound"
+        ),
+        version_confidence="low",
+        reachability_evidence="declaration_only",
+    )
+
+
+def _git_reference_package(line: str, *, is_direct: bool = True) -> Package | None:
+    """Return a Package for a git-URL requirement line, or None if not one.
+
+    A git reference resolves (at scan time) to whatever the host environment has
+    installed, which is *not* an exact match to the pinned ref. Mark it
+    ``floating_reference`` with lowered confidence so downstream matching does not
+    treat the host-env coincidence as an exact pin.
+    """
+    direct = _GIT_DIRECT_URL_RE.match(line)
+    if direct and _looks_like_git_requirement(direct.group("url")):
+        name, url = direct.group("name"), direct.group("url")
+    elif _looks_like_git_requirement(line):
+        egg = _GIT_EGG_RE.search(line)
+        if not egg:
+            return None
+        name, url = egg.group("name"), line.split()[0]
+    else:
+        return None
+    return Package(
+        name=name,
+        version="unknown",
+        ecosystem="pypi",
+        is_direct=is_direct,
+        declared_version=url,
+        floating_reference=True,
+        floating_reference_reason=_GIT_REF_FLOATING_REASON,
+        version_confidence="low",
+        reachability_evidence="declaration_only",
+    )
 
 
 def parse_poetry_lock(directory: Path) -> list[Package]:
@@ -39,7 +130,7 @@ def parse_poetry_lock(directory: Path) -> list[Package]:
             except ImportError:
                 import toml as tomllib  # type: ignore[no-redef,no-reattr,import-not-found,import-untyped]
 
-        data = tomllib.loads(lock_file.read_text())
+        data = tomllib.loads(read_text_limited(lock_file))
         for pkg in data.get("package", []):
             name = pkg.get("name", "")
             version = pkg.get("version", "unknown")
@@ -57,6 +148,13 @@ def parse_poetry_lock(directory: Path) -> list[Package]:
             )
     except Exception as exc:
         logger.debug("Failed to parse poetry.lock at %s: %s", lock_file, exc)
+        from agent_bom.coverage import record_manifest_parse_warning
+
+        record_manifest_parse_warning(
+            ecosystem="pypi",
+            path=str(lock_file),
+            detail=f"poetry.lock failed to parse ({exc}); Python dependencies were not scanned",
+        )
 
     return packages
 
@@ -84,13 +182,13 @@ def parse_uv_lock(directory: Path) -> list[Package]:
             except ImportError:
                 import toml as tomllib  # type: ignore[no-redef,no-reattr,import-not-found,import-untyped]
 
-        data = tomllib.loads(lock_file.read_text())
+        data = tomllib.loads(read_text_limited(lock_file))
         # Collect direct dep names from pyproject.toml if available
         direct_names: set[str] = set()
         pyproject = directory / "pyproject.toml"
         if pyproject.exists():
             try:
-                proj = tomllib.loads(pyproject.read_text())
+                proj = tomllib.loads(read_text_limited(pyproject))
                 for dep_str in proj.get("project", {}).get("dependencies", []):
                     m = re.match(r"^([a-zA-Z0-9_.-]+)", dep_str)
                     if m:
@@ -114,6 +212,13 @@ def parse_uv_lock(directory: Path) -> list[Package]:
             )
     except Exception as exc:
         logger.debug("Failed to parse uv.lock at %s: %s", lock_file, exc)
+        from agent_bom.coverage import record_manifest_parse_warning
+
+        record_manifest_parse_warning(
+            ecosystem="pypi",
+            path=str(lock_file),
+            detail=f"uv.lock failed to parse ({exc}); Python dependencies were not scanned",
+        )
 
     return packages
 
@@ -141,7 +246,7 @@ def parse_conda_environment(directory: Path) -> list[Package]:
             logger.debug("PyYAML not installed; skipping conda environment.yml parsing")
             return []
 
-        data = yaml.safe_load(env_file.read_text()) or {}
+        data = yaml.safe_load(read_text_limited(env_file)) or {}
         for dep in data.get("dependencies", []):
             if isinstance(dep, str):
                 # conda package: "name=version=build" or "name=version" or "name"
@@ -204,33 +309,34 @@ def parse_pip_packages(directory: Path) -> list[Package]:
     # Try requirements.txt
     req_file = directory / "requirements.txt"
     if req_file.exists():
-        for line in req_file.read_text().splitlines():
+        for line in read_text_limited(req_file).splitlines():
             line = line.strip()
             if not line or line.startswith("#") or line.startswith("-"):
                 continue
+            # Git URL/SHA reference (``flask @ git+…@<sha>``): version can't be
+            # pinned from the ref, so flag it floating rather than dropping it.
+            git_pkg = _git_reference_package(line, is_direct=True)
+            if git_pkg is not None:
+                packages.append(git_pkg)
+                continue
             # Parse name==version, name>=version, etc.
-            match = re.match(r"^([a-zA-Z0-9_.-]+)\s*([=<>!~]+)\s*([a-zA-Z0-9_.*+-]+)", line)
+            match = re.match(r"^([a-zA-Z0-9_.-]+(?:\[[^\]]+\])?)\s*([=<>!~]+)\s*([a-zA-Z0-9_.*+-]+)", line)
             if match:
-                name, _, version = match.groups()
-                packages.append(
-                    Package(
-                        name=name,
-                        version=version,
-                        ecosystem="pypi",
-                        purl=f"pkg:pypi/{name}@{version}",
-                        is_direct=True,
-                    )
-                )
+                raw_name, operator, version = match.groups()
+                name, _ = strip_pip_extras(raw_name)
+                packages.append(_requirement_package(name, operator, version, is_direct=True))
             else:
                 # Just a name, no version
-                name_match = re.match(r"^([a-zA-Z0-9_.-]+)", line)
+                name_match = re.match(r"^([a-zA-Z0-9_.-]+(?:\[[^\]]+\])?)", line)
                 if name_match:
+                    name, _ = strip_pip_extras(name_match.group(1))
                     packages.append(
                         Package(
-                            name=name_match.group(1),
+                            name=name,
                             version="unknown",
                             ecosystem="pypi",
                             is_direct=True,
+                            reachability_evidence="declaration_only",
                         )
                     )
 
@@ -238,7 +344,7 @@ def parse_pip_packages(directory: Path) -> list[Package]:
     pipfile_lock = directory / "Pipfile.lock"
     if pipfile_lock.exists() and not packages:
         try:
-            lock_data = json.loads(pipfile_lock.read_text())
+            lock_data = read_json_limited(pipfile_lock)
             for section in ("default", "develop"):
                 for name, info in lock_data.get(section, {}).items():
                     if isinstance(info, dict):
@@ -252,8 +358,8 @@ def parse_pip_packages(directory: Path) -> list[Package]:
                                 is_direct=section == "default",
                             )
                         )
-        except (json.JSONDecodeError, KeyError):
-            pass
+        except (json.JSONDecodeError, KeyError) as exc:
+            logger.debug("Failed to parse Pipfile.lock in %s: %s", directory, exc)
 
     # Try pyproject.toml
     pyproject = directory / "pyproject.toml"
@@ -261,23 +367,46 @@ def parse_pip_packages(directory: Path) -> list[Package]:
         try:
             import toml
 
-            proj_data = toml.loads(pyproject.read_text())
+            proj_data = toml.loads(read_text_limited(pyproject))
             deps = proj_data.get("project", {}).get("dependencies", [])
+            if not deps:
+                poetry_deps = proj_data.get("tool", {}).get("poetry", {}).get("dependencies", {})
+                deps = []
+                for raw_name, raw_spec in poetry_deps.items():
+                    if str(raw_name).lower() == "python":
+                        continue
+                    if isinstance(raw_spec, dict):
+                        raw_spec = raw_spec.get("version", "*")
+                    spec = str(raw_spec or "*")
+                    deps.append(f"{raw_name}{spec}")
             for dep in deps:
-                match = re.match(r"^([a-zA-Z0-9_.-]+)\s*([=<>!~]+)\s*([a-zA-Z0-9_.*+-]+)", dep)
+                match = re.match(r"^([a-zA-Z0-9_.-]+(?:\[[^\]]+\])?)\s*([=<>!~]+)\s*([a-zA-Z0-9_.*+-]+)", dep)
                 if match:
-                    name, _, version = match.groups()
-                    packages.append(
-                        Package(
-                            name=name,
-                            version=version,
-                            ecosystem="pypi",
-                            purl=f"pkg:pypi/{name}@{version}",
-                            is_direct=True,
+                    raw_name, operator, version = match.groups()
+                    name, _ = strip_pip_extras(raw_name)
+                    packages.append(_requirement_package(name, operator, version, is_direct=True))
+                else:
+                    bare = re.match(r"^([a-zA-Z0-9_.-]+(?:\[[^\]]+\])?)", dep)
+                    if bare:
+                        name, _ = strip_pip_extras(bare.group(1))
+                        packages.append(
+                            Package(
+                                name=name,
+                                version="unknown",
+                                ecosystem="pypi",
+                                is_direct=True,
+                                reachability_evidence="declaration_only",
+                            )
                         )
-                    )
         except Exception as e:
             logger.debug(f"Failed to parse pyproject.toml at {pyproject}: {e}")
+            from agent_bom.coverage import record_manifest_parse_warning
+
+            record_manifest_parse_warning(
+                ecosystem="pypi",
+                path=str(pyproject),
+                detail=f"pyproject.toml failed to parse ({e}); Python dependencies were not scanned",
+            )
 
     return packages
 
@@ -295,27 +424,22 @@ def _parse_requirements_lines(lines: list[str], is_direct: bool = True) -> list[
         line = raw.strip()
         if not line or line.startswith("#") or line.startswith("-"):
             continue
-        m = re.match(r"^([a-zA-Z0-9_.-]+)\s*([=<>!~]+)\s*([a-zA-Z0-9_.*+-]+)", line)
+        m = re.match(r"^([a-zA-Z0-9_.-]+(?:\[[^\]]+\])?)\s*([=<>!~]+)\s*([a-zA-Z0-9_.*+-]+)", line)
         if m:
-            req_name, _, req_version = m.groups()
-            packages.append(
-                Package(
-                    name=req_name,
-                    version=req_version,
-                    ecosystem="pypi",
-                    purl=f"pkg:pypi/{req_name}@{req_version}",
-                    is_direct=is_direct,
-                )
-            )
+            raw_name, operator, req_version = m.groups()
+            req_name, _ = strip_pip_extras(raw_name)
+            packages.append(_requirement_package(req_name, operator, req_version, is_direct=is_direct))
         else:
-            bare = re.match(r"^([a-zA-Z0-9_.-]+)", line)
+            bare = re.match(r"^([a-zA-Z0-9_.-]+(?:\[[^\]]+\])?)", line)
             if bare:
+                req_name, _ = strip_pip_extras(bare.group(1))
                 packages.append(
                     Package(
-                        name=bare.group(1),
+                        name=req_name,
                         version="unknown",
                         ecosystem="pypi",
                         is_direct=is_direct,
+                        reachability_evidence="declaration_only",
                     )
                 )
     return packages
@@ -384,7 +508,7 @@ def parse_pip_compile_inputs(directory: Path) -> list[Package]:
 
 
 def parse_pip_environment(python_exec: str | None = None) -> list[Package]:
-    """Scan an installed Python environment via ``pip list --format=json``.
+    """Scan an installed Python environment for installed packages.
 
     Useful when there is no lock file (e.g. bare virtualenv, conda env,
     system Python) and you want to audit what's actually installed.
@@ -395,10 +519,28 @@ def parse_pip_environment(python_exec: str | None = None) -> list[Package]:
 
     Returns:
         List of :class:`~agent_bom.models.Package` objects with
-        ``ecosystem="pypi"``.  Returns an empty list if ``pip`` is not
-        available in the target environment.
+        ``ecosystem="pypi"``.  Prefers ``pip list --format=json`` and falls
+        back to ``importlib.metadata`` for environments that intentionally do
+        not install the ``pip`` package.
     """
     import sys as _sys
+
+    def _packages_from_rows(rows: list[dict[str, str]]) -> list[Package]:
+        packages: list[Package] = []
+        for entry in rows:
+            name = entry.get("name", "")
+            version = entry.get("version", "unknown")
+            if name:
+                packages.append(
+                    Package(
+                        name=name,
+                        version=version,
+                        ecosystem="pypi",
+                        purl=f"pkg:pypi/{name.lower()}@{version}",
+                        is_direct=True,
+                    )
+                )
+        return packages
 
     exe = python_exec or _sys.executable
     try:
@@ -414,26 +556,41 @@ def parse_pip_environment(python_exec: str | None = None) -> list[Package]:
 
     if result.returncode != 0:
         logger.debug("parse_pip_environment: pip list failed: %s", result.stderr[:200])
-        return []
+        try:
+            fallback = subprocess.run(
+                [
+                    exe,
+                    "-c",
+                    (
+                        "import importlib.metadata as m, json; "
+                        "print(json.dumps(["
+                        "{'name': d.metadata.get('Name') or d.metadata.get('name') or '', "
+                        "'version': d.version} "
+                        "for d in m.distributions()]))"
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            logger.debug("parse_pip_environment: metadata fallback failed (%s)", exc)
+            return []
+        if fallback.returncode != 0:
+            logger.debug(
+                "parse_pip_environment: metadata fallback failed: %s",
+                fallback.stderr[:200],
+            )
+            return []
+        try:
+            raw = json.loads(fallback.stdout)
+        except json.JSONDecodeError:
+            return []
+        return _packages_from_rows(raw)
 
     try:
         raw = json.loads(result.stdout)
     except json.JSONDecodeError:
         return []
 
-    packages: list[Package] = []
-    for entry in raw:
-        name = entry.get("name", "")
-        version = entry.get("version", "unknown")
-        if name:
-            packages.append(
-                Package(
-                    name=name,
-                    version=version,
-                    ecosystem="pypi",
-                    purl=f"pkg:pypi/{name.lower()}@{version}",
-                    is_direct=True,
-                )
-            )
-
-    return packages
+    return _packages_from_rows(raw)

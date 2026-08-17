@@ -1,0 +1,2433 @@
+"""Azure general cloud-asset inventory — estate-wide, read-only, agentless.
+
+Unlike :mod:`agent_bom.cloud.azure` (which discovers *AI* runtimes: Container
+Apps, AI Foundry agents, Azure OpenAI deployments, Functions, ML endpoints),
+this module enumerates the general Azure estate so that a resource with **no**
+CIS finding, IaC target, or discovered AI runtime still becomes a first-class
+graph node. That feeds the CNAPP exposure overlay, the CIEM effective-
+permissions overlay, and the DSPM tiers, which were previously starved of
+inventory input.
+
+Three resource classes are enumerated subscription-wide (NOT filtered to
+findings):
+
+1. **Storage Accounts**       → emitted as ``DATA_STORE``-signalling
+   ``CLOUD_RESOURCE`` so the DSPM / ``STORES`` / ``EXPOSED_TO`` overlays apply.
+2. **VMs + Network Security Groups** → emitted as ``CLOUD_RESOURCE``.
+3. **Managed Identities / Service Principals** → emitted as identity principals
+   with a ``HAS_PERMISSION``-ready structure.
+
+This scanner is **opt-in** and **default OFF**. It runs only when
+``AGENT_BOM_AZURE_INVENTORY`` is truthy, mirroring the platform's other
+optional-feature gates (e.g. ``AGENT_BOM_CLOUD_INVENTORY``).
+
+Trust posture: read-only (``ScanMode.CLOUD_READ_ONLY``), reference-only, and
+agentless. Authentication is **token / credential only** — no passwords — via
+``azure-identity`` (``DefaultAzureCredential``: env service-principal token,
+managed identity, Azure CLI token, workload-identity). Only ``list`` / ``get``
+ARM APIs are called — no write APIs, no object-content reads, no credential
+exfiltration. SDK absence or missing credentials degrades to an empty inventory
+plus a clear status, never a crash.
+
+Requires ``azure-identity`` and ``azure-mgmt-*``. Install with::
+
+    pip install 'agent-bom[azure]'
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
+
+from agent_bom.discovery_envelope import DiscoveryEnvelope, RedactionStatus, ScanMode
+
+from .aws_inventory import dedupe_missing_permissions, record_discovery_failure
+from .azure_authorization_collector import collect_azure_authorization
+from .azure_rbac_evidence import normalize_azure_rbac_inventory
+from .normalization import sanitize_discovery_warning
+from .side_scan_targets import azure_managed_disk_targets
+
+logger = logging.getLogger(__name__)
+
+# Opt-in env flag. Default OFF — estate-wide enumeration must be explicitly
+# requested by an operator. Mirrors the other AGENT_BOM_* feature gates.
+INVENTORY_ENV_FLAG = "AGENT_BOM_AZURE_INVENTORY"
+
+_TRUTHY = {"1", "true", "yes", "on"}
+
+# Read-only ARM actions this scanner is allowed to exercise, by resource class.
+# Kept here so the per-run discovery envelope `permissions_used` stays honest.
+_AZURE_STORAGE_PERMISSIONS: tuple[str, ...] = ("Microsoft.Storage/storageAccounts/read",)
+_AZURE_COMPUTE_PERMISSIONS: tuple[str, ...] = (
+    "Microsoft.Compute/virtualMachines/read",
+    "Microsoft.Compute/disks/read",
+    "Microsoft.ContainerService/managedClusters/read",
+    "Microsoft.Web/sites/read",
+    "Microsoft.Network/networkSecurityGroups/read",
+)
+_AZURE_IDENTITY_PERMISSIONS: tuple[str, ...] = (
+    "Microsoft.ManagedIdentity/userAssignedIdentities/read",
+    "Microsoft.Authorization/denyAssignments/read",
+    "Microsoft.Authorization/roleAssignments/read",
+    "Microsoft.Authorization/roleDefinitions/read",
+)
+_AZURE_DATA_PERMISSIONS: tuple[str, ...] = (
+    "Microsoft.KeyVault/vaults/read",
+    "Microsoft.ContainerRegistry/registries/read",
+    "Microsoft.DocumentDB/databaseAccounts/read",
+    "Microsoft.Sql/servers/read",
+    "Microsoft.DBforPostgreSQL/flexibleServers/read",
+    "Microsoft.DBforMySQL/flexibleServers/read",
+    "Microsoft.EventHub/namespaces/read",
+    "Microsoft.ServiceBus/namespaces/read",
+    "Microsoft.Cache/redis/read",
+)
+_AZURE_NETWORK_PERMISSIONS: tuple[str, ...] = (
+    "Microsoft.Network/virtualNetworks/read",
+    "Microsoft.Network/virtualNetworks/subnets/read",
+    "Microsoft.Network/publicIPAddresses/read",
+    "Microsoft.Network/loadBalancers/read",
+    "Microsoft.Network/applicationGateways/read",
+    "Microsoft.Network/frontDoors/read",
+    "Microsoft.Network/azureFirewalls/read",
+    "Microsoft.Network/natGateways/read",
+    "Microsoft.Network/routeTables/read",
+    "Microsoft.Network/networkInterfaces/read",
+    "Microsoft.Network/privateEndpoints/read",
+    "Microsoft.ApiManagement/service/read",
+)
+
+# Open-to-the-world source-address ranges that mark an NSG inbound rule as
+# internet-facing. The CNAPP overlay keys off this `network_exposure` shape.
+_INTERNET_SOURCES = {"*", "0.0.0.0/0", "internet", "any", "::/0"}
+
+
+def inventory_enabled() -> bool:
+    """Return whether estate-wide Azure inventory enumeration is opted in.
+
+    Default OFF. Operators enable it by setting ``AGENT_BOM_AZURE_INVENTORY``
+    to a truthy value (``1`` / ``true`` / ``yes`` / ``on``).
+    """
+    return os.environ.get(INVENTORY_ENV_FLAG, "").strip().lower() in _TRUTHY
+
+
+def _derive_default_subscription(credential: Any) -> tuple[str, str]:
+    """Best-effort ``(subscription_id, note)`` from the signed-in credential.
+
+    Lists the subscriptions visible to the credential and returns the first
+    enabled one, so a single-subscription ``az login`` needs no explicit
+    ``AZURE_SUBSCRIPTION_ID``. Returns ``("", note)`` on any failure — read-only
+    and never raises. When more than one subscription is visible, the note asks
+    the operator to pin one so selection stays deterministic.
+    """
+    import json
+    import urllib.request
+
+    # Read-only ARM subscriptions list — the same endpoint the SDK clients call,
+    # reached directly with the credential's own bearer token so no extra SDK
+    # distribution is required just to resolve the subscription.
+    try:
+        token = credential.get_token("https://management.azure.com/.default").token
+    except Exception as exc:  # noqa: BLE001 — token acquisition must not crash a scan
+        return "", sanitize_discovery_warning(exc)
+    request = urllib.request.Request(  # noqa: S310 — fixed https ARM endpoint, not user input
+        "https://management.azure.com/subscriptions?api-version=2022-12-01",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:  # noqa: S310  # nosec B310 — fixed https ARM endpoint, not user input
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 — listing failures degrade to a warning
+        return "", sanitize_discovery_warning(exc)
+
+    subs = [s for s in payload.get("value", []) if s.get("subscriptionId")]
+    enabled = [s for s in subs if str(s.get("state", "Enabled")) == "Enabled"] or subs
+    if not enabled:
+        return "", "No Azure subscriptions visible to the signed-in credential."
+    chosen = enabled[0]["subscriptionId"]
+    note = ""
+    if len(enabled) > 1:
+        note = (
+            f"AZURE_SUBSCRIPTION_ID not set; auto-selected subscription {chosen} "
+            f"of {len(enabled)} visible. Set AZURE_SUBSCRIPTION_ID to pin one."
+        )
+    return str(chosen), note
+
+
+def discover_inventory(
+    subscription_id: str | None = None,
+    *,
+    credential: Any = None,
+    include_storage: bool = True,
+    include_compute: bool = True,
+    include_identity: bool = True,
+    include_data: bool = True,
+    include_network: bool = True,
+    include_hierarchy: bool = True,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Enumerate the general Azure estate (storage, VMs + NSGs, identities).
+
+    Returns a JSON-serialisable inventory payload destined for
+    ``report_json["cloud_inventory"]``; the graph builder turns it into nodes.
+
+    The payload always carries a ``status`` string so callers can surface a
+    clear reason when nothing was enumerated:
+
+    - ``"disabled"``           — the feature flag is off and ``force`` was not set.
+    - ``"sdk_missing"``        — azure-identity / azure-mgmt is not installed.
+    - ``"no_subscription"``    — no subscription id resolved.
+    - ``"no_credentials"``     — no Azure credential resolved.
+    - ``"ok"``                 — enumeration ran (possibly with per-service warnings).
+
+    Never raises: SDK absence, missing credentials, and per-service access
+    denials all degrade to an empty (or partial) inventory plus warnings.
+
+    Authentication is token/credential only (no passwords). When ``credential``
+    is not supplied, ``DefaultAzureCredential`` is used, which acquires
+    short-lived tokens from env service principals, managed identity, the Azure
+    CLI, or workload identity.
+    """
+    resolved_sub = subscription_id or os.environ.get("AZURE_SUBSCRIPTION_ID", "")
+    empty: dict[str, Any] = {
+        "provider": "azure",
+        "status": "disabled",
+        "subscription_id": resolved_sub,
+        "account_id": resolved_sub,
+        "region": "",
+        "storage_accounts": [],
+        "instances": [],
+        "container_clusters": [],
+        "security_groups": [],
+        "managed_identities": [],
+        "role_assignments": [],
+        "role_definitions": [],
+        "deny_assignments": [],
+        "authorization_sources": [],
+        "authorization_observed_at": None,
+        "authorization_evidence": None,
+        "service_principals": [],
+        "entra_groups": [],
+        "key_vaults": [],
+        "container_registries": [],
+        "databases": [],
+        "virtual_networks": [],
+        "subnets": [],
+        "public_ips": [],
+        "ip_addresses": [],
+        "network_interfaces": [],
+        "load_balancers": [],
+        "application_gateways": [],
+        "front_doors": [],
+        "azure_firewalls": [],
+        "nat_gateways": [],
+        "route_tables": [],
+        "private_endpoints": [],
+        "api_management": [],
+        "event_hubs": [],
+        "service_bus_namespaces": [],
+        "redis_caches": [],
+        "managed_disks": [],
+        "app_services": [],
+        "management_groups": [],
+        "warnings": [],
+        "missing_permissions": [],
+        "discovery_envelope": None,
+    }
+
+    if not force and not inventory_enabled():
+        return empty
+
+    try:
+        from azure.identity import DefaultAzureCredential  # noqa: F401
+    except ImportError:
+        return {
+            **empty,
+            "status": "sdk_missing",
+            "warnings": ["azure-identity is required for Azure inventory. Install with: pip install 'agent-bom[azure]'"],
+        }
+
+    if credential is None:
+        try:
+            credential = DefaultAzureCredential()
+        except Exception as exc:  # noqa: BLE001 — credential chain errors must not crash a scan
+            return {**empty, "status": "no_credentials", "warnings": [sanitize_discovery_warning(exc)]}
+
+    warnings: list[str] = []
+
+    # Auto-derive the subscription from the signed-in credential (e.g. ``az
+    # login``) when one was not supplied, so the common single-subscription case
+    # connects with zero extra configuration. Multi-subscription tenants still
+    # fan out via the management-group path or an explicit AZURE_SUBSCRIPTION_ID.
+    if not resolved_sub:
+        resolved_sub, derive_note = _derive_default_subscription(credential)
+        if derive_note:
+            warnings.append(derive_note)
+        if not resolved_sub:
+            return {
+                **empty,
+                "status": "no_subscription",
+                "warnings": ["No Azure subscription found. Run `az login`, set AZURE_SUBSCRIPTION_ID, or pass subscription_id."],
+            }
+        empty["subscription_id"] = resolved_sub
+        empty["account_id"] = resolved_sub
+
+    # Discover each service concurrently — the ARM list calls are independent and
+    # IO-bound, so a thread pool collapses the previously-sequential sum-of-latencies
+    # sweep to roughly the slowest single call. Each task gets its own warnings list
+    # (thread-safe) that is merged back in deterministic task order.
+    discovery_tasks: list[tuple[str, Any]] = []
+    if include_storage:
+        discovery_tasks.append(("storage_accounts", _discover_storage_accounts))
+    if include_compute:
+        discovery_tasks.append(("instances", _discover_vms))
+        discovery_tasks.append(("container_clusters", _discover_aks_clusters))
+        discovery_tasks.append(("managed_disks", _discover_managed_disks))
+        discovery_tasks.append(("app_services", _discover_app_services))
+        discovery_tasks.append(("security_groups", _discover_nsgs))
+    if include_identity:
+        discovery_tasks.append(("managed_identities", _discover_managed_identities))
+        discovery_tasks.append(("authorization", _discover_authorization))
+    if include_data:
+        discovery_tasks.append(("key_vaults", _discover_key_vaults))
+        discovery_tasks.append(("container_registries", _discover_container_registries))
+        discovery_tasks.append(("databases", _discover_databases))
+        discovery_tasks.append(("event_hubs", _discover_event_hubs))
+        discovery_tasks.append(("service_bus_namespaces", _discover_service_bus))
+        discovery_tasks.append(("redis_caches", _discover_redis_caches))
+    if include_network:
+        discovery_tasks.append(("virtual_networks", _discover_virtual_networks))
+        discovery_tasks.append(("subnets", _discover_subnets))
+        discovery_tasks.append(("public_ips", _discover_public_ips))
+        discovery_tasks.append(("ip_addresses", _discover_ip_addresses))
+        discovery_tasks.append(("network_interfaces", _discover_network_interfaces))
+        discovery_tasks.append(("load_balancers", _discover_load_balancers))
+        discovery_tasks.append(("application_gateways", _discover_application_gateways))
+        discovery_tasks.append(("front_doors", _discover_front_doors))
+        discovery_tasks.append(("azure_firewalls", _discover_azure_firewalls))
+        discovery_tasks.append(("nat_gateways", _discover_nat_gateways))
+        discovery_tasks.append(("route_tables", _discover_route_tables))
+        discovery_tasks.append(("private_endpoints", _discover_private_endpoints))
+        discovery_tasks.append(("api_management", _discover_api_management))
+
+    collected: dict[str, Any] = {}
+    task_warnings: dict[str, list[str]] = {key: [] for key, _ in discovery_tasks}
+    # Parallel per-task accumulator so one discoverer's missing-permission entries
+    # never race another's. Merged back in deterministic task order, then deduped.
+    task_missing: dict[str, list[dict[str, str]]] = {key: [] for key, _ in discovery_tasks}
+    missing: list[dict[str, str]] = []
+    if discovery_tasks:
+        with ThreadPoolExecutor(max_workers=min(8, len(discovery_tasks))) as executor:
+            future_to_key = {
+                executor.submit(fn, credential, resolved_sub, warnings=task_warnings[key], missing=task_missing[key]): key
+                for key, fn in discovery_tasks
+            }
+            for future in as_completed(future_to_key):
+                key = future_to_key[future]
+                try:
+                    collected[key] = future.result()
+                except Exception as exc:  # noqa: BLE001 — one service failing must not sink the rest
+                    collected[key] = []
+                    # Translate the abort into the same actionable guidance a
+                    # discoverer-local failure would have produced, so a crash at
+                    # the future boundary is never a silent empty result.
+                    record_discovery_failure(
+                        exc=exc,
+                        resource_type=key.replace("_", " "),
+                        permission=f"Microsoft.*/{key}/read",
+                        cloud="azure",
+                        warnings=task_warnings[key],
+                        missing=task_missing[key],
+                    )
+    for key, _ in discovery_tasks:
+        warnings.extend(task_warnings[key])
+        missing.extend(task_missing[key])
+
+    storage_accounts = collected.get("storage_accounts", [])
+    instances = collected.get("instances", [])
+    container_clusters = collected.get("container_clusters", [])
+    security_groups = collected.get("security_groups", [])
+    managed_identities = collected.get("managed_identities", [])
+    authorization = collected.get("authorization", {})
+    if not isinstance(authorization, dict):
+        authorization = {}
+    role_assignments = authorization.get("role_assignments", [])
+    role_definitions = authorization.get("role_definitions", [])
+    deny_assignments = authorization.get("deny_assignments", [])
+    authorization_sources = authorization.get("authorization_sources", [])
+    authorization_observed_at = authorization.get("authorization_observed_at")
+    key_vaults = collected.get("key_vaults", [])
+    container_registries = collected.get("container_registries", [])
+    databases = collected.get("databases", [])
+    virtual_networks = collected.get("virtual_networks", [])
+    subnets = collected.get("subnets", [])
+    public_ips = collected.get("public_ips", [])
+    ip_addresses = collected.get("ip_addresses", [])
+    network_interfaces = collected.get("network_interfaces", [])
+    load_balancers = collected.get("load_balancers", [])
+    application_gateways = collected.get("application_gateways", [])
+    front_doors = collected.get("front_doors", [])
+    azure_firewalls = collected.get("azure_firewalls", [])
+    nat_gateways = collected.get("nat_gateways", [])
+    route_tables = collected.get("route_tables", [])
+    private_endpoints = collected.get("private_endpoints", [])
+    api_management = collected.get("api_management", [])
+    event_hubs = collected.get("event_hubs", [])
+    service_bus_namespaces = collected.get("service_bus_namespaces", [])
+    redis_caches = collected.get("redis_caches", [])
+    managed_disks = collected.get("managed_disks", [])
+    app_services = collected.get("app_services", [])
+
+    # Management groups are tenant-scoped (above the subscription), so they are
+    # discovered with a single call rather than the per-subscription thread pool.
+    management_groups: list[dict[str, Any]] = []
+    if include_hierarchy:
+        management_groups, mg_warnings = _discover_management_groups(credential)
+        warnings.extend(mg_warnings)
+
+    # Entra (Azure AD) directory read — service principals + groups + memberships.
+    # Tenant-scoped and uses a Microsoft Graph token (not the ARM credential), so
+    # it runs once outside the per-subscription pool. Opt-in + degrades to empty:
+    # the ARM scan above is complete regardless of whether this grant is present.
+    service_principals: list[dict[str, Any]] = []
+    entra_groups: list[dict[str, Any]] = []
+    entra_ran = False
+    if include_identity:
+        entra_missing: list[dict[str, str]] = []
+        service_principals, entra_groups = _discover_entra_directory(warnings=warnings, missing=entra_missing)
+        missing.extend(entra_missing)
+        entra_ran = bool(service_principals or entra_groups or entra_missing)
+
+    permissions_used: list[str] = []
+    if include_storage:
+        permissions_used.extend(_AZURE_STORAGE_PERMISSIONS)
+    if include_compute:
+        permissions_used.extend(_AZURE_COMPUTE_PERMISSIONS)
+    if include_identity:
+        permissions_used.extend(_AZURE_IDENTITY_PERMISSIONS)
+    if include_data:
+        permissions_used.extend(_AZURE_DATA_PERMISSIONS)
+    if include_network:
+        permissions_used.extend(_AZURE_NETWORK_PERMISSIONS)
+    if include_hierarchy:
+        permissions_used.append("Microsoft.Management/managementGroups/read")
+    if entra_ran:
+        # Additional read-only Microsoft Graph grant beyond the ARM Reader role.
+        from agent_bom.identity.entra_nhi import ENTRA_READ_PERMISSIONS
+
+        permissions_used.extend(ENTRA_READ_PERMISSIONS)
+
+    envelope = DiscoveryEnvelope(
+        scan_mode=ScanMode.CLOUD_READ_ONLY,
+        discovery_scope=(f"azure:subscription/{resolved_sub}",),
+        permissions_used=tuple(sorted(set(permissions_used))),
+        redaction_status=RedactionStatus.CENTRAL_SANITIZER_APPLIED,
+    )
+
+    authorization_payload = {
+        "status": "ok" if include_identity else "disabled",
+        "subscription_id": resolved_sub,
+        "account_id": resolved_sub,
+        "role_assignments": role_assignments,
+        "role_definitions": role_definitions,
+        "deny_assignments": deny_assignments,
+        "authorization_sources": authorization_sources,
+        "authorization_observed_at": authorization_observed_at,
+        "entra_groups": entra_groups,
+    }
+    authorization_evidence = normalize_azure_rbac_inventory(authorization_payload).to_dict()
+
+    return {
+        "provider": "azure",
+        "status": "ok",
+        "subscription_id": resolved_sub,
+        "account_id": resolved_sub,
+        "region": "",
+        "storage_accounts": storage_accounts,
+        "instances": instances,
+        "container_clusters": container_clusters,
+        "security_groups": security_groups,
+        "managed_identities": managed_identities,
+        "role_assignments": role_assignments,
+        "role_definitions": role_definitions,
+        "deny_assignments": deny_assignments,
+        "authorization_sources": authorization_sources,
+        "authorization_observed_at": authorization_observed_at,
+        "authorization_evidence": authorization_evidence,
+        "service_principals": service_principals,
+        "entra_groups": entra_groups,
+        "key_vaults": key_vaults,
+        "container_registries": container_registries,
+        "databases": databases,
+        "virtual_networks": virtual_networks,
+        "subnets": subnets,
+        "public_ips": public_ips,
+        "ip_addresses": ip_addresses,
+        "network_interfaces": network_interfaces,
+        "load_balancers": load_balancers,
+        "application_gateways": application_gateways,
+        "front_doors": front_doors,
+        "azure_firewalls": azure_firewalls,
+        "nat_gateways": nat_gateways,
+        "route_tables": route_tables,
+        "private_endpoints": private_endpoints,
+        "api_management": api_management,
+        "event_hubs": event_hubs,
+        "service_bus_namespaces": service_bus_namespaces,
+        "redis_caches": redis_caches,
+        "managed_disks": managed_disks,
+        "side_scan_targets": azure_managed_disk_targets(managed_disks, subscription_id=resolved_sub),
+        "app_services": app_services,
+        "management_groups": management_groups,
+        "warnings": warnings,
+        "missing_permissions": dedupe_missing_permissions(missing),
+        "discovery_envelope": envelope.to_dict(),
+    }
+
+
+# Multi-subscription fan-out is opt-in (enumerating every subscription in a
+# tenant is heavier than a single-sub scan). Mirrors the AWS Organizations
+# multi-account enumeration: discover the subscription set, then inventory each.
+ALL_SUBSCRIPTIONS_ENV_FLAG = "AGENT_BOM_AZURE_ALL_SUBSCRIPTIONS"
+# Defensive cap so a tenant with thousands of subscriptions can't run unbounded
+# without an operator opting into a larger budget.
+_MAX_SUBSCRIPTIONS = int(os.environ.get("AGENT_BOM_AZURE_MAX_SUBSCRIPTIONS", "500") or "500")
+
+
+def all_subscriptions_enabled() -> bool:
+    """Whether to fan a single scan across every subscription in the tenant."""
+    return os.environ.get(ALL_SUBSCRIPTIONS_ENV_FLAG, "").strip().lower() in _TRUTHY
+
+
+def _subscription_ids_from_mg_tree(management_groups: list[dict[str, Any]]) -> list[str]:
+    """Extract every subscription id from the management-group hierarchy tree."""
+    sub_ids: list[str] = []
+    for group in management_groups:
+        for child in group.get("children", []) or []:
+            if "subscriptions" in str(child.get("type", "")).lower():
+                sid = str(child.get("name", "") or "").strip()
+                if sid and sid not in sub_ids:
+                    sub_ids.append(sid)
+    return sub_ids
+
+
+def enumerate_subscription_ids(credential: Any) -> tuple[list[str], list[str]]:
+    """Resolve every subscription id to fan a single scan across (read-only).
+
+    The single source of truth for the multi-subscription boundary set: discover
+    the management-group hierarchy, extract every subscription id from it, and
+    fall back to the configured ``AZURE_SUBSCRIPTION_ID`` when the tenant root is
+    not visible (e.g. the credential lacks Management Group Reader). Returns
+    ``(subscription_ids, warnings)``; never raises. Shared by both the inventory
+    fan-out and the CIS-benchmark fan-out so the boundary set stays identical.
+    """
+    warnings: list[str] = []
+    try:
+        management_groups, mg_warnings = _discover_management_groups(credential)
+        warnings.extend(mg_warnings)
+    except Exception as exc:  # noqa: BLE001 — MG enumeration failure must degrade, not crash
+        management_groups = []
+        warnings.append(sanitize_discovery_warning(exc))
+
+    sub_ids = _subscription_ids_from_mg_tree(management_groups)
+    if not sub_ids:
+        # No tenant-root visibility — fall back to the single configured sub.
+        single = os.environ.get("AZURE_SUBSCRIPTION_ID", "").strip()
+        if single:
+            sub_ids = [single]
+    return sub_ids, warnings
+
+
+def discover_all_subscription_inventories(credential: Any = None, *, force: bool = False) -> list[dict[str, Any]]:
+    """Inventory EVERY subscription in the tenant (multi-subscription fan-out).
+
+    The Azure counterpart of the AWS Organizations multi-account enumeration:
+    discover the subscription set from the management-group hierarchy, then run
+    the per-subscription inventory for each (partitioned by ``account_id`` so the
+    graph keeps thousands of subscriptions as distinct accounts under the
+    management-group ``CONTAINS`` tree). Read-only.
+
+    Returns a LIST of per-subscription inventory payloads (the exact shape the
+    graph builder's ``_iter_cloud_inventories`` consumes). Falls back to the
+    single ``AZURE_SUBSCRIPTION_ID`` when the management-group tree is unavailable
+    (e.g. the credential lacks Management Group Reader). Never raises.
+    """
+    if not force and not inventory_enabled():
+        return []
+    try:
+        from azure.identity import DefaultAzureCredential  # noqa: F401
+    except ImportError:
+        return []
+    if credential is None:
+        try:
+            credential = DefaultAzureCredential()
+        except Exception:  # noqa: BLE001
+            return []
+
+    sub_ids, _warnings = enumerate_subscription_ids(credential)
+
+    payloads: list[dict[str, Any]] = []
+    for sub_id in sub_ids[:_MAX_SUBSCRIPTIONS]:
+        payloads.append(discover_inventory(subscription_id=sub_id, credential=credential, force=True))
+    if len(sub_ids) > _MAX_SUBSCRIPTIONS:
+        logger.warning(
+            "Azure multi-subscription scan capped at %d of %d subscriptions (set AGENT_BOM_AZURE_MAX_SUBSCRIPTIONS to raise).",
+            _MAX_SUBSCRIPTIONS,
+            len(sub_ids),
+        )
+    return payloads
+
+
+# ---------------------------------------------------------------------------
+# Storage accounts (subscription-wide list)
+# ---------------------------------------------------------------------------
+
+
+def _discover_storage_accounts(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate every Storage Account in the subscription (read-only).
+
+    Public-access posture is read from the account's
+    ``allow_blob_public_access`` and network-rule default action — never from
+    blob contents. Accounts become ``DATA_STORE``-signalling nodes so DSPM and
+    exposure overlays apply.
+    """
+    try:
+        from azure.mgmt.storage import StorageManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-storage not installed. Skipping Storage Account inventory.")
+        return []
+
+    accounts: list[dict[str, Any]] = []
+    try:
+        client = StorageManagementClient(credential, subscription_id)
+        for account in client.storage_accounts.list():
+            name = str(getattr(account, "name", "") or "").strip()
+            if not name:
+                continue
+            account_id = str(getattr(account, "id", "") or "")
+            network_rules = getattr(account, "network_rule_set", None)
+            default_action = str(getattr(network_rules, "default_action", "") or "").lower()
+            allow_public = bool(getattr(account, "allow_blob_public_access", False))
+            # Publicly accessible when blob public access is allowed AND the
+            # network firewall default action is not "deny".
+            publicly_accessible = allow_public and default_action != "deny"
+            account_record: dict[str, Any] = {
+                "name": name,
+                "id": account_id,
+                "location": str(getattr(account, "location", "") or ""),
+                "resource_group": _resource_group_from_id(account_id),
+                "kind": str(getattr(account, "kind", "") or ""),
+                "publicly_accessible": publicly_accessible,
+                "allow_blob_public_access": allow_public,
+                "network_default_action": default_action,
+                "tags": _clean_tags(getattr(account, "tags", None)),
+                "subscription_id": subscription_id,
+            }
+            # Opt-in DSPM blob content sampling (parity with S3/GCS). Reads bounded
+            # blob byte ranges through the Storage Blob data plane and attaches
+            # redacted content_classification evidence so the crown-jewel overlay
+            # promotes a content-confirmed sensitive account. Best-effort — a
+            # sampling failure never sinks storage inventory.
+            _classify_storage_account_blobs(credential, account_record, warnings=warnings)
+            accounts.append(account_record)
+    except Exception as exc:  # noqa: BLE001 — one failed Azure Storage Accounts list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure Storage Accounts",
+            permission="Microsoft.Storage/storageAccounts/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return accounts
+
+
+def _classify_storage_account_blobs(credential: Any, account_record: dict[str, Any], *, warnings: list[str]) -> None:
+    """Attach redacted DSPM blob content_classification when sampling is enabled.
+
+    Opt-in via ``AGENT_BOM_DSPM_AZURE_BLOB_SAMPLING``. Opens the Storage Blob data
+    plane with the same read-only brokered credential and samples bounded byte
+    ranges; only redacted type/count/location evidence is attached. Never raises.
+    """
+    try:
+        from agent_bom.cloud.azure_blob_data_classifier import azure_blob_sampling_enabled, classify_azure_blob_account
+
+        if not azure_blob_sampling_enabled():
+            return
+        from azure.storage.blob import BlobServiceClient
+
+        name = str(account_record.get("name") or "")
+        account_url = f"https://{name}.blob.core.windows.net"
+        service = BlobServiceClient(account_url=account_url, credential=credential)
+        try:
+            account_record["content_classification"] = classify_azure_blob_account(service, account=name).to_dict()
+        finally:
+            try:
+                service.close()
+            except Exception:  # noqa: BLE001 — client close is best-effort
+                pass
+    except Exception as exc:  # noqa: BLE001 — sampling is optional and must not sink inventory
+        warnings.append(
+            f"Could not classify Azure Blob content for storage account {account_record.get('name')}: {sanitize_discovery_warning(exc)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Virtual machines + network security groups (subscription-wide list)
+# ---------------------------------------------------------------------------
+
+
+def _discover_vms(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate all VMs in the subscription (read-only, NOT tag-filtered)."""
+    try:
+        from azure.mgmt.compute import ComputeManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-compute not installed. Skipping VM inventory.")
+        return []
+
+    instances: list[dict[str, Any]] = []
+    try:
+        client = ComputeManagementClient(credential, subscription_id)
+        for vm in client.virtual_machines.list_all():
+            vm_id = str(getattr(vm, "id", "") or "")
+            name = str(getattr(vm, "name", "") or "").strip()
+            if not name:
+                continue
+            hardware = getattr(vm, "hardware_profile", None)
+            vm_size = str(getattr(hardware, "vm_size", "") or "")
+            instances.append(
+                {
+                    "instance_id": vm_id or name,
+                    "name": name,
+                    "instance_type": vm_size,
+                    "location": str(getattr(vm, "location", "") or ""),
+                    "resource_group": _resource_group_from_id(vm_id),
+                    "managed_identity": _vm_identity(vm),
+                    "user_assigned_identity_ids": _vm_user_assigned_identity_ids(vm),
+                    "tags": _clean_tags(getattr(vm, "tags", None)),
+                    "subscription_id": subscription_id,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure virtual machines list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure virtual machines",
+            permission="Microsoft.Compute/virtualMachines/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return instances
+
+
+def _discover_aks_clusters(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate AKS (managed Kubernetes) clusters in the subscription (read-only).
+
+    Captures control-plane metadata: Kubernetes version, the API-server FQDN
+    (its public reachability is the exposure signal), whether the API server is
+    private, and whether Kubernetes RBAC is enabled. Never reads workload or
+    secret contents.
+    """
+    try:
+        from azure.mgmt.containerservice import ContainerServiceClient
+    except ImportError:
+        warnings.append("azure-mgmt-containerservice not installed. Skipping AKS inventory.")
+        return []
+
+    clusters: list[dict[str, Any]] = []
+    try:
+        client = ContainerServiceClient(credential, subscription_id)
+        for cluster in client.managed_clusters.list():
+            cluster_id = str(getattr(cluster, "id", "") or "")
+            name = str(getattr(cluster, "name", "") or "").strip()
+            if not name:
+                continue
+            api_profile = getattr(cluster, "api_server_access_profile", None)
+            private_cluster = bool(getattr(api_profile, "enable_private_cluster", False)) if api_profile else False
+            fqdn = str(getattr(cluster, "fqdn", "") or "")
+            clusters.append(
+                {
+                    "name": name,
+                    "id": cluster_id,
+                    "native_type": "Microsoft.ContainerService/managedClusters",
+                    "location": str(getattr(cluster, "location", "") or ""),
+                    "resource_group": _resource_group_from_id(cluster_id),
+                    "tags": _clean_tags(getattr(cluster, "tags", None)),
+                    "kubernetes_version": str(getattr(cluster, "kubernetes_version", "") or ""),
+                    "api_server_fqdn": fqdn,
+                    "private_cluster": private_cluster,
+                    "rbac_enabled": bool(getattr(cluster, "enable_rbac", False)),
+                    # A reachable API-server FQDN on a non-private cluster is internet-facing.
+                    "internet_facing": bool(fqdn) and not private_cluster,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure AKS clusters list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure AKS clusters",
+            permission="Microsoft.ContainerService/managedClusters/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return clusters
+
+
+def _discover_nsgs(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate all Network Security Groups in the subscription (read-only)."""
+    try:
+        from azure.mgmt.network import NetworkManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-network not installed. Skipping NSG inventory.")
+        return []
+
+    groups: list[dict[str, Any]] = []
+    try:
+        client = NetworkManagementClient(credential, subscription_id)
+        for nsg in client.network_security_groups.list_all():
+            nsg_id = str(getattr(nsg, "id", "") or "")
+            name = str(getattr(nsg, "name", "") or "").strip()
+            if not name:
+                continue
+            groups.append(_normalize_nsg(nsg, nsg_id=nsg_id, name=name, subscription_id=subscription_id))
+    except Exception as exc:  # noqa: BLE001 — one failed Azure network security groups list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure network security groups",
+            permission="Microsoft.Network/networkSecurityGroups/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return groups
+
+
+def _normalize_nsg(nsg: Any, *, nsg_id: str, name: str, subscription_id: str) -> dict[str, Any]:
+    exposure = _nsg_internet_exposure(nsg)
+    return {
+        "group_id": nsg_id or name,
+        "name": name,
+        "location": str(getattr(nsg, "location", "") or ""),
+        "resource_group": _resource_group_from_id(nsg_id),
+        "internet_exposed": bool(exposure),
+        "network_exposure": exposure,
+        "subscription_id": subscription_id,
+    }
+
+
+def _nsg_internet_exposure(nsg: Any) -> list[dict[str, Any]]:
+    """Return internet-facing inbound rules in the CNAPP overlay's shape.
+
+    Each entry is ``{"scope": "internet", "from_port", "to_port", "protocol"}``
+    so :func:`agent_bom.graph.cnapp_overlay.apply_cnapp_overlay` can attach
+    structured exposure without keyword-matching free text.
+    """
+    exposure: list[dict[str, Any]] = []
+    for rule in getattr(nsg, "security_rules", None) or []:
+        direction = str(getattr(rule, "direction", "") or "").lower()
+        access = str(getattr(rule, "access", "") or "").lower()
+        if direction != "inbound" or access != "allow":
+            continue
+        sources = _rule_sources(rule)
+        if not any(src.lower() in _INTERNET_SOURCES for src in sources):
+            continue
+        from_port, to_port = _rule_port_range(rule)
+        exposure.append(
+            {
+                "scope": "internet",
+                "from_port": from_port,
+                "to_port": to_port,
+                "protocol": str(getattr(rule, "protocol", "") or "tcp").lower(),
+            }
+        )
+    return exposure
+
+
+def _rule_sources(rule: Any) -> list[str]:
+    sources: list[str] = []
+    single = getattr(rule, "source_address_prefix", None)
+    if single:
+        sources.append(str(single))
+    multiple = getattr(rule, "source_address_prefixes", None) or []
+    for prefix in multiple:
+        if prefix:
+            sources.append(str(prefix))
+    return sources
+
+
+def _rule_port_range(rule: Any) -> tuple[int | None, int | None]:
+    raw = getattr(rule, "destination_port_range", None)
+    candidates = [raw] if raw else list(getattr(rule, "destination_port_ranges", None) or [])
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if not text or text == "*":
+            return None, None
+        if "-" in text:
+            low, _, high = text.partition("-")
+            return _safe_int(low), _safe_int(high)
+        port = _safe_int(text)
+        return port, port
+    return None, None
+
+
+def _safe_int(value: str) -> int | None:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Managed identities (subscription-wide list)
+# ---------------------------------------------------------------------------
+
+
+def _discover_managed_identities(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate user-assigned managed identities in the subscription (read-only).
+
+    Each identity becomes a ``service_principal`` graph node carrying its
+    principal id so the effective-permissions overlay can attach
+    ``HAS_PERMISSION`` once role-assignment data is wired. Privilege defaults to
+    ``unknown`` — inventory never guesses an inflated level.
+    """
+    try:
+        from azure.mgmt.msi import ManagedServiceIdentityClient
+    except ImportError:
+        warnings.append("azure-mgmt-msi not installed. Skipping managed-identity inventory.")
+        return []
+
+    identities: list[dict[str, Any]] = []
+    try:
+        client = ManagedServiceIdentityClient(credential, subscription_id)
+        for identity in client.user_assigned_identities.list_by_subscription():
+            identity_id = str(getattr(identity, "id", "") or "")
+            name = str(getattr(identity, "name", "") or "").strip()
+            if not name:
+                continue
+            identities.append(
+                {
+                    "principal_type": "managed-identity",
+                    "name": name,
+                    "arn": identity_id or name,
+                    "principal_id": str(getattr(identity, "principal_id", "") or ""),
+                    "client_id": str(getattr(identity, "client_id", "") or ""),
+                    "location": str(getattr(identity, "location", "") or ""),
+                    "resource_group": _resource_group_from_id(identity_id),
+                    "account_id": subscription_id,
+                    "policies": [],
+                    "trust_principals": [],
+                    "privilege_level": "unknown",
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure managed identities list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure managed identities",
+            permission="Microsoft.ManagedIdentity/userAssignedIdentities/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return identities
+
+
+def _discover_authorization(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> dict[str, Any]:
+    """Collect decision-capable Azure RBAC authorization evidence read-only."""
+    return collect_azure_authorization(
+        credential,
+        subscription_id,
+        warnings=warnings,
+        missing=missing,
+    )
+
+
+def _discover_role_assignments(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Compatibility wrapper returning assignments from full RBAC evidence.
+
+    Each assignment links a principal (managed identity / service principal /
+    user / group) to a scope (subscription, resource group, or a specific
+    resource) via a role. The graph turns these into ``HAS_PERMISSION`` edges so
+    effective-access / privilege-escalation analysis can run on real RBAC rather
+    than guessed privilege. Role-definition ids are resolved to names once and
+    cached. Requires ``Microsoft.Authorization/roleAssignments/read`` +
+    ``roleDefinitions/read`` (both included in Reader).
+    """
+    return _discover_authorization(credential, subscription_id, warnings=warnings, missing=missing)["role_assignments"]
+
+
+# Microsoft Graph directory-read fan-out caps. A hostile/huge tenant must not be
+# able to make group-membership expansion run unbounded.
+_ENTRA_MAX_GROUPS_EXPANDED = int(os.environ.get("AGENT_BOM_ENTRA_MAX_GROUPS", "500") or "500")
+
+# Map a Microsoft Graph ``@odata.type`` to the canonical principal type the graph
+# builder understands, so a group member resolves to the right node entity.
+_ENTRA_MEMBER_TYPE: dict[str, str] = {
+    "#microsoft.graph.user": "user",
+    "#microsoft.graph.serviceprincipal": "service-principal",
+    "#microsoft.graph.group": "group",
+}
+
+
+def entra_directory_enabled() -> bool:
+    """Whether the opt-in Microsoft Graph directory-read path is enabled.
+
+    Reuses the existing Entra NHI discovery gate (``AGENT_BOM_ENTRA_DISCOVERY``)
+    so service-principal + Entra-group discovery shares one opt-in switch. This
+    needs Microsoft Graph ``Directory.Read.All`` — a read-only grant the ARM
+    ``Reader`` role does NOT include — so it stays default OFF and additive.
+    """
+    from agent_bom.identity import entra_nhi
+
+    return entra_nhi._is_truthy(os.environ.get(entra_nhi._DISCOVERY_FLAG_ENV))
+
+
+def _discover_entra_directory(
+    *,
+    client: Any = None,
+    force: bool = False,
+    warnings: list[str],
+    missing: list[dict[str, str]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Discover Entra service principals + groups (with members) — opt-in, read-only.
+
+    Returns ``(service_principals, entra_groups)``. A service principal that holds
+    a dangerous role is invisible to RBAC analysis unless it is a node, and a role
+    granted to a group only reaches its members once membership is known — this
+    closes both gaps.
+
+    Permission posture: this calls Microsoft Graph (``servicePrincipals`` /
+    ``groups`` / ``groups/{id}/members``) which requires ``Directory.Read.All``,
+    NOT covered by the ARM ``Reader`` role. It is therefore gated behind the same
+    ``AGENT_BOM_ENTRA_DISCOVERY`` flag (token via ``AGENT_BOM_ENTRA_TOKEN``) as
+    the Entra NHI path and is purely additive. When the gate is off, the token is
+    missing, or the Graph permission is denied, it warns and returns empty so the
+    rest of the ARM scan proceeds unaffected.
+    """
+    from agent_bom.identity import entra_nhi
+
+    gate_on = force or client is not None or entra_directory_enabled()
+    if not gate_on:
+        # Opt-in feature, default OFF: stay silent so a normal ARM-only scan is not
+        # spammed with a note every run. The grant requirement is documented; a
+        # warning is reserved for "enabled but the token/permission is missing".
+        return [], []
+
+    if client is None:
+        token = (os.environ.get(entra_nhi._TOKEN_ENV) or "").strip()
+        if not token:
+            warnings.append(f"Entra directory discovery enabled but {entra_nhi._TOKEN_ENV} is not set; skipping (ARM scan continues).")
+            return [], []
+        try:
+            client = entra_nhi.EntraClient(token)
+        except Exception as exc:  # noqa: BLE001 — client init failure must not sink the scan
+            warnings.append(f"Could not initialise the Microsoft Graph client for directory discovery: {sanitize_discovery_warning(exc)}")
+            return [], []
+
+    service_principals: list[dict[str, Any]] = []
+    entra_groups: list[dict[str, Any]] = []
+
+    try:
+        for sp in client.list_service_principals() or []:
+            if not isinstance(sp, dict):
+                continue
+            sp_id = str(sp.get("id") or "").strip()
+            if not sp_id:
+                continue
+            service_principals.append(
+                {
+                    "principal_type": "service-principal",
+                    "name": str(sp.get("displayName") or sp_id),
+                    "arn": sp_id,
+                    "principal_id": sp_id,
+                    "app_id": str(sp.get("appId") or ""),
+                    "service_principal_type": str(sp.get("servicePrincipalType") or ""),
+                    "policies": [],
+                    "trust_principals": [],
+                    "privilege_level": "unknown",
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — Graph SP listing failure degrades to a warning
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Entra service principals",
+            permission="Directory.Read.All",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+
+    try:
+        raw_groups = list(client.list_groups() or [])
+    except Exception as exc:  # noqa: BLE001 — Graph group listing failure degrades to a warning
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Entra groups",
+            permission="Directory.Read.All",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+        raw_groups = []
+
+    expanded = 0
+    for group in raw_groups:
+        if not isinstance(group, dict):
+            continue
+        group_id = str(group.get("id") or "").strip()
+        if not group_id:
+            continue
+        members: list[dict[str, str]] = []
+        if expanded < _ENTRA_MAX_GROUPS_EXPANDED:
+            expanded += 1
+            try:
+                for member in client.list_group_members(group_id) or []:
+                    if not isinstance(member, dict):
+                        continue
+                    member_id = str(member.get("id") or "").strip()
+                    if not member_id:
+                        continue
+                    odata = str(member.get("@odata.type") or "").strip().lower()
+                    members.append(
+                        {
+                            "id": member_id,
+                            "name": str(member.get("displayName") or member_id),
+                            "type": _ENTRA_MEMBER_TYPE.get(odata, "user"),
+                        }
+                    )
+            except Exception as exc:  # noqa: BLE001 — one group's member read must not sink the rest
+                warnings.append(f"Entra group-member read skipped for {group_id}: {sanitize_discovery_warning(exc)}")
+        entra_groups.append(
+            {
+                "principal_type": "group",
+                "name": str(group.get("displayName") or group_id),
+                "arn": group_id,
+                "principal_id": group_id,
+                "members": members,
+                "policies": [],
+                "privilege_level": "unknown",
+            }
+        )
+
+    return service_principals, entra_groups
+
+
+# ---------------------------------------------------------------------------
+# Data / secrets / registry (subscription-wide list)
+# ---------------------------------------------------------------------------
+
+
+def _discover_key_vaults(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate every Key Vault in the subscription (read-only).
+
+    Reads only control-plane metadata (URI, RBAC mode, public-network posture);
+    never reads secret/key/certificate material.
+    """
+    try:
+        from azure.mgmt.keyvault import KeyVaultManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-keyvault not installed. Skipping Key Vault inventory.")
+        return []
+
+    vaults: list[dict[str, Any]] = []
+    try:
+        client = KeyVaultManagementClient(credential, subscription_id)
+        for vault in client.vaults.list_by_subscription():
+            vault_id = str(getattr(vault, "id", "") or "")
+            name = str(getattr(vault, "name", "") or "").strip()
+            if not name:
+                continue
+            props = getattr(vault, "properties", None)
+            vaults.append(
+                {
+                    "name": name,
+                    "id": vault_id,
+                    "location": str(getattr(vault, "location", "") or ""),
+                    "resource_group": _resource_group_from_id(vault_id),
+                    "tags": _clean_tags(getattr(vault, "tags", None)),
+                    "uri": str(getattr(props, "vault_uri", "") or "") if props else "",
+                    "rbac_authorization": bool(getattr(props, "enable_rbac_authorization", False)) if props else False,
+                    "public_network_access": str(getattr(props, "public_network_access", "") or "") if props else "",
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure Key Vaults list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure Key Vaults",
+            permission="Microsoft.KeyVault/vaults/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return vaults
+
+
+def _discover_container_registries(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate every Container Registry in the subscription (read-only)."""
+    try:
+        from azure.mgmt.containerregistry import ContainerRegistryManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-containerregistry not installed. Skipping Container Registry inventory.")
+        return []
+
+    registries: list[dict[str, Any]] = []
+    try:
+        client = ContainerRegistryManagementClient(credential, subscription_id)
+        for registry in client.registries.list():
+            registry_id = str(getattr(registry, "id", "") or "")
+            name = str(getattr(registry, "name", "") or "").strip()
+            if not name:
+                continue
+            sku = getattr(registry, "sku", None)
+            registries.append(
+                {
+                    "name": name,
+                    "id": registry_id,
+                    "location": str(getattr(registry, "location", "") or ""),
+                    "resource_group": _resource_group_from_id(registry_id),
+                    "tags": _clean_tags(getattr(registry, "tags", None)),
+                    "login_server": str(getattr(registry, "login_server", "") or ""),
+                    "sku": str(getattr(sku, "name", "") or "") if sku else "",
+                    "admin_user_enabled": bool(getattr(registry, "admin_user_enabled", False)),
+                    "public_network_access": str(getattr(registry, "public_network_access", "") or ""),
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure Container Registries list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure Container Registries",
+            permission="Microsoft.ContainerRegistry/registries/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return registries
+
+
+def _append_db_servers(databases: list[dict[str, Any]], servers: Any, *, native_type: str, engine: str) -> None:
+    """Append SQL-family servers (Azure SQL / PostgreSQL / MySQL) in the shared shape.
+
+    Public-network posture lives either directly on the server (Azure SQL) or
+    under ``server.network`` (the flexible-server engines); read both.
+    """
+    for server in servers:
+        server_id = str(getattr(server, "id", "") or "")
+        name = str(getattr(server, "name", "") or "").strip()
+        if not name:
+            continue
+        network = getattr(server, "network", None)
+        public_access = str(getattr(server, "public_network_access", "") or "") or (
+            str(getattr(network, "public_network_access", "") or "") if network else ""
+        )
+        databases.append(
+            {
+                "name": name,
+                "id": server_id,
+                "native_type": native_type,
+                "engine": engine,
+                "location": str(getattr(server, "location", "") or ""),
+                "resource_group": _resource_group_from_id(server_id),
+                "tags": _clean_tags(getattr(server, "tags", None)),
+                "public_network_access": public_access,
+            }
+        )
+
+
+def _discover_databases(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate managed databases in the subscription (read-only).
+
+    Covers Cosmos DB, Azure SQL, PostgreSQL, and MySQL — each item carries its
+    own ``native_type`` so the normalized model maps them all to ``DATABASE``
+    without losing the provider-native type. Each engine is enumerated
+    independently so a missing SDK or access denial never sinks the others;
+    control-plane metadata only, never row / data-plane contents.
+    """
+    databases: list[dict[str, Any]] = []
+
+    try:
+        from azure.mgmt.cosmosdb import CosmosDBManagementClient
+
+        client = CosmosDBManagementClient(credential, subscription_id)
+        for account in client.database_accounts.list():
+            account_id = str(getattr(account, "id", "") or "")
+            name = str(getattr(account, "name", "") or "").strip()
+            if not name:
+                continue
+            databases.append(
+                {
+                    "name": name,
+                    "id": account_id,
+                    "native_type": "Microsoft.DocumentDB/databaseAccounts",
+                    "engine": "cosmosdb",
+                    "location": str(getattr(account, "location", "") or ""),
+                    "resource_group": _resource_group_from_id(account_id),
+                    "tags": _clean_tags(getattr(account, "tags", None)),
+                    "public_network_access": str(getattr(account, "public_network_access", "") or ""),
+                    "is_virtual_network_filter_enabled": bool(getattr(account, "is_virtual_network_filter_enabled", False)),
+                }
+            )
+    except ImportError:
+        warnings.append("azure-mgmt-cosmosdb not installed. Skipping Cosmos DB inventory.")
+    except Exception as exc:  # noqa: BLE001 — one failed Azure Cosmos DB accounts list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure Cosmos DB accounts",
+            permission="Microsoft.DocumentDB/databaseAccounts/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+
+    try:
+        from azure.mgmt.sql import SqlManagementClient
+
+        sql_client = SqlManagementClient(credential, subscription_id)
+        _append_db_servers(databases, sql_client.servers.list(), native_type="Microsoft.Sql/servers", engine="azure-sql")
+    except ImportError:
+        warnings.append("azure-mgmt-sql not installed. Skipping Azure SQL inventory.")
+    except Exception as exc:  # noqa: BLE001 — one failed Azure SQL servers list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure SQL servers",
+            permission="Microsoft.Sql/servers/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+
+    try:
+        from azure.mgmt.rdbms.postgresql_flexibleservers import PostgreSQLManagementClient
+
+        pg_client = PostgreSQLManagementClient(credential, subscription_id)
+        _append_db_servers(
+            databases,
+            pg_client.servers.list(),
+            native_type="Microsoft.DBforPostgreSQL/flexibleServers",
+            engine="postgresql",
+        )
+    except ImportError:
+        warnings.append("azure-mgmt-rdbms not installed. Skipping PostgreSQL inventory.")
+    except Exception as exc:  # noqa: BLE001 — one failed Azure PostgreSQL servers list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure PostgreSQL servers",
+            permission="Microsoft.DBforPostgreSQL/flexibleServers/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+
+    try:
+        from azure.mgmt.rdbms.mysql_flexibleservers import MySQLManagementClient
+
+        mysql_client = MySQLManagementClient(credential, subscription_id)
+        _append_db_servers(databases, mysql_client.servers.list(), native_type="Microsoft.DBforMySQL/flexibleServers", engine="mysql")
+    except ImportError:
+        warnings.append("azure-mgmt-rdbms not installed. Skipping MySQL inventory.")
+    except Exception as exc:  # noqa: BLE001 — one failed Azure MySQL servers list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure MySQL servers",
+            permission="Microsoft.DBforMySQL/flexibleServers/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+
+    return databases
+
+
+# ---------------------------------------------------------------------------
+# Network topology (subscription-wide list)
+# ---------------------------------------------------------------------------
+
+
+def _discover_virtual_networks(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate every VNet in the subscription with its address space and subnets."""
+    try:
+        from azure.mgmt.network import NetworkManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-network not installed. Skipping virtual-network inventory.")
+        return []
+
+    vnets: list[dict[str, Any]] = []
+    try:
+        client = NetworkManagementClient(credential, subscription_id)
+        for vnet in client.virtual_networks.list_all():
+            vnet_id = str(getattr(vnet, "id", "") or "")
+            name = str(getattr(vnet, "name", "") or "").strip()
+            if not name:
+                continue
+            address_space = getattr(vnet, "address_space", None)
+            prefixes = list(getattr(address_space, "address_prefixes", []) or []) if address_space else []
+            subnets = [str(getattr(s, "name", "") or "") for s in (getattr(vnet, "subnets", None) or [])]
+            vnets.append(
+                {
+                    "name": name,
+                    "id": vnet_id,
+                    "location": str(getattr(vnet, "location", "") or ""),
+                    "resource_group": _resource_group_from_id(vnet_id),
+                    "tags": _clean_tags(getattr(vnet, "tags", None)),
+                    "address_prefixes": [str(p) for p in prefixes],
+                    "subnets": [s for s in subnets if s],
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure virtual networks list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure virtual networks",
+            permission="Microsoft.Network/virtualNetworks/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return vnets
+
+
+def _discover_public_ips(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate public IP addresses — the internet-facing exposure surface."""
+    try:
+        from azure.mgmt.network import NetworkManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-network not installed. Skipping public-IP inventory.")
+        return []
+
+    public_ips: list[dict[str, Any]] = []
+    try:
+        client = NetworkManagementClient(credential, subscription_id)
+        for pip in client.public_ip_addresses.list_all():
+            pip_id = str(getattr(pip, "id", "") or "")
+            name = str(getattr(pip, "name", "") or "").strip()
+            if not name:
+                continue
+            public_ips.append(
+                {
+                    "name": name,
+                    "id": pip_id,
+                    "location": str(getattr(pip, "location", "") or ""),
+                    "resource_group": _resource_group_from_id(pip_id),
+                    "tags": _clean_tags(getattr(pip, "tags", None)),
+                    "ip_address": str(getattr(pip, "ip_address", "") or ""),
+                    "allocation_method": str(getattr(pip, "public_ip_allocation_method", "") or ""),
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure public IPs list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure public IPs",
+            permission="Microsoft.Network/publicIPAddresses/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return public_ips
+
+
+def _discover_ip_addresses(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Surface allocated public IP *addresses* and the resource each is bound to.
+
+    The symmetric counterpart of the NIC ``public_ip`` capture: from the
+    public-IP resource side, record the address value and the ARM id of the IP
+    configuration it is attached to (a NIC / load-balancer / gateway frontend),
+    so the graph can wire the address to its bearer from either direction.
+    """
+    try:
+        from azure.mgmt.network import NetworkManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-network not installed. Skipping IP-address inventory.")
+        return []
+
+    addresses: list[dict[str, Any]] = []
+    try:
+        client = NetworkManagementClient(credential, subscription_id)
+        for pip in client.public_ip_addresses.list_all():
+            address = str(getattr(pip, "ip_address", "") or "")
+            ip_config = getattr(pip, "ip_configuration", None)
+            attached_to = str(getattr(ip_config, "id", "") or "") if ip_config else ""
+            addresses.append(
+                {
+                    "address": address,
+                    "kind": "public",
+                    "attached_to": attached_to,
+                    "location": str(getattr(pip, "location", "") or ""),
+                    "account_id": subscription_id,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure public IPs list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure IP addresses",
+            permission="Microsoft.Network/publicIPAddresses/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return addresses
+
+
+def _discover_subnets(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate every subnet across the subscription's VNets (read-only).
+
+    Subnets are not listable subscription-wide directly, so they are read from
+    each VNet's expanded ``subnets`` collection. ``is_public`` is a conservative,
+    provable signal: a subnet with an attached NAT gateway has an explicit
+    internet egress path. The shared builder can refine exposure by joining a
+    subnet's route table against ``route_tables`` (``has_internet_route``).
+    """
+    try:
+        from azure.mgmt.network import NetworkManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-network not installed. Skipping subnet inventory.")
+        return []
+
+    subnets: list[dict[str, Any]] = []
+    try:
+        client = NetworkManagementClient(credential, subscription_id)
+        for vnet in client.virtual_networks.list_all():
+            vnet_id = str(getattr(vnet, "id", "") or "")
+            for subnet in getattr(vnet, "subnets", None) or []:
+                subnet_id = str(getattr(subnet, "id", "") or "")
+                name = str(getattr(subnet, "name", "") or "").strip()
+                if not name:
+                    continue
+                cidr = str(getattr(subnet, "address_prefix", "") or "")
+                if not cidr:
+                    prefixes = list(getattr(subnet, "address_prefixes", None) or [])
+                    cidr = str(prefixes[0]) if prefixes else ""
+                nat_gateway = getattr(subnet, "nat_gateway", None)
+                subnets.append(
+                    {
+                        "id": subnet_id,
+                        "name": name,
+                        "vpc_id": vnet_id,
+                        "cidr": cidr,
+                        "is_public": nat_gateway is not None,
+                        "location": str(getattr(vnet, "location", "") or ""),
+                        "account_id": subscription_id,
+                    }
+                )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure subnets list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure subnets",
+            permission="Microsoft.Network/virtualNetworks/subnets/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return subnets
+
+
+def _discover_network_interfaces(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate every NIC in the subscription with its IP-config topology (read-only).
+
+    Each NIC binds a VM to a subnet (hence a VNet) and may carry an NSG plus a
+    private and/or public IP — the edge data the graph needs to attach a VM to
+    its network position and exposure. Control-plane only; never any secrets.
+    """
+    try:
+        from azure.mgmt.network import NetworkManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-network not installed. Skipping network-interface inventory.")
+        return []
+
+    nics: list[dict[str, Any]] = []
+    try:
+        client = NetworkManagementClient(credential, subscription_id)
+        for nic in client.network_interfaces.list_all():
+            nic_id = str(getattr(nic, "id", "") or "")
+            name = str(getattr(nic, "name", "") or "").strip()
+            if not name:
+                continue
+            nics.append(_normalize_network_interface(nic, nic_id=nic_id, name=name, subscription_id=subscription_id))
+    except Exception as exc:  # noqa: BLE001 — one failed Azure network interfaces list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure network interfaces",
+            permission="Microsoft.Network/networkInterfaces/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return nics
+
+
+def _normalize_network_interface(nic: Any, *, nic_id: str, name: str, subscription_id: str) -> dict[str, Any]:
+    vm_ref = getattr(nic, "virtual_machine", None)
+    instance_id = str(getattr(vm_ref, "id", "") or "") if vm_ref else ""
+    nsg_ref = getattr(nic, "network_security_group", None)
+    nsg_id = str(getattr(nsg_ref, "id", "") or "") if nsg_ref else ""
+    subnet_id = ""
+    private_ip = ""
+    public_ip = ""
+    for ip_config in getattr(nic, "ip_configurations", None) or []:
+        if not private_ip:
+            private_ip = str(getattr(ip_config, "private_ip_address", "") or "")
+        if not subnet_id:
+            subnet_ref = getattr(ip_config, "subnet", None)
+            subnet_id = str(getattr(subnet_ref, "id", "") or "") if subnet_ref else ""
+        if not public_ip:
+            public_ip = _public_ip_ref_value(getattr(ip_config, "public_ip_address", None))
+    return {
+        "id": nic_id,
+        "name": name,
+        "instance_id": instance_id,
+        "subnet_id": subnet_id,
+        "vpc_id": _vnet_id_from_subnet_id(subnet_id),
+        "security_group_ids": [nsg_id] if nsg_id else [],
+        "private_ip": private_ip,
+        "public_ip": public_ip,
+        "location": str(getattr(nic, "location", "") or ""),
+        "account_id": subscription_id,
+    }
+
+
+def _discover_azure_firewalls(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate Azure Firewalls in the subscription (read-only).
+
+    Captures the firewall's private IP and the public IPs it fronts — the
+    network-edge choke point for north/south traffic. Control-plane only.
+    """
+    try:
+        from azure.mgmt.network import NetworkManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-network not installed. Skipping Azure Firewall inventory.")
+        return []
+
+    firewalls: list[dict[str, Any]] = []
+    try:
+        client = NetworkManagementClient(credential, subscription_id)
+        for fw in client.azure_firewalls.list_all():
+            fw_id = str(getattr(fw, "id", "") or "")
+            name = str(getattr(fw, "name", "") or "").strip()
+            if not name:
+                continue
+            private_ip = ""
+            public_ips: list[str] = []
+            for ip_config in getattr(fw, "ip_configurations", None) or []:
+                if not private_ip:
+                    private_ip = str(getattr(ip_config, "private_ip_address", "") or "")
+                value = _public_ip_ref_value(getattr(ip_config, "public_ip_address", None))
+                if value:
+                    public_ips.append(value)
+            firewalls.append(
+                {
+                    "id": fw_id,
+                    "name": name,
+                    "location": str(getattr(fw, "location", "") or ""),
+                    "account_id": subscription_id,
+                    "private_ip": private_ip,
+                    "public_ips": public_ips,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure Firewalls list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure Firewalls",
+            permission="Microsoft.Network/azureFirewalls/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return firewalls
+
+
+def _discover_nat_gateways(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate NAT gateways in the subscription (read-only).
+
+    A NAT gateway gives its associated subnet(s) an explicit outbound internet
+    path; the first associated subnet (and its VNet) is recorded so the graph can
+    attach the egress edge. Control-plane only.
+    """
+    try:
+        from azure.mgmt.network import NetworkManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-network not installed. Skipping NAT-gateway inventory.")
+        return []
+
+    gateways: list[dict[str, Any]] = []
+    try:
+        client = NetworkManagementClient(credential, subscription_id)
+        for nat in client.nat_gateways.list_all():
+            nat_id = str(getattr(nat, "id", "") or "")
+            name = str(getattr(nat, "name", "") or "").strip()
+            if not name:
+                continue
+            subnet_id = ""
+            for subnet_ref in getattr(nat, "subnets", None) or []:
+                subnet_id = str(getattr(subnet_ref, "id", "") or "")
+                if subnet_id:
+                    break
+            gateways.append(
+                {
+                    "id": nat_id,
+                    "name": name,
+                    "vpc_id": _vnet_id_from_subnet_id(subnet_id),
+                    "subnet_id": subnet_id,
+                    "location": str(getattr(nat, "location", "") or ""),
+                    "account_id": subscription_id,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure NAT gateways list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure NAT gateways",
+            permission="Microsoft.Network/natGateways/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return gateways
+
+
+def _discover_route_tables(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate route tables in the subscription (read-only).
+
+    ``has_internet_route`` is the exposure-relevant signal: any user-defined
+    route whose next hop is the Internet (a default ``0.0.0.0/0`` route to the
+    internet). Control-plane only.
+    """
+    try:
+        from azure.mgmt.network import NetworkManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-network not installed. Skipping route-table inventory.")
+        return []
+
+    tables: list[dict[str, Any]] = []
+    try:
+        client = NetworkManagementClient(credential, subscription_id)
+        for rt in client.route_tables.list_all():
+            rt_id = str(getattr(rt, "id", "") or "")
+            name = str(getattr(rt, "name", "") or "").strip()
+            if not name:
+                continue
+            vpc_id = ""
+            for subnet_ref in getattr(rt, "subnets", None) or []:
+                vpc_id = _vnet_id_from_subnet_id(str(getattr(subnet_ref, "id", "") or ""))
+                if vpc_id:
+                    break
+            tables.append(
+                {
+                    "id": rt_id,
+                    "name": name,
+                    "vpc_id": vpc_id,
+                    "has_internet_route": _route_table_has_internet_route(getattr(rt, "routes", None)),
+                    "location": str(getattr(rt, "location", "") or ""),
+                    "account_id": subscription_id,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure route tables list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure route tables",
+            permission="Microsoft.Network/routeTables/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return tables
+
+
+def _route_table_has_internet_route(routes: Any) -> bool:
+    """True if any route sends traffic straight to the internet (next hop Internet)."""
+    for route in routes or []:
+        next_hop = str(getattr(route, "next_hop_type", "") or "").lower()
+        prefix = str(getattr(route, "address_prefix", "") or "").strip()
+        if next_hop == "internet":
+            return True
+        if prefix == "0.0.0.0/0" and next_hop == "internet":
+            return True
+    return False
+
+
+def _discover_private_endpoints(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate private endpoints in the subscription (read-only).
+
+    A private endpoint places a private IP for a target PaaS resource inside a
+    subnet (the private-link inbound path). The subnet and the target resource id
+    are recorded so the graph can wire the private connection. Control-plane only.
+    """
+    try:
+        from azure.mgmt.network import NetworkManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-network not installed. Skipping private-endpoint inventory.")
+        return []
+
+    endpoints: list[dict[str, Any]] = []
+    try:
+        client = NetworkManagementClient(credential, subscription_id)
+        for pe in client.private_endpoints.list_by_subscription():
+            pe_id = str(getattr(pe, "id", "") or "")
+            name = str(getattr(pe, "name", "") or "").strip()
+            if not name:
+                continue
+            subnet_ref = getattr(pe, "subnet", None)
+            subnet_id = str(getattr(subnet_ref, "id", "") or "") if subnet_ref else ""
+            target_resource = ""
+            for conn in getattr(pe, "private_link_service_connections", None) or []:
+                target_resource = str(getattr(conn, "private_link_service_id", "") or "")
+                if target_resource:
+                    break
+            endpoints.append(
+                {
+                    "id": pe_id,
+                    "name": name,
+                    "location": str(getattr(pe, "location", "") or ""),
+                    "account_id": subscription_id,
+                    "subnet_id": subnet_id,
+                    "target_resource": target_resource,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure private endpoints list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure private endpoints",
+            permission="Microsoft.Network/privateEndpoints/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return endpoints
+
+
+def _discover_load_balancers(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate load balancers with their SKU and public-frontend posture."""
+    try:
+        from azure.mgmt.network import NetworkManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-network not installed. Skipping load-balancer inventory.")
+        return []
+
+    load_balancers: list[dict[str, Any]] = []
+    try:
+        client = NetworkManagementClient(credential, subscription_id)
+        for lb in client.load_balancers.list_all():
+            lb_id = str(getattr(lb, "id", "") or "")
+            name = str(getattr(lb, "name", "") or "").strip()
+            if not name:
+                continue
+            sku = getattr(lb, "sku", None)
+            frontends = getattr(lb, "frontend_ip_configurations", None) or []
+            public_ip_ids = [
+                str(getattr(getattr(fe, "public_ip_address", None), "id", "") or "")
+                for fe in frontends
+                if getattr(fe, "public_ip_address", None) is not None
+            ]
+            public_ip_ids = [pid for pid in public_ip_ids if pid]
+            load_balancers.append(
+                {
+                    "name": name,
+                    "id": lb_id,
+                    "location": str(getattr(lb, "location", "") or ""),
+                    "resource_group": _resource_group_from_id(lb_id),
+                    "tags": _clean_tags(getattr(lb, "tags", None)),
+                    "sku": str(getattr(sku, "name", "") or "") if sku else "",
+                    "internet_facing": bool(public_ip_ids),
+                    "public_ip_ids": public_ip_ids,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure load balancers list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure load balancers",
+            permission="Microsoft.Network/loadBalancers/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return load_balancers
+
+
+def _discover_application_gateways(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate Application Gateways (L7 LB + WAF) in the subscription (read-only).
+
+    Captures SKU tier, whether a WAF is attached (inline config or linked
+    firewall policy), and the public IPs that front it (so the graph's
+    public-IP → load-balancer exposure edge applies). Control-plane only.
+    """
+    try:
+        from azure.mgmt.network import NetworkManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-network not installed. Skipping Application Gateway inventory.")
+        return []
+
+    gateways: list[dict[str, Any]] = []
+    try:
+        client = NetworkManagementClient(credential, subscription_id)
+        for gw in client.application_gateways.list_all():
+            gw_id = str(getattr(gw, "id", "") or "")
+            name = str(getattr(gw, "name", "") or "").strip()
+            if not name:
+                continue
+            sku = getattr(gw, "sku", None)
+            sku_tier = str(getattr(sku, "tier", "") or "") if sku else ""
+            waf_config = getattr(gw, "web_application_firewall_configuration", None)
+            firewall_policy = getattr(gw, "firewall_policy", None)
+            waf_enabled = (
+                bool(waf_config and getattr(waf_config, "enabled", False))
+                or bool(getattr(firewall_policy, "id", "") if firewall_policy else "")
+                or "waf" in sku_tier.lower()
+            )
+            frontends = getattr(gw, "frontend_ip_configurations", None) or []
+            public_ip_ids = [
+                str(getattr(getattr(fe, "public_ip_address", None), "id", "") or "")
+                for fe in frontends
+                if getattr(fe, "public_ip_address", None) is not None
+            ]
+            public_ip_ids = [pid for pid in public_ip_ids if pid]
+            gateways.append(
+                {
+                    "name": name,
+                    "id": gw_id,
+                    "native_type": "Microsoft.Network/applicationGateways",
+                    "location": str(getattr(gw, "location", "") or ""),
+                    "resource_group": _resource_group_from_id(gw_id),
+                    "tags": _clean_tags(getattr(gw, "tags", None)),
+                    "sku": str(getattr(sku, "name", "") or "") if sku else "",
+                    "sku_tier": sku_tier,
+                    "waf_enabled": waf_enabled,
+                    "internet_facing": bool(public_ip_ids),
+                    "public_ip_ids": public_ip_ids,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure Application Gateways list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure Application Gateways",
+            permission="Microsoft.Network/applicationGateways/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return gateways
+
+
+def _discover_front_doors(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate Azure Front Door (classic) profiles — global internet edge (read-only)."""
+    try:
+        from azure.mgmt.frontdoor import FrontDoorManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-frontdoor not installed. Skipping Front Door inventory.")
+        return []
+
+    front_doors: list[dict[str, Any]] = []
+    try:
+        client = FrontDoorManagementClient(credential, subscription_id)
+        for fd in client.front_doors.list():
+            fd_id = str(getattr(fd, "id", "") or "")
+            name = str(getattr(fd, "name", "") or "").strip()
+            if not name:
+                continue
+            front_doors.append(
+                {
+                    "name": name,
+                    "id": fd_id,
+                    "native_type": "Microsoft.Network/frontDoors",
+                    "location": str(getattr(fd, "location", "") or "global"),
+                    "resource_group": _resource_group_from_id(fd_id),
+                    "tags": _clean_tags(getattr(fd, "tags", None)),
+                    "cname": str(getattr(fd, "cname", "") or ""),
+                    "enabled_state": str(getattr(fd, "enabled_state", "") or ""),
+                    "internet_facing": True,  # Front Door is a global internet edge by definition
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure Front Doors list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure Front Doors",
+            permission="Microsoft.Network/frontDoors/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return front_doors
+
+
+def _discover_api_management(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate API Management services (API gateway) in the subscription (read-only).
+
+    Internet-facing unless deployed *Internal* into a VNet. Control-plane only —
+    never reads API definitions or backend secrets.
+    """
+    try:
+        from azure.mgmt.apimanagement import ApiManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-apimanagement not installed. Skipping API Management inventory.")
+        return []
+
+    services: list[dict[str, Any]] = []
+    try:
+        client = ApiManagementClient(credential, subscription_id)
+        for svc in client.api_management_service.list():
+            svc_id = str(getattr(svc, "id", "") or "")
+            name = str(getattr(svc, "name", "") or "").strip()
+            if not name:
+                continue
+            sku = getattr(svc, "sku", None)
+            gateway_url = str(getattr(svc, "gateway_url", "") or "")
+            public_ips = [str(ip) for ip in (getattr(svc, "public_ip_addresses", None) or []) if ip]
+            vnet_type = str(getattr(svc, "virtual_network_type", "") or "")
+            internet_facing = vnet_type.lower() != "internal" and (bool(gateway_url) or bool(public_ips))
+            services.append(
+                {
+                    "name": name,
+                    "id": svc_id,
+                    "native_type": "Microsoft.ApiManagement/service",
+                    "location": str(getattr(svc, "location", "") or ""),
+                    "resource_group": _resource_group_from_id(svc_id),
+                    "tags": _clean_tags(getattr(svc, "tags", None)),
+                    "sku": str(getattr(sku, "name", "") or "") if sku else "",
+                    "gateway_url": gateway_url,
+                    "virtual_network_type": vnet_type,
+                    "internet_facing": internet_facing,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure API Management services list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure API Management services",
+            permission="Microsoft.ApiManagement/service/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return services
+
+
+# ---------------------------------------------------------------------------
+# Messaging / cache / block storage / app service (subscription-wide list)
+# ---------------------------------------------------------------------------
+
+
+def _discover_event_hubs(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate every Event Hub namespace in the subscription (read-only).
+
+    Control-plane metadata only (SKU, public-network posture); never reads
+    event/message payloads.
+    """
+    try:
+        from azure.mgmt.eventhub import EventHubManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-eventhub not installed. Skipping Event Hub inventory.")
+        return []
+
+    namespaces: list[dict[str, Any]] = []
+    try:
+        client = EventHubManagementClient(credential, subscription_id)
+        for namespace in client.namespaces.list():
+            namespace_id = str(getattr(namespace, "id", "") or "")
+            name = str(getattr(namespace, "name", "") or "").strip()
+            if not name:
+                continue
+            sku = getattr(namespace, "sku", None)
+            namespaces.append(
+                {
+                    "name": name,
+                    "id": namespace_id,
+                    "native_type": "Microsoft.EventHub/namespaces",
+                    "location": str(getattr(namespace, "location", "") or ""),
+                    "resource_group": _resource_group_from_id(namespace_id),
+                    "tags": _clean_tags(getattr(namespace, "tags", None)),
+                    "sku": str(getattr(sku, "name", "") or "") if sku else "",
+                    "public_network_access": str(getattr(namespace, "public_network_access", "") or ""),
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure Event Hub namespaces list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure Event Hub namespaces",
+            permission="Microsoft.EventHub/namespaces/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return namespaces
+
+
+def _discover_service_bus(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate every Service Bus namespace in the subscription (read-only).
+
+    Control-plane metadata only (SKU, public-network posture); never reads
+    queue/topic message contents.
+    """
+    try:
+        from azure.mgmt.servicebus import ServiceBusManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-servicebus not installed. Skipping Service Bus inventory.")
+        return []
+
+    namespaces: list[dict[str, Any]] = []
+    try:
+        client = ServiceBusManagementClient(credential, subscription_id)
+        for namespace in client.namespaces.list():
+            namespace_id = str(getattr(namespace, "id", "") or "")
+            name = str(getattr(namespace, "name", "") or "").strip()
+            if not name:
+                continue
+            sku = getattr(namespace, "sku", None)
+            namespaces.append(
+                {
+                    "name": name,
+                    "id": namespace_id,
+                    "native_type": "Microsoft.ServiceBus/namespaces",
+                    "location": str(getattr(namespace, "location", "") or ""),
+                    "resource_group": _resource_group_from_id(namespace_id),
+                    "tags": _clean_tags(getattr(namespace, "tags", None)),
+                    "sku": str(getattr(sku, "name", "") or "") if sku else "",
+                    "public_network_access": str(getattr(namespace, "public_network_access", "") or ""),
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure Service Bus namespaces list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure Service Bus namespaces",
+            permission="Microsoft.ServiceBus/namespaces/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return namespaces
+
+
+def _discover_redis_caches(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate every Azure Cache for Redis instance in the subscription (read-only).
+
+    Control-plane metadata only (SKU, public-network posture, non-SSL port);
+    never connects to the cache data plane or reads keys.
+    """
+    try:
+        from azure.mgmt.redis import RedisManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-redis not installed. Skipping Azure Cache for Redis inventory.")
+        return []
+
+    caches: list[dict[str, Any]] = []
+    try:
+        client = RedisManagementClient(credential, subscription_id)
+        for cache in client.redis.list_by_subscription():
+            cache_id = str(getattr(cache, "id", "") or "")
+            name = str(getattr(cache, "name", "") or "").strip()
+            if not name:
+                continue
+            sku = getattr(cache, "sku", None)
+            caches.append(
+                {
+                    "name": name,
+                    "id": cache_id,
+                    "native_type": "Microsoft.Cache/Redis",
+                    "location": str(getattr(cache, "location", "") or ""),
+                    "resource_group": _resource_group_from_id(cache_id),
+                    "tags": _clean_tags(getattr(cache, "tags", None)),
+                    "public_network_access": str(getattr(cache, "public_network_access", "") or ""),
+                    "sku": str(getattr(sku, "name", "") or "") if sku else "",
+                    "non_ssl_port_enabled": bool(getattr(cache, "enable_non_ssl_port", False)),
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure Cache for Redis instances list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure Cache for Redis instances",
+            permission="Microsoft.Cache/redis/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return caches
+
+
+def _discover_managed_disks(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate every Managed Disk in the subscription (read-only).
+
+    Control-plane metadata only (size, encryption type, public-network posture);
+    never reads disk contents. Disks hold data at rest, so they signal a data store.
+    """
+    try:
+        from azure.mgmt.compute import ComputeManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-compute not installed. Skipping Managed Disk inventory.")
+        return []
+
+    disks: list[dict[str, Any]] = []
+    try:
+        client = ComputeManagementClient(credential, subscription_id)
+        for disk in client.disks.list():
+            disk_id = str(getattr(disk, "id", "") or "")
+            name = str(getattr(disk, "name", "") or "").strip()
+            if not name:
+                continue
+            encryption = getattr(disk, "encryption", None)
+            disks.append(
+                {
+                    "name": name,
+                    "id": disk_id,
+                    "native_type": "Microsoft.Compute/disks",
+                    "location": str(getattr(disk, "location", "") or ""),
+                    "resource_group": _resource_group_from_id(disk_id),
+                    "tags": _clean_tags(getattr(disk, "tags", None)),
+                    "disk_size_gb": getattr(disk, "disk_size_gb", None),
+                    "encryption_type": str(getattr(encryption, "type", "") or "") if encryption else "",
+                    "public_network_access": str(getattr(disk, "public_network_access", "") or ""),
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure Managed Disks list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure Managed Disks",
+            permission="Microsoft.Compute/disks/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return disks
+
+
+def _discover_app_services(
+    credential: Any, subscription_id: str, *, warnings: list[str], missing: list[dict[str, str]] | None = None
+) -> list[dict[str, Any]]:
+    """Enumerate every App Service site (Web Apps + Function Apps) read-only.
+
+    ``web_apps.list()`` returns both; ``kind`` (contains ``functionapp``)
+    distinguishes them. Control-plane metadata only — the public host name (the
+    exposure signal), HTTPS-only, and public-network posture — never app code or
+    app-setting/secret values.
+    """
+    try:
+        from azure.mgmt.web import WebSiteManagementClient
+    except ImportError:
+        warnings.append("azure-mgmt-web not installed. Skipping App Service inventory.")
+        return []
+
+    sites: list[dict[str, Any]] = []
+    try:
+        client = WebSiteManagementClient(credential, subscription_id)
+        for site in client.web_apps.list():
+            site_id = str(getattr(site, "id", "") or "")
+            name = str(getattr(site, "name", "") or "").strip()
+            if not name:
+                continue
+            kind = str(getattr(site, "kind", "") or "")
+            default_host_name = str(getattr(site, "default_host_name", "") or "")
+            enabled = bool(getattr(site, "enabled", True))
+            sites.append(
+                {
+                    "name": name,
+                    "id": site_id,
+                    "native_type": "Microsoft.Web/sites",
+                    "location": str(getattr(site, "location", "") or ""),
+                    "resource_group": _resource_group_from_id(site_id),
+                    "tags": _clean_tags(getattr(site, "tags", None)),
+                    "kind": kind,
+                    "is_function_app": "functionapp" in kind.lower(),
+                    "default_host_name": default_host_name,
+                    "https_only": bool(getattr(site, "https_only", False)),
+                    "public_network_access": str(getattr(site, "public_network_access", "") or ""),
+                    "internet_facing": bool(default_host_name) and enabled,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 — one failed Azure App Services list must not sink the scan
+        record_discovery_failure(
+            exc=exc,
+            resource_type="Azure App Services",
+            permission="Microsoft.Web/sites/read",
+            cloud="azure",
+            warnings=warnings,
+            missing=missing,
+        )
+    return sites
+
+
+# ---------------------------------------------------------------------------
+# Management-group hierarchy (tenant-scoped)
+# ---------------------------------------------------------------------------
+
+
+def _discover_management_groups(credential: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    """Enumerate the tenant's management-group hierarchy (read-only, tenant-scoped).
+
+    Management groups sit above subscriptions and organize them into a tree.
+    Each entry carries its direct children (nested management groups and
+    subscriptions) so the graph can build the CONTAINS hierarchy across
+    subscriptions. Requires the Management Group Reader role at the tenant root;
+    absent that, this degrades to an empty list plus a warning.
+    """
+    try:
+        # azure-mgmt-managementgroups 2.0.0 renamed the top-level client
+        # ManagementGroupsAPI -> ManagementGroupsMgmtClient. Prefer the new
+        # name and fall back to the old one so both ends of the >=1.0 pin work.
+        try:
+            from azure.mgmt.managementgroups import (
+                ManagementGroupsMgmtClient as _MgmtGroupsClient,
+            )
+        except ImportError:
+            from azure.mgmt.managementgroups import (  # type: ignore[attr-defined,no-redef]
+                ManagementGroupsAPI as _MgmtGroupsClient,
+            )
+    except ImportError:
+        return [], ["azure-mgmt-managementgroups not installed. Skipping management-group hierarchy."]
+
+    groups: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    try:
+        client = _MgmtGroupsClient(credential)
+        for mg in client.management_groups.list():
+            name = str(getattr(mg, "name", "") or "").strip()
+            if not name:
+                continue
+            children: list[dict[str, Any]] = []
+            try:
+                detail = client.management_groups.get(group_id=name, expand="children", recurse=False)
+                for child in getattr(detail, "children", None) or []:
+                    children.append(
+                        {
+                            "id": str(getattr(child, "id", "") or ""),
+                            "name": str(getattr(child, "name", "") or ""),
+                            # ".../managementGroups" (nested group) or "/subscriptions" (a subscription)
+                            "type": str(getattr(child, "type", "") or ""),
+                            "display_name": str(getattr(child, "display_name", "") or ""),
+                        }
+                    )
+            except Exception as exc:  # noqa: BLE001 — child expansion is best-effort
+                warnings.append(f"Could not expand management group {name}: {sanitize_discovery_warning(exc)}")
+            groups.append(
+                {
+                    "id": str(getattr(mg, "id", "") or ""),
+                    "name": name,
+                    "display_name": str(getattr(mg, "display_name", "") or ""),
+                    "children": children,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001
+        warnings.append(f"Could not list Azure management groups: {sanitize_discovery_warning(exc)}")
+    return groups, warnings
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _vm_identity(vm: Any) -> str:
+    identity = getattr(vm, "identity", None)
+    if identity is None:
+        return ""
+    return str(getattr(identity, "principal_id", "") or getattr(identity, "type", "") or "")
+
+
+def _vm_user_assigned_identity_ids(vm: Any) -> list[str]:
+    """ARM IDs of the user-assigned managed identities attached to a VM.
+
+    The VM assumes each of these identities' permissions, so they drive the
+    VM → managed-identity privilege edge in the graph. Returns the resource IDs
+    only (the dict keys) — never any credential material.
+    """
+    identity = getattr(vm, "identity", None)
+    if identity is None:
+        return []
+    user_assigned = getattr(identity, "user_assigned_identities", None)
+    if not isinstance(user_assigned, dict):
+        return []
+    return [str(arm_id) for arm_id in user_assigned if arm_id]
+
+
+def _vnet_id_from_subnet_id(subnet_id: str) -> str:
+    """Derive the parent VNet ARM id from a subnet ARM id, else ''.
+
+    A subnet id is ``.../virtualNetworks/<vnet>/subnets/<subnet>``; the VNet id is
+    everything up to and including the ``virtualNetworks/<vnet>`` segment.
+    """
+    text = str(subnet_id or "")
+    marker = "/subnets/"
+    index = text.lower().find(marker)
+    return text[:index] if index != -1 else ""
+
+
+def _public_ip_ref_value(ref: Any) -> str:
+    """Resolve a public-IP sub-resource reference to its address, else its ARM id.
+
+    A NIC / firewall IP configuration usually carries only the public IP's ``id``
+    in a list response; the actual address is preferred when present.
+    """
+    if ref is None:
+        return ""
+    return str(getattr(ref, "ip_address", "") or getattr(ref, "id", "") or "")
+
+
+def _resource_group_from_id(resource_id: str) -> str:
+    """Extract the resourceGroups segment from an ARM resource id, else ''."""
+    parts = [p for p in str(resource_id or "").split("/") if p]
+    for index, part in enumerate(parts):
+        if part.lower() == "resourcegroups" and index + 1 < len(parts):
+            return parts[index + 1]
+    return ""
+
+
+def _clean_tags(tags: Any) -> dict[str, str]:
+    if not isinstance(tags, dict):
+        return {}
+    return {str(key): str(value) for key, value in tags.items() if key is not None}
+
+
+__all__ = [
+    "ALL_SUBSCRIPTIONS_ENV_FLAG",
+    "INVENTORY_ENV_FLAG",
+    "all_subscriptions_enabled",
+    "discover_all_subscription_inventories",
+    "discover_inventory",
+    "enumerate_subscription_ids",
+    "inventory_enabled",
+]

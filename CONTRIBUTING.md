@@ -1,6 +1,17 @@
 # Contributing to agent-bom
 
-agent-bom has 7,000+ monthly installs. Every contribution directly improves security for real AI agent deployments. This guide gets you from zero to merged PR.
+agent-bom runs against real AI agent deployments, so every contribution directly improves security for the people relying on it. This guide gets you from zero to merged PR.
+
+Not contributing code, just need help? [SUPPORT.md](SUPPORT.md) has the routing
+and what response to expect.
+
+The best ways to help:
+
+- Try the demo and open issues for confusing output, missing context, or weak remediation.
+- Request integrations for MCP clients, coding agents, CI systems, cloud providers, and security workflows you actually use.
+- Pick a `good first issue` or `help wanted` task and comment before starting.
+- Improve docs, screenshots, diagrams, and first-run examples when something is unclear.
+- Star, share, or recommend the project when agent-bom gives you useful evidence; community signal helps security teams trust an open tool.
 
 ## Table of contents
 
@@ -9,6 +20,7 @@ agent-bom has 7,000+ monthly installs. Every contribution directly improves secu
 - [Development workflow](#development-workflow)
 - [Tests](#tests)
 - [Code style](#code-style)
+- [Dependency updates](#dependency-updates)
 - [Submitting a PR](#submitting-a-pr)
 - [Architecture overview](#architecture-overview)
 - [Security reports](#security-reports)
@@ -20,13 +32,15 @@ agent-bom has 7,000+ monthly installs. Every contribution directly improves secu
 ```bash
 git clone https://github.com/msaad00/agent-bom.git
 cd agent-bom
-python3 -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
-pip install -e ".[dev]"
-pre-commit install                                  # wires ruff + ruff-format hooks
-pytest tests/ -x -q                                # must be green before you start
+uv sync --extra dev-all
+uv run pre-commit install                          # wires ruff + ruff-format hooks
+uv run pytest tests/ -x -q                         # must be green before you start
 ```
 
-That's it. `agent-bom scan` now runs from your local checkout.
+That's it. `agent-bom agents` now runs from your local checkout.
+Use `uv sync --extra dev` for a lighter core workflow (docs, skills, small
+fixes); `dev-all` is the supported full-suite contributor setup before larger
+code PRs.
 
 ---
 
@@ -36,21 +50,30 @@ That's it. `agent-bom scan` now runs from your local checkout.
 
 Browse [`good first issue`](https://github.com/msaad00/agent-bom/issues?q=is%3Aopen+label%3A%22good+first+issue%22) on GitHub. No architecture knowledge required.
 
+**That queue is often empty.** Labelled starter issues get opened in batches and
+picked up quickly, so an empty result is normal and does not mean the project is
+closed to contributions. When it is empty, take one of the standing tasks below,
+or open an issue proposing what you want to do — describing it first is welcome
+and saves you writing the wrong thing.
+
 Typical good-first tasks:
-- **Add an MCP client** — 5–15 lines in [`src/agent_bom/discovery/__init__.py`](src/agent_bom/discovery/__init__.py). Each entry is a dict with a config path and parser.
-- **Add a registry entry** — Add a JSON object to `mcp_registry.json` (schema in `config/schemas/`).
-- **Fix a test** — search for `# TODO` or `pytest.mark.skip` in `tests/`.
-- **Improve a docstring** — Any function in `src/agent_bom/` without a clear docstring.
+- **Add an MCP client** — add an `AgentType` member in [`src/agent_bom/models.py`](src/agent_bom/models.py), its per-platform config paths to `CONFIG_LOCATIONS` in [`src/agent_bom/discovery/__init__.py`](src/agent_bom/discovery/__init__.py), and a display label to `_DISPLAY_NAMES` in [`src/agent_bom/discovery/coverage.py`](src/agent_bom/discovery/coverage.py). A `CONFIG_LOCATIONS` entry maps the agent type to `{"Darwin": [...], "Linux": [...], "Windows": [...]}`; clients whose config is not JSON are dispatched by an explicit branch in `discover_global_configs`, not by a field on the entry.
+- **Add a registry entry** — add a server object to [`src/agent_bom/mcp_registry.json`](src/agent_bom/mcp_registry.json), following the shape of its neighbours. Bump the `_total_servers` header to match: `tests/test_stats_alignment.py` asserts the two agree, so a new entry fails CI without it.
+- **Fix a stale doc reference** — several docs cite files that have moved or no longer exist. `grep` a path out of a `docs/**/*.md` table, confirm it resolves, and correct it where it does not.
+- **Improve a docstring** — any function in `src/agent_bom/` without a clear docstring. `src/agent_bom/repo_auto_detect.py` is a good place to start: the `project_has_*` predicates are undocumented except `project_has_iac`, which shows the format to copy.
 
 ### Medium — help wanted
 
 Browse [`help wanted`](https://github.com/msaad00/agent-bom/issues?q=is%3Aopen+label%3A%22help+wanted%22).
 
 Typical help-wanted tasks:
-- **New package ecosystem parsers** — Ruby Gemfile.lock, .NET packages.lock.json, Swift Package.resolved
-- **Cloud CIS benchmark** — GCP or Azure module following the pattern in `src/agent_bom/cloud/`
+- **A package ecosystem we do not parse yet** — check [`src/agent_bom/parsers/`](src/agent_bom/parsers/) first. Python, npm, Ruby, .NET, Swift, Go, Rust, PHP and others already ship; propose the gap you actually hit.
+- **A cloud CIS benchmark we do not cover** — AWS, GCP, Azure and Snowflake modules already exist in [`src/agent_bom/cloud/`](src/agent_bom/cloud/); a new provider follows their pattern.
 - **Dashboard improvements** — Next.js components in `ui/` (TypeScript, Tailwind)
-- **Output format** — New `--format` target (CSV, Markdown table, etc.) in `src/agent_bom/output/`
+- **A new `--format` target** — the current list is `SCAN_OUTPUT_FORMATS` in [`src/agent_bom/cli/options_sources.py`](src/agent_bom/cli/options_sources.py); implementations live in [`src/agent_bom/output/`](src/agent_bom/output/).
+
+Before starting any of these, confirm the gap is still open against the current
+tree. This list is periodically overtaken by shipped work.
 
 ### Critical — P0 issues
 
@@ -64,14 +87,18 @@ See [open issues labeled P1](https://github.com/msaad00/agent-bom/issues?q=is%3A
 
 ## Development workflow
 
+Start with [`AGENTS.md`](AGENTS.md) when using assistant or agent workflows in
+this repo. It captures the product, security, verification, and release lenses
+that should be applied alongside this contributor guide.
+
 ```bash
 # Create a branch
 git checkout -b feat/your-feature   # or fix/your-fix
 
 # Make your changes, then run:
-ruff check src/ --fix               # lint + autofix
-ruff format src/                    # formatting
-pytest tests/ -x -q                 # full suite must stay green
+uv run ruff check src tests --fix   # lint + autofix
+uv run ruff format src tests        # formatting
+uv run pytest tests/ -x -q          # full suite must stay green
 
 # Pre-commit hooks do this automatically on commit
 git add -p                          # stage intentionally
@@ -81,14 +108,50 @@ gh pr create --base main            # or push + open PR on GitHub
 
 Branch naming: `feat/`, `fix/`, `docs/`, `chore/` prefixes. Always branch from and PR to `main`.
 
+### Important PR update rule
+
+Do **not** use GitHub's **Update branch** button on active PRs unless the PR is
+actually non-mergeable and you cannot refresh it locally.
+
+If GitHub only says **"This branch is out-of-date with the base branch"**, that
+does **not** automatically mean there is a conflict. In this repo, that banner
+is informational unless merge protection explicitly blocks on being current with
+`main`.
+
+Preferred path:
+
+```bash
+scripts/refresh-pr-branch.sh your-branch
+```
+
+Why:
+
+- GitHub's synthetic merge head can leave PRs in a bad check state where
+  expected checks never attach cleanly
+- a real locally pushed head is more reliable for CI, branch protection, and
+  debugging
+
+If a PR ever shows "no checks reported", "expected" checks with no attached
+run, or obviously stale check-rollup state after an update, replace the branch
+head with a clean local rebase instead of retrying the GitHub button again.
+
+Manual equivalent:
+
+```bash
+git fetch origin
+git checkout your-branch
+git rebase origin/main
+git push --force-with-lease origin your-branch
+```
+
 ---
 
 ## Tests
 
 ```bash
-pytest tests/ -x -q                 # all tests, stop on first fail
-pytest tests/ -k "scanner" -v       # run matching tests only
-pytest tests/test_core.py -v        # specific file
+uv run pytest tests/ -x -q          # all tests, stop on first fail
+uv run pytest tests/ -k "scanner" -v
+uv run pytest tests/test_core.py -v
 ```
 
 **Rules:**
@@ -118,16 +181,38 @@ pytest tests/test_core.py -v        # specific file
 - **Types:** Type hints on all new public functions. `mypy` is run in CI.
 - **No `print()`** — use `console.print()` (Rich) in CLI code, `logging` in library code.
 - **No stubs or vaporware** — only document and claim features that are implemented and tested.
+- **Shell scripts:** every script must enable strict mode at the top. Bash scripts (`#!/usr/bin/env bash` or `#!/bin/bash`) must use `set -euo pipefail`. POSIX `sh` scripts (`#!/bin/sh`) must use `set -eu` — `pipefail` is a non-POSIX extension and is intentionally omitted on `sh` shebangs to keep endpoint installers (Jamf, Kandji, Alpine `ash`) portable.
 
 Pre-commit hooks enforce ruff on every commit. Install once with `pre-commit install`.
+
+---
+
+## Dependency updates
+
+Dependency updates are part of the shipped product surface, not background noise.
+
+**Review bar**
+- Patch and minor updates still need green CI, security scan, and release-surface alignment.
+- Major updates need a short human review of upstream release notes before merge.
+- If an update changes user-visible behavior, contracts, runtime assumptions, or packaging, call that out in the PR body and release notes where applicable.
+- Do not merge “green but unexplained” upgrades. We should be able to say what changed, why it is safe, and what we validated.
+
+**For Dependabot and manual upgrade PRs include**
+- the package and version change
+- whether it is patch, minor, or major
+- any breaking-change risk or notable upstream release-note items
+- what was validated locally or in CI
+- whether docs, examples, pins, or release-managed files also needed updating
+
+This keeps update history readable for operators and makes package maintenance look intentional rather than accidental.
 
 ---
 
 ## Submitting a PR
 
 1. **Branch from main** and name it `feat/`, `fix/`, `docs/`, or `chore/`.
-2. **All tests pass:** `pytest tests/ -x -q`
-3. **Lint clean:** `ruff check src/ && ruff format --check src/`
+2. **All tests pass:** `uv run pytest tests/ -x -q`
+3. **Lint clean:** `uv run ruff check src tests && uv run ruff format --check src tests`
 4. **PR description:** one-sentence summary, what changed, how to test it. If the PR resolves a GitHub issue, include `Closes #<issue-number>` in the PR body — GitHub will auto-close the issue when the PR merges.
 5. **One review required** — a maintainer will review within a few days.
 
@@ -142,24 +227,24 @@ CI checks that run on every PR:
 
 **Commit style:** `type: short description` — types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`.
 
+For dependency PRs, prefer a one-line summary in the body such as:
+
+```md
+Upgrade type: minor
+Release notes reviewed: yes
+Breaking changes expected: no
+Validation: CI + targeted local tests
+```
+
 ---
 
 ## Architecture overview
 
-See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full module map. Key paths:
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for system diagrams and the full module map.
 
-| Path | Purpose |
-|------|---------|
-| `src/agent_bom/cli.py` | All CLI commands (Click) |
-| `src/agent_bom/scanners/__init__.py` | OSV batch scan + detail enrichment |
-| `src/agent_bom/enrichment.py` | NVD + EPSS + CISA KEV enrichment |
-| `src/agent_bom/discovery/__init__.py` | MCP client config discovery (22 clients) |
-| `src/agent_bom/models.py` | Core data models (Package, Vulnerability, Agent…) |
-| `src/agent_bom/runtime/` | Proxy detectors (7 detectors) |
-| `src/agent_bom/api/server.py` | FastAPI REST server |
-| `src/agent_bom/mcp_server.py` | MCP server (32 tools) |
+**5 products, 1 package:** `agent-bom` (BOM + scanning), `agent-shield` (runtime protection), `agent-cloud` (cloud posture), `agent-iac` (IaC security), `agent-claw` (fleet governance). All share the same core engine.
 
-The scan pipeline: **discover** MCP configs → **parse** packages → **scan** via OSV batch API → **enrich** full vuln details → **optional** NVD/EPSS/KEV enrichment → **output** (table, JSON, SARIF, CycloneDX…).
+Pipeline at a glance: **discover** MCP configs → **parse** packages → **scan** via OSV/NVD/GHSA → **enrich** (EPSS + KEV) → **blast radius** → **compliance tag** → **output**.
 
 ---
 
@@ -171,7 +256,7 @@ Only document and claim features that are actually implemented and tested. Do no
 
 ## Version bump
 
-Use `scripts/bump-version.py`. It updates all 19 files in one go. See `docs/PUBLISHING.md` for the full release checklist.
+Use `scripts/bump-version.py`. It updates the release-managed version surfaces in one go. See `docs/PUBLISHING.md` for the full release checklist.
 
 ---
 

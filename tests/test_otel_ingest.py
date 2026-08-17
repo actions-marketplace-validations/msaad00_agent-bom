@@ -63,6 +63,28 @@ def test_parse_generic_tool_name_attribute():
     assert traces[0].tool_name == "read_file"
 
 
+def test_parse_server_and_package_attributes():
+    data = _otlp_trace(
+        [
+            {
+                "traceId": "abc",
+                "spanId": "s2",
+                "name": "tool_call",
+                "attributes": [
+                    {"key": "tool.name", "value": {"stringValue": "query_db"}},
+                    {"key": "mcp.server", "value": {"stringValue": "sqlite-mcp"}},
+                    {"key": "package.name", "value": {"stringValue": "sqlite-utils"}},
+                ],
+                "status": {},
+            }
+        ]
+    )
+    traces = parse_otel_traces(data)
+    assert len(traces) == 1
+    assert traces[0].server_name == "sqlite-mcp"
+    assert traces[0].package_name == "sqlite-utils"
+
+
 def test_parse_skips_non_tool_spans():
     data = _otlp_trace(
         [
@@ -80,10 +102,12 @@ def test_parse_skips_non_tool_spans():
 
 
 def test_flag_vulnerable_server():
-    traces = [ToolCallTrace(trace_id="t1", span_id="s1", tool_name="evil_tool")]
-    flagged = flag_vulnerable_tool_calls(traces, vuln_servers={"evil_tool"})
+    traces = [ToolCallTrace(trace_id="t1", span_id="s1", tool_name="evil_tool", server_name="evil_tool")]
+    flagged = flag_vulnerable_tool_calls(traces, vuln_servers={"evil_tool": ["CVE-2026-1"]})
     assert len(flagged) == 1
     assert flagged[0].severity == "high"
+    assert flagged[0].server == "evil_tool"
+    assert flagged[0].matched_cves == ["CVE-2026-1"]
 
 
 def test_flag_no_match():
@@ -93,10 +117,11 @@ def test_flag_no_match():
 
 
 def test_flag_vulnerable_package():
-    traces = [ToolCallTrace(trace_id="t1", span_id="s1", tool_name="langchain_search")]
+    traces = [ToolCallTrace(trace_id="t1", span_id="s1", tool_name="langchain_search", package_name="langchain")]
     flagged = flag_vulnerable_tool_calls(traces, vuln_packages={"langchain": ["CVE-2025-1"]})
     assert len(flagged) == 1
     assert flagged[0].matched_cve == "CVE-2025-1"
+    assert flagged[0].package_name == "langchain"
 
 
 def test_parse_flat_spans_format():
@@ -469,3 +494,61 @@ def test_validate_otel_schema_rejects_non_list_resource_spans():
 
     with pytest.raises(ValueError, match="array"):
         validate_otel_schema({"resourceSpans": "not-a-list"})
+
+
+# ── Agent attribution (cost → graph join key) ─────────────────────────────────
+#
+# LLMCostRecord.agent was always "" for real OTLP ingest because LLMAPICall
+# carried no agent field, so every persisted cost row bucketed as "unknown" and
+# the graph cost overlay had nothing to join on.
+
+
+def _ml_span(attributes: list[dict]) -> dict:
+    return {
+        "traceId": "t1",
+        "spanId": "s1",
+        "parentSpanId": "",
+        "name": "chat gpt-4o",
+        "startTimeUnixNano": 1000000000,
+        "endTimeUnixNano": 1500000000,
+        "attributes": [{"key": "gen_ai.system", "value": {"stringValue": "openai"}}, *attributes],
+        "status": {},
+    }
+
+
+def _otlp_with_resource(spans: list[dict], resource_attributes: list[dict]) -> dict:
+    return {
+        "resourceSpans": [
+            {
+                "resource": {"attributes": resource_attributes},
+                "scopeSpans": [{"spans": spans}],
+            }
+        ]
+    }
+
+
+def test_ml_span_agent_read_from_gen_ai_agent_name():
+    calls = parse_ml_api_spans(_otlp_trace([_ml_span([{"key": "gen_ai.agent.name", "value": {"stringValue": "checkout-agent"}}])]))
+    assert len(calls) == 1
+    assert calls[0].agent == "checkout-agent"
+
+
+def test_ml_span_agent_falls_back_to_resource_service_name():
+    calls = parse_ml_api_spans(_otlp_with_resource([_ml_span([])], [{"key": "service.name", "value": {"stringValue": "billing-svc"}}]))
+    assert calls[0].agent == "billing-svc"
+
+
+def test_span_agent_attribute_beats_resource_service_name():
+    calls = parse_ml_api_spans(
+        _otlp_with_resource(
+            [_ml_span([{"key": "agent.name", "value": {"stringValue": "span-agent"}}])],
+            [{"key": "service.name", "value": {"stringValue": "resource-svc"}}],
+        )
+    )
+    assert calls[0].agent == "span-agent"
+
+
+def test_ml_span_agent_is_empty_when_absent():
+    """No attribution must stay empty rather than inventing one."""
+    calls = parse_ml_api_spans(_otlp_trace([_ml_span([])]))
+    assert calls[0].agent == ""

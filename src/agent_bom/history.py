@@ -3,17 +3,63 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from agent_bom.models import Package
+from agent_bom.package_utils import canonical_package_key
+from agent_bom.sbom import parse_sbom_document
+from agent_bom.security import sanitize_path_label, sanitize_text
+
+logger = logging.getLogger(__name__)
+
 HISTORY_DIR = Path.home() / ".agent-bom" / "history"
+
+# On-disk scan history is unbounded by default, so a long-lived workstation or
+# CI cache can accumulate thousands of reports. Cap the retained count and prune
+# the oldest reports on every save. Override with ``AGENT_BOM_HISTORY_MAX_REPORTS``.
+_DEFAULT_HISTORY_MAX_REPORTS = 500
+
+
+def _history_max_reports() -> int:
+    """Resolve the retained-report cap. ``<= 0`` disables pruning."""
+    raw = os.environ.get("AGENT_BOM_HISTORY_MAX_REPORTS", str(_DEFAULT_HISTORY_MAX_REPORTS))
+    try:
+        return int(raw)
+    except ValueError:
+        return _DEFAULT_HISTORY_MAX_REPORTS
 
 
 def history_dir() -> Path:
     """Return (and create) the history directory."""
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     return HISTORY_DIR
+
+
+def prune_history(max_reports: Optional[int] = None) -> int:
+    """Prune oldest saved reports when the count exceeds the cap.
+
+    Returns the number of reports deleted. A non-positive cap disables pruning.
+    Deletion is best-effort: a failure to remove one file is logged (sanitized)
+    and does not abort the sweep or the caller's save.
+    """
+    cap = _history_max_reports() if max_reports is None else max_reports
+    if cap <= 0:
+        return 0
+    reports = list_reports()  # newest first
+    if len(reports) <= cap:
+        return 0
+    removed = 0
+    for stale in reports[cap:]:
+        try:
+            stale.unlink()
+            removed += 1
+        except OSError as exc:
+            logger.warning("Failed to prune history report: %s", sanitize_text(str(exc)))
+    return removed
 
 
 def save_report(report_json: dict, label: Optional[str] = None) -> Path:
@@ -25,7 +71,44 @@ def save_report(report_json: dict, label: Optional[str] = None) -> Path:
     stem = f"{ts}-{label}" if label else ts
     path = history_dir() / f"{stem}.json"
     path.write_text(json.dumps(report_json, indent=2))
+    from agent_bom.db.adoption_events import adoption_channel, record_adoption_event_best_effort
+
+    record_adoption_event_best_effort("artifact_created", channel=adoption_channel(), artifact_type="json")
+    try:
+        from agent_bom.db.local_analytics import record_scan_report_best_effort
+
+        record_scan_report_best_effort(report_json, source="cli", artifact_path=path)
+    except Exception:
+        pass
+    _ingest_clickhouse_best_effort(report_json)
+    prune_history()
     return path
+
+
+def _ingest_clickhouse_best_effort(report_json: dict) -> None:
+    """Mirror the saved scan into ClickHouse when a URL is configured.
+
+    Disabled by default: with no ``AGENT_BOM_CLICKHOUSE_URL`` the ClickHouse
+    URL resolves empty and the ingest helper returns immediately (zero
+    overhead). Any error is swallowed here and inside the helper so analytics
+    ingest can never fail a scan — mirroring the local-analytics best-effort
+    hook above.
+    """
+    clickhouse_url = os.environ.get("AGENT_BOM_CLICKHOUSE_URL") or ""
+    if not clickhouse_url:
+        return
+    try:
+        from agent_bom.api.clickhouse_store import ingest_scan_report_best_effort
+        from agent_bom.cli._tenant import resolve_cli_tenant_id
+
+        ingest_scan_report_best_effort(
+            report_json,
+            source="cli",
+            tenant_id=resolve_cli_tenant_id(),
+            url=clickhouse_url,
+        )
+    except Exception:
+        logger.debug("ClickHouse scan-ingest hook skipped (best-effort)", exc_info=True)
 
 
 def list_reports() -> list[Path]:
@@ -36,6 +119,81 @@ def list_reports() -> list[Path]:
 def load_report(path: Path) -> dict:
     """Load a saved report JSON file."""
     return json.loads(path.read_text())
+
+
+def _synthetic_report_from_packages(
+    packages: list[Package],
+    *,
+    generated_at: str,
+    source_path: Path,
+    source_name: str,
+    format_name: str,
+) -> dict:
+    """Build a minimal report-shaped dict for non-agent package inventories."""
+    package_dicts = [
+        {
+            "name": pkg.name,
+            "version": pkg.version,
+            "ecosystem": pkg.ecosystem,
+            "purl": getattr(pkg, "purl", None),
+            "is_direct": getattr(pkg, "is_direct", True),
+            "stable_id": getattr(pkg, "stable_id", None),
+        }
+        for pkg in packages
+    ]
+    server_name = f"sbom:{source_name}"
+    return {
+        "generated_at": generated_at,
+        "summary": {
+            "total_agents": 1,
+            "total_packages": len(package_dicts),
+            "total_vulnerabilities": 0,
+            "critical_findings": 0,
+        },
+        "scan_sources": ["sbom"],
+        "sbom_baseline": {
+            "source_path": sanitize_path_label(source_path),
+            "source_name": source_name,
+            "format": format_name,
+            "package_count": len(package_dicts),
+        },
+        "agents": [
+            {
+                "name": server_name,
+                "stable_id": server_name,
+                "mcp_servers": [
+                    {
+                        "name": server_name,
+                        "stable_id": server_name,
+                        "surface": "sbom",
+                        "fingerprint": "",
+                        "packages": package_dicts,
+                        "tools": [],
+                        "resources": [],
+                    }
+                ],
+            }
+        ],
+        "blast_radius": [],
+    }
+
+
+def load_report_or_sbom(path: Path) -> dict:
+    """Load either an agent-bom report or an external CycloneDX/SPDX SBOM."""
+    data = load_report(path)
+    if "blast_radius" in data or "ai_bom_version" in data:
+        return data
+
+    packages, format_name, detected_name = parse_sbom_document(data, source_name=str(path))
+    generated_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+    source_name = detected_name or path.stem
+    return _synthetic_report_from_packages(
+        packages,
+        generated_at=generated_at,
+        source_path=path,
+        source_name=source_name,
+        format_name=format_name,
+    )
 
 
 def latest_report() -> Optional[Path]:
@@ -102,6 +260,7 @@ def diff_reports(baseline: dict, current: dict) -> dict:
         "unchanged": unchanged,
         "new_packages": new_pkgs,
         "removed_packages": removed_pkgs,
+        "inventory_diff": _diff_inventory(baseline, current),
         "summary": {
             "new_findings": len(new),
             "resolved_findings": len(resolved),
@@ -121,3 +280,204 @@ def _extract_packages(report: dict) -> set[str]:
                 key = f"{pkg.get('ecosystem', 'unknown')}:{pkg.get('name', '')}@{pkg.get('version', '')}"
                 pkgs.add(key)
     return pkgs
+
+
+def _get_inventory_snapshot(report: dict) -> dict:
+    """Return inventory snapshot from a report, deriving a minimal one if absent."""
+    snapshot = report.get("inventory_snapshot")
+    ai_bom_entities = report.get("ai_bom_entities") or {}
+    rich_entity_keys = ("servers", "tools", "resources", "prompts", "packages", "relationships")
+    if ai_bom_entities and any(ai_bom_entities.get(key) for key in rich_entity_keys):
+        return ai_bom_entities
+    if snapshot and ai_bom_entities:
+        merged = dict(snapshot)
+        if "relationships" not in merged and ai_bom_entities.get("relationships"):
+            merged["relationships"] = ai_bom_entities["relationships"]
+        return merged
+    if snapshot:
+        return snapshot
+
+    agents: list[dict] = []
+    servers: list[dict] = []
+    tools: list[dict] = []
+    resources: list[dict] = []
+    packages: list[dict] = []
+    relationships: list[dict] = []
+
+    seen_servers: set[str] = set()
+    seen_tools: set[str] = set()
+    seen_resources: set[str] = set()
+    seen_packages: set[str] = set()
+
+    for agent in report.get("agents", []):
+        agent_id = agent.get("stable_id") or agent.get("name", "")
+        agents.append({"id": agent_id, "name": agent.get("name", ""), "status": agent.get("status", "")})
+        for server in agent.get("mcp_servers", []):
+            server_id = server.get("stable_id") or server.get("name", "")
+            if server_id and server_id not in seen_servers:
+                servers.append(
+                    {
+                        "id": server_id,
+                        "name": server.get("name", ""),
+                        "fingerprint": server.get("fingerprint", ""),
+                        "auth_mode": server.get("auth_mode", ""),
+                        "transport": server.get("transport", ""),
+                    }
+                )
+                seen_servers.add(server_id)
+            if agent_id and server_id:
+                relationships.append({"from": agent_id, "to": server_id, "type": "uses"})
+            for tool in server.get("tools", []):
+                tool_id = tool.get("stable_id") or tool.get("name", "")
+                if tool_id and tool_id not in seen_tools:
+                    tools.append(
+                        {
+                            "id": tool_id,
+                            "name": tool.get("name", ""),
+                            "fingerprint": tool.get("fingerprint", ""),
+                            "risk_score": tool.get("risk_score", 0),
+                        }
+                    )
+                    seen_tools.add(tool_id)
+                if server_id and tool_id:
+                    relationships.append({"from": server_id, "to": tool_id, "type": "exposes_tool"})
+            for resource in server.get("resources", []):
+                resource_id = resource.get("stable_id") or resource.get("uri", "")
+                if resource_id and resource_id not in seen_resources:
+                    resources.append(
+                        {
+                            "id": resource_id,
+                            "uri": resource.get("uri", ""),
+                            "fingerprint": resource.get("fingerprint", ""),
+                            "risk_score": resource.get("risk_score", 0),
+                        }
+                    )
+                    seen_resources.add(resource_id)
+                if server_id and resource_id:
+                    relationships.append({"from": server_id, "to": resource_id, "type": "exposes_resource"})
+            for pkg in server.get("packages", []):
+                pkg_id = pkg.get("stable_id") or canonical_package_key(
+                    str(pkg.get("name", "") or ""),
+                    str(pkg.get("version", "") or ""),
+                    str(pkg.get("ecosystem", "unknown") or "unknown"),
+                    str(pkg.get("purl", "") or "") or None,
+                )
+                if pkg_id and pkg_id not in seen_packages:
+                    packages.append({"id": pkg_id, "name": pkg.get("name", ""), "version": pkg.get("version", "")})
+                    seen_packages.add(pkg_id)
+                if server_id and pkg_id:
+                    relationships.append({"from": server_id, "to": pkg_id, "type": "depends_on"})
+
+    return {
+        "agents": agents,
+        "servers": servers,
+        "tools": tools,
+        "resources": resources,
+        "packages": packages,
+        "relationships": relationships,
+    }
+
+
+def _diff_inventory(baseline: dict, current: dict) -> dict:
+    """Diff deterministic inventory entities across two reports."""
+    base_snapshot = _get_inventory_snapshot(baseline)
+    curr_snapshot = _get_inventory_snapshot(current)
+
+    result: dict[str, object] = {
+        "changed_servers": [],
+        "changed_tools": [],
+        "changed_resources": [],
+        "new_relationships": [],
+        "removed_relationships": [],
+    }
+    summary: dict[str, int] = {}
+
+    for entity_type in ("agents", "servers", "tools", "resources", "packages"):
+        base_map = {item.get("id", ""): item for item in base_snapshot.get(entity_type, []) if item.get("id")}
+        curr_map = {item.get("id", ""): item for item in curr_snapshot.get(entity_type, []) if item.get("id")}
+        new_ids = sorted(set(curr_map) - set(base_map))
+        removed_ids = sorted(set(base_map) - set(curr_map))
+        result[f"new_{entity_type}"] = [curr_map[i] for i in new_ids]
+        result[f"removed_{entity_type}"] = [base_map[i] for i in removed_ids]
+        summary[f"new_{entity_type}"] = len(new_ids)
+        summary[f"removed_{entity_type}"] = len(removed_ids)
+
+    base_servers = {item.get("id", ""): item for item in base_snapshot.get("servers", []) if item.get("id")}
+    curr_servers = {item.get("id", ""): item for item in curr_snapshot.get("servers", []) if item.get("id")}
+    changed_servers = []
+    for server_id in sorted(set(base_servers) & set(curr_servers)):
+        base_fp = base_servers[server_id].get("fingerprint")
+        curr_fp = curr_servers[server_id].get("fingerprint")
+        if base_fp and curr_fp and base_fp != curr_fp:
+            changed_servers.append(
+                {
+                    "id": server_id,
+                    "name": curr_servers[server_id].get("name", ""),
+                    "previous_fingerprint": base_fp,
+                    "current_fingerprint": curr_fp,
+                }
+            )
+    result["changed_servers"] = changed_servers
+    summary["changed_servers"] = len(changed_servers)
+
+    base_tools = {item.get("id", ""): item for item in base_snapshot.get("tools", []) if item.get("id")}
+    curr_tools = {item.get("id", ""): item for item in curr_snapshot.get("tools", []) if item.get("id")}
+    changed_tools = []
+    for tool_id in sorted(set(base_tools) & set(curr_tools)):
+        base_tool = base_tools[tool_id]
+        curr_tool = curr_tools[tool_id]
+        if base_tool.get("fingerprint") != curr_tool.get("fingerprint") or base_tool.get("risk_score") != curr_tool.get("risk_score"):
+            changed_tools.append(
+                {
+                    "id": tool_id,
+                    "name": curr_tool.get("name", ""),
+                    "previous_fingerprint": base_tool.get("fingerprint", ""),
+                    "current_fingerprint": curr_tool.get("fingerprint", ""),
+                    "previous_risk_score": base_tool.get("risk_score", 0),
+                    "current_risk_score": curr_tool.get("risk_score", 0),
+                }
+            )
+    result["changed_tools"] = changed_tools
+    summary["changed_tools"] = len(changed_tools)
+
+    base_resources = {item.get("id", ""): item for item in base_snapshot.get("resources", []) if item.get("id")}
+    curr_resources = {item.get("id", ""): item for item in curr_snapshot.get("resources", []) if item.get("id")}
+    changed_resources = []
+    for resource_id in sorted(set(base_resources) & set(curr_resources)):
+        base_resource = base_resources[resource_id]
+        curr_resource = curr_resources[resource_id]
+        if base_resource.get("fingerprint") != curr_resource.get("fingerprint") or base_resource.get("risk_score") != curr_resource.get(
+            "risk_score"
+        ):
+            changed_resources.append(
+                {
+                    "id": resource_id,
+                    "uri": curr_resource.get("uri", ""),
+                    "previous_fingerprint": base_resource.get("fingerprint", ""),
+                    "current_fingerprint": curr_resource.get("fingerprint", ""),
+                    "previous_risk_score": base_resource.get("risk_score", 0),
+                    "current_risk_score": curr_resource.get("risk_score", 0),
+                }
+            )
+    result["changed_resources"] = changed_resources
+    summary["changed_resources"] = len(changed_resources)
+
+    base_relationships = {
+        (item.get("from", ""), item.get("to", ""), item.get("type", ""))
+        for item in base_snapshot.get("relationships", [])
+        if item.get("from") and item.get("to") and item.get("type")
+    }
+    curr_relationships = {
+        (item.get("from", ""), item.get("to", ""), item.get("type", ""))
+        for item in curr_snapshot.get("relationships", [])
+        if item.get("from") and item.get("to") and item.get("type")
+    }
+    new_relationships = [{"from": rel[0], "to": rel[1], "type": rel[2]} for rel in sorted(curr_relationships - base_relationships)]
+    removed_relationships = [{"from": rel[0], "to": rel[1], "type": rel[2]} for rel in sorted(base_relationships - curr_relationships)]
+    result["new_relationships"] = new_relationships
+    result["removed_relationships"] = removed_relationships
+    summary["new_relationships"] = len(new_relationships)
+    summary["removed_relationships"] = len(removed_relationships)
+
+    result["summary"] = summary
+    return result

@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
+import io
 import json
 import sqlite3
+import zipfile
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from agent_bom.db.lookup import VulnDB, _version_affected, lookup_package
-from agent_bom.db.schema import DB_PATH, _validated_db_path, db_stats, init_db
+from agent_bom.db.schema import DB_PATH, _validated_db_path, db_stats, init_db, open_existing_db_readonly
 from agent_bom.db.sync import (
+    _EPSS_CSV_URL,
+    _ingest_alpine_secdb_payload,
     _ingest_osv_file,
+    _parse_alpine_secfix_tokens,
     _parse_osv_entry,
+    _resolve_epss_redirect,
     _validate_sync_url,
+    sync_alpine_secdb,
+    sync_db,
     sync_epss,
     sync_kev,
     sync_osv,
@@ -139,6 +148,21 @@ def test_version_affected_last_affected():
     assert _version_affected("2.1.0", "2.0.0", None, "2.0.9") is False
 
 
+def test_version_affected_debian_range():
+    assert _version_affected("6.5+20250216-2", "0", "6.5+20250216-3", None, "debian") is True
+    assert _version_affected("6.5+20250216-3", "0", "6.5+20250216-3", None, "debian") is False
+
+
+def test_version_affected_apk_range():
+    assert _version_affected("1.2.4-r2", "0", "1.2.4-r10", None, "apk") is True
+    assert _version_affected("1.2.4-r10", "0", "1.2.4-r10", None, "apk") is False
+
+
+def test_version_affected_rpm_range():
+    assert _version_affected("3.0.7-24.el9", "0", "3.0.7-25.el9", None, "linux") is True
+    assert _version_affected("3.0.7-25.el9", "0", "3.0.7-25.el9", None, "linux") is False
+
+
 # ---------------------------------------------------------------------------
 # lookup_package
 # ---------------------------------------------------------------------------
@@ -171,6 +195,34 @@ def test_lookup_package_ecosystem_case_insensitive(tmp_db):
     _insert_affected(tmp_db, ecosystem="pypi")
     results = lookup_package(tmp_db, "PyPI", "requests", "2.0.5")
     assert len(results) == 1
+
+
+def test_lookup_package_debian_version_match(tmp_db):
+    _insert_vuln(tmp_db, vuln_id="CVE-2025-NCURSES")
+    _insert_affected(
+        tmp_db,
+        vuln_id="CVE-2025-NCURSES",
+        ecosystem="debian",
+        pkg="ncurses-bin",
+        introduced="0",
+        fixed="6.5+20250216-3",
+    )
+    results = lookup_package(tmp_db, "Debian", "ncurses-bin", "6.5+20250216-2")
+    assert len(results) == 1
+
+
+def test_lookup_package_debian_fixed_version_not_affected(tmp_db):
+    _insert_vuln(tmp_db, vuln_id="CVE-2025-NCURSES")
+    _insert_affected(
+        tmp_db,
+        vuln_id="CVE-2025-NCURSES",
+        ecosystem="debian",
+        pkg="ncurses-bin",
+        introduced="0",
+        fixed="6.5+20250216-3",
+    )
+    results = lookup_package(tmp_db, "Debian", "ncurses-bin", "6.5+20250216-3")
+    assert results == []
 
 
 def test_lookup_package_name_normalized(tmp_db):
@@ -208,6 +260,24 @@ def test_lookup_package_epss_scores(tmp_db):
     results = lookup_package(tmp_db, "pypi", "requests", "2.0.5")
     assert results[0].epss_probability == pytest.approx(0.95)
     assert results[0].epss_percentile == pytest.approx(99.5)
+
+
+def test_lookup_package_alias_cve_enrichment(tmp_db):
+    _insert_vuln(tmp_db, vuln_id="GHSA-test-alias", cvss_score=None)
+    tmp_db.execute("UPDATE vulns SET aliases='CVE-2024-TESTALIAS' WHERE id='GHSA-test-alias'")
+    _insert_affected(tmp_db, vuln_id="GHSA-test-alias")
+    tmp_db.execute(
+        "INSERT OR REPLACE INTO epss_scores(cve_id, probability, percentile, updated_at) "
+        "VALUES ('CVE-2024-TESTALIAS', 0.42, 88.0, '2024-01-01')"
+    )
+    tmp_db.execute("INSERT OR REPLACE INTO kev_entries(cve_id, date_added) VALUES ('CVE-2024-TESTALIAS', '2024-02-01')")
+    tmp_db.commit()
+
+    results = lookup_package(tmp_db, "pypi", "requests", "2.0.5")
+    assert results[0].epss_probability == pytest.approx(0.42)
+    assert results[0].epss_percentile == pytest.approx(88.0)
+    assert results[0].is_kev is True
+    assert results[0].kev_date_added == "2024-02-01"
 
 
 def test_lookup_package_not_found(tmp_db):
@@ -321,19 +391,8 @@ def test_sync_kev_mocked(tmp_db):
             {"cveID": "CVE-2024-KEV-2", "dateAdded": "2024-01-02", "dueDate": "", "product": "Baz", "vendorProject": "Corp"},
         ]
     }
-    kev_bytes = json.dumps(kev_data).encode()
 
-    class _FakeResp:
-        def read(self):
-            return kev_bytes
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            pass
-
-    with patch("urllib.request.urlopen", return_value=_FakeResp()):
+    with patch("agent_bom.http_client.fetch_json", return_value=kev_data):
         count = sync_kev(tmp_db, url="https://fake/kev.json")
 
     assert count == 2
@@ -350,22 +409,29 @@ def test_sync_kev_mocked(tmp_db):
 def test_sync_epss_mocked(tmp_db):
     csv_content = b"cve,epss,percentile\nCVE-2024-1,0.95,99.5\nCVE-2024-2,0.10,50.0\n"
 
-    class _FakeResp:
-        def read(self):
-            return csv_content  # not gzipped — sync_epss handles both
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            pass
-
-    with patch("urllib.request.urlopen", return_value=_FakeResp()):
+    with patch("agent_bom.db.sync._fetch_epss_csv_bytes", return_value=csv_content):
         count = sync_epss(tmp_db, url="https://fake/epss.csv.gz")
 
     assert count == 2
     row = tmp_db.execute("SELECT probability FROM epss_scores WHERE cve_id='CVE-2024-1'").fetchone()
     assert row[0] == pytest.approx(0.95)
+
+
+def test_default_epss_url_uses_current_host():
+    assert _EPSS_CSV_URL == "https://epss.empiricalsecurity.com/epss_scores-current.csv.gz"
+
+
+def test_epss_redirect_allows_legacy_to_current_host():
+    redirected = _resolve_epss_redirect(
+        "https://epss.cyentia.com/epss_scores-current.csv.gz",
+        "https://epss.empiricalsecurity.com/epss_scores-current.csv.gz",
+    )
+    assert redirected == "https://epss.empiricalsecurity.com/epss_scores-current.csv.gz"
+
+
+def test_epss_redirect_rejects_unexpected_host():
+    with pytest.raises(ValueError, match="not allowed"):
+        _resolve_epss_redirect("https://epss.empiricalsecurity.com/epss_scores-current.csv.gz", "https://example.com/epss.csv.gz")
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +493,119 @@ def test_validated_db_path_rejects_arbitrary_system_path():
 def test_validated_db_path_rejects_traversal(tmp_path):
     with pytest.raises(ValueError):
         _validated_db_path(str(tmp_path / ".." / ".." / "etc" / "passwd"))
+
+
+def test_validated_db_path_accepts_tmp_alias():
+    p = _validated_db_path("/tmp/agent-bom-vulns.db")
+    assert p == Path("/tmp/agent-bom-vulns.db")
+
+
+# ---------------------------------------------------------------------------
+# Availability hardening — busy_timeout, streaming download, WAL checkpoint
+# ---------------------------------------------------------------------------
+
+
+def test_init_db_sets_busy_timeout(tmp_path):
+    """The DDL must arm busy_timeout so concurrent writers don't hit instant SQLITE_BUSY."""
+    conn = init_db(tmp_path / "bt.db")
+    try:
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+    finally:
+        conn.close()
+
+
+def test_readonly_conn_sets_busy_timeout(tmp_path):
+    """Read-only scan connections must also arm busy_timeout (was defaulting to 0)."""
+    db_file = tmp_path / "ro.db"
+    init_db(db_file).close()
+    conn = open_existing_db_readonly(db_file)
+    try:
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+    finally:
+        conn.close()
+
+
+def test_sync_db_runs_wal_checkpoint(tmp_path, monkeypatch):
+    """sync_db must checkpoint the WAL before closing so readers don't race a big -wal."""
+    import agent_bom.db.schema as schema_mod
+
+    class _ConnProxy:
+        def __init__(self, real):
+            self._real = real
+            self.executed: list[str] = []
+
+        def execute(self, sql, *args, **kwargs):
+            self.executed.append(sql)
+            return self._real.execute(sql, *args, **kwargs)
+
+        def close(self):
+            return self._real.close()
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    proxies: list[_ConnProxy] = []
+    real_init = schema_mod.init_db
+
+    def fake_init(path=None, **kwargs):
+        # `verify_integrity` is passed by the sync path (it rewrites the DB, so
+        # it is the one caller that still pays for a full integrity check).
+        proxy = _ConnProxy(real_init(path, **kwargs))
+        proxies.append(proxy)
+        return proxy
+
+    monkeypatch.setattr(schema_mod, "init_db", fake_init)
+    monkeypatch.setattr("agent_bom.db.sync.sync_osv", lambda *args, **kwargs: 0)
+    monkeypatch.setattr("agent_bom.db.sync.sync_alpine_secdb", lambda *args, **kwargs: 0)
+    monkeypatch.setattr("agent_bom.db.sync.sync_debian_tracker", lambda *args, **kwargs: 0)
+    monkeypatch.setattr("agent_bom.db.sync.sync_epss", lambda *args, **kwargs: 0)
+    monkeypatch.setattr("agent_bom.db.sync.sync_kev", lambda *args, **kwargs: 0)
+    sync_db(path=tmp_path / "ckpt.db", sources=[])
+
+    assert proxies
+    assert any("wal_checkpoint" in sql.lower() for sql in proxies[0].executed)
+
+
+def test_sync_osv_streams_to_disk(tmp_db, monkeypatch):
+    """sync_osv must stream the archive to a temp file, not buffer it all in RAM.
+
+    Regression: the whole all.zip was read into bytes and re-wrapped in BytesIO
+    (~1GB peak) before ingestion. The fix streams to disk and reads the zip from
+    that path; patching only the streaming downloader (not fetch_bytes) proves it.
+    """
+    osv_entry = _make_osv_entry(vuln_id="OSV-2024-STREAM")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("requests/OSV-2024-STREAM.json", json.dumps(osv_entry))
+    payload = buf.getvalue()
+
+    captured: dict = {}
+
+    def fake_download(url, dest, *, timeout=60, headers=None, chunk_size=1 << 20):
+        captured["dest"] = dest
+        with open(dest, "wb") as fh:
+            fh.write(payload)
+        return len(payload)
+
+    monkeypatch.setattr("agent_bom.http_client.download_to_file", fake_download)
+    count = sync_osv(tmp_db, url="https://osv.example.com/all.zip")
+
+    assert count == 1
+    # Downloaded to a real on-disk path (not held in memory)…
+    assert captured.get("dest")
+    # …and the temp file is cleaned up after ingestion.
+    assert not Path(captured["dest"]).exists()
+    row = tmp_db.execute("SELECT id FROM vulns WHERE id = 'OSV-2024-STREAM'").fetchone()
+    assert row is not None
+
+
+def test_sync_kev_guards_wrong_shape_payload(tmp_db):
+    """A non-dict KEV payload must not raise AttributeError and abort sync_db."""
+    with patch("agent_bom.http_client.fetch_json", return_value=["unexpected", "array"]):
+        count = sync_kev(tmp_db, url="https://fake/kev.json")
+
+    assert count == 0
+    assert tmp_db.execute("SELECT COUNT(*) FROM kev_entries").fetchone()[0] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -619,11 +798,151 @@ def test_parse_osv_entry_with_cvss_severity_type():
     assert vuln_row["cvss_vector"] is not None
 
 
+def test_parse_osv_entry_derives_cvss_score_from_vector():
+    data = {
+        "id": "DEBIAN-CVE-2014-6271",
+        "summary": "CVSS vector test",
+        "published": "2024-01-01T00:00:00Z",
+        "modified": "2024-01-02T00:00:00Z",
+        "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}],
+        "affected": [],
+    }
+    result = _parse_osv_entry(data)
+    assert result is not None
+    vuln_row, _ = result
+    assert vuln_row["cvss_score"] == pytest.approx(9.8)
+    assert vuln_row["severity"] == "critical"
+
+
+def test_parse_osv_entry_normalizes_debian_important_severity():
+    data = {
+        "id": "DEBIAN-CVE-2024-0001",
+        "summary": "Debian important advisory",
+        "published": "2024-01-01T00:00:00Z",
+        "modified": "2024-01-02T00:00:00Z",
+        "database_specific": {"severity": "important"},
+        "affected": [],
+    }
+    result = _parse_osv_entry(data)
+    assert result is not None
+    vuln_row, _ = result
+    assert vuln_row["severity"] == "high"
+
+
+def test_parse_osv_entry_uses_debian_affected_vendor_severity():
+    data = {
+        "id": "DEBIAN-CVE-2024-0002",
+        "summary": "Debian affected-level severity",
+        "published": "2024-01-01T00:00:00Z",
+        "modified": "2024-01-02T00:00:00Z",
+        "affected": [
+            {
+                "package": {"ecosystem": "Debian:12", "name": "openssl"},
+                "database_specific": {"severity": "important"},
+                "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "3.0.11-1~deb12u2"}]}],
+            }
+        ],
+    }
+    result = _parse_osv_entry(data)
+    assert result is not None
+    vuln_row, affected_rows = result
+    assert vuln_row["severity"] == "high"
+    assert affected_rows[0]["ecosystem"] == "debian:12"
+
+
+def test_parse_osv_entry_uses_debian_affected_cvss_vector():
+    data = {
+        "id": "DEBIAN-CVE-2024-0003",
+        "summary": "Debian affected-level CVSS",
+        "published": "2024-01-01T00:00:00Z",
+        "modified": "2024-01-02T00:00:00Z",
+        "affected": [
+            {
+                "package": {"ecosystem": "Debian:12", "name": "bash"},
+                "ecosystem_specific": {"severity_vectors": ["CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"]},
+                "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}]}],
+            }
+        ],
+    }
+    result = _parse_osv_entry(data)
+    assert result is not None
+    vuln_row, _ = result
+    assert vuln_row["severity"] == "critical"
+    assert vuln_row["cvss_score"] == pytest.approx(9.8)
+    assert vuln_row["cvss_vector"] == "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+
+
+def test_parse_alpine_secfix_tokens_splits_compound_entries():
+    assert _parse_alpine_secfix_tokens("CVE-2022-42333 CVE-2022-43334 XSA-428") == [
+        "CVE-2022-42333",
+        "CVE-2022-43334",
+        "XSA-428",
+    ]
+
+
+def test_ingest_alpine_secdb_payload_adds_affected_rows(tmp_db):
+    payload = {
+        "packages": [
+            {
+                "pkg": {
+                    "name": "util-linux",
+                    "secfixes": {
+                        "2.41.3-r1": ["CVE-2026-27456"],
+                    },
+                }
+            },
+            {
+                "pkg": {
+                    "name": "busybox",
+                    "secfixes": {
+                        "1.37.0-r28": ["CVE-2025-60876"],
+                    },
+                }
+            },
+        ]
+    }
+
+    count = _ingest_alpine_secdb_payload(tmp_db, payload, distro_version="v3.23", repository="main")
+    assert count == 2
+
+    util_vulns = lookup_package(tmp_db, "Alpine:v3.23", "util-linux", "2.41.3-r0")
+    busybox_vulns = lookup_package(tmp_db, "Alpine:v3.23", "busybox", "1.37.0-r0")
+
+    assert [v.id for v in util_vulns] == ["CVE-2026-27456"]
+    assert [v.fixed_version for v in util_vulns] == ["2.41.3-r1"]
+    assert [v.id for v in busybox_vulns] == ["CVE-2025-60876"]
+    assert [v.fixed_version for v in busybox_vulns] == ["1.37.0-r28"]
+
+
+def test_sync_alpine_secdb_downloads_selected_branches(tmp_db):
+    responses = {
+        "https://secdb.alpinelinux.org/v3.23/main.json": {
+            "packages": [
+                {
+                    "pkg": {
+                        "name": "util-linux",
+                        "secfixes": {"2.41.3-r1": ["CVE-2026-27456"]},
+                    }
+                }
+            ]
+        },
+        "https://secdb.alpinelinux.org/v3.23/community.json": {"packages": []},
+    }
+
+    with patch("agent_bom.http_client.fetch_json", side_effect=lambda url, timeout=30: responses[url]):
+        count = sync_alpine_secdb(tmp_db, branches=("v3.23",), repositories=("main", "community"))
+
+    assert count == 1
+    sync_row = tmp_db.execute("SELECT source, record_count FROM sync_meta WHERE source = 'alpine'").fetchone()
+    assert tuple(sync_row) == ("alpine", 1)
+
+
 # ---------------------------------------------------------------------------
 # sync_db — dispatcher with mocked sources
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.real_vuln_db_sync
 def test_sync_db_single_kev_source(tmp_path):
     """sync_db with sources=['kev'] only calls sync_kev."""
     from agent_bom.db.sync import sync_db
@@ -634,6 +953,7 @@ def test_sync_db_single_kev_source(tmp_path):
     mock_kev.assert_called_once()
 
 
+@pytest.mark.real_vuln_db_sync
 def test_sync_db_single_epss_source(tmp_path):
     """sync_db with sources=['epss'] only calls sync_epss."""
     from agent_bom.db.sync import sync_db
@@ -642,6 +962,17 @@ def test_sync_db_single_epss_source(tmp_path):
         result = sync_db(path=tmp_path / "test.db", sources=["epss"])
     assert result == {"epss": 500}
     mock_epss.assert_called_once()
+
+
+@pytest.mark.real_vuln_db_sync
+def test_sync_db_single_alpine_source(tmp_path):
+    """sync_db with sources=['alpine'] only calls sync_alpine_secdb."""
+    from agent_bom.db.sync import sync_db
+
+    with patch("agent_bom.db.sync.sync_alpine_secdb", return_value=12) as mock_alpine:
+        result = sync_db(path=tmp_path / "test.db", sources=["alpine"])
+    assert result == {"alpine": 12}
+    mock_alpine.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -706,3 +1037,28 @@ def test_db_freshness_days_old_db(tmp_path):
     age = db_freshness_days(db_file)
     assert age is not None
     assert age >= 14
+
+
+def test_db_freshness_days_uses_readonly_open_when_writable_open_is_not_available(tmp_path, monkeypatch):
+    from agent_bom.db.schema import db_freshness_days
+
+    db_file = tmp_path / "readonly.db"
+    conn = init_db(db_file)
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_meta(source, last_synced, record_count) VALUES (?, datetime('now'), ?)",
+        ("osv", 100),
+    )
+    conn.commit()
+    conn.close()
+
+    real_connect = sqlite3.connect
+
+    def fake_connect(target, *args, **kwargs):
+        if target == str(db_file):
+            raise sqlite3.OperationalError("readonly mount")
+        return real_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", fake_connect)
+    age = db_freshness_days(db_file)
+    assert age is not None
+    assert age >= 0

@@ -13,17 +13,95 @@ import re
 # Each pattern: (name, compiled regex)
 CREDENTIAL_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("AWS Access Key", re.compile(r"AKIA[0-9A-Z]{16}")),
-    ("AWS Secret Key", re.compile(r"(?:aws_secret_access_key|secret_?key)\s*[=:]\s*[A-Za-z0-9/+=]{40}", re.IGNORECASE)),
+    (
+        "AWS Secret Key",
+        re.compile(
+            r"(['\"]?)(?:aws_secret_access_key|secret_?key)\1\s*[=:]\s*"
+            r"(['\"]?)[A-Za-z0-9/+=]{40}\2(?![A-Za-z0-9/+=])",
+            re.IGNORECASE,
+        ),
+    ),
     ("GitHub Token", re.compile(r"gh[pousr]_[A-Za-z0-9_]{36,}")),
     ("GitLab Token", re.compile(r"glpat-[A-Za-z0-9\-_]{20,}")),
-    ("OpenAI API Key", re.compile(r"sk-[A-Za-z0-9]{20,}")),
+    ("OpenAI API Key", re.compile(r"sk-(?:proj-)?[A-Za-z0-9\-_]{20,}")),
     ("Anthropic API Key", re.compile(r"sk-ant-[A-Za-z0-9\-_]{20,}")),
     ("Slack Token", re.compile(r"xox[bporas]-[A-Za-z0-9\-]{10,}")),
     ("Stripe Key", re.compile(r"[sr]k_(live|test)_[A-Za-z0-9]{20,}")),
-    ("Generic Bearer Token", re.compile(r"Bearer\s+[A-Za-z0-9\-_.~+/]+=*", re.IGNORECASE)),
+    (
+        "Generic Bearer Token",
+        re.compile(r"(?:Authorization|token|bearer)['\"]?\s*[:=]\s*['\"]?Bearer\s+[A-Za-z0-9\-_.~+/]{20,}=*", re.IGNORECASE),
+    ),
     ("Generic API Key", re.compile(r"(?:api[_-]?key|apikey|access[_-]?token)\s*[=:]\s*['\"]?[A-Za-z0-9\-_.]{20,}", re.IGNORECASE)),
     ("Private Key Block", re.compile(r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----")),
     ("Connection String", re.compile(r"(?:mongodb|postgres|mysql|redis)://[^\s]{10,}", re.IGNORECASE)),
+    # Additional credential patterns for parity
+    ("Google API Key", re.compile(r"AIza[0-9A-Za-z\-_]{35}")),
+    ("Google OAuth Token", re.compile(r"ya29\.[0-9A-Za-z\-_]+")),
+    ("Twilio API Key", re.compile(r"SK[0-9a-fA-F]{32}")),
+    ("SendGrid API Key", re.compile(r"SG\.[A-Za-z0-9\-_]{22}\.[A-Za-z0-9\-_]{43}")),
+    ("Mailgun API Key", re.compile(r"key-[0-9a-zA-Z]{32}")),
+    ("Square Access Token", re.compile(r"sq0atp-[0-9A-Za-z\-_]{22}")),
+    ("Square OAuth Secret", re.compile(r"sq0csp-[0-9A-Za-z\-_]{43}")),
+    (
+        "Heroku API Key",
+        re.compile(
+            r"(?:HEROKU_API_KEY|heroku[_-]?api[_-]?key)\s*[=:]\s*['\"]?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            re.IGNORECASE,
+        ),
+    ),
+    ("npm Token", re.compile(r"npm_[A-Za-z0-9]{36}")),
+    ("PyPI Token", re.compile(r"pypi-[A-Za-z0-9\-_]{100,}")),
+    ("Discord Bot Token", re.compile(r"[MN][A-Za-z\d]{23,}\.[\w-]{6}\.[\w-]{27,}")),
+    ("Telegram Bot Token", re.compile(r"\d{8,10}:[A-Za-z0-9_-]{35}")),
+    ("Azure Storage Key", re.compile(r"DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{88}")),
+    ("Datadog API Key", re.compile(r"(?:DD_API_KEY|datadog[_-]?api[_-]?key)\s*[=:]\s*['\"]?[a-f0-9]{32}", re.IGNORECASE)),
+    ("Supabase Key", re.compile(r"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+")),
+    ("JWT Token", re.compile(r"eyJ[A-Za-z0-9\-_]+\.eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+")),
+    ("Shopify Access Token", re.compile(r"shpat_[A-Fa-f0-9]{32}")),
+    ("Databricks Token", re.compile(r"dapi[a-f0-9]{32}")),
+    ("Snowflake JWT", re.compile(r"(?:snowflake_jwt|sf_token)\s*[=:]\s*['\"]?[A-Za-z0-9\-_.]{20,}", re.IGNORECASE)),
+    ("HashiCorp Vault Token", re.compile(r"\bhv[sb]\.[A-Za-z0-9]{24,}")),
+    ("AWS Session Token", re.compile(r"(?:aws_session_token|AWS_SESSION_TOKEN)\s*[=:]\s*['\"]?[A-Za-z0-9/+=]{100,}")),
+    ("PagerDuty API Key", re.compile(r"\b[A-Za-z0-9+/]{20}-us\b")),
+]
+
+# A hardcoded secret is a literal — a quoted string or a bare token. Source
+# code frequently *derives* a secret-named variable from a function or method
+# call instead (``access_token = self.signing_key.sign(claims)`` mints an OAuth
+# token; it is not an exposed credential). This regex distinguishes an
+# assignment whose value is a function/method call from a literal secret so
+# file scanners can suppress those false positives. It matches
+# ``<secret-name> = <ident-chain>(`` where the value is an (optionally awaited)
+# identifier/attribute chain that is immediately called — never a quoted or
+# bare literal.
+CODE_CALL_ASSIGNMENT = re.compile(
+    r"""(?ix)
+    \b(?:secret|token|password|passwd|pwd|apikey|api[_-]?key|
+       access[_-]?key|access[_-]?token|refresh[_-]?token|session[_-]?secret|
+       client[_-]?secret|auth[_-]?token|credential|private[_-]?key|
+       bearer|signing[_-]?key)\w*
+    \s* [=:] \s*
+    (?:await\s+|new\s+)?
+    [A-Za-z_][\w.]*          # identifier / attribute chain (self.signing_key.sign)
+    \s* \(                   # ...immediately called → an expression, not a literal
+    """
+)
+
+# ─── PII patterns ────────────────────────────────────────────────────────────
+
+# Personal Identifiable Information patterns for detection and redaction
+PII_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("Email Address", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b")),
+    ("US Phone Number", re.compile(r"\b(?:\+1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b")),
+    ("US SSN", re.compile(r"\b\d{3}[-.\s]?\d{2}[-.\s]?\d{4}\b")),
+    ("Credit Card (Visa)", re.compile(r"\b4\d{3}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b")),
+    ("Credit Card (Mastercard)", re.compile(r"\b5[1-5]\d{2}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b")),
+    ("Credit Card (Amex)", re.compile(r"\b3[47]\d{2}[-\s]?\d{6}[-\s]?\d{5}\b")),
+    ("IP Address (IPv4)", re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b")),
+    ("Date of Birth", re.compile(r"\b(?:DOB|date\s*of\s*birth|birthday)\s*[=:]\s*\d{1,4}[/\-]\d{1,2}[/\-]\d{1,4}\b", re.IGNORECASE)),
+    ("Passport Number", re.compile(r"\b(?:passport)\s*[#:]\s*[A-Z0-9]{6,9}\b", re.IGNORECASE)),
+    ("IBAN", re.compile(r"\b[A-Z]{2}\d{2}\s?[A-Z0-9]{4}\s?(?:\d{4}\s?){2,7}\d{1,4}\b")),
+    ("Medical Record Number", re.compile(r"\b(?:MRN|medical\s*record)\s*[#:]\s*[A-Z0-9]{6,12}\b", re.IGNORECASE)),
 ]
 
 
@@ -32,7 +110,7 @@ CREDENTIAL_PATTERNS: list[tuple[str, re.Pattern]] = [
 # Patterns that indicate shell injection, path traversal, or credential exfiltration
 DANGEROUS_ARG_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("Shell metacharacter", re.compile(r"[;&|`$]|\$\(|>\s*/|<\s*/")),
-    ("Path traversal", re.compile(r"\.\./|\.\.\\|%2e%2e")),
+    ("Path traversal", re.compile(r"\.\./|\.\.\\|%2e%2e|\\u002e\\u002e")),
     ("Command injection", re.compile(r"\b(?:curl|wget|nc|ncat|bash|sh|python|perl|ruby)\s", re.IGNORECASE)),
     (
         "Environment variable access",
@@ -50,6 +128,12 @@ DANGEROUS_ARG_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("SQL external stage access", re.compile(r"\bCREATE\s+(?:OR\s+REPLACE\s+)?STAGE\b", re.IGNORECASE)),
     ("SQL network rule", re.compile(r"\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:NETWORK\s+RULE|EXTERNAL\s+ACCESS)\b", re.IGNORECASE)),
     ("SQL EXECUTE IMMEDIATE", re.compile(r"\bEXECUTE\s+IMMEDIATE\b", re.IGNORECASE)),
+    # SSRF / sandbox escape patterns (Snowflake CoCo, Meta agent incidents)
+    (
+        "SSRF attempt",
+        re.compile(r"(?:http|ftp)s?://(?:169\.254\.|127\.0\.0\.|0\.0\.0\.0|localhost|metadata\.google|100\.100\.100\.200)", re.IGNORECASE),
+    ),
+    ("Process spawn", re.compile(r"\b(?:subprocess|os\.system|os\.popen|os\.exec|child_process|eval|exec)\s*\(", re.IGNORECASE)),
 ]
 
 
@@ -121,11 +205,11 @@ RESPONSE_SVG_PATTERNS: list[tuple[str, re.Pattern]] = [
 
 # Zero-width and invisible Unicode characters used to hide instructions
 RESPONSE_INVISIBLE_CHARS: list[tuple[str, re.Pattern]] = [
-    ("Zero-width space cluster", re.compile(r"[\u200b\u200c\u200d\ufeff]{3,}")),
-    ("Zero-width joiner sequence", re.compile(r"(?:\u200d.){4,}")),
+    ("Zero-width space cluster", re.compile(r"[\u200b\u200c\u200d\ufeff]+")),
+    ("Zero-width joiner sequence", re.compile(r"(?:\u200d.){2,}")),
     ("Homoglyph substitution", re.compile(r"[\u0410-\u044f](?=[a-zA-Z])|(?<=[a-zA-Z])[\u0410-\u044f]")),  # Cyrillic mixed with Latin
     ("Right-to-left override", re.compile(r"[\u202e\u2066\u2067\u2068\u202a\u202b]")),
-    ("Tag characters", re.compile(r"[\U000e0001-\U000e007f]{3,}")),
+    ("Tag characters", re.compile(r"[\U000e0001-\U000e007f]+")),
 ]
 
 # Base64 encoded content in responses (potential exfiltration staging)
@@ -188,6 +272,161 @@ RESPONSE_INJECTION_PATTERNS: list[tuple[str, re.Pattern]] = [
         "Prompt delimiter attack",
         re.compile(
             r"(?:###\s*(?:SYSTEM|INSTRUCTION|CONTEXT)|---\s*(?:SYSTEM|NEW\s+PROMPT)|={3,}\s*(?:SYSTEM|INSTRUCTION))",
+            re.IGNORECASE,
+        ),
+    ),
+    # Multi-language injection patterns
+    (
+        "Markdown injection",
+        re.compile(
+            r"\[(?:system|admin|developer)\]\((?:data|javascript|vbscript):",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "XML injection",
+        re.compile(
+            r"<\?xml[^>]*>|<!DOCTYPE[^>]*>|<!ENTITY[^>]*>",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "JSON injection",
+        re.compile(
+            r'"(?:__proto__|constructor|prototype)"\s*:',
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Unicode encoding attack",
+        re.compile(
+            r"(?:%u[0-9a-fA-F]{4}){3,}|(?:\\u[0-9a-fA-F]{4}){3,}",
+        ),
+    ),
+    (
+        "Tool call forgery",
+        re.compile(
+            r"\b(?:call|invoke|execute|use)\s+(?:tool|function)\s*[:\(]",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Output manipulation",
+        re.compile(
+            r"\b(?:respond|reply|output|return|print|echo)\s+(?:only|exactly|just)\s*[:\"]",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Persona swap",
+        re.compile(
+            r"\b(?:pretend|act|behave|roleplay|role-?play)\s+(?:as|like|you\s+are)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Multi-turn injection",
+        re.compile(
+            r"\b(?:in\s+(?:the\s+)?next\s+(?:turn|response|message)|after\s+this|from\s+now\s+on)\b"
+            r".{0,60}\b(?:you\s+(?:must|should|will)|output|execute|send|forward|respond)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Future instruction planting",
+        re.compile(
+            r"\b(?:next\s+(?:time|response|turn|message)|when\s+(?:asked|prompted|queried))\b"
+            r".{0,60}\b(?:always|never|must|shall|respond|output|include|execute)\b",
+            re.IGNORECASE,
+        ),
+    ),
+]
+
+
+# ─── AI-safety response patterns (heuristic first-pass) ──────────────────────
+# Bias / toxicity / hallucination are inherently fuzzy; these are deliberately
+# conservative, high-precision regexes (explicit assertions, not topic mentions)
+# to keep false positives low. They give the guardrail engine a detector for
+# each category so red-team coverage scoring includes them; the LLM-harness
+# layer deepens detection beyond pattern matching.
+
+# Bias: confident generalisations / stereotype assertions about a protected group.
+RESPONSE_BIAS_PATTERNS: list[tuple[str, re.Pattern]] = [
+    (
+        "Group generalization",
+        re.compile(
+            r"\b(?:all|every|most|typical)\s+(?:men|women|boys|girls|blacks?|whites?|asians?|"
+            r"jews?|muslims?|christians?|immigrants?|gay\s+people|trans\s+people|old\s+people|"
+            r"young\s+people)\s+(?:are|can'?t|cannot|always|never|tend\s+to|should)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Inherent-trait stereotype",
+        re.compile(
+            r"\b(?:men|women|blacks?|whites?|asians?|jews?|muslims?|immigrants?)\s+are\s+"
+            r"(?:inherently|naturally|genetically|biologically)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Attribute-because-of-group",
+        re.compile(
+            r"\bbecause\s+(?:he|she|they)\s+(?:is|are|was|were)\s+(?:a\s+|an\s+)?"
+            r"(?:woman|man|black|white|asian|jew|muslim|immigrant|gay|trans)\b",
+            re.IGNORECASE,
+        ),
+    ),
+]
+
+# Toxicity: explicit threats / direct abuse directed at a person.
+RESPONSE_TOXICITY_PATTERNS: list[tuple[str, re.Pattern]] = [
+    (
+        "Direct threat of harm",
+        re.compile(
+            r"\bI(?:'?m\s+going\s+to|\s+will|'?ll)\s+(?:kill|hurt|harm|destroy|beat|murder)\s+you\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Direct personal abuse",
+        re.compile(
+            r"\byou(?:'?re|\s+are)\s+(?:a\s+|an\s+)?(?:worthless|pathetic|disgusting|stupid|"
+            r"idiot|moron|loser|trash|garbage)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Incitement to self-harm",
+        re.compile(r"\b(?:kill\s+yourself|kys|you\s+should\s+(?:just\s+)?die)\b", re.IGNORECASE),
+    ),
+]
+
+# Hallucination: confident attribution to fabricated/unverifiable sources, or an
+# admission of fabrication.
+RESPONSE_HALLUCINATION_PATTERNS: list[tuple[str, re.Pattern]] = [
+    (
+        "Admitted fabrication",
+        re.compile(
+            r"\bI\s+(?:made\s+up|fabricated|invented|hallucinated)\s+(?:this|that|the|a)\s+"
+            r"(?:citation|reference|source|study|statistic|quote|fact)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Fabricated citation marker",
+        re.compile(
+            r"\b(?:according\s+to|as\s+(?:shown|documented|cited)\s+in|per)\s+"
+            r"(?:a\s+|the\s+)?(?:study|paper|report|article)\s+(?:by|from|titled)\s+"
+            r"[\"']?\[?(?:citation|source|reference|author)[\s_]*(?:needed|here|tbd|placeholder)\]?",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Unsupported authority claim",
+        re.compile(
+            r"\b(?:studies|researchers|scientists|experts)\s+(?:have\s+)?(?:shown|proven|"
+            r"confirmed|established)\s+(?:beyond\s+doubt|conclusively|definitively)\b",
             re.IGNORECASE,
         ),
     ),

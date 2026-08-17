@@ -74,6 +74,28 @@ def test_registry_list_with_filters():
         assert result.exit_code == 0
 
 
+def test_registry_list_table_does_not_truncate_long_package_names():
+    runner = CliRunner()
+    long_name = "@modelcontextprotocol/server-with-a-very-long-but-important-name"
+    with patch(
+        "agent_bom.registry.list_registry",
+        return_value=[
+            {
+                "package": long_name,
+                "latest_version": "2026.5.1",
+                "ecosystem": "npm",
+                "category": "filesystem-and-repository",
+                "risk_level": "medium",
+                "verified": True,
+            }
+        ],
+    ):
+        result = runner.invoke(registry, ["list"])
+        assert result.exit_code == 0
+        assert long_name in result.output
+        assert "…" not in result.output
+
+
 # ---------------------------------------------------------------------------
 # registry search
 # ---------------------------------------------------------------------------
@@ -186,6 +208,8 @@ def test_registry_enrich_cves_found():
     runner = CliRunner()
     mock_result = SimpleNamespace(
         enriched=1,
+        updated=1,
+        cleared=0,
         total=5,
         scannable=3,
         total_cves=3,
@@ -205,6 +229,8 @@ def test_registry_enrich_cves_none():
     runner = CliRunner()
     mock_result = SimpleNamespace(
         enriched=0,
+        updated=0,
+        cleared=0,
         total=5,
         scannable=3,
         total_cves=0,
@@ -222,6 +248,8 @@ def test_registry_enrich_cves_with_kev():
     runner = CliRunner()
     mock_result = SimpleNamespace(
         enriched=1,
+        updated=1,
+        cleared=0,
         total=2,
         scannable=2,
         total_cves=1,
@@ -363,6 +391,15 @@ def test_schedule_add():
         result = runner.invoke(schedule, ["add", "--name", "daily", "--cron", "0 0 * * *"])
         assert result.exit_code == 0
         assert "Schedule created" in result.output
+
+
+def test_schedule_add_rejects_invalid_cron():
+    runner = CliRunner()
+    with patch("agent_bom.api.schedule_store.InMemoryScheduleStore") as mock_cls:
+        result = runner.invoke(schedule, ["add", "--name", "daily", "--cron", "bad cron"])
+        assert result.exit_code != 0
+        assert "Invalid cron expression" in result.output
+        mock_cls.assert_not_called()
 
 
 def test_schedule_list_empty():

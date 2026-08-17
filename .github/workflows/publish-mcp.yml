@@ -6,23 +6,26 @@ on:
     types: [completed]
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}  # all permissions denied by default; jobs declare only what they need
 
 jobs:
   publish-stdio:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
-      id-token: write
-      attestations: write
+      id-token: write       # required for SLSA provenance attestation
+      attestations: write   # required for SBOM + provenance attestations
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -34,29 +37,39 @@ jobs:
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
+          # Always read version from pyproject.toml as source of truth
+          PYPROJECT_VER=$(python3 -c "import re; m=re.search(r'version\s*=\s*\"([^\"]+)\"', open('pyproject.toml').read()); print(m.group(1))")
+          echo "version=${PYPROJECT_VER}" >> "$GITHUB_OUTPUT"
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "tag=v${PYPROJECT_VER}" >> "$GITHUB_OUTPUT"
           else
-            echo "version=${HEAD_BRANCH#v}" >> "$GITHUB_OUTPUT"
-            echo "tag=${HEAD_BRANCH}" >> "$GITHUB_OUTPUT"
+            echo "tag=${HEAD_BRANCH:-v${PYPROJECT_VER}}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build and push MCP container (stdio)
         id: build-stdio
-        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          file: integrations/toolhive/Dockerfile.mcp
+          file: deploy/docker/Dockerfile.mcp
           push: true
+          provenance: true
+          sbom: true
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/agent-bom:${{ steps.version.outputs.tag }}
             ghcr.io/${{ github.repository_owner }}/agent-bom:latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.title=agent-bom
+            org.opencontainers.image.description=Open security scanner for AI supply chain and infrastructure — agents, MCP, packages, containers, cloud, GPU, and runtime. MCP server (stdio).
+            org.opencontainers.image.created=${{ github.event.workflow_run.created_at || github.event.repository.updated_at }}
+            org.opencontainers.image.revision=${{ github.sha }}
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/${{ github.repository_owner }}/agent-bom
           subject-digest: ${{ steps.build-stdio.outputs.digest }}
@@ -64,15 +77,21 @@ jobs:
 
   publish-sse:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
+      id-token: write       # required for SLSA provenance attestation
+      attestations: write   # required for SBOM + provenance attestations
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -84,22 +103,40 @@ jobs:
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
+          # Always read version from pyproject.toml as source of truth
+          PYPROJECT_VER=$(python3 -c "import re; m=re.search(r'version\s*=\s*\"([^\"]+)\"', open('pyproject.toml').read()); print(m.group(1))")
+          echo "version=${PYPROJECT_VER}" >> "$GITHUB_OUTPUT"
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "tag=v${PYPROJECT_VER}" >> "$GITHUB_OUTPUT"
           else
-            echo "version=${HEAD_BRANCH#v}" >> "$GITHUB_OUTPUT"
-            echo "tag=${HEAD_BRANCH}" >> "$GITHUB_OUTPUT"
+            echo "tag=${HEAD_BRANCH:-v${PYPROJECT_VER}}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build and push MCP container (SSE)
-        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        id: build-sse
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: deploy/docker/Dockerfile.sse
           push: true
+          provenance: true
+          sbom: true
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/agent-bom-sse:${{ steps.version.outputs.tag }}
             ghcr.io/${{ github.repository_owner }}/agent-bom-sse:latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.title=agent-bom-sse
+            org.opencontainers.image.description=Open security scanner for AI supply chain and infrastructure — agents, MCP, packages, containers, cloud, GPU, and runtime. MCP server (streamable HTTP).
+            org.opencontainers.image.created=${{ github.event.workflow_run.created_at || github.event.repository.updated_at }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/agent-bom-sse
+          subject-digest: ${{ steps.build-sse.outputs.digest }}
+          push-to-registry: true

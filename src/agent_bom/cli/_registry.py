@@ -10,8 +10,10 @@ from typing import Optional
 import click
 from rich.console import Console
 
+from agent_bom.cli._grouped_help import SuggestingGroup
 
-@click.group()
+
+@click.group(cls=SuggestingGroup)
 def schedule():
     """Manage recurring scan schedules."""
 
@@ -25,7 +27,7 @@ def schedule_add(name: str, cron: str, config: Optional[str]):
     import uuid as _uuid
 
     from agent_bom.api.schedule_store import InMemoryScheduleStore, ScanSchedule, SQLiteScheduleStore
-    from agent_bom.api.scheduler import parse_cron_next
+    from agent_bom.api.scheduler import parse_cron_next, validate_cron_expression
 
     console = Console()
 
@@ -37,6 +39,8 @@ def schedule_add(name: str, cron: str, config: Optional[str]):
     from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc)
+    if not validate_cron_expression(cron):
+        raise click.ClickException("Invalid cron expression")
     next_run = parse_cron_next(cron, now)
 
     db_path = _os.environ.get("AGENT_BOM_DB")
@@ -100,7 +104,7 @@ def schedule_remove(schedule_id: str):
         sys.exit(1)
 
 
-@click.group()
+@click.group(cls=SuggestingGroup)
 def registry():
     """Manage the MCP server registry."""
 
@@ -123,14 +127,23 @@ def registry_list(category, risk_level, ecosystem, fmt):
     from rich.console import Console
     from rich.table import Table
 
-    con = Console()
-    table = Table(title=f"MCP Server Registry ({len(entries)} servers)")
-    table.add_column("Name", style="cyan", no_wrap=True)
-    table.add_column("Version", style="green")
-    table.add_column("Ecosystem")
-    table.add_column("Category")
-    table.add_column("Risk", style="bold")
-    table.add_column("Verified")
+    con = Console(width=160)
+    longest_name = max(
+        (len(entry.get("package", entry.get("name", ""))) for entry in entries),
+        default=10,
+    )
+    table = Table(title=f"MCP Server Registry ({len(entries)} servers)", expand=False)
+    table.add_column(
+        "Name",
+        style="cyan",
+        overflow="fold",
+        min_width=min(longest_name, 120),
+    )
+    table.add_column("Version", style="green", no_wrap=True)
+    table.add_column("Ecosystem", no_wrap=True)
+    table.add_column("Category", overflow="fold")
+    table.add_column("Risk", style="bold", no_wrap=True)
+    table.add_column("Verified", no_wrap=True)
 
     risk_colors = {"high": "red", "medium": "yellow", "low": "green"}
     for entry in entries:
@@ -185,6 +198,52 @@ def registry_search(query, category):
             (entry.get("description", "")[:50] + "...") if len(entry.get("description", "")) > 50 else entry.get("description", ""),
         )
     con.print(table)
+
+
+@registry.command("status")
+@click.option("--stale-after-days", type=int, default=14, show_default=True, help="Mark registry stale after this many days.")
+@click.option("--format", "-f", "fmt", type=click.Choice(["table", "json"]), default="table", help="Output format.")
+@click.option("--fail-on-stale", is_flag=True, help="Exit 1 when the bundled registry is stale or has never synced.")
+def registry_status(stale_after_days: int, fmt: str, fail_on_stale: bool):
+    """Show MCP registry freshness and source posture."""
+    from rich.console import Console
+    from rich.table import Table
+
+    from agent_bom.registry import registry_freshness_status
+
+    status = registry_freshness_status(stale_after_days=stale_after_days)
+    payload = status.to_dict()
+    if fmt == "json":
+        click.echo(json.dumps(payload, indent=2))
+        if fail_on_stale and status.needs_refresh:
+            raise click.exceptions.Exit(1)
+        return
+
+    con = Console()
+    color = {
+        "fresh": "green",
+        "stale": "yellow",
+        "airgapped": "cyan",
+        "airgapped_stale": "yellow",
+        "never_synced": "red",
+    }.get(status.status, "white")
+    table = Table(title="MCP Registry Freshness")
+    table.add_column("Field", style="cyan")
+    table.add_column("Value")
+    table.add_row("Status", f"[{color}]{status.status}[/{color}]")
+    table.add_row("Last synced", status.last_synced_at or "unknown")
+    table.add_row("Age", "unknown" if status.age_days is None else f"{status.age_days} day(s)")
+    table.add_row("Stale after", f"{status.stale_after_days} day(s)")
+    table.add_row("Servers", str(status.server_count))
+    table.add_row("Sources", ", ".join(status.sources) if status.sources else "unknown")
+    table.add_row("Recommended action", status.recommended_action)
+    if status.airgapped:
+        table.add_row("Airgapped", "yes")
+    if status.error:
+        table.add_row("Error", status.error)
+    con.print(table)
+    if fail_on_stale and status.needs_refresh:
+        raise click.exceptions.Exit(1)
 
 
 @registry.command("update")
@@ -304,11 +363,12 @@ def registry_enrich_cves(nvd_api_key, dry_run):
 
     con.print(
         f"\n[bold]Summary:[/bold] {result.scannable} scannable, {result.enriched} with CVEs, "
+        f"{result.updated} CVE metadata update(s), {result.cleared} cleared, "
         f"{result.total_cves} total CVEs, {result.total_critical} critical, {result.total_kev} KEV "
         f"(of {result.total} total servers)"
     )
-    if not dry_run and result.enriched > 0:
-        con.print("[green]Registry file updated with CVE data.[/green]")
+    if not dry_run and result.updated > 0:
+        con.print("[green]Registry file updated with CVE metadata changes.[/green]")
 
 
 @registry.command("smithery-sync")

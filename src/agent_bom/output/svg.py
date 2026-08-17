@@ -15,6 +15,9 @@ from __future__ import annotations
 import html
 from typing import TYPE_CHECKING
 
+from agent_bom.asset_provenance import package_version_provenance
+from agent_bom.output.finding_views import cve_findings, severity_value, topology_package_key
+
 if TYPE_CHECKING:
     from agent_bom.models import AIBOMReport, BlastRadius
 
@@ -31,6 +34,10 @@ _NODE_H = 44
 _NODE_RX = 8
 _ROW_GAP = 14
 _HEADER_H = 80
+_ROWS_PER_PAGE = 50
+_PAGE_HEADER_H = 34
+_PAGE_GAP = 28
+_DEFAULT_MAX_ROWS_PER_COLUMN = _ROWS_PER_PAGE
 
 # ── Color palette ─────────────────────────────────────────────────────────────
 
@@ -46,6 +53,7 @@ _COLORS = {
     "cve_high": ("#e65100", "#ffe0b2", "#ff9800"),
     "cve_medium": ("#f9a825", "#fff9c4", "#ffee58"),
     "cve_low": ("#2e7d32", "#c8e6c9", "#66bb6a"),
+    "omitted": ("#92400e", "#fffbeb", "#f59e0b"),
 }
 
 _FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif"
@@ -54,6 +62,8 @@ _FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif"
 def to_svg(
     report: AIBOMReport,
     blast_radii: list[BlastRadius],
+    *,
+    max_rows_per_column: int | None = _DEFAULT_MAX_ROWS_PER_COLUMN,
 ) -> str:
     """Generate a self-contained SVG supply chain diagram.
 
@@ -63,20 +73,28 @@ def to_svg(
     Args:
         report: The AI-BOM report.
         blast_radii: List of BlastRadius objects for CVE indicators.
+        max_rows_per_column: Maximum rendered rows per SVG column. ``None``
+            renders the full graph. The default keeps static SVG exports
+            readable in browsers and reports by adding an explicit omission
+            marker for oversized columns.
 
     Returns:
         Complete SVG document as a string.
     """
-    vuln_pkg_keys: set[tuple[str, str]] = {(br.package.name, br.package.ecosystem) for br in blast_radii}
+    if max_rows_per_column is not None and max_rows_per_column < 2:
+        raise ValueError("max_rows_per_column must be at least 2 or None")
+
+    findings = cve_findings(report, blast_radii)
+    vuln_pkg_keys: set[tuple[str, str]] = {topology_package_key(finding) for finding in findings}
     pkg_cve_map: dict[tuple[str, str], list[dict]] = {}
-    for br in blast_radii:
-        key = (br.package.name, br.package.ecosystem)
+    for finding in findings:
+        key = topology_package_key(finding)
         if key not in pkg_cve_map:
             pkg_cve_map[key] = []
         pkg_cve_map[key].append(
             {
-                "id": br.vulnerability.id,
-                "severity": br.vulnerability.severity.value.lower(),
+                "id": finding.cve_id or finding.title,
+                "severity": severity_value(finding),
             }
         )
 
@@ -145,6 +163,7 @@ def to_svg(
                         "label": f"{pkg.name}@{pkg.version}",
                         "type": "pkg_vuln" if is_vuln else "pkg_clean",
                         "ecosystem": pkg.ecosystem,
+                        "version_provenance": package_version_provenance(pkg),
                     }
                 )
                 server_to_packages.append((sid, pid))
@@ -167,30 +186,64 @@ def to_svg(
     # Deduplicate packages/servers (same ID can appear under multiple parents)
     packages = _dedup_by_id(packages)
     servers = _dedup_by_id(servers)
+    graph_counts = {
+        "agents": len(agents),
+        "servers": len(servers),
+        "packages": len(packages),
+        "cves": len(cves),
+    }
+
+    omitted_counts: dict[str, int] = {}
+    providers, omitted_counts["sources"] = _bound_column(providers, "sources", max_rows_per_column)
+    agents, omitted_counts["agents"] = _bound_column(agents, "agents", max_rows_per_column)
+    servers, omitted_counts["servers"] = _bound_column(servers, "servers", max_rows_per_column)
+    packages, omitted_counts["packages"] = _bound_column(packages, "packages", max_rows_per_column)
+    cves, omitted_counts["CVEs"] = _bound_column(cves, "CVEs", max_rows_per_column)
+    omitted_nodes = sum(omitted_counts.values())
 
     # ── Assign Y positions ────────────────────────────────────────────────
     columns = [providers, agents, servers, packages, cves]
     max_rows = max(len(col) for col in columns) if columns else 1
-    total_h = _HEADER_H + max_rows * (_NODE_H + _ROW_GAP) + 40
+    page_count = max(1, (max_rows + _ROWS_PER_PAGE - 1) // _ROWS_PER_PAGE)
+    page_h = _PAGE_HEADER_H + min(max_rows, _ROWS_PER_PAGE) * (_NODE_H + _ROW_GAP) + _PAGE_GAP
+    total_h = _HEADER_H + page_count * page_h + 40
 
     col_positions = [_COL_PROVIDER, _COL_AGENT, _COL_SERVER, _COL_PACKAGE, _COL_CVE]
     node_y_map: dict[str, float] = {}
+    node_page_map: dict[str, int] = {}
 
     for col_items, _x in zip(columns, col_positions):
-        col_h = len(col_items) * (_NODE_H + _ROW_GAP)
-        start_y = _HEADER_H + (total_h - _HEADER_H - col_h) / 2
         for i, item in enumerate(col_items):
-            node_y_map[item["id"]] = start_y + i * (_NODE_H + _ROW_GAP)
+            page_idx = i // _ROWS_PER_PAGE
+            row_idx = i % _ROWS_PER_PAGE
+            page_top = _HEADER_H + page_idx * page_h
+            node_y_map[item["id"]] = page_top + _PAGE_HEADER_H + row_idx * (_NODE_H + _ROW_GAP)
+            node_page_map[item["id"]] = page_idx
 
     total_w = _COL_CVE + _NODE_W + 60 if cves else _COL_PACKAGE + _NODE_W + 60
+
+    visible_node_ids = {item["id"] for column in columns for item in column}
+    all_edges = provider_to_agents + agent_to_servers + server_to_packages + package_to_cves
+    unique_edges = set(all_edges)
+    rendered_edges = {edge for edge in unique_edges if edge[0] in visible_node_ids and edge[1] in visible_node_ids}
+    omitted_edges = len(unique_edges) - len(rendered_edges)
 
     # ── Build SVG ─────────────────────────────────────────────────────────
     parts: list[str] = []
     parts.append(
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total_w} {total_h}" '
         f'width="{total_w}" height="{total_h}" '
+        f'preserveAspectRatio="xMinYMin meet" '
         f'style="font-family: {_FONT}; font-size: 12px; background: #fafafa;">'
     )
+    if omitted_nodes or omitted_edges:
+        omitted_label = ", ".join(f"{count} {kind}" for kind, count in omitted_counts.items() if count)
+        parts.append(
+            "<metadata>"
+            f"Bounded SVG export: omitted {html.escape(omitted_label or '0 nodes')} "
+            f"and {omitted_edges} edges. Export JSON, DOT, GraphML, or Cypher for the full graph."
+            "</metadata>"
+        )
 
     # Defs: arrowhead
     parts.append("""<defs>
@@ -201,10 +254,6 @@ def to_svg(
 </defs>""")
 
     # Title bar
-    agent_count = len(agents)
-    server_count = len(servers)
-    pkg_count = len(packages)
-    vuln_count = len(cves)
     parts.append(
         f'<text x="{total_w / 2}" y="30" text-anchor="middle" '
         f'font-size="18" font-weight="bold" fill="#1a1a1a">'
@@ -213,9 +262,15 @@ def to_svg(
     parts.append(
         f'<text x="{total_w / 2}" y="52" text-anchor="middle" '
         f'font-size="13" fill="#666">'
-        f"{agent_count} agents | {server_count} servers | "
-        f"{pkg_count} packages | {vuln_count} CVEs</text>"
+        f"{graph_counts['agents']} agents | {graph_counts['servers']} servers | "
+        f"{graph_counts['packages']} packages | {graph_counts['cves']} CVEs</text>"
     )
+    if omitted_nodes or omitted_edges:
+        parts.append(
+            f'<text x="{total_w / 2}" y="70" text-anchor="middle" '
+            f'font-size="11" fill="#92400e">'
+            f"Bounded view: {omitted_nodes} nodes and {omitted_edges} edges omitted; export JSON/DOT/GraphML/Cypher for full graph</text>"
+        )
 
     # Column headers
     headers = [
@@ -233,8 +288,18 @@ def to_svg(
             f"{label}</text>"
         )
 
+    if page_count > 1:
+        for page_idx in range(page_count):
+            page_top = _HEADER_H + page_idx * page_h
+            parts.append(
+                f'<g id="page-{page_idx + 1}">'
+                f'<rect x="20" y="{page_top + 2}" width="{total_w - 40}" height="{page_h - _PAGE_GAP / 2}" '
+                f'fill="none" stroke="#d7dde3" stroke-width="1" stroke-dasharray="6 6"/>'
+                f'<text x="34" y="{page_top + 23}" font-size="12" font-weight="600" fill="#59636e">'
+                f"Page {page_idx + 1} of {page_count}</text></g>"
+            )
+
     # Edges (draw first so nodes appear on top)
-    all_edges = provider_to_agents + agent_to_servers + server_to_packages + package_to_cves
     col_x_map = {}
     for item in providers:
         col_x_map[item["id"]] = _COL_PROVIDER
@@ -248,11 +313,15 @@ def to_svg(
         col_x_map[item["id"]] = _COL_CVE
 
     seen_edges: set[tuple[str, str]] = set()
+    skipped_cross_page_edges = 0
     for src, tgt in all_edges:
         if (src, tgt) in seen_edges:
             continue
         seen_edges.add((src, tgt))
         if src not in node_y_map or tgt not in node_y_map:
+            continue
+        if node_page_map.get(src, 0) != node_page_map.get(tgt, 0):
+            skipped_cross_page_edges += 1
             continue
         sx = col_x_map.get(src, 0) + _NODE_W
         sy = node_y_map[src] + _NODE_H / 2
@@ -264,6 +333,12 @@ def to_svg(
             f'fill="none" stroke="#ccc" stroke-width="1.5" marker-end="url(#arrow)"/>'
         )
 
+    if skipped_cross_page_edges:
+        parts.append(
+            f'<text x="{total_w / 2}" y="{total_h - 18}" text-anchor="middle" font-size="12" fill="#6b7280">'
+            f"{skipped_cross_page_edges} cross-page relationships summarized to keep dense SVG pages readable</text>"
+        )
+
     # Nodes
     def _draw_nodes(items: list[dict], col_x: int, color_key: str) -> None:
         for item in items:
@@ -272,10 +347,16 @@ def to_svg(
             colors = _COLORS.get(ctype, _COLORS.get(color_key, ("#333", "#f5f5f5", "#999")))
             text_color, bg_color, border_color = colors
             label = html.escape(item["label"][:28])
+            version_attrs = ""
+            version_provenance = item.get("version_provenance")
+            if isinstance(version_provenance, dict):
+                source = html.escape(str(version_provenance.get("version_source", "unknown")), quote=True)
+                confidence = html.escape(str(version_provenance.get("confidence", "unknown")), quote=True)
+                version_attrs = f' data-version-source="{source}" data-version-confidence="{confidence}"'
 
             parts.append(
                 f'<rect x="{col_x}" y="{y}" width="{_NODE_W}" height="{_NODE_H}" '
-                f'rx="{_NODE_RX}" fill="{bg_color}" stroke="{border_color}" stroke-width="1.5"/>'
+                f'rx="{_NODE_RX}" fill="{bg_color}" stroke="{border_color}" stroke-width="1.5"{version_attrs}/>'
             )
             parts.append(
                 f'<text x="{col_x + _NODE_W / 2}" y="{y + _NODE_H / 2 + 4}" '
@@ -323,6 +404,23 @@ def _dedup_by_id(items: list[dict]) -> list[dict]:
             seen.add(item["id"])
             result.append(item)
     return result
+
+
+def _bound_column(items: list[dict], label: str, max_rows: int | None) -> tuple[list[dict], int]:
+    """Bound a rendered SVG column and append a visible omission marker."""
+    if max_rows is None or len(items) <= max_rows:
+        return items, 0
+
+    visible = items[: max_rows - 1]
+    omitted = len(items) - len(visible)
+    return [
+        *visible,
+        {
+            "id": f"omitted:{label}",
+            "label": f"{omitted} more {label} omitted",
+            "type": "omitted",
+        },
+    ], omitted
 
 
 def _provider_label(source: str) -> str:

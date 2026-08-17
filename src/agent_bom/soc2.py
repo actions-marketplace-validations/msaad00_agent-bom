@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from agent_bom.constants import AI_PACKAGES as _AI_PACKAGES
 from agent_bom.constants import high_risk_severities
-from agent_bom.risk_analyzer import ToolCapability, classify_tool
+from agent_bom.risk_analyzer import ToolCapability, classify_mcp_tool
 
 if TYPE_CHECKING:
     from agent_bom.models import BlastRadius
@@ -23,20 +23,26 @@ _HIGH_RISK = high_risk_severities()
 
 # ─── Catalog ──────────────────────────────────────────────────────────────────
 
+# NOTE — the descriptors below are agent-bom's OWN short wording for each
+# criterion area, not the official AICPA Trust Services Criteria text. The AICPA
+# TSC is copyrighted, so its criteria text is NOT reproduced or redistributed
+# here; only the criterion **identifier** (the fact) is used. Consult the AICPA
+# source for the official wording:
+# https://www.aicpa.org/resources/landing/system-and-organization-controls-soc-suite-of-services
 SOC2_TSC: dict[str, str] = {
     # CC6 — Logical and physical access controls
-    "CC6.1": "Logical and physical access controls implemented",
-    "CC6.6": "Security boundaries and system access restricted",
-    "CC6.8": "Unauthorized or malicious software prevented or detected",
+    "CC6.1": "Logical/physical access restriction",
+    "CC6.6": "External access-boundary protection",
+    "CC6.8": "Malicious/unauthorized software controls",
     # CC7 — System operations
-    "CC7.1": "Detection and monitoring of anomalies and events",
-    "CC7.2": "Monitoring of system components for anomalies",
-    "CC7.4": "Incident response activities executed",
+    "CC7.1": "Anomaly and event detection",
+    "CC7.2": "Security-event monitoring",
+    "CC7.4": "Security-incident response",
     # CC8 — Change management
-    "CC8.1": "Change management processes authorized and implemented",
+    "CC8.1": "Change authorization and control",
     # CC9 — Risk mitigation
-    "CC9.1": "Risk mitigation activities identified and applied",
-    "CC9.2": "Vendor and business partner risk is managed",
+    "CC9.1": "Risk-mitigation activities",
+    "CC9.2": "Vendor/third-party risk management",
 }
 
 
@@ -67,7 +73,7 @@ def tag_blast_radius(br: BlastRadius) -> list[str]:
 
     has_exec = False
     for tool in br.exposed_tools:
-        caps = classify_tool(tool.name, tool.description)
+        caps = classify_mcp_tool(tool)
         if ToolCapability.EXECUTE in caps:
             has_exec = True
 
@@ -97,11 +103,9 @@ def tag_blast_radius(br: BlastRadius) -> list[str]:
 
     # CWE-based compliance tagging (applies to all vulns with CWE data)
     if br.vulnerability.cwe_ids:
-        from agent_bom.constants import CWE_COMPLIANCE_MAP
+        from agent_bom.framework_mapping import controls_for_cwes
 
-        for cwe in br.vulnerability.cwe_ids:
-            for tag in CWE_COMPLIANCE_MAP.get(cwe.upper(), {}).get("soc2", []):
-                tags.add(tag)
+        tags.update(controls_for_cwes(br.vulnerability.cwe_ids, "soc2"))
 
     return sorted(tags)
 

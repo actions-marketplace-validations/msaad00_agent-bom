@@ -11,13 +11,20 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Protocol
 
+from agent_bom.security import redact_secret_url, sanitize_error, sanitize_log_label
+
 logger = logging.getLogger(__name__)
+
+
+def _log_value(value: object, max_len: int = 500) -> str:
+    return sanitize_log_label(value, max_len=max_len)
 
 
 # ─── Alert model ─────────────────────────────────────────────────────────────
@@ -53,6 +60,7 @@ class ConsoleAlertSink:
 
     def send(self, alert: Alert) -> None:
         from rich.console import Console
+        from rich.markup import escape
 
         con = Console(stderr=True)
         severity_styles = {
@@ -63,10 +71,13 @@ class ConsoleAlertSink:
             "info": "cyan",
         }
         style = severity_styles.get(alert.severity, "white")
-        con.print(f"  [{style}][{alert.severity.upper()}][/{style}] {alert.summary}")
+        summary = escape(_log_value(alert.summary))
+        con.print(f"  [{style}][{alert.severity.upper()}][/{style}] {summary}")
         if alert.details:
             for key, val in alert.details.items():
-                con.print(f"    [dim]{key}: {val}[/dim]")
+                safe_key = escape(_log_value(key, max_len=120))
+                safe_val = escape(_log_value(val))
+                con.print(f"    [dim]{safe_key}: {safe_val}[/dim]")
 
 
 class WebhookAlertSink:
@@ -79,6 +90,13 @@ class WebhookAlertSink:
     """
 
     def __init__(self, url: str, retries: int = 2, timeout: float = 10.0):
+        from agent_bom.security import validate_url
+
+        validate_url(url)
+        if isinstance(retries, bool) or not isinstance(retries, int) or not 0 <= retries <= 10:
+            raise ValueError("retries must be an integer between 0 and 10")
+        if not math.isfinite(timeout) or not 0 < timeout <= 300:
+            raise ValueError("timeout must be a finite value between 0 and 300 seconds")
         self.url = url
         self.retries = retries
         self.timeout = timeout
@@ -103,14 +121,18 @@ class WebhookAlertSink:
                 if resp.status_code >= 500 and attempt < self.retries:
                     time.sleep(0.5 * (2**attempt))
                     continue  # Retry on 5xx
-                logger.warning("Webhook alert to %s returned HTTP %d", self.url, resp.status_code)
+                logger.warning("Webhook alert to %s returned HTTP %d", redact_secret_url(self.url), resp.status_code)
                 return
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
                 if attempt < self.retries:
                     time.sleep(0.5 * (2**attempt))
                     continue
-        logger.warning("Failed to send webhook alert to %s: %s", self.url, last_err)
+        logger.warning(
+            "Failed to send webhook alert to %s: %s",
+            redact_secret_url(self.url),
+            sanitize_error(last_err or "delivery failed"),
+        )
 
 
 class FileAlertSink:
@@ -170,7 +192,7 @@ class ConfigChangeHandler:
             return  # Debounce
 
         self._last_trigger[path] = now
-        logger.info("Config change detected: %s", path)
+        logger.info("Config change detected: %s", _log_value(path))
         self._scan_and_alert(path)
 
     def _scan_and_alert(self, config_path: str) -> None:
@@ -218,7 +240,7 @@ class ConfigChangeHandler:
             self._last_scan = current_scan
 
         except Exception as exc:  # noqa: BLE001
-            logger.error("Scan failed after config change: %s", exc)
+            logger.error("Scan failed after config change: %s", _log_value(exc))
 
     def _process_diff(self, diff: dict, config_path: str) -> None:
         """Generate alerts from a scan diff."""
@@ -283,7 +305,7 @@ def start_watching(
         from watchdog.events import FileSystemEventHandler
         from watchdog.observers import Observer
     except ImportError:
-        raise ImportError("watchdog is required for `agent-bom watch`.\nInstall with: pip install 'agent-bom[watch]'") from None
+        raise ImportError("watchdog is required for `agent-bom runtime watch`.\nInstall with: pip install 'agent-bom[watch]'") from None
 
     handler = ConfigChangeHandler(alert_sinks, debounce_seconds)
 

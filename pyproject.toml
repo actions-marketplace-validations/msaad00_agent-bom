@@ -4,24 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-bom"
-version = "0.70.12"
-description = "Security scanner for AI infrastructure and supply chain. Discover MCP configs (22 clients), generate SBOMs, scan for CVEs (OSV/NVD/EPSS/KEV), map blast radius to credentials and tools, runtime proxy with 7 detectors, 32 MCP tools, CIS benchmarks (AWS/Azure/GCP/Snowflake), MITRE ATT&CK mapping, 13-framework compliance, and 16 output formats."
-readme = "README.md"
-license = {text = "Apache-2.0"}
+version = "0.101.0"
+description = "Open security scanner and self-hosted control plane for AI, MCP, and cloud infrastructure."
+readme = "PYPI_README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [
     {name = "Wagdy Saad", email = "andwgdysaad@gmail.com"}
 ]
-keywords = ["ai-bom", "sbom", "mcp", "mcp-server", "security", "ai-agents", "vulnerability", "supply-chain", "owasp", "mitre-atlas", "nist-ai-rmf", "grype", "syft", "blast-radius", "cve", "llm-security", "remediation", "mcp-introspection", "openclaw", "ai-enrichment", "credential-exposure", "config-security", "ai-supply-chain", "ai-infrastructure", "gpu-security", "cuda", "pytorch", "openssf-scorecard", "malicious-package-detection", "runtime-monitoring", "model-provenance"]
+keywords = ["ai-bom", "sbom", "mcp", "mcp-server", "security", "ai-agents", "vulnerability", "supply-chain", "owasp", "mitre-atlas", "nist-ai-rmf", "blast-radius", "cve", "llm-security", "remediation", "mcp-introspection", "openclaw", "ai-enrichment", "credential-exposure", "config-security", "ai-supply-chain", "ai-infrastructure", "gpu-security", "cuda", "pytorch", "openssf-scorecard", "malicious-package-detection", "runtime-monitoring", "model-provenance"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Information Technology",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Environment :: Console",
@@ -31,31 +32,52 @@ classifiers = [
 dependencies = [
     "click>=8.0",
     "rich>=13.0",
-    "httpx>=0.28.1",  # Requires urllib3>=2.6.3 (CVE-2025-66418, CVE-2025-66471, CVE-2026-21441)
+    "httpx>=0.28.1",  # core async HTTP client (CLI, TestClient, registry/OSV fetchers)
+    "httpcore>=1.0.9,<2",  # public network-backend API for connect-time gateway DNS pinning
     "pydantic>=2.0",
     "cyclonedx-python-lib>=11.6",  # Updated for better CycloneDX 1.6 support
     "packageurl-python>=0.17",
+    "packaging>=24.0",
     "toml>=0.10",
     "pyyaml>=6.0",
     "jsonschema>=4.0",
+    # Workstation preset process/listener inventory must work from the base
+    # package. The collector reads names and local bind classes only; it never
+    # captures process arguments, environment values, or remote addresses.
+    "psutil>=5.9",
+    # MCP is a first-class advertised entry point (`uvx agent-bom mcp server`)
+    # and must work from the base package used by the official registry.
+    # Bounded to the major we import: we use `mcp.server.fastmcp`, which mcp
+    # 2.0.0 removed. An unbounded floor resolved straight to 2.x on a fresh
+    # install and left `agent-bom mcp server` unable to start.
+    "mcp>=1.26,<2",
     # Transitive dep pins — fix known CVEs flagged by OpenSSF/OSV
     "jinja2>=3.1.6",  # GHSA-cpwx-vrp4-4pq7, GHSA-gmj6-6f8f-6699 (sandbox breakout)
-    "werkzeug>=3.1.6",  # GHSA-q34m-jh98-afg2 + 8 more Werkzeug advisories
-    "requests>=2.32.4",  # GHSA-9hjg-9r4m-mvj7, GHSA-j8r2-6x86-q33q (session cookie leak)
-    "nltk>=3.9.3",  # CVE-2025-14009 (fixed in 3.9.3) — transitive via safety
+    "werkzeug>=3.1.8",  # GHSA-29vq-49wr-vm6x, GHSA-2g68-c3qc-8985, GHSA-87hc-h4r5-73f7, GHSA-f9vj-2wh5-fj8j, GHSA-hgf8-39gv-g3f2, GHSA-hrfv-mqp8-q5rw, GHSA-px8h-6qxv-m22q, GHSA-q34m-jh98-gwm2, GHSA-xg9f-g7g7-2323
+    "flask>=3.1.3",  # GHSA-68rp-wp8r-4726, GHSA-m2qf-hxjv-5gpq (Vary: Cookie session exposure; transitive via mlflow)
+    "requests>=2.33.0",  # GHSA-9hjg-9r4m-mvj7, GHSA-j8r2-6x86-q33q (session cookie leak)
+    "urllib3>=2.7.0",  # PYSEC-2026-141, PYSEC-2026-142 (fixed 2.7.0) — transitive via requests/botocore
+    # NOTE: nltk pin removed — safety (which pulled nltk) was replaced by pip-audit.
+    # nltk is not imported by agent-bom. Keeping it added 3 CVEs to Docker images.
+    "pyjwt>=2.13.0",  # CVE-2026-32597 (crit header bypass), PYSEC-2026-175..179 — transitive via auth
+    "tornado>=6.5.7",  # CVE-2026-49854, CVE-2026-49853, CVE-2026-49855, GHSA-pw6j-qg29-8w7f — transitive via streamlit
+    # NOTE: stale pyopenssl suppressions were retired after snowflake-connector-python moved to a compatible range.
+    # Tracked: https://github.com/msaad00/agent-bom/issues/930
+    "cryptography>=50.0.0",  # CVE-2026-69247; required by audit chain, proxy response signing, and OIDC.
 ]
 
 [project.optional-dependencies]
 api = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.32",
+    "fastapi>=0.115,!=0.136.3",
+    "uvicorn[standard]>=0.49.0",
     "sse-starlette>=2.1",
+    "zstandard>=0.23",
 ]
 otel = [
     "opentelemetry-api>=1.20",
-    "opentelemetry-sdk>=1.20",
+    "opentelemetry-sdk>=1.43.0",
     "opentelemetry-exporter-otlp-proto-http>=1.20",
-    "protobuf>=3.20.2",  # CVE-2022-1941 (fixed in 3.18.3 / 3.20.2) — transitive via otlp-proto-http
+    "protobuf>=6.33.5",  # CVE-2022-1941, CVE-2026-0994 (ParseDict DoS) — transitive via otlp-proto-http
 ]
 ui = [
     "agent-bom[api]",
@@ -63,42 +85,129 @@ ui = [
 aws = ["boto3>=1.34"]
 azure = [
     "azure-identity>=1.15",
+    "azure-mgmt-resource>=23.0",
+    "azure-mgmt-authorization>=4.0",
     "azure-mgmt-cognitiveservices>=13.5",
     "azure-mgmt-web>=7.2",
+    "azure-mgmt-appcontainers>=3.0",
     "azure-mgmt-containerinstance>=10.1",
+    "azure-mgmt-containerservice>=41.3.0",
     "azure-mgmt-machinelearningservices>=1.0",
-    "azure-mgmt-containerservice>=30.0",
-    "azure-mgmt-resource>=23.0",
+    "azure-ai-ml>=1.34",  # v2 control plane: online endpoints/deployments live here, not in the mgmt SDK
+    "azure-ai-projects>=1.0",
+    "azure-mgmt-compute>=30.0",
+    "azure-mgmt-storage>=21.0",
+    "azure-mgmt-network>=25.0",
+    "azure-mgmt-msi>=7.0",
+    "azure-mgmt-monitor>=6.0",
+    "azure-mgmt-security>=7.0",
+    "azure-mgmt-keyvault>=10.3",
+    "azure-keyvault-keys>=4.8",
+    "azure-keyvault-secrets>=4.7",
+    "azure-mgmt-sql>=3.0",
+    "azure-mgmt-rdbms>=10.1",
+    "azure-mgmt-containerregistry>=15.0.0",
+    "azure-containerregistry>=1.2",
+    "azure-mgmt-cosmosdb>=9.5",
+    "azure-mgmt-managementgroups>=1.0",
+    "azure-mgmt-eventhub>=11.0",
+    "azure-mgmt-servicebus>=8.2",
+    "azure-mgmt-redis>=14.3",
+    "azure-mgmt-frontdoor>=1.1",
+    "azure-mgmt-apimanagement>=4.0",
+    "azure-storage-queue>=12.9",
+    # Scheduled findings export to an Azure Blob sink (#4040).
+    "azure-storage-blob>=12.19",
+    "six>=1.17.0",
 ]
 gcp = [
     "google-cloud-aiplatform>=1.38",
+    "google-cloud-asset>=3.30",
     "google-cloud-functions>=1.16",
     "google-cloud-container>=2.36",
     "google-cloud-run>=0.10",
     "google-cloud-resource-manager>=1.12",
+    # Estate inventory imports these directly — without them GCP compute/firewall,
+    # IAM service-account, storage, and log discovery silently return empty.
+    "google-cloud-compute>=1.14",
+    "google-cloud-iam>=2.19",
+    "google-cloud-storage>=2.10",
+    "google-cloud-logging>=3.5",
+    "google-cloud-pubsub>=2.18",
+    # The CIS benchmark builds service clients via the discovery API.
+    "google-api-python-client>=2.100",
+    # Scheduled findings export to a BigQuery table sink (#4040).
+    "google-cloud-bigquery>=3.14",
+    # These google.cloud modules are imported (guarded) by the GCP code but were
+    # never declared here, so API Gateway / Artifact Registry / Org Policy
+    # discovery silently no-op unless the package happens to arrive transitively:
+    #   apigateway_v1     -> gcp_inventory._discover_api_gateways
+    #   artifactregistry_v1 -> registry_sweep (GAR sweep)
+    #   orgpolicy_v2      -> gcp_organizations (org-policy constraints)
+    "google-cloud-api-gateway>=1.9",
+    "google-cloud-artifact-registry>=1.11",
+    "google-cloud-org-policy>=1.11",
 ]
 coreweave = []  # kubectl only — no pip packages
-databricks = ["databricks-sdk>=0.20"]
+# databricks-sdk: CIS/control-plane discovery. databricks-sql-connector: the
+# DBAPI path the scheduled findings export writes through (#4040).
+databricks = ["databricks-sdk>=0.20", "databricks-sql-connector>=3.0"]
 snowflake = ["snowflake-connector-python>=3.6"]
-nebius = ["requests>=2.32.4"]  # GHSA-9hjg-9r4m-mvj7 (session cookie leak)
+nebius = ["requests>=2.33.0"]  # GHSA-9hjg-9r4m-mvj7 (session cookie leak)
 huggingface = ["huggingface-hub>=0.20"]
 wandb = ["wandb>=0.16"]
-mlflow = ["mlflow>=2.10"]
+# Temporarily unbundled from agent-bom extras until upstream MLflow CVEs are fixed.
+# MLflow discovery still works if users install `mlflow` separately.
 openai = ["openai>=1.12"]
-ai-enrich = ["litellm>=1.30"]
-graph = ["networkx>=3.0"]
-postgres = ["psycopg[binary]>=3.1", "psycopg-pool>=3.1"]
+ai-enrich = [
+    "litellm>=1.83.14",
+    # Security floors mirrored from [tool.uv].override-dependencies so pip installs
+    # cannot land vulnerable litellm transitives (Closes #3684).
+    "python-dotenv>=1.2.2",
+    "aiohttp>=3.13.4",
+    "openai>=2.30.0",
+]
+graph = [
+    "networkx>=3.0",
+    "numpy>=1.26",
+    "scipy>=1.13",
+]
+pdf = []
+postgres = [
+    "psycopg[binary]>=3.1",
+    "psycopg-pool>=3.1",
+    "alembic>=1.13",
+    "sqlalchemy>=2.0",
+]
 watch = ["watchdog>=4.0"]
-runtime = ["psutil>=5.9"]  # Process + container discovery (--include-processes)
+runtime = [
+    "cryptography>=50.0.0",  # Proxy audit hash chain + response signing; CVE-2026-69247 floor.
+]
+visual = [
+    # Visual-leak detection on MCP screenshot/image tool responses.
+    # Opt-in because OCR is CPU-heavy — pilots without screen-capture MCPs
+    # don't pay for pytesseract at runtime. See issue #1568.
+    "Pillow>=10.0",
+    "pytesseract>=0.3.10",
+]
 mcp-server = [
-    "mcp>=1.26",
+    # Retained for install-command compatibility; Smithery remains specific
+    # to hosted MCP registry adapters rather than the core stdio server.
     "smithery>=0.4",
 ]
-dashboard = ["streamlit>=1.37.0", "plotly>=5.18", "pillow>=10.4.0"]  # GHSA-rxff-vr5r-8cj5 (fixed in 1.37.0); pillow>=10.4.0 fixes CVE-2023-50447 + CVE-2024-28219 (transitive via streamlit)
+dashboard = ["streamlit>=1.55.0", "plotly>=5.24.0", "pandas>=2.2.0"]
+lake = [
+    "pyarrow>=15.0",
+    "pyiceberg>=0.11.1",
+]
 snyk = []  # Uses existing httpx dependency, no additional packages needed
+interactive = ["prompt-toolkit>=3.0"]
 oidc = [
-    "PyJWT>=2.8",
-    "cryptography>=41.0",
+    "PyJWT>=2.13.0",  # PYSEC-2026-175..179
+    "cryptography>=50.0.0",  # CVE-2026-69247 and older non-contiguous-buffer advisories.
+]
+saml = [
+    "python3-saml>=1.16.0",
 ]
 cloud = [
     "agent-bom[aws]",
@@ -109,8 +218,25 @@ cloud = [
     "agent-bom[nebius]",
     "agent-bom[huggingface]",
     "agent-bom[wandb]",
-    "agent-bom[mlflow]",
     "agent-bom[openai]",
+]
+all = [
+    # First-run product surfaces only. Dev/docs stay separate, and MLflow stays
+    # intentionally unbundled until its upstream CVE backlog is fixed.
+    "agent-bom[ai-enrich]",
+    "agent-bom[cloud]",
+    "agent-bom[dashboard]",
+    "agent-bom[graph]",
+    "agent-bom[interactive]",
+    "agent-bom[mcp-server]",
+    "agent-bom[oidc]",
+    "agent-bom[otel]",
+    "agent-bom[postgres]",
+    "agent-bom[runtime]",
+    "agent-bom[saml]",
+    "agent-bom[ui]",
+    "agent-bom[visual]",
+    "agent-bom[watch]",
 ]
 docs = [
     "mkdocs-material>=9.5",
@@ -118,20 +244,50 @@ docs = [
 ]
 dev = [
     "pytest>=7.0",
-    "pytest-asyncio>=0.21",
-    "ruff>=0.4",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.2",
     "mypy>=1.0",
     "types-PyYAML>=6.0",
     "types-requests>=2.31",
-    "types-toml>=0.10",
-    "pip-audit>=2.10",  # Security dependency scanning
+    "types-toml>=0.10.8.20260518",
     "bandit>=1.9",      # Static security analysis
-    "safety>=3.7",      # Vulnerability checking
-    "pytest-cov>=4.1",  # Coverage reporting
+    "pytest-cov>=7.1.0",  # Coverage reporting
+    "pytest-benchmark>=5.2.3",  # Performance benchmarking — see docs/PERFORMANCE_BENCHMARKS.md
+    "pytest-xdist>=3.5",  # Parallel test execution (-n auto) — cuts CI test wall time
+    "pytest-randomly>=3.15",  # Randomize test order to surface order-dependence early
+    # API-layer test modules (tests/test_api_*, TestClient) fail to COLLECT
+    # without these. Keep Starlette on its patched 1.x line but do not install
+    # its optional TestClient transport until that package passes our
+    # supply-chain gate; tests use Starlette's governed httpx fallback instead.
+    # fastapi + starlette live in the [api] extra, so a dev-only env can't import
+    # the API app under test. Pin them into [dev] so the full suite collects
+    # locally without needing `[dev,api]`. (#1969)
+    "fastapi>=0.115,!=0.136.3",
+    "starlette>=1.3.1,<2",
+]
+dev-all = [
+    "agent-bom[dev]",
+    "agent-bom[ui]",
+    "agent-bom[mcp-server]",
+    "agent-bom[graph]",
+    "agent-bom[postgres]",
 ]
 
 [project.scripts]
 agent-bom = "agent_bom.cli:cli_main"
+agent-shield = "agent_bom.cli.shield:shield_main"
+agent-cloud = "agent_bom.cli.cloud:cloud_main"
+agent-iac = "agent_bom.cli.iac:iac_main"
+agent-claw = "agent_bom.cli.claw:claw_main"
+
+[project.entry-points."agent_bom.cloud_providers"]
+agent_bom_builtin = "agent_bom.cloud:builtin_provider_registrations"
+
+[project.entry-points."agent_bom.connectors"]
+agent_bom_builtin = "agent_bom.connectors:builtin_connector_registrations"
+
+[project.entry-points."agent_bom.inventory_parsers"]
+agent_bom_builtin = "agent_bom.parsers:builtin_inventory_parser_registrations"
 
 [project.urls]
 Homepage = "https://github.com/msaad00/agent-bom"
@@ -147,42 +303,297 @@ Documentation = "https://github.com/msaad00/agent-bom#readme"
 # Prevents `uv sync` from pulling heavy optional deps (azure, gcp, etc.)
 # which break on Python 3.14 and bloat CI/container builds.
 default-groups = []
+# Override litellm's stale exact transitive pin to avoid CVE-2026-28684.
+override-dependencies = [
+    "python-dotenv>=1.2.2",
+    "aiohttp>=3.13.4",
+    "openai>=2.30.0",
+    "gitpython>=3.1.54",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-agent_bom = ["mcp_registry.json", "ui_dist/**"]
+agent_bom = ["mcp_registry.json", "ui_dist/**", "data/*.json", "demo_estate/data/*.jsonl", "output/vendor/*.js", "output/vendor/*.md"]
 
 [tool.smithery]
 server = "agent_bom.mcp_server:create_smithery_server"
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
+pythonpath = ["src"]
+# pytest-randomly is ON by default: every run (local + CI — main matrix,
+# Alpine/musl, Postgres) shuffles test order to keep order-dependence from
+# creeping back in. Order-independence is enforced structurally by the autouse
+# reset_global_test_state fixture in tests/conftest.py, which snapshots and
+# restores every process-global store singleton (the ~35 set_*_store accessors),
+# the shared Rich output console, the proxy in-memory alert/metric buffers, and
+# the auth env/config — so a test that swaps a global and skips its own cleanup
+# cannot leak into the next test regardless of order. A failing run stays
+# reproducible: pytest-randomly prints "Using --randomly-seed=N"; re-run with
+# `--randomly-seed=N` to replay the exact order. To force deterministic order
+# for a one-off local run, pass `-p no:randomly`.
+addopts = ""
+# Starlette 1.x recommends an optional TestClient transport that our own
+# supply-chain scanner currently blocks. Keep the patched framework and its
+# supported httpx fallback while silencing only this exact upstream migration
+# warning; all other deprecations remain visible.
+filterwarnings = [
+    "ignore:Using `httpx` with `starlette\\.testclient` is deprecated; install `httpx2` instead\\.:DeprecationWarning",
+]
 markers = [
     "network: tests that require network access (OSV API)",
+    "slow: slow tests (e.g. large-scale perf benchmarks) — opt-in only",
+    "live_cluster: tests that require a reachable local Kubernetes cluster (e.g. kind) — opt-in only",
+    "real_vuln_db_sync: test drives sync_db itself; opts out of the autouse no-download patch",
 ]
 
 [tool.mypy]
 python_version = "3.11"
 warn_unused_configs = true
-disallow_untyped_defs = false          # Phase 2: enable after all functions annotated
-check_untyped_defs = false             # Phase 2: enable after baseline is clean
+disallow_untyped_defs = false          # Phase 3: enable after remaining untyped modules are reduced
+check_untyped_defs = true              # Phase 2: check bodies of existing untyped functions
 ignore_missing_imports = true          # Third-party stubs (yaml, toml, requests)
 no_implicit_optional = true
 warn_redundant_casts = true
 show_error_codes = true
+
+# Phase 3 (per-module): strict typing for the enterprise/compliance surface.
+# New modules land here first; expand the glob as older modules are retyped.
+[[tool.mypy.overrides]]
+module = [
+    "agent_bom.api.access_review",
+    "agent_bom.api.agent_identity_store",
+    "agent_bom.api.delegation_token",
+    "agent_bom.api.mcp_config_store",
+    "agent_bom.api.postgres_mcp_config",
+    "agent_bom.api.routes.mcp_config",
+    "agent_bom.api.anomaly",
+    "agent_bom.api.audit_log",
+    "agent_bom.api.auth",
+    "agent_bom.api.blueprint_store",
+    "agent_bom.api.postgres_blueprint",
+    "agent_bom.api.routes.blueprints",
+    "agent_bom.api.compliance_hub_store",
+    "agent_bom.api.compliance_signing",
+    "agent_bom.api.connection_crypto",
+    "agent_bom.api.connection_store",
+    "agent_bom.api.cost_forecast",
+    "agent_bom.api.credential_expiry",
+    "agent_bom.api.credential_rotation",
+    "agent_bom.api.credential_store",
+    "agent_bom.api.dashboard_csp",
+    "agent_bom.api.dataset_version_store",
+    "agent_bom.api.drift_incident_store",
+    "agent_bom.api.durable_store",
+    "agent_bom.api.evaluation_store",
+    "agent_bom.api.exception_store",
+    "agent_bom.api.firewall_decision_store",
+    "agent_bom.api.fleet_store",
+    "agent_bom.api.governance_audit_log",
+    "agent_bom.api.idempotency_store",
+    "agent_bom.api.issue_mapping_store",
+    "agent_bom.api.mcp_observation_store",
+    "agent_bom.api.metrics",
+    "agent_bom.api.models",
+    "agent_bom.api.policy_store",
+    "agent_bom.api.postgres_access",
+    "agent_bom.api.postgres_access_review",
+    "agent_bom.api.postgres_agent_identity",
+    "agent_bom.api.postgres_audit",
+    "agent_bom.api.postgres_common",
+    "agent_bom.api.postgres_compliance_hub",
+    "agent_bom.api.postgres_connection",
+    "agent_bom.api.postgres_cost",
+    "agent_bom.api.postgres_runtime_event",
+    "agent_bom.api.postgres_scim",
+    # Phase 1 (#1969): core store/pipeline surface brought under strict typing.
+    # Phase 4 (#1969): findings-list pipeline, store accessors, background
+    # workers, and tenant-retention surface brought under strict typing.
+    "agent_bom.api.finding_cursor",
+    "agent_bom.api.finding_lifecycle",
+    "agent_bom.api.findings_count_cache",
+    "agent_bom.api.versioning",
+    "agent_bom.api.service_registry",
+    "agent_bom.api.readiness",
+    "agent_bom.api.hub_current_payload",
+    "agent_bom.api.hub_reference_store",
+    "agent_bom.api.cost_store",
+    "agent_bom.api.stores",
+    "agent_bom.api.scan_queue",
+    "agent_bom.api.scheduler",
+    "agent_bom.api.connection_scheduler",
+    "agent_bom.api.partition_maintenance",
+    "agent_bom.api.hub_observations_partition",
+    "agent_bom.api.tenant_graph_retention",
+    "agent_bom.api.tenant_graph_retention_store",
+    "agent_bom.api.store",
+    "agent_bom.api.pipeline",
+    "agent_bom.api.hub_payload_codec",
+    "agent_bom.api.hub_reference_payload",
+    "agent_bom.api.credential_ref_validation",
+    "agent_bom.api.shared_auth_state",
+    "agent_bom.api.postgres_tenant_quota",
+    "agent_bom.api.proxy_replay_store",
+    "agent_bom.api.routes.agent_manifest",
+    "agent_bom.api.routes.assets",
+    "agent_bom.api.routes.cloud_connections",
+    "agent_bom.api.routes.connectors",
+    "agent_bom.api.routes.credentials",
+    "agent_bom.api.routes.datasets",
+    "agent_bom.api.routes.entitlements",
+    "agent_bom.api.routes.evaluations",
+    "agent_bom.api.routes.frameworks",
+    "agent_bom.api.routes.intel",
+    "agent_bom.api.routes.plugins",
+    "agent_bom.api.routes.posture_streaming",
+    "agent_bom.api.routes.privacy",
+    "agent_bom.api.routes.runtime_blueprints",
+    "agent_bom.api.runtime_event_store",
+    "agent_bom.api.scan_batches",
+    "agent_bom.api.scan_job_reconciliation",
+    "agent_bom.api.schedule_store",
+    "agent_bom.api.scim",
+    "agent_bom.api.scim_store",
+    "agent_bom.api.secret_lifecycle",
+    "agent_bom.api.secret_rotation_adapters",
+    "agent_bom.api.source_store",
+    "agent_bom.api.storage_schema",
+    "agent_bom.api.tenancy",
+    "agent_bom.api.tenant_quota",
+    "agent_bom.api.tenant_quota_store",
+    "agent_bom.api.tracing",
+    "agent_bom.api.webhook_store",
+    "agent_bom.models",
+    "agent_bom.cloud.connection_broker",
+    "agent_bom.backpressure",
+    "agent_bom.proxy_sandbox",
+    "agent_bom.capabilities",
+    "agent_bom.routing",
+    "agent_bom.orchestration",
+    "agent_bom.components.base",
+    "agent_bom.components.enricher_registry",
+    "agent_bom.components.matcher_registry",
+    # Phase 6 (#1969): remaining api/ surface — routes, stores, workers,
+    # graph/inventory/report/gateway modules — brought under strict typing.
+    "agent_bom.api",
+    "agent_bom.api.browser_session",
+    "agent_bom.api.campaign_store",
+    "agent_bom.api.clickhouse_store",
+    "agent_bom.api.exec_score_config",
+    "agent_bom.api.export_destination_store",
+    "agent_bom.api.export_schedule_store",
+    "agent_bom.api.export_scheduler",
+    "agent_bom.api.graph_store",
+    "agent_bom.api.hitl_approval_queue",
+    "agent_bom.api.hitl_approval_store",
+    "agent_bom.api.hub_ingest",
+    "agent_bom.api.hub_overview_cache",
+    "agent_bom.api.inventory_service",
+    "agent_bom.api.kspm_posture_store",
+    "agent_bom.api.middleware",
+    "agent_bom.api.model_key_broker",
+    "agent_bom.api.neptune_graph",
+    "agent_bom.api.oauth_as",
+    "agent_bom.api.oidc_browser",
+    "agent_bom.api.oidc_discovery_shim",
+    "agent_bom.api.postgres_auth",
+    "agent_bom.api.postgres_campaign",
+    "agent_bom.api.postgres_governance_audit",
+    "agent_bom.api.postgres_graph",
+    "agent_bom.api.postgres_job_store",
+    "agent_bom.api.postgres_model_key_broker",
+    "agent_bom.api.postgres_policy",
+    "agent_bom.api.postgres_store",
+    "agent_bom.api.postgres_tenant_graph_retention",
+    "agent_bom.api.postgres_tenant_score_config",
+    "agent_bom.api.repo_tree_scan",
+    "agent_bom.api.report_artifact_store",
+    "agent_bom.api.report_job_store",
+    "agent_bom.api.report_worker",
+    "agent_bom.api.risk_campaigns",
+    "agent_bom.api.routes",
+    "agent_bom.api.routes.campaigns",
+    "agent_bom.api.routes.cloud",
+    "agent_bom.api.routes.compliance",
+    "agent_bom.api.routes.discovery",
+    "agent_bom.api.routes.enterprise",
+    "agent_bom.api.routes.estate",
+    "agent_bom.api.routes.exports",
+    "agent_bom.api.routes.fleet",
+    "agent_bom.api.routes.gateway",
+    "agent_bom.api.routes.gateway_feed",
+    "agent_bom.api.routes.governance",
+    "agent_bom.api.routes.graph",
+    "agent_bom.api.routes.identities",
+    "agent_bom.api.routes.inventory_assets",
+    "agent_bom.api.routes.kspm",
+    "agent_bom.api.routes.mitre",
+    "agent_bom.api.routes.model_keys",
+    "agent_bom.api.routes.observability",
+    "agent_bom.api.routes.overview",
+    "agent_bom.api.routes.proxy",
+    "agent_bom.api.routes.reports",
+    "agent_bom.api.routes.scan",
+    "agent_bom.api.routes.schedules",
+    "agent_bom.api.routes.scim",
+    "agent_bom.api.routes.self_posture",
+    "agent_bom.api.routes.sources",
+    "agent_bom.api.routes.ticketing",
+    "agent_bom.api.routes.webhooks",
+    "agent_bom.api.saml",
+    "agent_bom.api.secret_source",
+    "agent_bom.api.server",
+    "agent_bom.api.snowflake_oauth",
+    "agent_bom.api.snowflake_store",
+    "agent_bom.api.tenant_score_config_store",
+    "agent_bom.api.trace_explorer",
+]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_return_any = true
+warn_unused_ignores = true
+
+# Phase 2+5 (#1969): modules brought under the stricter profile that also
+# bans implicit ``Any`` generics (``dict``/``list`` without parameters).
+# Applied module-by-module; expand this list as each module is de-genericized.
+# Not a global flip — the base [tool.mypy] settings stay unchanged.
+[[tool.mypy.overrides]]
+module = [
+    "agent_bom.models",
+    "agent_bom.api.findings_current",
+    "agent_bom.api.oidc",
+    "agent_bom.api.postgres_fleet_store",
+    "agent_bom.api.finding_list_envelope",
+    "agent_bom.api.time_window",
+    "agent_bom.api.cost_owner",
+]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_any_generics = true
+warn_return_any = true
+warn_unused_ignores = true
 
 [tool.ruff]
 line-length = 140  # Relaxed from 120 for CLI help strings
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "W"]
+# T201 = `print` found: library code under src/agent_bom/ routes all
+# user-visible output through Rich (``console.print``) and everything else
+# through the structured logger (``logging.getLogger(__name__)``). Bare
+# ``print()`` is not allowed — it breaks MCP stdio, corrupts JSON API
+# responses, and skips log aggregation / SIEM forwarding. This rule locks
+# in the print -> logger migration (closes #1521).
+select = ["E", "F", "I", "N", "T201", "W"]
 ignore = []
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]  # Allow unused imports in __init__.py
-"fuzz/*.py" = ["N802"]  # TestOneInput is the required atheris entry-point name
-"src/agent_bom/output/html.py" = ["E501"]  # Inline HTML/CSS/JS template strings cannot be meaningfully wrapped
-"src/agent_bom/cloud/*_cis_benchmark.py" = ["E501"]  # CIS benchmark remediation strings are naturally long
+"fuzz/*.py" = ["N802", "T201"]  # TestOneInput is required atheris entry; harnesses print repro output
+"src/agent_bom/output/html/*.py" = ["E501", "F541"]  # Inline HTML/CSS/JS template strings cannot be wrapped; f-prefix is load-bearing (unescapes `{{`)
+"scripts/generate_doc_architecture_svgs.py" = ["E501"]  # SVG coordinate strings are intentionally single-line
+# T201 allowlist — places where bare `print()` is legitimately the contract:
+"scripts/*.py" = ["T201"]  # Ops scripts — stdout is the documented interface
+"tests/**/*.py" = ["T201"]  # Pytest assertions + debug tracebacks

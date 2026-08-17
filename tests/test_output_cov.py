@@ -13,6 +13,7 @@ from agent_bom.models import (
     MCPServer,
     MCPTool,
     Package,
+    PackageOccurrence,
     Severity,
     TransportType,
     Vulnerability,
@@ -28,6 +29,7 @@ from agent_bom.output import (
     print_export_hint,
     print_policy_results,
     print_posture_summary,
+    print_scan_performance_summary,
     print_severity_chart,
     print_summary,
     print_threat_frameworks,
@@ -36,6 +38,7 @@ from agent_bom.output import (
     to_sarif,
     to_spdx,
 )
+from agent_bom.output.ocsf import alert_to_ocsf
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -134,6 +137,71 @@ class TestPrintSummary:
         agent = _make_agent(servers=[_make_server()])
         report = _make_report(agents=[agent])
         print_summary(report)
+
+    def test_with_scan_performance_data(self, capsys):
+        report = _make_report()
+        report.scan_performance_data = {
+            "osv": {"cache_hits": 3, "cache_misses": 1, "cache_hit_rate_pct": 75},
+            "registry": {"cache_hits": 4, "cache_misses": 2, "cache_hit_rate_pct": 67},
+            "advisory_coverage": {
+                "primary_sources": {"osv": 3, "ghsa": 1, "nvidia_csaf": 0},
+                "enrichment_sources": {"nvd": 2, "epss": 2, "cisa_kev": 1},
+                "records_with_enrichment": 2,
+            },
+        }
+        print_summary(report)
+
+    def test_with_project_inventory_data(self, capsys):
+        report = _make_report()
+        report.project_inventory_data = {
+            "manifest_files": 3,
+            "lockfiles": 2,
+            "package_count": 12,
+            "direct_packages": 5,
+            "transitive_packages": 7,
+            "lockfile_backed_packages": 9,
+            "declaration_only_packages": 3,
+            "advisory_depth_pct": 75,
+        }
+        print_summary(report)
+
+    def test_with_model_supply_chain_data(self, capsys):
+        report = _make_report()
+        report.model_supply_chain_data = {
+            "model_files": 2,
+            "provenance_checks": 1,
+            "signed_files": 1,
+            "files_with_security_flags": 1,
+            "provenance_with_security_flags": 0,
+            "hash_verification": {"verified": 1, "tampered": 0},
+        }
+        print_summary(report)
+
+
+class TestPrintScanPerformanceSummary:
+    def test_prints_cache_summary(self, capsys):
+        report = _make_report()
+        report.scan_performance_data = {
+            "osv": {"cache_hits": 3, "cache_misses": 1, "packages_queried": 2, "cache_hit_rate_pct": 75, "lookup_errors": 0},
+            "registry": {"cache_hits": 4, "cache_misses": 2, "network_requests": 2, "cache_hit_rate_pct": 67},
+            "advisory_coverage": {
+                "primary_sources": {"osv": 3, "ghsa": 1, "nvidia_csaf": 0},
+                "enrichment_sources": {"nvd": 2, "epss": 2, "cisa_kev": 1},
+                "records_with_multiple_sources": 2,
+            },
+        }
+        print_scan_performance_summary(report)
+
+    def test_suppresses_zero_lookup_cache_summary(self, capsys):
+        report = _make_report()
+        report.scan_performance_data = {
+            "osv": {"cache_hits": 0, "cache_misses": 0, "packages_queried": 0, "cache_hit_rate_pct": 0, "lookup_errors": 0},
+            "registry": {"cache_hits": 0, "cache_misses": 0, "network_requests": 0, "cache_hit_rate_pct": 0},
+        }
+        print_scan_performance_summary(report)
+        output = capsys.readouterr().out
+        assert "Cache & lookup reuse" not in output
+        assert "0 hit / 0 miss" not in output
 
 
 # ── print_posture_summary ────────────────────────────────────────────────────
@@ -321,6 +389,32 @@ class TestToSarif:
         sarif = to_sarif(report)
         assert len(sarif["runs"][0]["results"]) >= 1
 
+    def test_cve_result_preserves_sanitized_discovery_provenance(self):
+        pkg = _make_pkg()
+        pkg.discovery_provenance = {
+            "source_type": "operator_pushed_inventory",
+            "source": "pipeline:token=secret",
+            "collector": "cmdb-export",
+            "version_source": "manifest",
+        }
+        agent = _make_agent()
+        agent.discovery_provenance = {
+            "source_type": "operator_pushed_inventory",
+            "collector": "cmdb-export",
+        }
+        br = _make_blast_radius(pkg=pkg, agents=[agent])
+        report = _make_report(agents=[agent], blast_radii=[br])
+
+        sarif = to_sarif(report)
+        props = sarif["runs"][0]["results"][0]["properties"]
+
+        assert props["package_discovery_provenance"]["source_type"] == "operator_pushed_inventory"
+        assert props["package_discovery_provenance"]["source"] == "<redacted>"
+        assert props["package_discovery_provenance"]["version_source"] == "manifest"
+        assert props["package_version_provenance"]["version_source"] == "command_pin"
+        assert props["package_version_provenance"]["confidence"] == "exact"
+        assert props["agent_discovery_provenance"][0]["collector"] == "cmdb-export"
+
 
 # ── to_cyclonedx ─────────────────────────────────────────────────────────────
 
@@ -330,7 +424,7 @@ class TestToCyclonedx:
         report = _make_report()
         cdx = to_cyclonedx(report)
         assert cdx["bomFormat"] == "CycloneDX"
-        assert cdx["specVersion"] == "1.6"
+        assert cdx["specVersion"] == "1.7"
 
     def test_with_agents_and_vulns(self):
         pkg = _make_pkg()
@@ -343,6 +437,50 @@ class TestToCyclonedx:
         # Vulnerabilities may be in a nested structure depending on CycloneDX version
         assert len(cdx["components"]) >= 1
 
+    def test_mcp_command_property_redacts_args(self):
+        token = "ghp_" + "A" * 36
+        server = _make_server()
+        server.args = ["server", "--token", token]
+        agent = _make_agent(servers=[server])
+
+        cdx = to_cyclonedx(_make_report(agents=[agent]))
+        payload = str(cdx)
+
+        assert token not in payload
+        server_component = next(component for component in cdx["components"] if component["name"] == server.name)
+        command_prop = next(prop for prop in server_component["properties"] if prop["name"] == "agent-bom:command")
+        assert command_prop["value"] == "npx server --token <redacted>"
+
+    def test_cyclonedx_components_preserve_discovery_provenance_properties(self):
+        pkg = _make_pkg()
+        pkg.discovery_provenance = {
+            "source_type": "skill_invoked_pull",
+            "observed_via": ["skill_invoked_pull", "aws_sdk"],
+            "collector": "agent-bom-discover-aws",
+            "version_source": "detected",
+        }
+        server = _make_server(packages=[pkg])
+        server.discovery_provenance = {
+            "source_type": "skill_invoked_pull",
+            "provider": "aws",
+            "service": "bedrock",
+        }
+        agent = _make_agent(servers=[server])
+        agent.discovery_provenance = {
+            "source_type": "skill_invoked_pull",
+            "collector": "agent-bom-discover-aws",
+        }
+
+        cdx = to_cyclonedx(_make_report(agents=[agent]))
+        pkg_component = next(component for component in cdx["components"] if component["name"] == pkg.name)
+        props = {prop["name"]: prop["value"] for prop in pkg_component["properties"]}
+
+        assert props["agent-bom:discovery-provenance:source-type"] == "skill_invoked_pull"
+        assert props["agent-bom:discovery-provenance:collector"] == "agent-bom-discover-aws"
+        assert props["agent-bom:discovery-provenance:observed-via"] == '["skill_invoked_pull","aws_sdk"]'
+        assert props["agent-bom:version-provenance-source"] == "unknown"
+        assert props["agent-bom:version-provenance-confidence"] == "unknown"
+
 
 # ── to_spdx ──────────────────────────────────────────────────────────────────
 
@@ -351,7 +489,40 @@ class TestToSpdx:
     def test_empty_report(self):
         report = _make_report()
         spdx = to_spdx(report)
-        assert spdx["spdxVersion"] == "SPDX-3.0"
+        assert next(n for n in spdx["@graph"] if n["type"] == "CreationInfo")["specVersion"] == "3.0.1"
+
+
+def test_spdx_package_preserves_version_provenance_annotations():
+    pkg = _make_pkg()
+    pkg.version_source = "lockfile"
+    server = _make_server(packages=[pkg])
+    agent = _make_agent(servers=[server])
+    report = _make_report(agents=[agent])
+
+    spdx = to_spdx(report)
+    pkg_element = next(element for element in spdx["@graph"] if element.get("name") == pkg.name)
+    statements = {annotation["statement"] for annotation in pkg_element["annotation"]}
+
+    assert "agent-bom:version-provenance-source=lockfile" in statements
+    assert "agent-bom:version-provenance-confidence=exact" in statements
+
+
+def test_json_output_redacts_server_launch_fields():
+    token = "ghp_" + "A" * 36
+    server = _make_server()
+    server.args = ["server", "--token", token]
+    server.url = f"https://user:pass@example.com/sse?token={token}"
+    server.env = {"API_KEY": token}
+    server.security_warnings = [f"token {token}"]
+    agent = _make_agent(servers=[server])
+
+    payload = to_json(_make_report(agents=[agent]))
+    server_payload = payload["agents"][0]["mcp_servers"][0]
+
+    assert token not in str(payload)
+    assert server_payload["args"] == ["server", "--token", "<redacted>"]
+    assert server_payload["url"] == "https://example.com/sse"
+    assert server_payload["security_warnings"] == ["token <redacted>"]
 
     def test_with_agents_and_vulns(self):
         pkg = _make_pkg()
@@ -360,7 +531,73 @@ class TestToSpdx:
         br = _make_blast_radius(pkg=pkg, agents=[agent])
         report = _make_report(agents=[agent], blast_radii=[br])
         spdx = to_spdx(report)
-        assert len(spdx["elements"]) >= 1
+        assert len(spdx["@graph"]) >= 1
+
+
+class TestToJson:
+    def test_includes_project_inventory(self):
+        report = _make_report()
+        report.project_inventory_data = {
+            "root": "/tmp/project",
+            "manifest_directories": 2,
+            "lockfile_directories": 1,
+            "declaration_only_directories": 1,
+            "manifest_files": 4,
+            "lockfiles": 2,
+            "declaration_only_files": 2,
+            "package_count": 8,
+            "direct_packages": 3,
+            "transitive_packages": 5,
+            "lockfile_backed_packages": 6,
+            "declaration_only_packages": 2,
+            "lockfile_backed_direct_packages": 2,
+            "lockfile_backed_transitive_packages": 4,
+            "declaration_only_direct_packages": 1,
+            "declaration_only_transitive_packages": 1,
+            "advisory_depth_pct": 75,
+            "ecosystems": {"pypi": 3, "npm": 5},
+            "directories": [
+                {
+                    "path": ".",
+                    "package_count": 8,
+                    "direct_packages": 3,
+                    "transitive_packages": 5,
+                    "manifest_files": ["package.json", "package-lock.json"],
+                    "lockfile_files": ["package-lock.json"],
+                    "declaration_files": ["package.json"],
+                    "advisory_evidence": "lockfile_backed",
+                    "ecosystems": {"npm": 5},
+                }
+            ],
+        }
+        data = to_json(report)
+        assert data["project_inventory"]["lockfiles"] == 2
+        assert data["project_inventory"]["advisory_depth_pct"] == 75
+        assert data["project_inventory"]["directories"][0]["path"] == "."
+
+    def test_includes_advisory_source_fields(self):
+        vuln = Vulnerability(
+            id="CVE-2026-3000",
+            summary="test",
+            severity=Severity.HIGH,
+            advisory_sources=["osv"],
+            epss_score=0.8,
+            is_kev=True,
+        )
+        pkg = Package(name="demo", version="1.0.0", ecosystem="npm", vulnerabilities=[vuln])
+        server = _make_server(packages=[pkg])
+        agent = _make_agent(servers=[server])
+        br = _make_blast_radius(pkg=pkg, vuln=vuln, agents=[agent])
+        report = _make_report(agents=[agent], blast_radii=[br])
+
+        data = to_json(report)
+        vuln_json = data["agents"][0]["mcp_servers"][0]["packages"][0]["vulnerabilities"][0]
+        blast_json = data["blast_radius"][0]
+
+        assert vuln_json["advisory_sources"] == ["osv", "epss", "cisa_kev"]
+        assert vuln_json["primary_advisory_source"] == "osv"
+        assert vuln_json["advisory_coverage_state"] == "enriched"
+        assert blast_json["advisory_sources"] == ["osv", "epss", "cisa_kev"]
 
 
 # ── _pct / _coverage_bar (from cov2) ────────────────────────────────────────
@@ -558,6 +795,88 @@ def test_build_remediation_plan_with_items():
     assert plan[0]["package"] == "lodash"
 
 
+def test_build_remediation_plan_no_downgrade():
+    """Regression: multi-branch OSV advisories must not produce downgrade entries.
+
+    Django 3.2.0 CVE has two fix branches: 2.2.26 (older branch) and 3.2.14.
+    The remediation plan must emit exactly ONE entry for django@3.2.0 pointing
+    to 3.2.14 — not a second entry pointing backward to 2.2.26.
+    """
+    pkg = Package(name="django", version="3.2.0", ecosystem="pypi", vulnerabilities=[])
+    vuln_downgrade = Vulnerability(id="CVE-2025-9999", severity=Severity.HIGH, summary="Django XSS", fixed_version="2.2.26")
+    vuln_valid = Vulnerability(id="CVE-2025-9999", severity=Severity.HIGH, summary="Django XSS", fixed_version="3.2.14")
+    br1 = BlastRadius(
+        vulnerability=vuln_downgrade, package=pkg, affected_agents=[], affected_servers=[], exposed_credentials=[], exposed_tools=[]
+    )
+    br2 = BlastRadius(
+        vulnerability=vuln_valid, package=pkg, affected_agents=[], affected_servers=[], exposed_credentials=[], exposed_tools=[]
+    )
+    plan = build_remediation_plan([br1, br2])
+    # Must be exactly one entry (grouped by package+ecosystem+version)
+    assert len(plan) == 1
+    # fix must be the forward upgrade, not the downgrade
+    assert plan[0]["fix"] == "3.2.14"
+
+
+def test_build_remediation_plan_chooses_highest_forward_fix():
+    """Grouped remediation should not recommend a lower fix when a higher fix is needed."""
+    pkg = Package(name="pillow", version="9.0.0", ecosystem="pypi", vulnerabilities=[])
+    lower = Vulnerability(id="CVE-2026-0001", severity=Severity.HIGH, summary="Pillow issue", fixed_version="9.0.1")
+    higher = Vulnerability(id="CVE-2026-0002", severity=Severity.CRITICAL, summary="Pillow issue", fixed_version="10.2.0")
+    br1 = BlastRadius(vulnerability=lower, package=pkg, affected_agents=[], affected_servers=[], exposed_credentials=[], exposed_tools=[])
+    br2 = BlastRadius(vulnerability=higher, package=pkg, affected_agents=[], affected_servers=[], exposed_credentials=[], exposed_tools=[])
+
+    plan = build_remediation_plan([br1, br2])
+
+    assert len(plan) == 1
+    assert plan[0]["fix"] == "10.2.0"
+
+
+def test_build_remediation_plan_skips_prerelease_downgrade_for_npm():
+    """npm canary/pre-release branches should not be emitted as a downgrade fix."""
+    pkg = Package(name="next", version="16.2.1", ecosystem="npm", vulnerabilities=[])
+    vuln_canary = Vulnerability(
+        id="CVE-2026-1111",
+        severity=Severity.HIGH,
+        summary="Next issue",
+        fixed_version="13.4.20-canary.13",
+    )
+    vuln_valid = Vulnerability(
+        id="CVE-2026-1111",
+        severity=Severity.HIGH,
+        summary="Next issue",
+        fixed_version="16.2.2",
+    )
+    br1 = BlastRadius(
+        vulnerability=vuln_canary, package=pkg, affected_agents=[], affected_servers=[], exposed_credentials=[], exposed_tools=[]
+    )
+    br2 = BlastRadius(
+        vulnerability=vuln_valid, package=pkg, affected_agents=[], affected_servers=[], exposed_credentials=[], exposed_tools=[]
+    )
+    plan = build_remediation_plan([br1, br2])
+    assert len(plan) == 1
+    assert plan[0]["fix"] == "16.2.2"
+
+
+def test_build_remediation_plan_suppresses_prerelease_only_fix():
+    """Prerelease-only fixes should not be emitted as default remediation."""
+    pkg = Package(name="samplelib", version="1.4.0", ecosystem="pypi", vulnerabilities=[])
+    vuln = Vulnerability(
+        id="CVE-2026-2222",
+        severity=Severity.HIGH,
+        summary="Sample issue",
+        fixed_version="2.0.0rc1",
+    )
+    br = BlastRadius(vulnerability=vuln, package=pkg, affected_agents=[], affected_servers=[], exposed_credentials=[], exposed_tools=[])
+
+    plan = build_remediation_plan([br])
+
+    assert len(plan) == 1
+    assert plan[0]["fix"] is None
+    assert plan[0]["reason"] == "prerelease fix suppressed by default"
+    assert "suppressed by default" in plan[0]["action"]
+
+
 # ── to_json (from cov2) ─────────────────────────────────────────────────────
 
 
@@ -579,15 +898,68 @@ def test_to_json_with_agents():
     assert result["agents"][0]["name"] == "agent1"
 
 
+def test_to_json_mcp_server_registry_verified_badge():
+    verified = _make_server_cov2(name="verified-srv")
+    verified.registry_verified = True
+    unverified = _make_server_cov2(name="unknown-srv")
+    unverified.registry_verified = False
+    agent = _make_agent_cov2(servers=[verified, unverified])
+    report = _make_report_cov2(agents=[agent])
+    result = to_json(report)
+    servers = result["agents"][0]["mcp_servers"]
+    by_name = {s["name"]: s for s in servers}
+    assert by_name["verified-srv"]["registry_verified"] is True
+    assert by_name["verified-srv"]["registry_badge"] == "verified"
+    assert by_name["unknown-srv"]["registry_verified"] is False
+    assert by_name["unknown-srv"]["registry_badge"] == "unknown"
+
+
 def test_to_json_with_blast_radius():
     vuln = _make_vuln_cov2()
     pkg = _make_pkg_cov2(vulns=[vuln])
+    pkg.occurrences = [
+        PackageOccurrence(
+            layer_index=2,
+            layer_id="sha256:layer2",
+            layer_path="blobs/sha256/layer2",
+            package_path="usr/lib/node_modules/lodash/package.json",
+            created_by="/bin/sh -c npm install lodash@4.17.20",
+            dockerfile_instruction="RUN npm install lodash@4.17.20",
+        )
+    ]
     agent = _make_agent_cov2()
     br = _make_blast_radius_cov2(vuln=vuln, pkg=pkg, agents=[agent])
     report = _make_report_cov2(agents=[agent], blast_radii=[br])
     result = to_json(report)
     assert len(result["blast_radius"]) >= 1
     assert "threat_framework_summary" in result
+    assert result["blast_radius"][0]["introduced_in_layer"]["layer_index"] == 2
+    assert result["blast_radius"][0]["layer_attribution"][0]["dockerfile_instruction"] == "RUN npm install lodash@4.17.20"
+
+
+def test_to_json_blast_radius_uses_finding_stream():
+    """JSON blast_radius rows iterate cve_findings while preserving BlastRadius-only fields."""
+    from agent_bom.finding import blast_radius_to_finding
+
+    vuln = _make_vuln_cov2(vid="CVE-2025-7777")
+    pkg = _make_pkg_cov2(vulns=[vuln])
+    agent = _make_agent_cov2()
+    br = _make_blast_radius_cov2(vuln=vuln, pkg=pkg, agents=[agent], creds=["API_KEY"])
+    br.risk_score = 8.2
+    br.graph_reachable = True
+    br.symbol_reachability = "confirmed"
+    report = _make_report_cov2(agents=[agent], blast_radii=[br])
+
+    result = to_json(report)
+    row = result["blast_radius"][0]
+    finding = blast_radius_to_finding(br)
+
+    assert row["vulnerability_id"] == finding.cve_id
+    assert row["exposure_path"]["label"] == result["exposure_paths"]["paths"][0]["label"]
+    assert row["graph_reachable"] is True
+    assert row["symbol_reachability"] == "confirmed"
+    assert row["risk_score"] == 8.2
+    assert row["exposed_credentials"] == ["API_KEY"]
 
 
 def test_to_json_with_optional_fields():
@@ -601,6 +973,45 @@ def test_to_json_with_optional_fields():
     assert result.get("executive_summary") == "Test summary"
     assert "skill_audit" in result
     assert "trust_assessment" in result
+
+
+def test_to_json_with_model_supply_chain_fields():
+    report = _make_report_cov2()
+    report.model_manifests = [{"filename": "model.safetensors.index.json", "manifest_type": "weight_index"}]
+    report.model_hash_verification_data = {
+        "scanned": 2,
+        "verified": 1,
+        "tampered": 0,
+        "unverified": 1,
+        "offline": 0,
+        "has_tampering": False,
+        "results": [],
+    }
+    report.model_supply_chain_data = {
+        "model_files": 2,
+        "manifest_files": 1,
+        "signed_files": 1,
+        "unsigned_files": 1,
+        "unsafe_format_files": 1,
+        "files_with_security_flags": 1,
+        "formats": ["Pickle", "SafeTensors"],
+        "ecosystems": ["HuggingFace", "Python"],
+        "provenance_checks": 1,
+        "provenance_with_digest": 1,
+        "gated_models": 0,
+        "provenance_with_security_flags": 0,
+        "provenance_sources": ["huggingface"],
+        "manifests_with_repo_id": 1,
+        "adapter_lineage_refs": 0,
+        "sharded_bundles": 1,
+        "manifests_with_security_flags": 0,
+        "hash_verification": {"scanned": 2, "verified": 1, "tampered": 0, "unverified": 1, "offline": 0, "has_tampering": False},
+    }
+    result = to_json(report)
+    assert result["model_manifests"][0]["manifest_type"] == "weight_index"
+    assert result["model_hash_verification"]["verified"] == 1
+    assert result["model_supply_chain"]["model_files"] == 2
+    assert result["model_supply_chain"]["manifest_files"] == 1
 
 
 # ── print_threat_frameworks (from cov2) ──────────────────────────────────────
@@ -688,6 +1099,22 @@ def test_build_remediation_json():
     report = _make_report_cov2(agents=[agent], blast_radii=[br])
     result = _build_remediation_json(report)
     assert isinstance(result, list)
+    assert "ranking_rationale" in result[0]
+    assert result[0]["ranking_reasons"]
+
+
+def test_build_remediation_json_includes_reason_for_unfixable_item():
+    from agent_bom.output import _build_remediation_json
+
+    pkg = Package(name="samplelib", version="1.4.0", ecosystem="pypi", vulnerabilities=[])
+    vuln = Vulnerability(id="CVE-2026-3333", severity=Severity.HIGH, summary="Issue", fixed_version="2.0.0rc1")
+    br = BlastRadius(vulnerability=vuln, package=pkg, affected_agents=[], affected_servers=[], exposed_credentials=[], exposed_tools=[])
+    report = _make_report_cov2(blast_radii=[br])
+
+    result = _build_remediation_json(report)
+
+    assert result[0]["fixed_version"] is None
+    assert result[0]["reason"] == "prerelease fix suppressed by default"
 
 
 # ── export_json (from cov2) ──────────────────────────────────────────────────
@@ -730,6 +1157,126 @@ def test_to_cyclonedx_no_fix():
     assert "vulnerabilities" in result
 
 
+# ── CycloneDX ML BOM extensions ─────────────────────────────────────────────
+
+
+def test_to_cyclonedx_ml_model_provenance():
+    """Model provenance should produce machine-learning-model components with modelCard."""
+    report = _make_report()
+    report.model_provenance = [
+        {
+            "model_id": "meta-llama/Llama-3.1-8B",
+            "source": "huggingface",
+            "format": "safetensors",
+            "is_safe_format": True,
+            "has_digest": True,
+            "digest": "abc123def456",
+            "risk_flags": [],
+            "risk_level": "safe",
+            "metadata": {"pipeline_tag": "text-generation", "tags": ["dataset:wikitext"]},
+        }
+    ]
+    result = to_cyclonedx(report)
+    ml_comps = [c for c in result["components"] if c["type"] == "machine-learning-model"]
+    assert len(ml_comps) >= 1
+    assert any("modelCard" in c for c in ml_comps)
+    assert any("Llama" in c["name"] for c in ml_comps)
+
+
+def test_to_cyclonedx_ml_model_files():
+    """Model file scan results should produce ML components with security flags."""
+    report = _make_report()
+    report.model_files = [
+        {
+            "filename": "model.pkl",
+            "format": "Pickle",
+            "ecosystem": "scikit-learn",
+            "size_bytes": 5242880,
+            "size_human": "5.0 MB",
+            "security_flags": [{"type": "PICKLE_DESERIALIZATION", "severity": "HIGH", "description": "Pickle can execute arbitrary code"}],
+        }
+    ]
+    result = to_cyclonedx(report)
+    ml_comps = [c for c in result["components"] if c["type"] == "machine-learning-model"]
+    assert len(ml_comps) >= 1
+    pkl_comp = [c for c in ml_comps if "model.pkl" in c["name"]]
+    assert len(pkl_comp) == 1
+
+
+def test_to_cyclonedx_dataset_cards():
+    """Dataset cards should produce data components with CycloneDX data extension."""
+    report = _make_report()
+    report.dataset_cards = {
+        "datasets": [
+            {
+                "name": "wikitext-103",
+                "description": "Wikipedia text corpus",
+                "license": "CC-BY-SA-4.0",
+                "source_file": "dataset_info.json",
+                "features": ["text"],
+                "splits": {"train": 1801350},
+                "task_categories": ["language-modeling"],
+                "languages": ["en"],
+                "security_flags": [],
+            }
+        ]
+    }
+    result = to_cyclonedx(report)
+    data_comps = [c for c in result["components"] if c["type"] == "data"]
+    assert len(data_comps) == 1
+    assert "data" in data_comps[0]
+    assert data_comps[0]["data"][0]["type"] == "dataset"
+
+
+def test_to_cyclonedx_training_pipelines():
+    """Training runs should produce ML components with quantitativeAnalysis."""
+    report = _make_report()
+    report.training_pipelines = {
+        "runs": [
+            {
+                "name": "finetune-v2",
+                "framework": "mlflow",
+                "source_file": "MLmodel",
+                "run_id": "abc123",
+                "model_flavor": "transformers",
+                "metrics": {"eval_loss": 2.31, "accuracy": 0.87},
+                "parameters": {"lr": "2e-5"},
+                "security_flags": [],
+            }
+        ]
+    }
+    result = to_cyclonedx(report)
+    ml_comps = [c for c in result["components"] if c["type"] == "machine-learning-model"]
+    assert any("finetune" in c["name"] for c in ml_comps)
+    training_comp = [c for c in ml_comps if "finetune" in c["name"]][0]
+    assert "modelCard" in training_comp
+    assert "quantitativeAnalysis" in training_comp["modelCard"]
+
+
+def test_to_cyclonedx_ml_models_metadata_count():
+    """Metadata should include ml-models count."""
+    report = _make_report()
+    report.model_provenance = [
+        {
+            "model_id": "m1",
+            "source": "hf",
+            "format": "safetensors",
+            "is_safe_format": True,
+            "has_digest": False,
+            "digest": "",
+            "risk_flags": [],
+            "risk_level": "safe",
+            "metadata": {},
+        }
+    ]
+    report.model_files = [
+        {"filename": "f1.gguf", "format": "GGUF", "ecosystem": "llama.cpp", "size_bytes": 100, "size_human": "100 B", "security_flags": []}
+    ]
+    result = to_cyclonedx(report)
+    meta_props = {p["name"]: p["value"] for p in result["metadata"]["properties"]}
+    assert meta_props["agent-bom:ml-models"] == "2"
+
+
 # ── to_spdx extras (from cov2) ──────────────────────────────────────────────
 
 
@@ -740,7 +1287,7 @@ def test_to_spdx_with_agent():
     agent = _make_agent_cov2(servers=[srv])
     report = _make_report_cov2(agents=[agent])
     result = to_spdx(report)
-    assert len(result.get("packages", result.get("elements", []))) >= 1
+    assert len(result["@graph"]) >= 1
 
 
 # ── to_sarif extras (from cov2) ─────────────────────────────────────────────
@@ -756,3 +1303,81 @@ def test_to_sarif_with_findings():
     assert "runs" in result
     run = result["runs"][0]
     assert len(run.get("results", [])) >= 1
+
+
+def test_to_sarif_emits_unified_non_cve_findings():
+    from agent_bom.finding import Asset, Finding, FindingSource, FindingType
+
+    finding = Finding(
+        finding_type=FindingType.MCP_BLOCKLIST,
+        source=FindingSource.MCP_SCAN,
+        asset=Asset(name="bad-server", asset_type="mcp_server", location="/tmp/mcp.json"),
+        severity="high",
+        title="Blocked MCP server",
+    )
+    report = _make_report()
+    report.findings = [finding]
+
+    result = to_sarif(report)
+    run = result["runs"][0]
+    rule_ids = {item["ruleId"] for item in run["results"]}
+    uris = [item["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for item in run["results"]]
+
+    assert "finding/MCP_BLOCKLIST" in rule_ids
+    assert "mcp.json" in uris
+
+
+def test_output_ocsf_preserves_nested_sanitized_details():
+    event = alert_to_ocsf(
+        {
+            "severity": "high",
+            "detector": "argument_analyzer",
+            "message": "suspicious resource read",
+            "details": {
+                "tool": "resources/read",
+                "discovery_provenance": {
+                    "source_type": "operator_pushed_inventory",
+                    "source": "pipeline:token=secret",
+                },
+            },
+        }
+    )
+
+    data = event["resources"][0]["data"]
+    assert data["discovery_provenance"]["source_type"] == "operator_pushed_inventory"
+    assert "secret" not in str(data)
+
+
+def test_to_sarif_normalizes_iac_and_ai_inventory_paths():
+    report = _make_report()
+    report.iac_findings_data = {
+        "findings": [
+            {
+                "rule_id": "TEST001",
+                "severity": "high",
+                "file_path": "/tmp/absolute.tf",
+                "line_number": 7,
+                "title": "Absolute IaC path",
+                "message": "test",
+            }
+        ]
+    }
+    report.ai_inventory_data = {
+        "components": [
+            {
+                "type": "api_usage",
+                "severity": "high",
+                "name": "openai",
+                "file": "/tmp/absolute.py",
+                "line": 3,
+                "description": "test",
+            }
+        ]
+    }
+
+    result = to_sarif(report)
+    uris = [item["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for item in result["runs"][0]["results"]]
+
+    assert "absolute.tf" in uris
+    assert "absolute.py" in uris
+    assert all(not uri.startswith("/") for uri in uris)

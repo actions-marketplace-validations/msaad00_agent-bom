@@ -1,613 +1,841 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import {
   api,
   ComplianceResponse,
   ComplianceControl,
+  FrameworkCatalogMetadata,
+  MitreAtlasCatalogMetadata,
+  HubPostureResponse,
   OWASP_LLM_TOP10,
   OWASP_MCP_TOP10,
   OWASP_AGENTIC_TOP10,
   EU_AI_ACT,
   MITRE_ATLAS,
   NIST_AI_RMF,
+  NIST_CSF,
+  ISO_27001,
+  SOC2_TSC,
+  CIS_CONTROLS,
+  CMMC_PRACTICES,
   formatDate,
 } from "@/lib/api";
 import {
-  Shield,
-  ShieldCheck,
-  ShieldAlert,
-  ShieldX,
-  CheckCircle,
-  AlertTriangle,
-  XCircle,
-  Package,
-  Server,
-  ChevronDown,
-  ChevronRight,
-  Loader2,
   Scan,
   Grid3X3,
   List,
+  Search,
+  Download,
+  Loader2,
 } from "lucide-react";
-import Link from "next/link";
+import { ComplianceControlDrawer } from "@/components/compliance-control-drawer";
+import {
+  controlStatusLabel,
+  evidenceReasonLabel,
+  isControlUnscored,
+  isNotEvaluated,
+  postureLabel,
+  statusColor,
+  StatusIcon,
+} from "@/components/compliance-status";
 import { ComplianceHeatmap } from "@/components/compliance-heatmap";
 import { ComplianceMatrix } from "@/components/compliance-matrix";
+import { CISBenchmarkDetail } from "@/components/cis-benchmark-detail";
+import { ComplianceNistCatalog } from "@/components/compliance-nist-catalog";
+import { FrameworkIcon } from "@/components/framework-icon";
+import {
+  complianceFrameworkSummaries,
+  compliancePassRate,
+  complianceScoredTotals,
+  controlMatchesQuery,
+  type ComplianceFrameworkSummary,
+} from "@/lib/compliance-frameworks";
+import { ApiOfflineState } from "@/components/api-offline-state";
+import { PageEmptyState, PageLoadingState } from "@/components/states/page-state";
+import { ApiAuthError, ApiForbiddenError } from "@/lib/api-errors";
+import { FIRST_EVIDENCE_ACTIONS } from "@/lib/empty-state-actions";
+import { StatStrip, type StatStripItem, type StatAccent } from "@/components/stat-strip";
+import { DataTable, type DataTableColumn } from "@/components/data-table";
+import { SplitLayout } from "@/components/split-layout";
+import { Collapsible } from "@/components/collapsible";
 
-// ─── Status helpers ──────────────────────────────────────────────────────────
-
-function statusColor(status: string): string {
-  switch (status) {
-    case "pass":    return "text-emerald-400";
-    case "warning": return "text-yellow-400";
-    case "fail":    return "text-red-400";
-    default:        return "text-zinc-400";
-  }
+function _classifyApiErrorKind(err: unknown): "network" | "auth" | "forbidden" {
+  if (err instanceof ApiAuthError) return "auth";
+  if (err instanceof ApiForbiddenError) return "forbidden";
+  return "network";
 }
 
-function statusBg(status: string): string {
-  switch (status) {
-    case "pass":    return "bg-emerald-950 border-emerald-800";
-    case "warning": return "bg-yellow-950 border-yellow-800";
-    case "fail":    return "bg-red-950 border-red-800";
-    default:        return "bg-zinc-900 border-zinc-800";
-  }
+function downloadBlobToFile(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
-function StatusIcon({ status, className }: { status: string; className?: string }) {
-  switch (status) {
-    case "pass":    return <CheckCircle className={`${className ?? "w-4 h-4"} text-emerald-400`} />;
-    case "warning": return <AlertTriangle className={`${className ?? "w-4 h-4"} text-yellow-400`} />;
-    case "fail":    return <XCircle className={`${className ?? "w-4 h-4"} text-red-400`} />;
-    default:        return <Shield className={`${className ?? "w-4 h-4"} text-zinc-400`} />;
-  }
+function statusToAccent(status: string): StatAccent {
+  if (isNotEvaluated(status)) return "neutral";
+  if (status === "pass") return "success";
+  if (status === "warning") return "warn";
+  if (status === "fail") return "critical";
+  return "neutral";
 }
 
-function PostureIcon({ status }: { status: string }) {
-  switch (status) {
-    case "pass":    return <ShieldCheck className="w-10 h-10 text-emerald-400" />;
-    case "warning": return <ShieldAlert className="w-10 h-10 text-yellow-400" />;
-    case "fail":    return <ShieldX className="w-10 h-10 text-red-400" />;
-    default:        return <Shield className="w-10 h-10 text-zinc-400" />;
-  }
-}
-
-function postureLabel(status: string): string {
-  switch (status) {
-    case "pass":    return "COMPLIANT";
-    case "warning": return "NEEDS ATTENTION";
-    case "fail":    return "NON-COMPLIANT";
-    default:        return "NO DATA";
-  }
-}
-
-// ─── Score Ring ──────────────────────────────────────────────────────────────
-
-function ScoreRing({ score, status }: { score: number; status: string }) {
-  const r = 54;
-  const circ = 2 * Math.PI * r;
-  const offset = circ - (score / 100) * circ;
-  const color = status === "pass" ? "#34d399" : status === "warning" ? "#facc15" : "#f87171";
-
+/** Compact three-segment pass/warn/fail bar, token-styled for both themes. */
+function CoverageBar({
+  pass,
+  warn,
+  fail,
+  total,
+}: Pick<ComplianceFrameworkSummary, "pass" | "warn" | "fail" | "total">) {
+  const seg = (n: number) => (total > 0 ? (n / total) * 100 : 0);
   return (
-    <div className="relative w-32 h-32">
-      <svg viewBox="0 0 120 120" className="w-full h-full -rotate-90">
-        <circle cx="60" cy="60" r={r} fill="none" stroke="#27272a" strokeWidth="8" />
-        <circle
-          cx="60" cy="60" r={r} fill="none"
-          stroke={color} strokeWidth="8"
-          strokeDasharray={circ} strokeDashoffset={offset}
-          strokeLinecap="round"
-          className="transition-all duration-1000"
-        />
-      </svg>
-      <div className="absolute inset-0 flex flex-col items-center justify-center">
-        <span className="text-2xl font-bold text-zinc-100">{Math.round(score)}%</span>
-        <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Score</span>
-      </div>
+    <div className="flex h-1.5 w-full min-w-[72px] max-w-[140px] overflow-hidden rounded-full bg-[color:var(--surface-muted)]">
+      {pass > 0 ? (
+        <div style={{ width: `${seg(pass)}%`, backgroundColor: "var(--status-success)" }} />
+      ) : null}
+      {warn > 0 ? (
+        <div style={{ width: `${seg(warn)}%`, backgroundColor: "var(--status-warn)" }} />
+      ) : null}
+      {fail > 0 ? (
+        <div style={{ width: `${seg(fail)}%`, backgroundColor: "var(--status-danger)" }} />
+      ) : null}
     </div>
   );
 }
 
-// ─── Framework Summary Bar ──────────────────────────────────────────────────
+type CategoryFilter = "all" | "ai" | "governance" | "cloud";
 
-function FrameworkBar({
-  label, pass: p, warn, fail, total,
-}: {
-  label: string; pass: number; warn: number; fail: number; total: number;
-}) {
-  const pPct = (p / total) * 100;
-  const wPct = (warn / total) * 100;
-  const fPct = (fail / total) * 100;
-
-  return (
-    <div className="space-y-1.5">
-      <div className="flex items-center justify-between">
-        <span className="text-sm font-medium text-zinc-300">{label}</span>
-        <span className="text-xs text-zinc-500">{p}/{total} pass</span>
-      </div>
-      <div className="h-2.5 rounded-full bg-zinc-800 overflow-hidden flex">
-        {p > 0 && (
-          <div className="bg-emerald-500 transition-all duration-700" style={{ width: `${pPct}%` }} />
-        )}
-        {warn > 0 && (
-          <div className="bg-yellow-500 transition-all duration-700" style={{ width: `${wPct}%` }} />
-        )}
-        {fail > 0 && (
-          <div className="bg-red-500 transition-all duration-700" style={{ width: `${fPct}%` }} />
-        )}
-      </div>
-      <div className="flex gap-4 text-xs text-zinc-500">
-        <span className="flex items-center gap-1">
-          <span className="w-2 h-2 rounded-full bg-emerald-500" /> {p} pass
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="w-2 h-2 rounded-full bg-yellow-500" /> {warn} warning
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="w-2 h-2 rounded-full bg-red-500" /> {fail} fail
-        </span>
-      </div>
-    </div>
-  );
-}
-
-// ─── Control Card ───────────────────────────────────────────────────────────
-
-function ControlCard({ control, catalog }: { control: ComplianceControl; catalog?: Record<string, string> }) {
-  const [expanded, setExpanded] = useState(false);
-  const name = catalog?.[control.code] ?? control.name;
-  const sev = control.severity_breakdown;
-  const hasSev = sev.critical > 0 || sev.high > 0 || sev.medium > 0 || sev.low > 0;
-
-  return (
-    <div
-      className={`border rounded-xl p-4 transition-colors ${statusBg(control.status)}`}
-    >
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex items-start gap-3 min-w-0">
-          <StatusIcon status={control.status} className="w-5 h-5 mt-0.5 shrink-0" />
-          <div className="min-w-0">
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="font-mono text-sm font-semibold text-zinc-200">{control.code}</span>
-              <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                control.status === "pass"
-                  ? "bg-emerald-900/60 text-emerald-300"
-                  : control.status === "warning"
-                  ? "bg-yellow-900/60 text-yellow-300"
-                  : "bg-red-900/60 text-red-300"
-              }`}>
-                {control.status === "pass" ? "Pass" : control.status === "warning" ? "Needs Attention" : "Fail"}
-              </span>
-            </div>
-            <p className="text-sm text-zinc-400 mt-1 leading-snug">{name}</p>
-          </div>
-        </div>
-        {control.findings > 0 && (
-          <span className="text-xs font-mono px-2 py-1 rounded bg-zinc-800 text-zinc-300 shrink-0">
-            {control.findings} finding{control.findings !== 1 ? "s" : ""}
-          </span>
-        )}
-      </div>
-
-      {/* Severity dots */}
-      {hasSev && (
-        <div className="flex gap-3 mt-3 ml-8 text-xs text-zinc-500">
-          {sev.critical > 0 && (
-            <span className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-red-500" /> {sev.critical} critical
-            </span>
-          )}
-          {sev.high > 0 && (
-            <span className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-orange-500" /> {sev.high} high
-            </span>
-          )}
-          {sev.medium > 0 && (
-            <span className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-yellow-500" /> {sev.medium} medium
-            </span>
-          )}
-          {sev.low > 0 && (
-            <span className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-blue-500" /> {sev.low} low
-            </span>
-          )}
-        </div>
-      )}
-
-      {/* Expandable details */}
-      {(control.affected_packages.length > 0 || control.affected_agents.length > 0) && (
-        <div className="mt-3 ml-8">
-          <button
-            onClick={() => setExpanded(!expanded)}
-            className="flex items-center gap-1 text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
-          >
-            {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-            Details
-          </button>
-          {expanded && (
-            <div className="mt-2 space-y-2">
-              {control.affected_packages.length > 0 && (
-                <div>
-                  <div className="flex items-center gap-1.5 text-xs text-zinc-500 mb-1">
-                    <Package className="w-3 h-3" /> Affected Packages
-                  </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {control.affected_packages.map((pkg) => (
-                      <span key={pkg} className="text-xs px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 font-mono">
-                        {pkg}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {control.affected_agents.length > 0 && (
-                <div>
-                  <div className="flex items-center gap-1.5 text-xs text-zinc-500 mb-1">
-                    <Server className="w-3 h-3" /> Affected Agents
-                  </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {control.affected_agents.map((agent) => (
-                      <span key={agent} className="text-xs px-2 py-0.5 rounded bg-zinc-800 text-zinc-300">
-                        {agent}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
+function categoryFor(id: string): "ai" | "governance" | "cloud" {
+  if (id === "cis" || id === "cmmc" || id === "cis-foundations") return "cloud";
+  if (
+    id === "eu-ai-act" ||
+    id === "nist-csf" ||
+    id === "iso27001" ||
+    id === "soc2" ||
+    id === "nist-800-53" ||
+    id === "pci-dss" ||
+    id === "fedramp"
+  )
+    return "governance";
+  return "ai";
 }
 
 // ─── Page ───────────────────────────────────────────────────────────────────
 
-export default function CompliancePage() {
+function CompliancePageContent() {
+  const searchParams = useSearchParams();
+  const queryParam = searchParams.get("q") ?? "";
+  const scanParam = searchParams.get("scan") ?? "";
   const [data, setData] = useState<ComplianceResponse | null>(null);
+  const [mitreCatalog, setMitreCatalog] = useState<FrameworkCatalogMetadata | null>(null);
+  const [atlasCatalog, setAtlasCatalog] = useState<MitreAtlasCatalogMetadata | null>(null);
+  const [hubPosture, setHubPosture] = useState<HubPostureResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Per #2199 splash-kind sweep: classify API errors so the splash matches
+  // the actual cause (auth/forbidden/network) instead of always reading as
+  // "Cannot connect to the agent-bom API".
+  const [errorKind, setErrorKind] = useState<"network" | "auth" | "forbidden">("network");
   const [viewMode, setViewMode] = useState<"detail" | "heatmap" | "matrix">("detail");
+  const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>("all");
+  const [controlQuery, setControlQuery] = useState(queryParam);
+  const [statusFilter, setStatusFilter] = useState<"all" | "pass" | "warning" | "fail">("all");
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [selectedFrameworkId, setSelectedFrameworkId] = useState("");
+  const [selectedControl, setSelectedControl] = useState<{
+    control: ComplianceControl;
+    frameworkLabel: string;
+    catalog?: Record<string, string> | undefined;
+  } | null>(null);
+
+  const hasMcp = data?.has_mcp_context ?? false;
+
+  const detailSections = useMemo(() => {
+    if (!data) return [];
+    return [
+      {
+        id: "owasp-llm",
+        title: "OWASP LLM Top 10",
+        subtitle: "2025 Edition",
+        controls: data.owasp_llm_top10,
+        catalog: OWASP_LLM_TOP10,
+        emptyMessage: undefined as string | undefined,
+      },
+      {
+        id: "owasp-mcp",
+        title: "OWASP MCP Top 10",
+        subtitle: "MCP security risks",
+        controls: hasMcp ? data.owasp_mcp_top10 : [],
+        catalog: OWASP_MCP_TOP10,
+        emptyMessage: "MCP-specific controls appear after a scan with MCP server context.",
+      },
+      {
+        id: "atlas",
+        title: "MITRE ATLAS",
+        subtitle: "Adversarial ML techniques",
+        controls: data.mitre_atlas,
+        catalog: MITRE_ATLAS,
+        emptyMessage: undefined,
+      },
+      {
+        id: "nist-ai-rmf",
+        title: "NIST AI RMF 1.0",
+        subtitle: "Govern / Map / Measure / Manage",
+        controls: data.nist_ai_rmf,
+        catalog: NIST_AI_RMF,
+        emptyMessage: undefined,
+      },
+      {
+        id: "owasp-agentic",
+        title: "OWASP Agentic Top 10",
+        subtitle: "2026 Edition",
+        controls: hasMcp ? data.owasp_agentic_top10 : [],
+        catalog: OWASP_AGENTIC_TOP10,
+        emptyMessage: "Agentic controls appear after a scan with agent and MCP context.",
+      },
+      {
+        id: "eu-ai-act",
+        title: "EU AI Act",
+        subtitle: "Regulation (EU) 2024/1689",
+        controls: data.eu_ai_act,
+        catalog: EU_AI_ACT,
+        emptyMessage: undefined,
+      },
+      {
+        id: "nist-csf",
+        title: "NIST CSF 2.0",
+        subtitle: "Cybersecurity Framework",
+        controls: data.nist_csf,
+        catalog: NIST_CSF,
+        emptyMessage: undefined,
+      },
+      {
+        id: "iso27001",
+        title: "ISO/IEC 27001:2022",
+        subtitle: "Annex A controls",
+        controls: data.iso_27001,
+        catalog: ISO_27001,
+        emptyMessage: undefined,
+      },
+      {
+        id: "soc2",
+        title: "SOC 2",
+        subtitle: "Trust Services Criteria",
+        controls: data.soc2,
+        catalog: SOC2_TSC,
+        emptyMessage: undefined,
+      },
+      {
+        id: "cis",
+        title: "CIS Controls v8",
+        subtitle: "Critical security controls",
+        controls: data.cis_controls,
+        catalog: CIS_CONTROLS,
+        emptyMessage: undefined,
+      },
+      {
+        id: "cmmc",
+        title: "CMMC 2.0",
+        subtitle: "Level 2 practices",
+        controls: data.cmmc,
+        catalog: CMMC_PRACTICES,
+        emptyMessage: undefined,
+      },
+      // Scored on every response and counted by the headline, previously shown
+      // in no section. The API returns each control's code and name, so these
+      // need no bundled catalog.
+      {
+        id: "nist-800-53",
+        title: "NIST SP 800-53 Rev 5",
+        subtitle: "Controls with mapped evidence",
+        controls: data.nist_800_53,
+        catalog: {},
+        emptyMessage: undefined,
+      },
+      {
+        id: "pci-dss",
+        title: "PCI DSS 4.0",
+        subtitle: "Requirements with mapped evidence",
+        controls: data.pci_dss,
+        catalog: {},
+        emptyMessage: undefined,
+      },
+      {
+        id: "fedramp",
+        title: "FedRAMP Moderate",
+        subtitle: "Baseline controls",
+        controls: data.fedramp,
+        catalog: {},
+        emptyMessage: undefined,
+      },
+    ];
+  }, [data, hasMcp]);
+
+  const frameworks = useMemo(
+    () => (data ? complianceFrameworkSummaries(data, hasMcp) : []),
+    [data, hasMcp],
+  );
+
+  const visibleFrameworks = useMemo(
+    () =>
+      categoryFilter === "all"
+        ? frameworks
+        : frameworks.filter((framework) => categoryFor(framework.id) === categoryFilter),
+    [frameworks, categoryFilter],
+  );
+
+  const selectedSection = useMemo(
+    () => detailSections.find((section) => section.id === selectedFrameworkId) ?? detailSections[0],
+    [detailSections, selectedFrameworkId],
+  );
+
+  const sectionCatalog = selectedSection?.catalog;
+
+  const visibleControls = useMemo(() => {
+    if (!selectedSection) return [];
+    return selectedSection.controls.filter((control) => {
+      const matchesStatus = statusFilter === "all" || control.status === statusFilter;
+      return matchesStatus && controlMatchesQuery(control, controlQuery);
+    });
+  }, [controlQuery, selectedSection, statusFilter]);
 
   useEffect(() => {
-    api
-      .getCompliance()
-      .then(setData)
-      .catch((e) => setError(e.message))
+    if (!frameworks.length || selectedFrameworkId) return;
+    const firstFailing = frameworks.find((framework) => !framework.disabled && framework.fail > 0);
+    const fallback = frameworks.find((framework) => !framework.disabled);
+    setSelectedFrameworkId(firstFailing?.id ?? fallback?.id ?? "");
+  }, [frameworks, selectedFrameworkId]);
+
+  const handleExportPack = async () => {
+    setExporting(true);
+    setExportError(null);
+    try {
+      const blob = await api.downloadCompliancePack();
+      const stamp = new Date().toISOString().slice(0, 10);
+      downloadBlobToFile(blob, `agent-bom-compliance-pack-${stamp}.json`);
+    } catch (err) {
+      setExportError(err instanceof Error ? err.message : "Failed to export compliance pack");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  useEffect(() => {
+    setControlQuery(queryParam);
+  }, [queryParam]);
+
+  useEffect(() => {
+    void Promise.allSettled([
+      api.getCompliance(scanParam),
+      api.getFrameworkCatalogs(),
+      api.getHubPosture(),
+    ])
+      .then(([complianceResult, catalogResult, hubResult]) => {
+        if (complianceResult.status === "fulfilled") {
+          setData(complianceResult.value);
+        } else {
+          const reason = complianceResult.reason;
+          setError(reason?.message ?? "Failed to load compliance view");
+          setErrorKind(_classifyApiErrorKind(reason));
+        }
+        if (catalogResult.status === "fulfilled") {
+          setMitreCatalog(catalogResult.value.frameworks?.mitre_attack ?? null);
+          setAtlasCatalog(catalogResult.value.frameworks?.mitre_atlas ?? null);
+        }
+        // Hub posture is best-effort: a missing endpoint shouldn't blank the page
+        if (hubResult.status === "fulfilled") {
+          setHubPosture(hubResult.value);
+        }
+      })
       .finally(() => setLoading(false));
-  }, []);
+  }, [scanParam]);
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-[60vh]">
-        <Loader2 className="w-6 h-6 text-zinc-500 animate-spin" />
-      </div>
+      <PageLoadingState
+        title="Loading compliance posture"
+        detail="Fetching framework coverage, catalog metadata, and hub posture evidence from the API."
+        data-testid="compliance-loading-state"
+      />
     );
   }
 
   if (error) {
+    const fallbackTitle = errorKind === "network" ? "Compliance view needs the agent-bom API" : undefined;
     return (
-      <div className="max-w-xl mx-auto mt-20 text-center space-y-4">
-        <ShieldX className="w-12 h-12 text-red-400 mx-auto" />
-        <h2 className="text-lg font-semibold text-zinc-200">Unable to load compliance data</h2>
-        <p className="text-sm text-zinc-500">
-          Make sure the API server is running: <code className="text-zinc-300">agent-bom api</code>
-        </p>
-        <p className="text-xs text-zinc-600">{error}</p>
-      </div>
+      <ApiOfflineState
+        title={fallbackTitle}
+        detail={error}
+        kind={errorKind}
+      />
     );
   }
 
   if (!data) return null;
 
-  const { summary: s } = data;
-  const hasMcp = data.has_mcp_context ?? false;
+  // Scored rows only, which is the same basis as `evaluated_controls`: the two
+  // reconcile by construction (ui/tests/compliance-reconciliation.test.ts).
+  // Technique catalogs have no pass/fail to add, and the independently scored
+  // NIST catalog rescores evidence these rows already counted.
+  const { pass: totalPass, warn: totalWarn, fail: totalFail } = complianceScoredTotals(frameworks);
+  const evaluatedFrameworks = frameworks.filter((f) => !f.disabled).length;
+  const overallNotEvaluated = isNotEvaluated(data.overall_status);
+
+  const kpis: StatStripItem[] = [
+    {
+      label: "Overall",
+      value: overallNotEvaluated ? "—" : `${Math.round(data.overall_score)}%`,
+      accent: statusToAccent(data.overall_status),
+      // The score is a percentage of EVALUATED controls, so it always ships its
+      // denominator. Without it, passing the handful of controls a scan can
+      // actually evaluate renders as a bare "100% / Compliant" over an estate
+      // that was almost entirely unmeasured.
+      hint: overallNotEvaluated
+        ? postureLabel(data.overall_status)
+        : `${postureLabel(data.overall_status)} · ${data.evaluated_controls} of ${data.total_controls} controls evaluated`,
+    },
+    {
+      label: "Frameworks",
+      value: evaluatedFrameworks,
+      hint: `${frameworks.length} tracked`,
+    },
+    {
+      label: "Passing",
+      value: totalPass,
+      accent: "success",
+      // Passing + Attention + Failing is exactly `evaluated_controls` above.
+      // Say so, because the page also shows a NIST 800-53 catalog line scored
+      // independently over the same evidence — a reader who adds it to these
+      // gets a larger number than the headline and no way to tell which is
+      // wrong.
+      hint: "of the evaluated controls",
+    },
+    { label: "Attention", value: totalWarn, accent: "warn", accentThreshold: 0 },
+    { label: "Failing", value: totalFail, accent: "critical", accentThreshold: 0 },
+  ];
+
+  // ── Frameworks master table ────────────────────────────────────────────────
+  const frameworkColumns: DataTableColumn<ComplianceFrameworkSummary>[] = [
+    {
+      key: "label",
+      header: "Framework",
+      cell: (f) => (
+        <div className="flex items-center gap-2">
+          <FrameworkIcon frameworkId={f.id} size={18} />
+          <div className="min-w-0">
+            <div className="truncate font-medium text-[color:var(--foreground)]">{f.shortLabel}</div>
+            <div className="truncate text-[11px] text-[color:var(--text-tertiary)]">{f.label}</div>
+          </div>
+        </div>
+      ),
+    },
+    {
+      key: "coverage",
+      header: "Coverage",
+      cell: (f) =>
+        f.disabled ? (
+          <span className="text-[11px] text-[color:var(--text-tertiary)]">
+            {f.disabledReason ?? "Not evaluated"}
+          </span>
+        ) : f.kind === "applicability" ? (
+          // A technique catalog reports which techniques the evidence puts in
+          // play. Rendering that as a pass/fail bar would claim the estate
+          // passed the ones nothing matched.
+          <span className="text-[11px] text-[color:var(--text-tertiary)]">
+            {f.applicable ?? 0} of {f.total} applicable
+          </span>
+        ) : (
+          <div className="flex items-center gap-2">
+            <CoverageBar pass={f.pass} warn={f.warn} fail={f.fail} total={f.total} />
+            <span className="tabular-nums text-[11px] text-[color:var(--text-tertiary)]">
+              {compliancePassRate(f)}%
+            </span>
+          </div>
+        ),
+    },
+    {
+      key: "fail",
+      header: "Fail",
+      align: "right",
+      sortable: true,
+      width: "4rem",
+      cell: (f) =>
+        f.kind === "applicability" ? (
+          <span className="text-[color:var(--text-tertiary)]">—</span>
+        ) : (
+          <span
+            className={
+              f.fail > 0 ? "font-semibold text-[color:var(--status-danger)]" : "text-[color:var(--text-tertiary)]"
+            }
+          >
+            {f.fail}
+          </span>
+        ),
+    },
+  ];
+
+  const master = (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-1 rounded-lg border border-[color:var(--border-subtle)] bg-[color:var(--surface-muted)] p-0.5">
+        {(["all", "ai", "governance", "cloud"] as const).map((value) => (
+          <button
+            key={value}
+            type="button"
+            onClick={() => setCategoryFilter(value)}
+            className={`rounded-md px-2.5 py-1 text-xs font-medium capitalize transition-colors ${
+              categoryFilter === value
+                ? "bg-[color:var(--surface-elevated)] text-[color:var(--foreground)]"
+                : "text-[color:var(--text-tertiary)] hover:text-[color:var(--text-secondary)]"
+            }`}
+          >
+            {value === "ai" ? "AI" : value}
+          </button>
+        ))}
+      </div>
+      <DataTable
+        rows={visibleFrameworks}
+        rowKey={(f) => f.id}
+        columns={frameworkColumns}
+        selectedKey={selectedSection?.id}
+        onRowClick={(f) => {
+          if (f.disabled) return;
+          // Benchmark rows are in the table because the headline counts them,
+          // but their evidence has its own drill-down below rather than a
+          // control list here. Selecting one would show a different framework's
+          // controls under its name.
+          if (!detailSections.some((section) => section.id === f.id)) return;
+          setSelectedFrameworkId(f.id);
+        }}
+        maxHeight="calc(100vh - 22rem)"
+        caption="Framework coverage"
+        empty="No frameworks in this category."
+        data-testid="compliance-frameworks-table"
+      />
+    </div>
+  );
+
+  // ── Controls detail table ──────────────────────────────────────────────────
+  const controlColumns: DataTableColumn<ComplianceControl>[] = [
+    {
+      key: "code",
+      header: "Control",
+      cell: (c) => (
+        <div className="min-w-0">
+          <div className="font-mono text-xs font-medium text-[color:var(--foreground)]">{c.code}</div>
+          <div className="truncate text-[11px] text-[color:var(--text-tertiary)]">
+            {sectionCatalog?.[c.code] ?? c.name}
+          </div>
+        </div>
+      ),
+    },
+    {
+      key: "status",
+      header: "Status",
+      width: "9rem",
+      cell: (c) => {
+        // Surface the provenance behind an unscored control: instead of a bare
+        // "Not evaluated", show WHY (e.g. "No completed scan"). The full CTA
+        // lives in the drawer; here it's a dense, honest one-liner.
+        const reason = isControlUnscored(c.status) ? evidenceReasonLabel(c.evidence_reason) : null;
+        return (
+          <div className="min-w-0">
+            <span className="inline-flex items-center gap-1.5">
+              <StatusIcon status={c.status} className="h-3.5 w-3.5" />
+              <span className={`text-xs font-medium ${statusColor(c.status)}`}>
+                {controlStatusLabel(c.status)}
+              </span>
+            </span>
+            {reason ? (
+              <span
+                className="mt-0.5 block truncate text-[10px] text-[color:var(--text-tertiary)]"
+                title={reason}
+                data-testid="control-evidence-reason"
+              >
+                {reason}
+              </span>
+            ) : null}
+          </div>
+        );
+      },
+    },
+    {
+      key: "findings",
+      header: "Findings",
+      align: "right",
+      width: "5rem",
+      cell: (c) =>
+        c.findings > 0 ? (
+          // Drill a non-zero count into the findings queue, scoped to this
+          // control's framework + control id. stopPropagation keeps the row
+          // click (which opens the evidence drawer) from also firing.
+          <Link
+            href={`/findings?framework=${encodeURIComponent(selectedSection?.id ?? "")}&control=${encodeURIComponent(c.code)}`}
+            onClick={(e) => e.stopPropagation()}
+            aria-label={`View ${c.findings} findings for ${c.code}`}
+            className="font-semibold text-[color:var(--accent)] underline-offset-2 hover:underline focus-visible:underline focus-visible:outline-none"
+          >
+            {c.findings}
+          </Link>
+        ) : (
+          <span className="text-[color:var(--text-tertiary)]">{c.findings}</span>
+        ),
+    },
+  ];
+
+  const detail = selectedSection ? (
+    <div className="flex h-full min-h-0 flex-col rounded-xl border border-[color:var(--border-subtle)] bg-[color:var(--surface)] elev-1">
+      <div className="border-b border-[color:var(--border-subtle)] p-4">
+        <div className="flex items-center gap-2">
+          <FrameworkIcon frameworkId={selectedSection.id} size={22} />
+          <h2 className="text-base font-semibold text-[color:var(--foreground)]">
+            {selectedSection.title}
+          </h2>
+        </div>
+        {selectedSection.subtitle ? (
+          <p className="mt-0.5 text-xs text-[color:var(--text-tertiary)]">{selectedSection.subtitle}</p>
+        ) : null}
+        <p className="mt-1 text-xs text-[color:var(--text-tertiary)]">
+          {visibleControls.length} of {selectedSection.controls.length} controls shown · click a row for evidence
+        </p>
+        <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center">
+          <div className="relative min-w-0 flex-1">
+            <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[color:var(--text-tertiary)]" />
+            <input
+              type="text"
+              value={controlQuery}
+              onChange={(e) => setControlQuery(e.target.value)}
+              placeholder="Search control, package, agent"
+              className="w-full rounded-lg border border-[color:var(--border-subtle)] bg-[color:var(--surface-elevated)] py-2 pl-9 pr-3 text-sm text-[color:var(--foreground)] placeholder-[color:var(--text-tertiary)] focus:border-[color:var(--border-strong)] focus:outline-none"
+            />
+          </div>
+          <div className="flex items-center gap-1 rounded-lg border border-[color:var(--border-subtle)] bg-[color:var(--surface-muted)] p-0.5">
+            {(["all", "fail", "warning", "pass"] as const).map((value) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() => setStatusFilter(value)}
+                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                  statusFilter === value
+                    ? "bg-[color:var(--surface-elevated)] text-[color:var(--foreground)]"
+                    : "text-[color:var(--text-tertiary)] hover:text-[color:var(--text-secondary)]"
+                }`}
+              >
+                {value === "all" ? "All" : value === "pass" ? "Pass" : value === "warning" ? "Warn" : "Fail"}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto p-3">
+        {selectedSection.controls.length === 0 && selectedSection.emptyMessage ? (
+          <div className="rounded-xl border border-[color:var(--border-subtle)] bg-[color:var(--surface-muted)] p-5 text-sm text-[color:var(--text-tertiary)]">
+            {selectedSection.emptyMessage}
+          </div>
+        ) : (
+          <DataTable
+            rows={visibleControls}
+            rowKey={(c) => c.code}
+            columns={controlColumns}
+            onRowClick={(control) =>
+              setSelectedControl({
+                control,
+                frameworkLabel: selectedSection.title,
+                catalog: selectedSection.catalog,
+              })
+            }
+            selectedKey={selectedControl?.control.code}
+            caption={`${selectedSection.title} controls`}
+            empty="No controls match the current filters."
+          />
+        )}
+      </div>
+    </div>
+  ) : null;
 
   return (
-    <div className="space-y-8">
-      {/* ── Posture Header ─────────────────────────────────────────────── */}
-      <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6">
-        <div className="flex items-center gap-6">
-          <ScoreRing score={data.overall_score} status={data.overall_status} />
-          <div className="flex-1 space-y-2">
-            <div className="flex items-center gap-3">
-              <PostureIcon status={data.overall_status} />
-              <div>
-                <h1 className={`text-xl font-bold ${statusColor(data.overall_status)}`}>
-                  {postureLabel(data.overall_status)}
-                </h1>
-                <p className="text-sm text-zinc-500">
-                  AI Supply Chain Compliance Posture
-                </p>
-              </div>
-            </div>
-            <div className="flex gap-6 text-xs text-zinc-500">
-              <span>
-                {data.scan_count} scan{data.scan_count !== 1 ? "s" : ""} analyzed
-              </span>
-              {data.latest_scan && (
-                <span>Latest: {formatDate(data.latest_scan)}</span>
-              )}
-            </div>
+    <div className="space-y-5">
+      {/* ── Trust center header ─────────────────────────────────────────── */}
+      <div className="flex flex-col gap-3 rounded-2xl border border-[color:var(--border-subtle)] bg-[color:var(--surface)] p-4 elev-1 lg:flex-row lg:items-center lg:justify-between">
+        <div className="min-w-0">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-[color:var(--text-tertiary)]">
+            Trust center
+          </p>
+          <h1 className={`text-xl font-bold ${statusColor(data.overall_status)}`}>
+            {postureLabel(data.overall_status)}
+          </h1>
+          <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-[color:var(--text-tertiary)]">
+            <span>
+              {data.scan_count} scan{data.scan_count !== 1 ? "s" : ""} analyzed
+            </span>
+            {data.latest_scan ? <span>Latest {formatDate(data.latest_scan)}</span> : null}
+            <span>{totalFail} failing controls</span>
           </div>
+          <p
+            className="mt-2 max-w-3xl text-xs leading-relaxed text-[color:var(--text-secondary)]"
+            data-testid="compliance-helper-disclaimer"
+          >
+            Curated evidence helper for AI/MCP/agent risk — not a certification, audit opinion, or complete
+            control catalog. Validate mapped controls against your environment and auditor scope.
+          </p>
         </div>
-
-        {/* Framework mini-cards */}
-        <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mt-6">
-          <div className="bg-zinc-950 rounded-xl p-4 border border-zinc-800">
-            <div className="text-xs text-zinc-500 mb-1">OWASP LLM Top 10</div>
-            <div className="flex items-baseline gap-2">
-              <span className="text-2xl font-bold text-zinc-100">{s.owasp_pass}</span>
-              <span className="text-sm text-zinc-500">/ 10 pass</span>
-            </div>
-            <div className="flex gap-2 mt-2 text-xs">
-              {s.owasp_fail > 0 && <span className="text-red-400">{s.owasp_fail} fail</span>}
-              {s.owasp_warn > 0 && <span className="text-yellow-400">{s.owasp_warn} warn</span>}
-            </div>
-          </div>
-          <div className={`bg-zinc-950 rounded-xl p-4 border border-zinc-800 ${!hasMcp ? "opacity-40" : ""}`}>
-            <div className="text-xs text-amber-500/80 mb-1">OWASP MCP Top 10</div>
-            {hasMcp ? (
-              <>
-                <div className="flex items-baseline gap-2">
-                  <span className="text-2xl font-bold text-zinc-100">{s.owasp_mcp_pass}</span>
-                  <span className="text-sm text-zinc-500">/ 10 pass</span>
-                </div>
-                <div className="flex gap-2 mt-2 text-xs">
-                  {s.owasp_mcp_fail > 0 && <span className="text-red-400">{s.owasp_mcp_fail} fail</span>}
-                  {s.owasp_mcp_warn > 0 && <span className="text-yellow-400">{s.owasp_mcp_warn} warn</span>}
-                </div>
-              </>
-            ) : (
-              <div className="text-xs text-zinc-600 mt-1">No MCP servers detected</div>
-            )}
-          </div>
-          <div className="bg-zinc-950 rounded-xl p-4 border border-zinc-800">
-            <div className="text-xs text-zinc-500 mb-1">MITRE ATLAS</div>
-            <div className="flex items-baseline gap-2">
-              <span className="text-2xl font-bold text-zinc-100">{s.atlas_pass}</span>
-              <span className="text-sm text-zinc-500">/ {data.mitre_atlas.length} pass</span>
-            </div>
-            <div className="flex gap-2 mt-2 text-xs">
-              {s.atlas_fail > 0 && <span className="text-red-400">{s.atlas_fail} fail</span>}
-              {s.atlas_warn > 0 && <span className="text-yellow-400">{s.atlas_warn} warn</span>}
-            </div>
-          </div>
-          <div className="bg-zinc-950 rounded-xl p-4 border border-zinc-800">
-            <div className="text-xs text-zinc-500 mb-1">NIST AI RMF</div>
-            <div className="flex items-baseline gap-2">
-              <span className="text-2xl font-bold text-zinc-100">{s.nist_pass}</span>
-              <span className="text-sm text-zinc-500">/ {data.nist_ai_rmf.length} pass</span>
-            </div>
-            <div className="flex gap-2 mt-2 text-xs">
-              {s.nist_fail > 0 && <span className="text-red-400">{s.nist_fail} fail</span>}
-              {s.nist_warn > 0 && <span className="text-yellow-400">{s.nist_warn} warn</span>}
-            </div>
-          </div>
-          <div className={`bg-zinc-950 rounded-xl p-4 border border-zinc-800 ${!hasMcp ? "opacity-40" : ""}`}>
-            <div className="text-xs text-fuchsia-500/80 mb-1">OWASP Agentic Top 10</div>
-            {hasMcp ? (
-              <>
-                <div className="flex items-baseline gap-2">
-                  <span className="text-2xl font-bold text-zinc-100">{s.owasp_agentic_pass}</span>
-                  <span className="text-sm text-zinc-500">/ 10 pass</span>
-                </div>
-                <div className="flex gap-2 mt-2 text-xs">
-                  {s.owasp_agentic_fail > 0 && <span className="text-red-400">{s.owasp_agentic_fail} fail</span>}
-                  {s.owasp_agentic_warn > 0 && <span className="text-yellow-400">{s.owasp_agentic_warn} warn</span>}
-                </div>
-              </>
-            ) : (
-              <div className="text-xs text-zinc-600 mt-1">No agents detected</div>
-            )}
-          </div>
-          <div className="bg-zinc-950 rounded-xl p-4 border border-zinc-800">
-            <div className="text-xs text-blue-500/80 mb-1">EU AI Act</div>
-            <div className="flex items-baseline gap-2">
-              <span className="text-2xl font-bold text-zinc-100">{s.eu_ai_act_pass}</span>
-              <span className="text-sm text-zinc-500">/ {data.eu_ai_act.length} pass</span>
-            </div>
-            <div className="flex gap-2 mt-2 text-xs">
-              {s.eu_ai_act_fail > 0 && <span className="text-red-400">{s.eu_ai_act_fail} fail</span>}
-              {s.eu_ai_act_warn > 0 && <span className="text-yellow-400">{s.eu_ai_act_warn} warn</span>}
-            </div>
-          </div>
-        </div>
+        <button
+          onClick={() => void handleExportPack()}
+          disabled={exporting}
+          title="Download a signed evidence pack covering every framework"
+          className="flex shrink-0 items-center gap-1.5 self-start rounded-lg border border-[color:var(--accent-border)] bg-[color:var(--accent-soft)] px-3 py-2 text-sm font-medium text-[color:var(--accent)] transition-colors hover:bg-[color:var(--accent-soft-hover)] disabled:opacity-50"
+          data-testid="compliance-export-pack"
+        >
+          {exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+          {exporting ? "Exporting…" : "Export pack"}
+        </button>
       </div>
+      {exportError ? (
+        <p className="text-right text-xs text-[color:var(--status-danger)]">{exportError}</p>
+      ) : null}
+
+      <StatStrip items={kpis} data-testid="compliance-kpi-strip" />
 
       {/* ── View Toggle ────────────────────────────────────────────────── */}
-      <div className="flex items-center gap-2">
-        <button
-          onClick={() => setViewMode("detail")}
-          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-            viewMode === "detail"
-              ? "bg-emerald-600 text-white"
-              : "bg-zinc-800 text-zinc-400 hover:text-zinc-200 border border-zinc-700"
-          }`}
-        >
-          <List className="w-3.5 h-3.5" />
-          Detail
-        </button>
-        <button
-          onClick={() => setViewMode("heatmap")}
-          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-            viewMode === "heatmap"
-              ? "bg-emerald-600 text-white"
-              : "bg-zinc-800 text-zinc-400 hover:text-zinc-200 border border-zinc-700"
-          }`}
-        >
-          <Grid3X3 className="w-3.5 h-3.5" />
-          Heatmap
-        </button>
-        <button
-          onClick={() => setViewMode("matrix")}
-          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-            viewMode === "matrix"
-              ? "bg-emerald-600 text-white"
-              : "bg-zinc-800 text-zinc-400 hover:text-zinc-200 border border-zinc-700"
-          }`}
-        >
-          <Scan className="w-3.5 h-3.5" />
-          Matrix
-        </button>
+      <div className="flex items-center gap-1 rounded-lg border border-[color:var(--border-subtle)] bg-[color:var(--surface-muted)] p-0.5 self-start w-fit">
+        {(
+          [
+            { key: "detail", label: "Detail", icon: List },
+            { key: "heatmap", label: "Heatmap", icon: Grid3X3 },
+            { key: "matrix", label: "Matrix", icon: Scan },
+          ] as const
+        ).map(({ key, label, icon: Icon }) => (
+          <button
+            key={key}
+            type="button"
+            onClick={() => setViewMode(key)}
+            className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+              viewMode === key
+                ? "bg-[color:var(--accent-soft)] text-[color:var(--accent)]"
+                : "text-[color:var(--text-tertiary)] hover:text-[color:var(--text-secondary)]"
+            }`}
+          >
+            <Icon className="h-3.5 w-3.5" />
+            {label}
+          </button>
+        ))}
       </div>
 
-      {/* ── Heatmap View ──────────────────────────────────────────────── */}
       {viewMode === "heatmap" && <ComplianceHeatmap data={data} />}
-
-      {/* ── Matrix View ───────────────────────────────────────────────── */}
-      {viewMode === "matrix" && <ComplianceMatrix data={data} />}
-
-      {/* ── Detail View ───────────────────────────────────────────────── */}
-      {viewMode === "detail" && (
-      <>
-
-      {/* ── Framework Coverage Bars ────────────────────────────────────── */}
-      <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 space-y-5">
-        <h2 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider">Framework Coverage</h2>
-        <FrameworkBar label="OWASP LLM Top 10" pass={s.owasp_pass} warn={s.owasp_warn} fail={s.owasp_fail} total={10} />
-        <FrameworkBar label="MITRE ATLAS" pass={s.atlas_pass} warn={s.atlas_warn} fail={s.atlas_fail} total={data.mitre_atlas.length} />
-        {hasMcp && <FrameworkBar label="OWASP MCP Top 10" pass={s.owasp_mcp_pass} warn={s.owasp_mcp_warn} fail={s.owasp_mcp_fail} total={10} />}
-        <FrameworkBar label="NIST AI RMF" pass={s.nist_pass} warn={s.nist_warn} fail={s.nist_fail} total={data.nist_ai_rmf.length} />
-        {hasMcp && <FrameworkBar label="OWASP Agentic Top 10" pass={s.owasp_agentic_pass} warn={s.owasp_agentic_warn} fail={s.owasp_agentic_fail} total={10} />}
-        <FrameworkBar label="EU AI Act" pass={s.eu_ai_act_pass} warn={s.eu_ai_act_warn} fail={s.eu_ai_act_fail} total={data.eu_ai_act.length} />
-      </div>
-
-      {/* ── OWASP LLM Top 10 ──────────────────────────────────────────── */}
-      <section>
-        <div className="flex items-center gap-2 mb-4">
-          <Shield className="w-5 h-5 text-emerald-400" />
-          <h2 className="text-lg font-semibold text-zinc-200">OWASP LLM Top 10</h2>
-          <span className="text-xs text-zinc-500 ml-2">2025 Edition</span>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          {data.owasp_llm_top10.map((c) => (
-            <ControlCard key={c.code} control={c} catalog={OWASP_LLM_TOP10} />
-          ))}
-        </div>
-      </section>
-
-      {/* ── OWASP MCP Top 10 ─────────────────────────────────────────── */}
-      {hasMcp ? (
-      <section>
-        <div className="flex items-center gap-2 mb-4">
-          <Shield className="w-5 h-5 text-amber-400" />
-          <h2 className="text-lg font-semibold text-zinc-200">OWASP MCP Top 10</h2>
-          <span className="text-xs text-zinc-500 ml-2">MCP Security Risks</span>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          {data.owasp_mcp_top10.map((c) => (
-            <ControlCard key={c.code} control={c} catalog={OWASP_MCP_TOP10} />
-          ))}
-        </div>
-      </section>
-      ) : (
-      <section>
-        <div className="flex items-center gap-2 mb-4">
-          <Shield className="w-5 h-5 text-amber-400 opacity-40" />
-          <h2 className="text-lg font-semibold text-zinc-500">OWASP MCP Top 10</h2>
-        </div>
-        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 text-center">
-          <p className="text-sm text-zinc-500">MCP framework analysis not applicable — no MCP servers detected</p>
-          <p className="text-xs text-zinc-600 mt-2">Run an agent discovery scan to include MCP server data</p>
-        </div>
-      </section>
+      {viewMode === "matrix" && (
+        <ComplianceMatrix
+          data={data}
+          onSelectControl={(selection) => setSelectedControl(selection)}
+        />
       )}
 
-      {/* ── MITRE ATLAS ───────────────────────────────────────────────── */}
-      <section>
-        <div className="flex items-center gap-2 mb-4">
-          <Shield className="w-5 h-5 text-blue-400" />
-          <h2 className="text-lg font-semibold text-zinc-200">MITRE ATLAS</h2>
-          <span className="text-xs text-zinc-500 ml-2">Adversarial ML Techniques</span>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          {data.mitre_atlas.map((c) => (
-            <ControlCard key={c.code} control={c} catalog={MITRE_ATLAS} />
-          ))}
-        </div>
-      </section>
+      {viewMode === "detail" ? (
+        <>
+          <SplitLayout
+            masterWidth="24rem"
+            height="calc(100vh - 20rem)"
+            master={master}
+            detail={detail}
+            placeholder="Select a framework to review its controls and evidence."
+            data-testid="compliance-split"
+          />
 
-      {/* ── NIST AI RMF ───────────────────────────────────────────────── */}
-      <section>
-        <div className="flex items-center gap-2 mb-4">
-          <Shield className="w-5 h-5 text-purple-400" />
-          <h2 className="text-lg font-semibold text-zinc-200">NIST AI RMF 1.0</h2>
-          <span className="text-xs text-zinc-500 ml-2">Govern / Map / Measure / Manage</span>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          {data.nist_ai_rmf.map((c) => (
-            <ControlCard key={c.code} control={c} catalog={NIST_AI_RMF} />
-          ))}
-        </div>
-      </section>
+          <ComplianceNistCatalog />
 
-      {/* ── OWASP Agentic Top 10 ─────────────────────────────────────── */}
-      {hasMcp ? (
-      <section>
-        <div className="flex items-center gap-2 mb-4">
-          <Shield className="w-5 h-5 text-fuchsia-400" />
-          <h2 className="text-lg font-semibold text-zinc-200">OWASP Agentic Top 10</h2>
-          <span className="text-xs text-zinc-500 ml-2">2026 Edition</span>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          {data.owasp_agentic_top10.map((c) => (
-            <ControlCard key={c.code} control={c} catalog={OWASP_AGENTIC_TOP10} />
-          ))}
-        </div>
-      </section>
-      ) : (
-      <section>
-        <div className="flex items-center gap-2 mb-4">
-          <Shield className="w-5 h-5 text-fuchsia-400 opacity-40" />
-          <h2 className="text-lg font-semibold text-zinc-500">OWASP Agentic Top 10</h2>
-        </div>
-        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 text-center">
-          <p className="text-sm text-zinc-500">Agentic framework analysis not applicable — no AI agents detected</p>
-          <p className="text-xs text-zinc-600 mt-2">Run an agent discovery scan to include agent data</p>
-        </div>
-      </section>
-      )}
+          <Collapsible
+            title="Cloud CIS benchmark drill-down"
+            subtitle="AWS / Azure / GCP / Snowflake / Databricks"
+            icon={Scan}
+            defaultOpen={false}
+          >
+            <CISBenchmarkDetail />
+          </Collapsible>
 
-      {/* ── EU AI Act ────────────────────────────────────────────────── */}
-      <section>
-        <div className="flex items-center gap-2 mb-4">
-          <Shield className="w-5 h-5 text-blue-400" />
-          <h2 className="text-lg font-semibold text-zinc-200">EU AI Act</h2>
-          <span className="text-xs text-zinc-500 ml-2">Regulation (EU) 2024/1689</span>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          {data.eu_ai_act.map((c) => (
-            <ControlCard key={c.code} control={c} catalog={EU_AI_ACT} />
-          ))}
-        </div>
-      </section>
+          {(hubPosture && hubPosture.totals.combined > 0) || mitreCatalog || atlasCatalog ? (
+            <Collapsible title="Operator & catalog context" defaultOpen={false}>
+              <div className="space-y-3 text-xs text-[color:var(--text-tertiary)]">
+                {hubPosture && hubPosture.totals.combined > 0 ? (
+                  <p>
+                    Compliance hub: {hubPosture.totals.combined.toLocaleString()} findings (
+                    {hubPosture.totals.native.toLocaleString()} native ·{" "}
+                    {hubPosture.totals.hub.toLocaleString()} ingested). Import via{" "}
+                    <code className="rounded bg-[color:var(--surface-muted)] px-1 py-0.5">
+                      POST /v1/compliance/ingest
+                    </code>
+                    .
+                  </p>
+                ) : null}
+                {mitreCatalog ? (
+                  <p>
+                    MITRE ATT&CK {mitreCatalog.attack_version || "catalog"} ·{" "}
+                    {mitreCatalog.technique_count} techniques · refresh with{" "}
+                    <code className="rounded bg-[color:var(--surface-muted)] px-1 py-0.5">
+                      agent-bom db update-frameworks
+                    </code>
+                    .
+                  </p>
+                ) : null}
+                {atlasCatalog ? (
+                  <p>
+                    MITRE ATLAS {atlasCatalog.atlas_version || "catalog"} ·{" "}
+                    {atlasCatalog.technique_count} techniques · refresh with{" "}
+                    <code className="rounded bg-[color:var(--surface-muted)] px-1 py-0.5">
+                      agent-bom db update-frameworks --framework atlas
+                    </code>
+                    .
+                  </p>
+                ) : null}
+              </div>
+            </Collapsible>
+          ) : null}
+        </>
+      ) : null}
 
-      </>
-      )}
+      {selectedControl ? (
+        <ComplianceControlDrawer
+          control={selectedControl.control}
+          frameworkLabel={selectedControl.frameworkLabel}
+          catalogName={selectedControl.catalog?.[selectedControl.control.code]}
+          onClose={() => setSelectedControl(null)}
+        />
+      ) : null}
 
       {/* ── Empty state ───────────────────────────────────────────────── */}
       {data.scan_count === 0 && (
-        <div className="text-center py-12 space-y-4">
-          <Scan className="w-12 h-12 text-zinc-600 mx-auto" />
-          <h3 className="text-lg font-medium text-zinc-300">No scans yet</h3>
-          <p className="text-sm text-zinc-500 max-w-md mx-auto">
-            Run a scan to populate the compliance posture dashboard.
-            Compliance scores are computed from OWASP, ATLAS, and NIST
-            framework tags on your blast radius findings.
-          </p>
-          <Link
-            href="/scan"
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium transition-colors"
-          >
-            <Scan className="w-4 h-4" />
-            Start a Scan
-          </Link>
-        </div>
+        <PageEmptyState
+          title="No compliance scans yet"
+          detail="Run a scan to populate framework coverage, control status, affected packages, and governance evidence."
+          icon={Scan}
+          suggestions={[
+            "Start with a local scan to generate compliance-tagged findings.",
+            "Open findings after the scan to verify the evidence behind failed controls.",
+            "Use the matrix view once multiple frameworks have populated control coverage.",
+          ]}
+          command="agent-bom agents --demo --offline"
+          actions={FIRST_EVIDENCE_ACTIONS}
+          data-testid="compliance-empty-state"
+        />
       )}
     </div>
+  );
+}
+
+export default function CompliancePage() {
+  return (
+    <Suspense
+      fallback={
+        <PageLoadingState
+          title="Loading compliance posture"
+          detail="Preparing framework controls and scan-derived posture summaries."
+        />
+      }
+    >
+      <CompliancePageContent />
+    </Suspense>
   );
 }

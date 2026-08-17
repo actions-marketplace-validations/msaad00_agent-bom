@@ -12,9 +12,11 @@ from __future__ import annotations
 import logging
 import os
 
+from agent_bom.discovery_envelope import RedactionStatus, ScanMode, attach_envelope_to_agents
 from agent_bom.models import Agent, AgentType, MCPServer, MCPTool, Package, TransportType
 
 from .base import CloudDiscoveryError
+from .normalization import build_cloud_origin
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +47,7 @@ def discover(
     agents: list[Agent] = []
     warnings: list[str] = []
 
-    resolved_token = token or os.environ.get("HF_TOKEN", "")
+    resolved_token = token or os.environ.get("HF_TOKEN") or ""
 
     author = organization or username
     if not author and not resolved_token:
@@ -79,6 +81,19 @@ def discover(
         except Exception as exc:
             warnings.append(f"HF inference endpoint discovery error: {exc}")
 
+    # Per-run discovery envelope (#2083 PR B).
+    attach_envelope_to_agents(
+        agents,
+        scan_mode=ScanMode.SAAS_READ_ONLY,
+        discovery_scope=("huggingface:hub",),
+        permissions_used=(
+            "huggingface:models:list",
+            "huggingface:models:get",
+            "huggingface:spaces:list",
+            "huggingface:inference-endpoints:list",
+        ),
+        redaction_status=RedactionStatus.CENTRAL_SANITIZER_APPLIED,
+    )
     return agents, warnings
 
 
@@ -127,6 +142,14 @@ def _discover_models(
 
         # Parse model card metadata (YAML frontmatter)
         card_meta = _parse_model_card(model)
+        card_meta["cloud_origin"] = build_cloud_origin(
+            provider="huggingface",
+            service="hub",
+            resource_type="model",
+            resource_id=model_id,
+            resource_name=model_id,
+            raw_identity={"id": model_id, "library_name": library, "pipeline_tag": pipeline_tag},
+        )
 
         agent = Agent(
             name=f"hf-model:{model_id}",
@@ -186,6 +209,16 @@ def _discover_spaces(
             source="huggingface-space",
             version=sdk or None,
             mcp_servers=[server],
+            metadata={
+                "cloud_origin": build_cloud_origin(
+                    provider="huggingface",
+                    service="spaces",
+                    resource_type="space",
+                    resource_id=space_id,
+                    resource_name=space_id,
+                    raw_identity={"id": space_id, "sdk": sdk},
+                )
+            },
         )
         agents.append(agent)
 
@@ -229,6 +262,16 @@ def _discover_inference_endpoints(
             source="huggingface-endpoint",
             version=str(status),
             mcp_servers=[server],
+            metadata={
+                "cloud_origin": build_cloud_origin(
+                    provider="huggingface",
+                    service="inference-endpoints",
+                    resource_type="endpoint",
+                    resource_id=ep_name,
+                    resource_name=ep_name,
+                    raw_identity={"name": ep_name, "status": status, "framework": framework},
+                )
+            },
         )
         agents.append(agent)
 

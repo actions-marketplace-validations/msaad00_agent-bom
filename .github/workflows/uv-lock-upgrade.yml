@@ -12,15 +12,18 @@ jobs:
   upgrade:
     name: Upgrade uv.lock
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
       pull-requests: write
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@e06108dd0aef18192324c70427afc47652e63a82 # v7.5.0
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           python-version: '3.11'
 
@@ -28,6 +31,7 @@ jobs:
         run: uv lock --upgrade
 
       - name: Check for changes
+        shell: bash
         id: diff
         run: |
           if git diff --quiet uv.lock; then
@@ -38,18 +42,47 @@ jobs:
             git diff uv.lock | grep '^[+-].*version' | grep -v '^---\|^+++' | head -50 >> "$GITHUB_STEP_SUMMARY" || true
           fi
 
-      - name: Open PR if lockfile changed
+      - name: Configure signed automation commits
+        id: signing
         if: steps.diff.outputs.changed == 'true'
+        env:
+          AUTOMATION_SSH_SIGNING_KEY: ${{ secrets.AUTOMATION_SSH_SIGNING_KEY }}
+        run: |
+          if [ -z "$AUTOMATION_SSH_SIGNING_KEY" ]; then
+            # Graceful skip: scheduled runs on repos without the signing
+            # secret previously hard-failed daily.  Skip the PR-open step
+            # and exit successfully so the cron stops alerting.  Repos
+            # that want signed automation PRs can set the secret per
+            # docs/AUTOMATION_SIGNING.md and the next run will sign.
+            echo "AUTOMATION_SSH_SIGNING_KEY not configured — skipping PR creation."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          eval "$(ssh-agent -s)"
+          ssh-add - <<< "$AUTOMATION_SSH_SIGNING_KEY"
+          pubkey_path="$RUNNER_TEMP/automation_signing_key.pub"
+          ssh-keygen -y -f <(printf '%s\n' "$AUTOMATION_SSH_SIGNING_KEY") > "$pubkey_path"
+          git config user.name "github-actions[bot]"
+          git config user.email "34316639+msaad00@users.noreply.github.com"
+          git config gpg.format ssh
+          git config user.signingkey "$pubkey_path"
+          git config commit.gpgsign true
+          {
+            echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK"
+            echo "SSH_AGENT_PID=$SSH_AGENT_PID"
+          } >> "$GITHUB_ENV"
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open PR if lockfile changed
+        if: steps.diff.outputs.changed == 'true' && steps.signing.outputs.configured == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           BRANCH="chore/uv-lock-upgrade-$(date +%Y%m%d)"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH"
+          git switch -C "$BRANCH" origin/main
           git add uv.lock
-          git commit -m "chore: weekly uv.lock upgrade"
-          git push origin "$BRANCH"
+          git commit -S -m "chore: weekly uv.lock upgrade"
+          git push --force-with-lease origin "$BRANCH"
           BODY=$(cat <<'PREOF'
           Weekly automated lockfile refresh via `uv lock --upgrade`.
 
@@ -60,10 +93,22 @@ jobs:
           - [ ] No unexpected major version bumps
           PREOF
           )
-          gh pr create \
-            --title "chore: weekly uv.lock upgrade $(date +%Y-%m-%d)" \
-            --body "$BODY" \
-            --base main
+          PR_NUMBER=$(gh pr list --head "$BRANCH" --base main --json number --jq '.[0].number')
+          if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
+            gh pr edit "$PR_NUMBER" \
+              --title "chore: weekly uv.lock upgrade $(date +%Y-%m-%d)" \
+              --body "$BODY"
+          else
+            gh pr create \
+              --title "chore: weekly uv.lock upgrade $(date +%Y-%m-%d)" \
+              --body "$BODY" \
+              --base main
+          fi
+
+      - name: Stop signing agent
+        if: always() && steps.diff.outputs.changed == 'true' && steps.signing.outputs.configured == 'true'
+        run: |
+          ssh-agent -k || true
 
       - name: No changes
         if: steps.diff.outputs.changed == 'false'

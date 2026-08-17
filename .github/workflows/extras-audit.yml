@@ -1,0 +1,69 @@
+name: Extras Dependency Audit
+
+on:
+  pull_request:
+    paths:
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/extras-audit.yml
+  schedule:
+    - cron: "0 8 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-extras:
+    name: Audit extras (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api-runtime
+            extras: "api oidc runtime"
+          - name: mcp-surface
+            extras: "mcp-server graph"
+          - name: analytics-ui
+            extras: "postgres dashboard lake"
+          - name: cloud-surface
+            extras: "cloud"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-python
+        with:
+          python-version: "3.11"
+
+      - name: Install selected extras
+        run: |
+          args=""
+          for extra in ${{ matrix.extras }}; do
+            args="$args --extra $extra"
+          done
+          uv sync $args
+
+      - name: Capture resolved dependency tree
+        run: |
+          mkdir -p audit
+          uv tree > "audit/${{ matrix.name }}-tree.txt"
+
+      - name: Audit selected extras with pip-audit
+        run: |
+          mkdir -p audit
+          # Ignore no-fix advisories from the temporary pip-audit tool environment
+          # and resolved auth libraries until upstream publishes a patched release.
+          uv run --with pip-audit pip-audit \
+            --ignore-vuln CVE-2026-3219 \
+            --ignore-vuln PYSEC-2025-183 \
+            --format json \
+            --output "audit/${{ matrix.name }}-pip-audit.json"
+
+      - name: Upload extras audit artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: extras-audit-${{ matrix.name }}
+          path: audit/

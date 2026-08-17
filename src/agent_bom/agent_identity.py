@@ -8,14 +8,21 @@ Two supported token formats:
 - **JWT** (three base64url parts): payload decoded, ``sub`` claim used as
   ``agent_id``.  When ``jwks_uri`` is set in policy, the signature is
   cryptographically verified (RS256/ES256/RS384/ES384).  Expiry (``exp``) is
-  always checked.  The ``none`` algorithm is always rejected.
+  always checked.  The ``none`` algorithm is always rejected.  Enforced
+  identity mode requires JWT verification; unsigned JWTs are only accepted in
+  non-blocking audit mode.
 - **Opaque token**: looked up in ``policy.agent_tokens`` dict
   (``{token: agent_id}``).
 
 Policy keys:
-- ``jwks_uri``: URL to a JWKS endpoint for signature verification
+- ``jwks_uri``: URL to a JWKS endpoint for signature verification. When set
+  directly, ``expected_audience`` MUST also be set or JWT verification fails
+  closed — otherwise a validly-signed token minted for a different relying
+  party by the same IdP keys would be accepted (audience confusion).
 - ``oidc_issuer``: OIDC issuer base URL; ``jwks_uri`` auto-discovered via
-  ``{issuer}/.well-known/openid-configuration``
+  ``{issuer}/.well-known/openid-configuration`` (issuer is pinned)
+- ``expected_audience`` / ``expected_issuer``: pinned ``aud`` / ``iss`` claims;
+  ``expected_audience`` is required alongside a direct ``jwks_uri``
 - ``require_agent_identity``: if true, calls without a valid identity are
   blocked
 - ``agent_tokens``: opaque token → agent_id mapping
@@ -31,7 +38,10 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
+
+from agent_bom.security import sanitize_log_label
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +55,14 @@ _ACCEPTED_ALGORITHMS = ["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"]
 _jwks_cache: dict[str, tuple[dict, float]] = {}
 _jwks_lock = threading.Lock()
 _JWKS_CACHE_TTL = 3600.0  # 1 hour
+
+
+def _sanitize_identity_error(error: str) -> str:
+    """Return a bounded single-line identity validation reason."""
+
+    sanitized = sanitize_log_label(error, max_len=240)
+    sanitized = sanitized.replace("\\r", " ").replace("\\n", " ").replace("\\t", " ")
+    return sanitize_log_label(sanitized, max_len=240) or "identity validation failed"
 
 
 # ─── JWKS helpers ────────────────────────────────────────────────────────────
@@ -107,8 +125,34 @@ def _resolve_jwks_uri(policy: dict) -> str | None:
     return None
 
 
-def _verify_jwt_signature(token: str, jwks_uri: str) -> tuple[bool, str | None]:
+def _resolve_expected_aud_iss(policy: dict) -> tuple[str | None, str | None]:
+    """Return the ``(expected_audience, expected_issuer)`` the policy pins.
+
+    Audience accepts ``expected_audience``/``audience``; issuer accepts
+    ``expected_issuer``/``oidc_issuer``. Any value is enforced during JWT decode
+    so a validly-signed token minted for a different aud/iss is rejected. Absent
+    values leave the corresponding claim unenforced (back-compatible).
+    """
+    aud = policy.get("expected_audience") or policy.get("audience")
+    iss = policy.get("expected_issuer") or policy.get("oidc_issuer")
+    aud_str = str(aud).strip() if isinstance(aud, str) and aud.strip() else None
+    iss_str = str(iss).strip() if isinstance(iss, str) and iss.strip() else None
+    return aud_str, iss_str
+
+
+def _verify_jwt_signature(
+    token: str,
+    jwks_uri: str,
+    *,
+    expected_audience: str | None = None,
+    expected_issuer: str | None = None,
+) -> tuple[bool, str | None]:
     """Cryptographically verify a JWT signature using a JWKS endpoint.
+
+    When ``expected_audience`` / ``expected_issuer`` are provided the ``aud`` /
+    ``iss`` claims are pinned during decode, so a validly-signed token minted for
+    a different audience or issuer is rejected (audience-confusion defense). When
+    they are ``None`` the corresponding claim is not enforced (back-compatible).
 
     Returns (verified, error_message).  On library-unavailable or network
     failure, returns (False, reason) so the caller can decide whether to
@@ -152,15 +196,28 @@ def _verify_jwt_signature(token: str, jwks_uri: str) -> tuple[bool, str | None]:
                 public_key = ECAlgorithm.from_jwk(json.dumps(jwk))  # type: ignore[assignment]
             else:
                 continue
-            # Verify signature only; expiry is checked separately
+            # Verify signature (expiry is checked separately by the caller).
+            # aud/iss are pinned when the policy provides expected values so a
+            # token minted for a different audience/issuer is rejected.
+            decode_kwargs: dict[str, Any] = {
+                "algorithms": [alg],
+                "options": {"verify_exp": False, "verify_aud": expected_audience is not None},
+            }
+            if expected_audience is not None:
+                decode_kwargs["audience"] = expected_audience
+            if expected_issuer is not None:
+                decode_kwargs["issuer"] = expected_issuer
             pyjwt.decode(
                 token,
                 public_key,  # type: ignore[arg-type]
-                algorithms=[alg],
-                options={"verify_exp": False, "verify_aud": False},
+                **decode_kwargs,
             )
             return True, None
-        except Exception:  # noqa: BLE001
+        except (pyjwt.InvalidAudienceError, pyjwt.InvalidIssuerError) as claim_err:
+            # Signature is valid but the token targets a different aud/iss —
+            # fail closed immediately; other keys cannot change the claim.
+            return False, f"JWT claim mismatch: {claim_err}"
+        except (ValueError, KeyError, TypeError, pyjwt.PyJWTError):
             continue
 
     return False, "JWT signature verification failed (no matching key succeeded)"
@@ -185,7 +242,7 @@ def _decode_jwt_payload(token: str) -> dict | None:
     try:
         payload_bytes = base64.urlsafe_b64decode(payload_b64)
         return json.loads(payload_bytes.decode("utf-8"))
-    except Exception:  # noqa: BLE001
+    except (ValueError, KeyError, UnicodeDecodeError, json.JSONDecodeError):
         return None
 
 
@@ -195,6 +252,20 @@ def _looks_like_jwt(token: str) -> bool:
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
+
+
+_LOCAL_IDENTITY_VERIFIER: Callable[[str], tuple[str, str | None]] | None = None
+
+
+def set_local_identity_verifier(verifier: Callable[[str], tuple[str, str | None]] | None) -> None:
+    """Register a resolver for agent-bom-issued ``abi_`` identity tokens.
+
+    The control-plane identity lifecycle store registers this so issued tokens
+    resolve to their agent_id and revoked/expired ones fail closed, without this
+    low-level module importing the API layer.
+    """
+    global _LOCAL_IDENTITY_VERIFIER
+    _LOCAL_IDENTITY_VERIFIER = verifier
 
 
 def extract_identity_token(msg: dict) -> str | None:
@@ -241,17 +312,44 @@ def resolve_agent_id(token: str, policy: dict) -> tuple[str, str | None]:
             except (TypeError, ValueError):
                 return ANONYMOUS, "Invalid JWT exp claim"
 
-        # Cryptographic signature verification when JWKS is configured
+        # Cryptographic signature verification when JWKS is configured. In
+        # enforced mode, a JWT without verification policy is not an identity.
         jwks_uri = _resolve_jwks_uri(policy)
         if jwks_uri:
-            verified, sig_err = _verify_jwt_signature(token, jwks_uri)
+            expected_audience, expected_issuer = _resolve_expected_aud_iss(policy)
+            # Fail closed on audience confusion: a directly-configured jwks_uri
+            # MUST pin an audience. Without it, a validly-signed token minted by
+            # the same IdP keys for a DIFFERENT relying party would be accepted
+            # (verify_aud=False). A jwks_uri derived from oidc_issuer already pins
+            # the issuer, so this requirement is scoped to the direct config.
+            if policy.get("jwks_uri") and not expected_audience:
+                return (
+                    ANONYMOUS,
+                    "JWT audience pinning required: set expected_audience (and ideally expected_issuer) when configuring jwks_uri directly",
+                )
+            verified, sig_err = _verify_jwt_signature(
+                token,
+                jwks_uri,
+                expected_audience=expected_audience,
+                expected_issuer=expected_issuer,
+            )
             if not verified:
                 return ANONYMOUS, f"JWT signature invalid: {sig_err}"
+        elif policy.get("require_agent_identity"):
+            return ANONYMOUS, "JWT signature verification required: configure jwks_uri or oidc_issuer"
 
         agent_id = claims.get("sub") or claims.get("agent_id") or claims.get("name")
         if not agent_id or not isinstance(agent_id, str):
             return ANONYMOUS, "JWT missing sub/agent_id/name claim"
         return agent_id.strip(), None
+
+    # agent-bom-issued lifecycle token: resolve via the registered verifier so
+    # revoked/expired identities fail closed (provisioning/rotation/revocation).
+    if token.startswith("abi_") and _LOCAL_IDENTITY_VERIFIER is not None:
+        agent_id, error = _LOCAL_IDENTITY_VERIFIER(token)
+        if error is not None:
+            return ANONYMOUS, error
+        return agent_id, None
 
     # Opaque token: look up in policy.agent_tokens
     agent_tokens: dict = policy.get("agent_tokens", {})
@@ -288,9 +386,74 @@ def check_identity(
     agent_id, error = resolve_agent_id(token, policy)
 
     if error is not None:
-        logger.debug("Identity token error: %s", error)
+        safe_error = _sanitize_identity_error(error)
+        logger.debug("Identity token error: %s", safe_error)
         if policy.get("require_agent_identity"):
-            return agent_id, f"Identity required: {error}"
+            return agent_id, f"Identity required: {safe_error}"
         return ANONYMOUS, None
 
     return agent_id, None
+
+
+def identity_token_scopes(token: str) -> set[str]:
+    """Extract OAuth scopes from a JWT identity token's claims.
+
+    Reads the standard ``scope`` (space-delimited string) or ``scp`` (string or
+    list) claim. Returns an empty set for opaque tokens or tokens without a
+    scope claim. The token's signature is NOT (re)verified here — callers must
+    have already validated the token (the gateway verifies via JWKS / the AS
+    before reading scopes), so this only parses the already-trusted payload.
+    """
+    if not _looks_like_jwt(token):
+        return set()
+    claims = _decode_jwt_payload(token)
+    if not isinstance(claims, dict):
+        return set()
+    return scopes_from_claims(claims)
+
+
+def scopes_from_claims(claims: dict) -> set[str]:
+    """Return the OAuth scope set declared in a JWT claims dict."""
+    scopes: set[str] = set()
+    raw_scope = claims.get("scope")
+    if isinstance(raw_scope, str):
+        scopes |= {s for s in raw_scope.replace(",", " ").split() if s}
+    scp = claims.get("scp")
+    if isinstance(scp, str):
+        scopes |= {s for s in scp.replace(",", " ").split() if s}
+    elif isinstance(scp, (list, tuple)):
+        scopes |= {str(s) for s in scp if str(s).strip()}
+    return scopes
+
+
+def check_caller_identity(
+    msg: dict,
+    policy: dict,
+) -> tuple[str, bool, str | None]:
+    """Resolve caller identity while preserving the token-present signal.
+
+    Unlike :func:`check_identity` — which collapses a present-but-invalid token
+    and a fully-absent token to the same ``(ANONYMOUS, None)`` result when
+    ``require_agent_identity`` is unset — this returns enough information for a
+    caller (e.g. the gateway relay) to fail closed on an invalid/revoked token
+    while still treating a fully-missing identity as a separate, configurable
+    case.
+
+    Returns:
+        ``(agent_id, token_present, invalid_reason)`` where:
+        - ``token_present`` is True when a structurally-present identity token
+          was supplied in ``_meta.agent_identity`` (whether or not it resolved).
+        - ``invalid_reason`` is a sanitized string when a token *was* present
+          but failed to resolve (malformed / expired / unsigned / unknown /
+          revoked); None when no token was present or the token resolved
+          cleanly. A non-None ``invalid_reason`` means the caller must fail
+          closed regardless of ``require_agent_identity``.
+    """
+    token = extract_identity_token(msg)
+    if token is None:
+        return ANONYMOUS, False, None
+
+    agent_id, error = resolve_agent_id(token, policy)
+    if error is not None:
+        return ANONYMOUS, True, _sanitize_identity_error(error)
+    return agent_id, True, None

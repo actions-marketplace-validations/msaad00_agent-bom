@@ -1,0 +1,86 @@
+controlPlane:
+  enabled: true
+  postgresSecrets:
+    enabled: true
+    appSecretRef:
+      name: agent-bom-control-plane-db
+    maintenanceSecretRef:
+      name: agent-bom-control-plane-maintenance
+    adminSecretRef:
+      name: agent-bom-control-plane-admin
+  api:
+    replicas: 2
+    envFrom:
+      - secretRef:
+          name: agent-bom-control-plane-auth
+  ui:
+    replicas: 2
+    env:
+      - name: NEXT_PUBLIC_API_URL
+        value: ""
+  ingress:
+    enabled: true
+    className: nginx
+    hosts:
+      - host: agent-bom.internal.example.com
+        apiPaths:
+          - path: /v1
+            pathType: Prefix
+          - path: /scim
+            pathType: Prefix
+          - path: /health
+            pathType: Prefix
+          - path: /docs
+            pathType: Prefix
+          - path: /redoc
+            pathType: Prefix
+          - path: /openapi.json
+            pathType: Prefix
+          - path: /ws
+            pathType: Prefix
+        uiPaths:
+          - path: /
+            pathType: Prefix
+
+scanner:
+  enabled: true
+  allNamespaces: true
+  extraArgs:
+    - --k8s-mcp
+    - --k8s-all-namespaces
+    - --introspect
+    - --enforce
+    - --preset
+    - enterprise
+
+monitor:
+  enabled: false
+
+pdb:
+  enabled: true
+  minAvailable: 1
+
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::REPLACE_ME_ACCOUNT_ID:role/REPLACE_ME_AGENT_BOM_DISCOVERY_ROLE
+
+networkPolicy:
+  enabled: true
+  restrictIngress: true
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: agent-bom
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: controller
+      ports:
+        - protocol: TCP
+          port: 8422
+        - protocol: TCP
+          port: 3000

@@ -2,9 +2,17 @@
 
 Maps agent-bom blast radius findings to the NIST CSF 2.0 six-function model
 (Govern, Identify, Protect, Detect, Respond, Recover).  Every finding triggers
-at minimum ID.RA-01 (vulnerability identification) and GV.SC-05 (supply chain
-risk management) since any package CVE in an AI agent dependency tree
-represents both.
+at minimum GV.SC-05 / GV.SC-07 (supply chain risk management) since any package
+CVE in an AI agent dependency tree is supplier risk reaching the estate.
+
+Only CORRECTIVE / PREVENTIVE categories are tagged here. The DETECTIVE
+categories — ID.RA-01 "Vulnerabilities in assets are identified", ID.RA-02
+"Cyber threat intelligence received from information sharing forums", and
+DE.CM-09 "Computing hardware and software are monitored for vulnerabilities" —
+are IMPLEMENTED BY this scan and its KEV/EPSS enrichment. Tagging a finding
+onto them would fail the control the finding proves is working, so they are
+scored from scan freshness instead
+(see :mod:`agent_bom.evidence.control_modes`).
 
 Reference: https://www.nist.gov/cyberframework
 """
@@ -15,7 +23,8 @@ from typing import TYPE_CHECKING
 
 from agent_bom.constants import AI_PACKAGES as _AI_PACKAGES
 from agent_bom.constants import high_risk_severities
-from agent_bom.risk_analyzer import ToolCapability, classify_tool
+from agent_bom.evidence.control_modes import finding_taggable_controls
+from agent_bom.risk_analyzer import ToolCapability, classify_mcp_tool
 
 if TYPE_CHECKING:
     from agent_bom.models import BlastRadius
@@ -55,8 +64,6 @@ def tag_blast_radius(br: BlastRadius) -> list[str]:
 
     Rules:
     - GV.SC-05: Always — any CVE in a dependency is a supply chain risk.
-    - ID.RA-01: Always — vulnerability identified in an asset.
-    - ID.RA-02: KEV/EPSS enriched (threat intelligence applied).
     - ID.RA-05: HIGH+ severity (risk assessment needed).
     - ID.AM-05: AI framework package (critical asset classification).
     - GV.SC-07: Supplier risk recorded (always with vuln).
@@ -64,7 +71,6 @@ def tag_blast_radius(br: BlastRadius) -> list[str]:
     - PR.AA-03: EXECUTE-capable tools (authentication bypass risk).
     - PR.DS-01: READ-capable tools + credentials (data-at-rest risk).
     - PR.DS-02: >3 affected agents (data-in-transit across agents).
-    - DE.CM-09: Always — vulnerability monitoring triggered.
     - DE.CM-01: >1 affected agent (network-level monitoring needed).
     - RS.AN-03: Fixable vulnerability (analysis for remediation).
     - RS.MI-02: KEV vulnerability (active exploitation, containment needed).
@@ -72,8 +78,6 @@ def tag_blast_radius(br: BlastRadius) -> list[str]:
     tags: set[str] = {
         "GV.SC-05",  # always — supply chain risk
         "GV.SC-07",  # always — supplier risk recorded
-        "ID.RA-01",  # always — vulnerability identified
-        "DE.CM-09",  # always — vulnerability monitoring
     }
 
     is_high = br.vulnerability.severity in _HIGH_RISK
@@ -81,17 +85,13 @@ def tag_blast_radius(br: BlastRadius) -> list[str]:
     has_exec = False
     has_read = False
     for tool in br.exposed_tools:
-        caps = classify_tool(tool.name, tool.description)
+        caps = classify_mcp_tool(tool)
         if ToolCapability.EXECUTE in caps:
             has_exec = True
         if ToolCapability.READ in caps:
             has_read = True
 
     is_ai_pkg = br.package.name.lower() in _AI_PACKAGES
-
-    # ID.RA-02 — threat intelligence applied (KEV or EPSS enrichment)
-    if br.vulnerability.is_kev or (br.vulnerability.epss_score or 0) > 0:
-        tags.add("ID.RA-02")
 
     # ID.RA-05 — risk assessment for high-severity findings
     if is_high:
@@ -131,13 +131,11 @@ def tag_blast_radius(br: BlastRadius) -> list[str]:
 
     # CWE-based compliance tagging (applies to all vulns with CWE data)
     if br.vulnerability.cwe_ids:
-        from agent_bom.constants import CWE_COMPLIANCE_MAP
+        from agent_bom.framework_mapping import controls_for_cwes
 
-        for cwe in br.vulnerability.cwe_ids:
-            for tag in CWE_COMPLIANCE_MAP.get(cwe.upper(), {}).get("nist_csf", []):
-                tags.add(tag)
+        tags.update(controls_for_cwes(br.vulnerability.cwe_ids, "nist_csf"))
 
-    return sorted(tags)
+    return sorted(finding_taggable_controls("nist_csf_tags", tags))
 
 
 def nist_csf_label(code: str) -> str:

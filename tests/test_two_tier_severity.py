@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from io import StringIO
 from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
+from rich.console import Console
 
 from agent_bom.cli import main
 
@@ -51,7 +53,7 @@ def _run_scan_with_findings(
     blast_radii: list,
     extra_args: list[str] | None = None,
 ):
-    """Invoke `agent-bom scan` with mocked scan output returning the given blast radii.
+    """Invoke `agent-bom agents` with mocked scan output returning the given blast radii.
 
     Uses a minimal agent with one package so the scan step is reached.
     Mocks scan_agents_sync to return the provided blast radii.
@@ -67,13 +69,13 @@ def _run_scan_with_findings(
         mcp_servers=[server],
     )
 
-    args = ["scan"] + (extra_args or [])
+    args = ["scan", "--no-auto-update-db"] + (extra_args or [])
 
     with (
-        patch("agent_bom.cli.scan.discover_all", return_value=[mock_agent]),
-        patch("agent_bom.cli.scan.scan_agents_sync", return_value=blast_radii),
-        patch("agent_bom.cli.scan.extract_packages", return_value=[pkg]),
-        patch("agent_bom.cli.scan.resolve_all_versions_sync", return_value=None),
+        patch("agent_bom.cli.agents.discover_all", return_value=[mock_agent]),
+        patch("agent_bom.cli.agents.scan_agents_sync", return_value=blast_radii),
+        patch("agent_bom.cli.agents.extract_packages", return_value=[pkg]),
+        patch("agent_bom.cli.agents.resolve_all_versions_sync", return_value=None),
         patch("agent_bom.vex.is_vex_suppressed", return_value=False),
     ):
         return runner.invoke(main, args, catch_exceptions=False)
@@ -133,12 +135,66 @@ def test_fail_on_severity_exits_one():
     assert result.exit_code == 1
 
 
+def test_fail_on_severity_exits_one_for_unified_non_cve_finding():
+    """--fail-on-severity should include unified findings such as MCP_BLOCKLIST."""
+    from agent_bom.cli.agents._context import ScanContext
+    from agent_bom.cli.agents._post import compute_exit_code
+    from agent_bom.finding import Asset, Finding, FindingSource, FindingType
+    from agent_bom.models import AIBOMReport
+
+    finding = Finding(
+        finding_type=FindingType.MCP_BLOCKLIST,
+        source=FindingSource.MCP_SCAN,
+        asset=Asset(name="bad-mcp", asset_type="mcp_server", location="mcp.json"),
+        severity="high",
+        title="Blocked MCP",
+    )
+    report = AIBOMReport(findings=[finding])
+    ctx = ScanContext(con=Console(file=StringIO(), force_terminal=False), report=report)
+
+    assert (
+        compute_exit_code(
+            ctx,
+            fail_on_severity="high",
+            warn_on_severity=None,
+            fail_on_kev=False,
+            fail_if_ai_risk=False,
+            push_url=None,
+            push_api_key=None,
+            quiet=True,
+        )
+        == 1
+    )
+
+
+def test_fail_on_severity_accepts_uppercase_choice():
+    """--fail-on-severity should normalize case like --warn-on."""
+    runner = CliRunner()
+    br = _make_blast_radius("high", "CVE-2025-HIGH")
+    result = _run_scan_with_findings(runner, [br], extra_args=["--fail-on-severity", "HIGH"])
+    assert result.exit_code == 1
+
+
 def test_fail_on_severity_exits_zero_no_match():
     """--fail-on-severity=critical with only a MEDIUM finding → exit 0."""
     runner = CliRunner()
     br = _make_blast_radius("medium")
     result = _run_scan_with_findings(runner, [br], extra_args=["--fail-on-severity", "critical"])
     assert result.exit_code == 0
+
+
+def test_fail_on_severity_fails_closed_on_unknown_severity():
+    """An UNKNOWN-severity CVE must trip an active --fail-on-severity gate.
+
+    Regression: UNKNOWN ranks below every selectable threshold, so a naive rank
+    comparison let un-enriched CVEs silently pass the gate (fail-open). The gate
+    is now fail-closed for UNKNOWN/NONE.
+    """
+    runner = CliRunner()
+    br = _make_blast_radius("unknown", "CVE-2025-UNKNOWN")
+    # Operator asks to fail on low+; an unknown-severity finding must not slip past.
+    result = _run_scan_with_findings(runner, [br], extra_args=["--fail-on-severity", "low"])
+    assert result.exit_code == 1
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +249,7 @@ async def test_scan_impl_warn_severity_warn_status():
 
     raw = await scan_impl(
         warn_severity="medium",
+        auto_update_db=False,
         _run_scan_pipeline=_mock_pipeline,
         _truncate_response=lambda x: x,
     )
@@ -224,6 +281,7 @@ async def test_scan_impl_warn_severity_pass_status():
 
     raw = await scan_impl(
         warn_severity="high",
+        auto_update_db=False,
         _run_scan_pipeline=_mock_pipeline,
         _truncate_response=lambda x: x,
     )
@@ -243,9 +301,11 @@ def test_preset_ci_sets_warn_on_high():
     # Verify the preset==ci block assigns warn_on_severity via AST inspection
     # (avoids the cost of a full scan invocation).
     import ast
-    import pathlib
+    import inspect
 
-    src = pathlib.Path("src/agent_bom/cli/scan/__init__.py").read_text()
+    from agent_bom.cli.agents import scan
+
+    src = inspect.getsource(scan.callback)
     tree = ast.parse(src)
 
     # Find the preset == "ci" block and verify warn_on_severity assignment

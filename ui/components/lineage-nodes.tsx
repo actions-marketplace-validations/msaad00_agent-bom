@@ -1,279 +1,787 @@
 "use client";
 
+import type { ComponentType, ReactNode } from "react";
 import { Handle, Position } from "@xyflow/react";
-import {
-  ShieldAlert,
-  Server,
-  Package,
-  Bug,
-  KeyRound,
-  Wrench,
-} from "lucide-react";
+import { Bug, KeyRound, Package, Wrench } from "lucide-react";
+
 import { severityColor } from "@/lib/api";
+import type { ReachBreakdown } from "@/lib/effective-reach";
+import {
+  ENTITY_ICONS,
+  entityIcon,
+  type EntityIcon,
+  type LineageNodeType,
+} from "@/lib/entity-icons";
 
-// ─── Shared types ────────────────────────────────────────────────────────────
+// ENTITY_ICONS / entityIcon / LineageNodeType / EntityIcon now live in
+// `@/lib/entity-icons` (the shared source of truth). Re-exported here so the
+// many existing `@/components/lineage-nodes` importers keep working unchanged.
+export { ENTITY_ICONS, entityIcon };
+export type { EntityIcon, LineageNodeType };
 
-export type LineageNodeType =
-  | "agent"
-  | "server"
-  | "package"
-  | "vulnerability"
-  | "credential"
-  | "tool"
-  | "sharedServer";
+export type RuntimeEvidenceTier = "static_scan" | "runtime_observed" | "runtime_blocked";
 
 export type LineageNodeData = {
   label: string;
   nodeType: LineageNodeType;
-  // Agent
-  agentType?: string;
-  agentStatus?: string;
-  serverCount?: number;
-  packageCount?: number;
-  vulnCount?: number;
+  entityType?: string | undefined;
+  status?: string | undefined;
+  riskScore?: number | undefined;
+  firstSeen?: string | undefined;
+  lastSeen?: string | undefined;
+  dataSources?: string[] | undefined;
+  complianceTags?: string[] | undefined;
+  attributes?: Record<string, unknown> | undefined;
+  neighborCount?: number | undefined;
+  sourceCount?: number | undefined;
+  incomingEdgeCount?: number | undefined;
+  outgoingEdgeCount?: number | undefined;
+  impactCount?: number | undefined;
+  maxImpactDepth?: number | undefined;
+  impactByType?: Record<string, number> | undefined;
+  // Agent / provider
+  agentType?: string | undefined;
+  agentStatus?: string | undefined;
+  agentCount?: number | undefined;
+  serverCount?: number | undefined;
+  packageCount?: number | undefined;
+  vulnCount?: number | undefined;
   // Server / Shared Server
-  toolCount?: number;
-  credentialCount?: number;
-  command?: string;
-  sharedBy?: number;
-  sharedAgents?: string[];
-  // Package
-  ecosystem?: string;
-  version?: string;
-  versionSource?: string;
-  registryVersion?: string;
-  // Vulnerability
-  severity?: string;
-  cvssScore?: number;
-  epssScore?: number;
-  isKev?: boolean;
-  fixedVersion?: string;
-  owaspTags?: string[];
-  atlasTags?: string[];
+  toolCount?: number | undefined;
+  credentialCount?: number | undefined;
+  command?: string | undefined;
+  sharedBy?: number | undefined;
+  sharedAgents?: string[] | undefined;
+  // Package / model / dataset
+  ecosystem?: string | undefined;
+  version?: string | undefined;
+  versionSource?: string | undefined;
+  versionConfidence?: string | undefined;
+  registryVersion?: string | undefined;
+  // Vulnerability / misconfiguration
+  severity?: string | undefined;
+  cvssScore?: number | undefined;
+  epssScore?: number | undefined;
+  isKev?: boolean | undefined;
+  effectiveReach?: ReachBreakdown | undefined;
+  fixedVersion?: string | undefined;
+  owaspTags?: string[] | undefined;
+  atlasTags?: string[] | undefined;
   // Credential
-  serverName?: string;
-  // Tool
-  description?: string;
+  serverName?: string | undefined;
+  // Tool / generic assets
+  description?: string | undefined;
   // Highlighting
-  dimmed?: boolean;
-  highlighted?: boolean;
-  // Critical / KEV animation flag
-  isCritical?: boolean;
+  dimmed?: boolean | undefined;
+  highlighted?: boolean | undefined;
+  isCritical?: boolean | undefined;
+  // Evidence redaction tier (#2261) — per-row badge in lineage detail panel.
+  evidenceTier?: "safe_to_store" | "replay_only" | undefined;
+  /** Runtime evidence overlay (#3610) — static vs observed vs blocked graph paths. */
+  runtimeEvidenceTier?: RuntimeEvidenceTier | undefined;
+  evidenceCaptureReplay?: boolean | undefined;
+  evidenceNotAfter?: string | undefined;
+  renderBand?: "detail" | "summary" | "cluster" | undefined;
 };
 
-// ─── Agent Node ──────────────────────────────────────────────────────────────
+type CardProps = {
+  data: LineageNodeData;
+  borderClass: string;
+  bgClass: string;
+  ringClass: string;
+  shapeClass?: string;
+  iconClass: string;
+  source?: boolean;
+  target?: boolean;
+  footer?: ReactNode;
+  subtitle?: ReactNode;
+};
+
+const RUNTIME_EVIDENCE_CHIP: Record<
+  RuntimeEvidenceTier,
+  { label: string; className: string }
+> = {
+  static_scan: {
+    label: "Static",
+    className:
+      "border-[var(--border-strong)] bg-[var(--surface-muted)] text-[var(--text-secondary)]",
+  },
+  runtime_observed: {
+    label: "Observed",
+    className:
+      "border-sky-500/30 dark:border-sky-800/70 bg-sky-500/10 dark:bg-sky-950/50 text-sky-700 dark:text-sky-300",
+  },
+  runtime_blocked: {
+    label: "Blocked",
+    className:
+      "border-rose-500/30 dark:border-rose-800/70 bg-rose-500/10 dark:bg-rose-950/50 text-rose-700 dark:text-rose-300",
+  },
+};
+
+function RuntimeEvidenceChip({ tier }: { tier: RuntimeEvidenceTier }) {
+  const chip = RUNTIME_EVIDENCE_CHIP[tier];
+  return (
+    <span
+      className={`rounded border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide ${chip.className}`}
+    >
+      {chip.label}
+    </span>
+  );
+}
+
+function NodeCard({
+  data,
+  borderClass,
+  bgClass,
+  ringClass,
+  shapeClass = "rounded-xl",
+  iconClass,
+  source = true,
+  target = true,
+  subtitle,
+  footer,
+}: CardProps) {
+  // The glyph is keyed by entity type from the shared ENTITY_ICONS map, so the
+  // node and its legend row are always the same icon — even for the renderers
+  // shared across several types (e.g. CredentialNode serves role/policy/grants).
+  const Icon = entityIcon(data.nodeType);
+  const isRollupContainer = data.attributes?.rollup_is_container === true;
+  return (
+    <div
+      title={data.label}
+      data-rollup-container={isRollupContainer ? "true" : undefined}
+      className={`${shapeClass} border-2 px-4 py-3 min-w-[208px] max-w-[300px] shadow-xl backdrop-blur transition-opacity ${
+        isRollupContainer
+          ? "border-[color:var(--border-strong)] bg-[color:var(--surface-elevated)]"
+          : `${borderClass} ${bgClass}`
+      } ${
+        data.dimmed ? "opacity-25" : ""
+      } ${data.highlighted ? `ring-2 ${ringClass}` : ""}`}
+    >
+      <Handle
+        type="target"
+        position={Position.Left}
+        className={`!w-2 !h-2 !bg-current ${target ? "" : "!opacity-0"}`}
+      />
+      <Handle
+        type="source"
+        position={Position.Right}
+        className={`!w-2 !h-2 !bg-current ${source ? "" : "!opacity-0"}`}
+      />
+      <div className="mb-1 flex min-w-0 items-center gap-2">
+        <Icon className={`w-[18px] h-[18px] shrink-0 ${iconClass}`} />
+        <span className="min-w-0 flex-1 truncate text-[15px] font-semibold leading-5 text-[var(--foreground)]">
+          {data.label}
+        </span>
+        <span className="ml-auto shrink-0 rounded border border-[color:var(--border-subtle)] bg-[color:var(--surface)] px-1.5 py-0.5 text-[10px] uppercase tracking-[0.1em] text-[var(--text-secondary)]">
+          {NODE_TYPE_BADGES[data.nodeType]}
+        </span>
+        {data.runtimeEvidenceTier && data.runtimeEvidenceTier !== "static_scan" ? (
+          <RuntimeEvidenceChip tier={data.runtimeEvidenceTier} />
+        ) : null}
+      </div>
+      {subtitle && (
+        <div className="text-xs leading-4 text-[var(--text-secondary)] truncate">
+          {subtitle}
+        </div>
+      )}
+      {footer}
+    </div>
+  );
+}
+
+const NODE_TYPE_BADGES: Record<LineageNodeType, string> = {
+  provider: "Provider",
+  agent: "Agent",
+  server: "Server",
+  package: "Package",
+  vulnerability: "CVE",
+  misconfiguration: "Config",
+  credential: "Cred ref",
+  tool: "Tool",
+  model: "Model",
+  framework: "Framework",
+  dataset: "Dataset",
+  container: "Container",
+  cloudResource: "Cloud",
+  org: "Org",
+  account: "Account",
+  user: "User",
+  group: "Group",
+  role: "Role",
+  policy: "Policy",
+  serviceAccount: "Service",
+  servicePrincipal: "Principal",
+  federatedIdentity: "Federated",
+  environment: "Env",
+  fleet: "Fleet",
+  cluster: "Cluster",
+  sharedServer: "Shared",
+  managedIdentity: "Identity",
+  accessGrant: "Grant",
+  accessPolicy: "Policy",
+  driftIncident: "Drift",
+  dataStore: "Data",
+  directory: "Folder",
+  sourceFile: "Source",
+  configFile: "Config",
+  codeModule: "Module",
+  ciJob: "CI job",
+  apiGateway: "Gateway",
+  toolCall: "Tool call",
+  blueprint: "Blueprint",
+};
 
 function AgentNode({ data }: { data: LineageNodeData }) {
   const notConfigured = data.agentStatus === "installed-not-configured";
   return (
-    <div
-      className={`rounded-lg border-2 px-3 py-2 min-w-[150px] max-w-[210px] shadow-lg backdrop-blur transition-opacity ${
+    <NodeCard
+      data={data}
+      borderClass={
         notConfigured
-          ? "border-yellow-600 bg-yellow-950/80 border-dashed"
-          : "border-emerald-600 bg-emerald-950/80"
-      } ${data.dimmed ? "opacity-25" : ""} ${data.highlighted ? "ring-2 ring-emerald-400" : ""}`}
-    >
-      <Handle type="source" position={Position.Right} className="!bg-emerald-500 !w-2 !h-2" />
-      <div className="flex items-center gap-1.5 mb-0.5">
-        <ShieldAlert className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-        <span className="text-xs font-semibold text-zinc-100 truncate">{data.label}</span>
-      </div>
-      {data.agentType && (
-        <div className="text-[10px] text-zinc-400 truncate">{data.agentType}</div>
-      )}
-      <div className="flex gap-2 mt-1 text-[10px] text-zinc-500">
-        {data.serverCount !== undefined && <span>{data.serverCount} srv</span>}
-        {data.packageCount !== undefined && <span>{data.packageCount} pkg</span>}
-        {data.vulnCount !== undefined && data.vulnCount > 0 && (
-          <span className="text-red-400">{data.vulnCount} vuln</span>
-        )}
-      </div>
-    </div>
+          ? "border-yellow-500 border-dashed"
+          : "border-emerald-500 dark:border-emerald-600"
+      }
+      bgClass={
+        notConfigured
+          ? "bg-yellow-50 dark:bg-yellow-950/80"
+          : "bg-emerald-50 dark:bg-emerald-950/80"
+      }
+      ringClass="ring-emerald-400"
+      iconClass="text-emerald-600 dark:text-emerald-400"
+      target={false}
+      subtitle={data.agentType}
+      footer={
+        <div className="flex gap-2 mt-1 text-[10px] text-[var(--text-tertiary)]">
+          {data.serverCount !== undefined && (
+            <span>{data.serverCount} srv</span>
+          )}
+          {data.packageCount !== undefined && (
+            <span>{data.packageCount} pkg</span>
+          )}
+          {(data.vulnCount ?? 0) > 0 && (
+            <span className="text-red-400">{data.vulnCount} finding</span>
+          )}
+        </div>
+      }
+    />
   );
 }
 
-// ─── Server Node ─────────────────────────────────────────────────────────────
+function ProviderNode({ data }: { data: LineageNodeData }) {
+  return (
+    <NodeCard
+      data={data}
+      borderClass="border-[var(--border-subtle)]"
+      bgClass="bg-[var(--surface)]"
+      ringClass="ring-[var(--border-strong)]"
+      iconClass="text-[var(--text-tertiary)]"
+      target={false}
+      footer={
+        data.agentCount !== undefined ? (
+          <div className="mt-1 text-[10px] text-[var(--text-tertiary)]">
+            {data.agentCount} agents
+          </div>
+        ) : undefined
+      }
+    />
+  );
+}
+
+function IdentityNode({
+  data,
+  borderClass,
+  bgClass,
+  ringClass,
+  iconClass,
+  subtitle,
+}: {
+  data: LineageNodeData;
+  borderClass: string;
+  bgClass: string;
+  ringClass: string;
+  iconClass: string;
+  subtitle?: ReactNode;
+}) {
+  return (
+    <NodeCard
+      data={data}
+      borderClass={borderClass}
+      bgClass={bgClass}
+      ringClass={ringClass}
+      iconClass={iconClass}
+      subtitle={subtitle}
+    />
+  );
+}
+
+function UserNode({ data }: { data: LineageNodeData }) {
+  return (
+    <IdentityNode
+      data={data}
+      borderClass="border-emerald-400 dark:border-emerald-700"
+      bgClass="bg-emerald-50 dark:bg-emerald-950/60"
+      ringClass="ring-emerald-400"
+      iconClass="text-emerald-600 dark:text-emerald-300"
+      subtitle={data.description}
+    />
+  );
+}
+
+function GroupNode({ data }: { data: LineageNodeData }) {
+  return (
+    <IdentityNode
+      data={data}
+      borderClass="border-fuchsia-400 dark:border-fuchsia-700"
+      bgClass="bg-fuchsia-50 dark:bg-fuchsia-950/55"
+      ringClass="ring-fuchsia-400"
+      iconClass="text-fuchsia-600 dark:text-fuchsia-300"
+      subtitle={data.description}
+    />
+  );
+}
+
+function ServiceAccountNode({ data }: { data: LineageNodeData }) {
+  return (
+    <IdentityNode
+      data={data}
+      borderClass="border-amber-400 dark:border-amber-700"
+      bgClass="bg-amber-50 dark:bg-amber-950/55"
+      ringClass="ring-amber-400"
+      iconClass="text-amber-600 dark:text-amber-300"
+      subtitle={data.description}
+    />
+  );
+}
+
+function StructureNode({
+  data,
+  borderClass,
+  bgClass,
+  ringClass,
+  iconClass,
+}: {
+  data: LineageNodeData;
+  borderClass: string;
+  bgClass: string;
+  ringClass: string;
+  iconClass: string;
+}) {
+  return (
+    <NodeCard
+      data={data}
+      borderClass={borderClass}
+      bgClass={bgClass}
+      ringClass={ringClass}
+      iconClass={iconClass}
+      subtitle={data.description}
+      footer={
+        <div className="flex gap-2 mt-1 text-[10px] text-[var(--text-tertiary)]">
+          {data.agentCount !== undefined && (
+            <span>{data.agentCount} agents</span>
+          )}
+          {data.serverCount !== undefined && (
+            <span>{data.serverCount} servers</span>
+          )}
+        </div>
+      }
+    />
+  );
+}
+
+function EnvironmentNode({ data }: { data: LineageNodeData }) {
+  return (
+    <StructureNode
+      data={data}
+      borderClass="border-teal-400 dark:border-teal-700"
+      bgClass="bg-teal-50 dark:bg-teal-950/55"
+      ringClass="ring-teal-400"
+      iconClass="text-teal-600 dark:text-teal-300"
+    />
+  );
+}
+
+function FleetNode({ data }: { data: LineageNodeData }) {
+  return (
+    <StructureNode
+      data={data}
+      borderClass="border-cyan-400 dark:border-cyan-700"
+      bgClass="bg-cyan-50 dark:bg-cyan-950/55"
+      ringClass="ring-cyan-400"
+      iconClass="text-cyan-600 dark:text-cyan-300"
+    />
+  );
+}
+
+function ClusterNode({ data }: { data: LineageNodeData }) {
+  return (
+    <StructureNode
+      data={data}
+      borderClass="border-sky-400 dark:border-sky-700"
+      bgClass="bg-sky-50 dark:bg-sky-950/55"
+      ringClass="ring-sky-400"
+      iconClass="text-sky-600 dark:text-sky-300"
+    />
+  );
+}
 
 function ServerNode({ data }: { data: LineageNodeData }) {
   return (
-    <div
-      className={`rounded-lg border-2 px-3 py-2 min-w-[140px] max-w-[200px] shadow-lg backdrop-blur border-blue-600 bg-blue-950/80 transition-opacity ${
-        data.dimmed ? "opacity-25" : ""
-      } ${data.highlighted ? "ring-2 ring-blue-400" : ""}`}
-    >
-      <Handle type="target" position={Position.Left} className="!bg-blue-500 !w-2 !h-2" />
-      <Handle type="source" position={Position.Right} className="!bg-blue-500 !w-2 !h-2" />
-      <div className="flex items-center gap-1.5 mb-0.5">
-        <Server className="w-3.5 h-3.5 text-blue-400 shrink-0" />
-        <span className="text-xs font-semibold text-zinc-100 truncate">{data.label}</span>
-      </div>
-      {data.command && (
-        <div className="text-[10px] text-zinc-400 truncate font-mono">{data.command}</div>
-      )}
-      <div className="flex gap-2 mt-1">
-        {data.toolCount !== undefined && data.toolCount > 0 && (
-          <span className="flex items-center gap-0.5 text-[10px] text-purple-400">
-            <Wrench className="w-2.5 h-2.5" /> {data.toolCount}
-          </span>
-        )}
-        {data.credentialCount !== undefined && data.credentialCount > 0 && (
-          <span className="flex items-center gap-0.5 text-[10px] text-amber-400">
-            <KeyRound className="w-2.5 h-2.5" /> {data.credentialCount}
-          </span>
-        )}
-      </div>
-    </div>
+    <NodeCard
+      data={data}
+      borderClass="border-blue-500 dark:border-blue-600"
+      bgClass="bg-blue-50 dark:bg-blue-950/80"
+      ringClass="ring-blue-400"
+      iconClass="text-blue-600 dark:text-blue-400"
+      subtitle={data.command}
+      footer={
+        <div className="flex gap-2 mt-1">
+          {data.toolCount !== undefined && data.toolCount > 0 && (
+            <span className="flex items-center gap-0.5 text-[10px] text-purple-400">
+              <Wrench className="w-2.5 h-2.5" /> {data.toolCount}
+            </span>
+          )}
+          {data.credentialCount !== undefined && data.credentialCount > 0 && (
+            <span className="flex items-center gap-0.5 text-[10px] text-amber-400">
+              <KeyRound className="w-2.5 h-2.5" /> {data.credentialCount}
+            </span>
+          )}
+          {data.packageCount !== undefined && data.packageCount > 0 && (
+            <span className="flex items-center gap-0.5 text-[10px] text-[var(--text-secondary)]">
+              <Package className="w-2.5 h-2.5" /> {data.packageCount}
+            </span>
+          )}
+        </div>
+      }
+    />
   );
 }
-
-// ─── Package Node ────────────────────────────────────────────────────────────
 
 function PackageNode({ data }: { data: LineageNodeData }) {
   const hasVulns = (data.vulnCount ?? 0) > 0;
+  const provenance = data.versionSource
+    ? `${data.versionSource}${data.versionConfidence ? ` · ${data.versionConfidence}` : ""}`
+    : "";
   return (
-    <div
-      className={`rounded-lg border-2 px-3 py-2 min-w-[140px] max-w-[200px] shadow-lg backdrop-blur transition-opacity ${
-        hasVulns ? "border-red-600/60 bg-red-950/40" : "border-zinc-600 bg-zinc-900/80"
-      } ${data.dimmed ? "opacity-25" : ""} ${data.highlighted ? "ring-2 ring-zinc-400" : ""}`}
-    >
-      <Handle type="target" position={Position.Left} className="!bg-zinc-500 !w-2 !h-2" />
-      <Handle type="source" position={Position.Right} className="!bg-zinc-500 !w-2 !h-2" />
-      <div className="flex items-center gap-1.5 mb-0.5">
-        <Package className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
-        <span className="text-xs font-semibold text-zinc-100 truncate">{data.label}</span>
-      </div>
-      <div className="flex gap-2 text-[10px]">
-        {data.ecosystem && <span className="text-zinc-500">{data.ecosystem}</span>}
-        {hasVulns && (
-          <span className="text-red-400">
+    <NodeCard
+      data={data}
+      borderClass={
+        hasVulns
+          ? "border-red-400 dark:border-red-600/60"
+          : "border-[var(--border-subtle)]"
+      }
+      bgClass={
+        hasVulns
+          ? "bg-red-50 dark:bg-red-950/40"
+          : "bg-[var(--surface)]"
+      }
+      ringClass="ring-[var(--border-strong)]"
+      iconClass="text-[var(--text-tertiary)]"
+      subtitle={
+        data.version
+          ? `${data.version}${data.ecosystem ? ` · ${data.ecosystem}` : ""}${provenance ? ` · ${provenance}` : ""}`
+          : data.ecosystem
+      }
+      footer={
+        hasVulns ? (
+          <div className="mt-1 text-[10px] text-red-400">
             <Bug className="w-2.5 h-2.5 inline mr-0.5" />
             {data.vulnCount}
-          </span>
-        )}
-      </div>
-    </div>
+          </div>
+        ) : undefined
+      }
+    />
   );
 }
 
-// ─── Vulnerability Node ──────────────────────────────────────────────────────
+function FindingNode({
+  data,
+  accentClass,
+  borderClass,
+  bgClass,
+}: {
+  data: LineageNodeData;
+  accentClass: string;
+  borderClass: string;
+  bgClass: string;
+}) {
+  return (
+    <NodeCard
+      data={data}
+      borderClass={borderClass}
+      bgClass={bgClass}
+      ringClass="ring-white/50"
+      shapeClass={
+        data.nodeType === "misconfiguration" ? "rounded-md" : "rounded-lg"
+      }
+      iconClass={accentClass}
+      source={false}
+      subtitle={data.description}
+      footer={
+        <div className="flex flex-wrap gap-1 mt-1">
+          {data.severity && (
+            <span
+              className={`text-[10px] px-1.5 py-0.5 rounded border font-mono uppercase ${severityColor(data.severity)}`}
+            >
+              {data.severity}
+            </span>
+          )}
+          {typeof data.cvssScore === "number" &&
+          Number.isFinite(data.cvssScore) ? (
+            <span className="text-[10px] text-[var(--text-secondary)]">
+              CVSS {data.cvssScore.toFixed(1)}
+            </span>
+          ) : null}
+          {data.isKev && (
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-900 text-red-300 border border-red-700 font-mono">
+              KEV
+            </span>
+          )}
+        </div>
+      }
+    />
+  );
+}
 
 function VulnNode({ data }: { data: LineageNodeData }) {
   const sev = data.severity ?? "medium";
-  const glowColor =
-    sev === "critical" ? "shadow-red-500/40 shadow-lg" :
-    sev === "high" ? "shadow-orange-500/30 shadow-md" : "";
-  const borderColor =
-    sev === "critical" ? "border-red-500" :
-    sev === "high" ? "border-orange-500" :
-    sev === "medium" ? "border-yellow-500" : "border-blue-500";
-  const bgColor =
-    sev === "critical" ? "bg-red-950/80" :
-    sev === "high" ? "bg-orange-950/80" :
-    sev === "medium" ? "bg-yellow-950/80" : "bg-blue-950/80";
-
+  const borderClass =
+    sev === "critical"
+      ? "border-red-500"
+      : sev === "high"
+        ? "border-orange-500"
+        : sev === "medium"
+          ? "border-yellow-500"
+          : "border-blue-500";
+  const bgClass =
+    sev === "critical"
+      ? "bg-red-100 dark:bg-red-950/80"
+      : sev === "high"
+        ? "bg-orange-100 dark:bg-orange-950/80"
+        : sev === "medium"
+          ? "bg-yellow-100 dark:bg-yellow-950/80"
+          : "bg-blue-100 dark:bg-blue-950/80";
   return (
-    <div
-      className={`rounded-lg border-2 px-3 py-2 min-w-[140px] max-w-[220px] backdrop-blur transition-opacity ${borderColor} ${bgColor} ${glowColor} ${
-        data.dimmed ? "opacity-25" : ""
-      } ${data.highlighted ? "ring-2 ring-white/50" : ""}`}
-      style={data.isCritical ? { boxShadow: "0 0 12px rgba(239, 68, 68, 0.6)" } : undefined}
-    >
-      <Handle type="target" position={Position.Left} className="!bg-red-500 !w-2 !h-2" />
-      <div className="flex items-center gap-1.5 mb-0.5">
-        <Bug className="w-3.5 h-3.5 shrink-0" />
-        <span className="text-xs font-semibold text-zinc-100 truncate">{data.label}</span>
-      </div>
-      <div className="flex flex-wrap gap-1 mt-1">
-        <span className={`text-[10px] px-1.5 py-0.5 rounded border font-mono uppercase ${severityColor(sev)}`}>
-          {sev}
-        </span>
-        {data.cvssScore !== undefined && (
-          <span className="text-[10px] text-zinc-400">CVSS {data.cvssScore.toFixed(1)}</span>
-        )}
-        {data.epssScore !== undefined && data.epssScore > 0 && (
-          <span className="text-[10px] text-zinc-400">EPSS {(data.epssScore * 100).toFixed(1)}%</span>
-        )}
-        {data.isKev && (
-          <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-900 text-red-300 border border-red-700 font-mono">KEV</span>
-        )}
-      </div>
-    </div>
+    <FindingNode
+      data={data}
+      accentClass="text-red-300"
+      borderClass={borderClass}
+      bgClass={bgClass}
+    />
   );
 }
 
-// ─── Credential Node ─────────────────────────────────────────────────────────
+function MisconfigNode({ data }: { data: LineageNodeData }) {
+  return (
+    <FindingNode
+      data={data}
+      accentClass="text-orange-600 dark:text-orange-300"
+      borderClass="border-orange-500"
+      bgClass="bg-orange-100 dark:bg-orange-950/75"
+    />
+  );
+}
 
 function CredentialNode({ data }: { data: LineageNodeData }) {
   return (
-    <div
-      className={`rounded-lg border-2 border-dashed px-3 py-2 min-w-[120px] max-w-[180px] shadow-lg backdrop-blur border-amber-500 bg-amber-950/60 transition-opacity ${
-        data.dimmed ? "opacity-25" : ""
-      } ${data.highlighted ? "ring-2 ring-amber-400" : ""}`}
-    >
-      <Handle type="target" position={Position.Left} className="!bg-amber-500 !w-2 !h-2" />
-      <div className="flex items-center gap-1.5">
-        <KeyRound className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-        <span className="text-xs font-semibold text-amber-200 truncate">{data.label}</span>
-      </div>
-      {data.serverName && (
-        <div className="text-[10px] text-amber-400/60 truncate mt-0.5">{data.serverName}</div>
-      )}
-    </div>
+    <NodeCard
+      data={data}
+      borderClass="border-amber-500 border-dashed"
+      bgClass="bg-amber-50 dark:bg-amber-950/60"
+      ringClass="ring-amber-400"
+      shapeClass="rounded-2xl"
+      iconClass="text-amber-600 dark:text-amber-400"
+      source={false}
+      subtitle={data.serverName}
+    />
   );
 }
-
-// ─── Tool Node ───────────────────────────────────────────────────────────────
 
 function ToolNode({ data }: { data: LineageNodeData }) {
   return (
+    <NodeCard
+      data={data}
+      borderClass="border-purple-500 dark:border-purple-600"
+      bgClass="bg-purple-50 dark:bg-purple-950/60"
+      ringClass="ring-purple-400"
+      shapeClass="rounded-2xl"
+      iconClass="text-purple-600 dark:text-purple-400"
+      source={false}
+      subtitle={data.description}
+    />
+  );
+}
+
+function ModelNode({ data }: { data: LineageNodeData }) {
+  return (
+    <NodeCard
+      data={data}
+      borderClass="border-violet-500 dark:border-violet-600"
+      bgClass="bg-violet-50 dark:bg-violet-950/70"
+      ringClass="ring-violet-400"
+      iconClass="text-violet-600 dark:text-violet-300"
+      subtitle={data.description}
+    />
+  );
+}
+
+function DatasetNode({ data }: { data: LineageNodeData }) {
+  return (
+    <NodeCard
+      data={data}
+      borderClass="border-cyan-500 dark:border-cyan-600"
+      bgClass="bg-cyan-50 dark:bg-cyan-950/70"
+      ringClass="ring-cyan-400"
+      iconClass="text-cyan-600 dark:text-cyan-300"
+      subtitle={data.description}
+    />
+  );
+}
+
+function ContainerNode({ data }: { data: LineageNodeData }) {
+  return (
+    <NodeCard
+      data={data}
+      borderClass="border-indigo-500 dark:border-indigo-600"
+      bgClass="bg-indigo-50 dark:bg-indigo-950/70"
+      ringClass="ring-indigo-400"
+      iconClass="text-indigo-600 dark:text-indigo-300"
+      subtitle={data.description}
+    />
+  );
+}
+
+function CloudResourceNode({ data }: { data: LineageNodeData }) {
+  return (
+    <NodeCard
+      data={data}
+      borderClass="border-sky-500 dark:border-sky-600"
+      bgClass="bg-sky-50 dark:bg-sky-950/70"
+      ringClass="ring-sky-400"
+      iconClass="text-sky-600 dark:text-sky-300"
+      subtitle={data.description}
+    />
+  );
+}
+
+/**
+ * Cluster pill (#2257 — sibling aggregation).
+ *
+ * Visually distinct rounded pill that absorbs N siblings of the same type
+ * and edge kind. Subtle pulse signals "click me to expand". The data shape
+ * is the union of `LineageNodeData` + extra cluster fields injected by
+ * `aggregateSiblings` — we read the cluster fields off `data` defensively
+ * because the renderer is registered globally and any node could in theory
+ * land here under that key.
+ */
+function ClusterPillNode({ data }: { data: LineageNodeData }) {
+  const cluster = data as LineageNodeData & {
+    count?: number;
+    childType?: LineageNodeType;
+  };
+  const count = cluster.count ?? 0;
+  const childType = (cluster.childType ?? cluster.nodeType) as LineageNodeType;
+  const Icon = entityIcon(childType);
+  return (
     <div
-      className={`rounded-lg border px-2.5 py-1.5 min-w-[100px] max-w-[160px] shadow backdrop-blur border-purple-600 bg-purple-950/60 transition-opacity ${
+      data-testid="cluster-pill"
+      data-cluster-count={count}
+      className={`relative rounded-full border border-sky-400/60 bg-sky-500/10 px-3 py-1.5 shadow-lg backdrop-blur transition-opacity hover:border-sky-300 hover:bg-sky-500/15 ${
         data.dimmed ? "opacity-25" : ""
-      } ${data.highlighted ? "ring-2 ring-purple-400" : ""}`}
+      } cluster-pill-pulse cursor-pointer`}
+      title="Click to expand"
     >
-      <Handle type="target" position={Position.Left} className="!bg-purple-500 !w-2 !h-2" />
+      <Handle
+        type="target"
+        position={Position.Left}
+        className="!w-2 !h-2 !bg-sky-300"
+      />
+      <Handle
+        type="source"
+        position={Position.Right}
+        className="!w-2 !h-2 !bg-sky-300"
+      />
       <div className="flex items-center gap-1.5">
-        <Wrench className="w-3 h-3 text-purple-400 shrink-0" />
-        <span className="text-[11px] font-medium text-purple-200 truncate">{data.label}</span>
+        <Icon className="w-3.5 h-3.5 text-sky-200" />
+        <span className="text-xs font-semibold text-sky-100 whitespace-nowrap">
+          {data.label}
+        </span>
+        <span className="text-[9px] uppercase tracking-[0.18em] text-sky-300/80">
+          expand
+        </span>
       </div>
     </div>
   );
 }
-
-// ─── Shared Server Node ──────────────────────────────────────────────────────
 
 function SharedServerNode({ data }: { data: LineageNodeData }) {
   return (
-    <div
-      className={`rounded-xl border-2 px-4 py-3 min-w-[170px] max-w-[240px] shadow-lg shadow-cyan-500/20 backdrop-blur border-cyan-400 bg-cyan-950/80 transition-opacity ${
-        data.dimmed ? "opacity-25" : ""
-      } ${data.highlighted ? "ring-2 ring-cyan-300" : ""}`}
-    >
-      <Handle type="target" position={Position.Left} className="!bg-cyan-400 !w-2.5 !h-2.5" />
-      <Handle type="source" position={Position.Right} className="!bg-cyan-400 !w-2.5 !h-2.5" />
-      <div className="flex items-center gap-1.5 mb-1">
-        <Server className="w-4 h-4 text-cyan-300 shrink-0" />
-        <span className="text-xs font-bold text-cyan-100 truncate">{data.label}</span>
-      </div>
-      {data.sharedBy && data.sharedBy > 1 && (
-        <div className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-900/60 text-cyan-300 border border-cyan-700 font-mono inline-block mb-1">
-          Shared by {data.sharedBy} agents
+    <NodeCard
+      data={data}
+      borderClass="border-cyan-400"
+      bgClass="bg-cyan-50 dark:bg-cyan-950/80"
+      ringClass="ring-cyan-300"
+      shapeClass="rounded-[18px]"
+      iconClass="text-cyan-600 dark:text-cyan-300"
+      subtitle={data.command}
+      footer={
+        <div className="flex gap-2 mt-1">
+          {data.sharedBy && (
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-100 text-cyan-700 border border-cyan-300 font-mono dark:bg-cyan-900/60 dark:text-cyan-300 dark:border-cyan-700">
+              Shared by {data.sharedBy}
+            </span>
+          )}
+          {data.packageCount !== undefined && data.packageCount > 0 && (
+            <span className="flex items-center gap-0.5 text-[10px] text-[var(--text-secondary)]">
+              <Package className="w-2.5 h-2.5" /> {data.packageCount}
+            </span>
+          )}
         </div>
-      )}
-      <div className="flex gap-2 mt-1">
-        {data.toolCount !== undefined && data.toolCount > 0 && (
-          <span className="flex items-center gap-0.5 text-[10px] text-purple-400">
-            <Wrench className="w-2.5 h-2.5" /> {data.toolCount}
-          </span>
-        )}
-        {data.credentialCount !== undefined && data.credentialCount > 0 && (
-          <span className="flex items-center gap-0.5 text-[10px] text-amber-400">
-            <KeyRound className="w-2.5 h-2.5" /> {data.credentialCount}
-          </span>
-        )}
-        {data.packageCount !== undefined && data.packageCount > 0 && (
-          <span className="flex items-center gap-0.5 text-[10px] text-zinc-400">
-            <Package className="w-2.5 h-2.5" /> {data.packageCount}
+      }
+    />
+  );
+}
+
+/**
+ * Summary-band renderer (#2257 LOD): compact dot with severity badge + label.
+ *
+ * Used when 0.4 <= zoom < 1.0 — the operator can still parse a label and a
+ * one-glance severity/CVE-count chip but the canvas isn't drowning in chips
+ * and footers. The same data shape as `LineageNodeData` so swap-in is free.
+ */
+function SummaryNode({ data }: { data: LineageNodeData }) {
+  const sev = (data.severity ?? "").toLowerCase();
+  const accent =
+    sev === "critical"
+      ? "border-red-500 bg-red-100 text-red-950 dark:bg-red-950/70 dark:text-red-200"
+      : sev === "high"
+        ? "border-orange-500 bg-orange-100 text-orange-950 dark:bg-orange-950/60 dark:text-orange-200"
+        : sev === "medium"
+          ? "border-yellow-500 bg-yellow-100 text-yellow-950 dark:bg-yellow-950/55 dark:text-yellow-200"
+          : "border-[var(--border-subtle)] bg-[var(--surface)] text-[var(--foreground)]";
+  const vulnCount = data.vulnCount ?? 0;
+  return (
+    <div
+      data-testid="summary-node"
+      className={`min-w-[112px] max-w-[180px] rounded-lg border px-2.5 py-1.5 shadow transition-opacity ${accent} ${
+        data.dimmed ? "opacity-25" : ""
+      } ${data.highlighted ? "ring-2 ring-sky-400" : ""}`}
+    >
+      <Handle
+        type="target"
+        position={Position.Left}
+        className="!w-1.5 !h-1.5"
+      />
+      <Handle
+        type="source"
+        position={Position.Right}
+        className="!w-1.5 !h-1.5"
+      />
+      <div className="flex items-center gap-1">
+        <span className="min-w-0 flex-1 truncate text-[11px] font-semibold">{data.label}</span>
+        {vulnCount > 0 && (
+          <span className="ml-auto rounded bg-white/70 px-1 text-[9px] font-mono dark:bg-black/40">
+            {vulnCount}
           </span>
         )}
       </div>
@@ -281,14 +789,261 @@ function SharedServerNode({ data }: { data: LineageNodeData }) {
   );
 }
 
-// ─── Node Types Map ──────────────────────────────────────────────────────────
+/**
+ * Cluster-band renderer (#2257 LOD): one bubble per node — the operator
+ * is zoomed too far out for labels to be readable anyway, so we render a
+ * coloured circle keyed by entity type. The entity colour comes from the
+ * standard ENTITY_COLOR_MAP via the parent's `nodeType`.
+ */
+function ClusterBubbleNode({ data }: { data: LineageNodeData }) {
+  const color = CLUSTER_BUBBLE_COLORS[data.nodeType] ?? "#52525b";
+  return (
+    <div
+      data-testid="cluster-bubble"
+      className={`rounded-full border-2 transition-opacity ${
+        data.dimmed ? "opacity-25" : ""
+      } ${data.highlighted ? "ring-2 ring-sky-400" : ""}`}
+      style={{
+        width: 18,
+        height: 18,
+        backgroundColor: `${color}cc`,
+        borderColor: color,
+      }}
+    >
+      <Handle
+        type="target"
+        position={Position.Left}
+        className="!w-1 !h-1 !bg-transparent !border-0"
+      />
+      <Handle
+        type="source"
+        position={Position.Right}
+        className="!w-1 !h-1 !bg-transparent !border-0"
+      />
+    </div>
+  );
+}
 
+const CLUSTER_BUBBLE_COLORS: Record<LineageNodeType, string> = {
+  provider: "#71717a",
+  agent: "#10b981",
+  user: "#34d399",
+  group: "#d946ef",
+  serviceAccount: "#fbbf24",
+  environment: "#14b8a6",
+  fleet: "#22d3ee",
+  cluster: "#38bdf8",
+  server: "#3b82f6",
+  sharedServer: "#22d3ee",
+  package: "#52525b",
+  vulnerability: "#ef4444",
+  credential: "#f59e0b",
+  tool: "#a855f7",
+  model: "#8b5cf6",
+  framework: "#06b6d4",
+  dataset: "#06b6d4",
+  container: "#6366f1",
+  cloudResource: "#0ea5e9",
+  org: "#115e59",
+  account: "#0f766e",
+  misconfiguration: "#f97316",
+  role: "#ea580c",
+  policy: "#d97706",
+  servicePrincipal: "#0f766e",
+  federatedIdentity: "#0e7490",
+  managedIdentity: "#0891b2",
+  accessGrant: "#ca8a04",
+  accessPolicy: "#a16207",
+  driftIncident: "#fb923c",
+  dataStore: "#0284c7",
+  directory: "#0d9488",
+  sourceFile: "#22d3ee",
+  configFile: "#f97316",
+  codeModule: "#06b6d4",
+  ciJob: "#a855f7",
+  apiGateway: "#2563eb",
+  toolCall: "#c084fc",
+  blueprint: "#818cf8",
+};
+
+const DETAIL_RENDERERS: Record<
+  LineageNodeType,
+  ComponentType<{ data: LineageNodeData }>
+> = {
+  provider: ProviderNode,
+  agent: AgentNode,
+  user: UserNode,
+  group: GroupNode,
+  serviceAccount: ServiceAccountNode,
+  environment: EnvironmentNode,
+  fleet: FleetNode,
+  cluster: ClusterNode,
+  server: ServerNode,
+  sharedServer: SharedServerNode,
+  package: PackageNode,
+  vulnerability: VulnNode,
+  misconfiguration: MisconfigNode,
+  credential: CredentialNode,
+  tool: ToolNode,
+  model: ModelNode,
+  framework: ModelNode,
+  dataset: DatasetNode,
+  container: ContainerNode,
+  cloudResource: CloudResourceNode,
+  org: ProviderNode,
+  account: ProviderNode,
+  role: CredentialNode,
+  policy: CredentialNode,
+  servicePrincipal: ServiceAccountNode,
+  federatedIdentity: ServiceAccountNode,
+  managedIdentity: ServiceAccountNode,
+  accessGrant: CredentialNode,
+  accessPolicy: CredentialNode,
+  driftIncident: MisconfigNode,
+  dataStore: CloudResourceNode,
+  directory: ContainerNode,
+  sourceFile: PackageNode,
+  configFile: PackageNode,
+  codeModule: PackageNode,
+  ciJob: ToolNode,
+  apiGateway: CloudResourceNode,
+  toolCall: ToolNode,
+  blueprint: CredentialNode,
+};
+
+function AdaptiveLineageNode({ data }: { data: LineageNodeData }) {
+  if (data.renderBand === "cluster") return <ClusterBubbleNode data={data} />;
+  if (data.renderBand === "summary") return <SummaryNode data={data} />;
+  const Renderer = DETAIL_RENDERERS[data.nodeType] ?? SummaryNode;
+  return <Renderer data={data} />;
+}
+
+export const lineageNodeTypesAdaptive = {
+  providerNode: AdaptiveLineageNode,
+  agentNode: AdaptiveLineageNode,
+  userNode: AdaptiveLineageNode,
+  groupNode: AdaptiveLineageNode,
+  serviceAccountNode: AdaptiveLineageNode,
+  environmentNode: AdaptiveLineageNode,
+  fleetNode: AdaptiveLineageNode,
+  clusterNode: AdaptiveLineageNode,
+  serverNode: AdaptiveLineageNode,
+  packageNode: AdaptiveLineageNode,
+  vulnNode: AdaptiveLineageNode,
+  misconfigNode: AdaptiveLineageNode,
+  credentialNode: AdaptiveLineageNode,
+  toolNode: AdaptiveLineageNode,
+  modelNode: AdaptiveLineageNode,
+  frameworkNode: AdaptiveLineageNode,
+  datasetNode: AdaptiveLineageNode,
+  containerNode: AdaptiveLineageNode,
+  cloudResourceNode: AdaptiveLineageNode,
+  sharedServerNode: AdaptiveLineageNode,
+  managedIdentityNode: AdaptiveLineageNode,
+  accessGrantNode: AdaptiveLineageNode,
+  accessPolicyNode: AdaptiveLineageNode,
+  driftIncidentNode: AdaptiveLineageNode,
+  dataStoreNode: AdaptiveLineageNode,
+  clusterPillNode: ClusterPillNode,
+};
+
+/**
+ * Detail-band renderer registry — the full chip-laden cards. This is the
+ * "default" map and matches what /graph rendered before LOD existed.
+ */
 export const lineageNodeTypes = {
+  providerNode: ProviderNode,
   agentNode: AgentNode,
+  userNode: UserNode,
+  groupNode: GroupNode,
+  serviceAccountNode: ServiceAccountNode,
+  environmentNode: EnvironmentNode,
+  fleetNode: FleetNode,
+  clusterNode: ClusterNode,
   serverNode: ServerNode,
   packageNode: PackageNode,
   vulnNode: VulnNode,
+  misconfigNode: MisconfigNode,
   credentialNode: CredentialNode,
   toolNode: ToolNode,
+  modelNode: ModelNode,
+  frameworkNode: ModelNode,
+  datasetNode: DatasetNode,
+  containerNode: ContainerNode,
+  cloudResourceNode: CloudResourceNode,
   sharedServerNode: SharedServerNode,
+  managedIdentityNode: ServiceAccountNode,
+  accessGrantNode: CredentialNode,
+  accessPolicyNode: CredentialNode,
+  driftIncidentNode: MisconfigNode,
+  dataStoreNode: CloudResourceNode,
+  clusterPillNode: ClusterPillNode,
+};
+
+/**
+ * Summary-band registry — every node-type collapses to `SummaryNode`
+ * except cluster pills, which keep their dedicated renderer because they
+ * already encode "+N children" copy and wouldn't survive the squeeze.
+ */
+export const lineageNodeTypesSummary = {
+  providerNode: SummaryNode,
+  agentNode: SummaryNode,
+  userNode: SummaryNode,
+  groupNode: SummaryNode,
+  serviceAccountNode: SummaryNode,
+  environmentNode: SummaryNode,
+  fleetNode: SummaryNode,
+  clusterNode: SummaryNode,
+  serverNode: SummaryNode,
+  packageNode: SummaryNode,
+  vulnNode: SummaryNode,
+  misconfigNode: SummaryNode,
+  credentialNode: SummaryNode,
+  toolNode: SummaryNode,
+  modelNode: SummaryNode,
+  frameworkNode: SummaryNode,
+  datasetNode: SummaryNode,
+  containerNode: SummaryNode,
+  cloudResourceNode: SummaryNode,
+  sharedServerNode: SummaryNode,
+  managedIdentityNode: SummaryNode,
+  accessGrantNode: SummaryNode,
+  accessPolicyNode: SummaryNode,
+  driftIncidentNode: SummaryNode,
+  dataStoreNode: SummaryNode,
+  clusterPillNode: ClusterPillNode,
+};
+
+/**
+ * Cluster-band registry — regular node-types collapse to `ClusterBubbleNode`.
+ * Aggregation pills keep their summary representation so a materially
+ * compressed graph still shows meaningful "+N" cluster affordances.
+ */
+export const lineageNodeTypesCluster = {
+  providerNode: ClusterBubbleNode,
+  agentNode: ClusterBubbleNode,
+  userNode: ClusterBubbleNode,
+  groupNode: ClusterBubbleNode,
+  serviceAccountNode: ClusterBubbleNode,
+  environmentNode: ClusterBubbleNode,
+  fleetNode: ClusterBubbleNode,
+  clusterNode: ClusterBubbleNode,
+  serverNode: ClusterBubbleNode,
+  packageNode: ClusterBubbleNode,
+  vulnNode: ClusterBubbleNode,
+  misconfigNode: ClusterBubbleNode,
+  credentialNode: ClusterBubbleNode,
+  toolNode: ClusterBubbleNode,
+  modelNode: ClusterBubbleNode,
+  frameworkNode: ClusterBubbleNode,
+  datasetNode: ClusterBubbleNode,
+  containerNode: ClusterBubbleNode,
+  cloudResourceNode: ClusterBubbleNode,
+  sharedServerNode: ClusterBubbleNode,
+  managedIdentityNode: ClusterBubbleNode,
+  accessGrantNode: ClusterBubbleNode,
+  accessPolicyNode: ClusterBubbleNode,
+  driftIncidentNode: ClusterBubbleNode,
+  dataStoreNode: ClusterBubbleNode,
+  clusterPillNode: ClusterPillNode,
 };

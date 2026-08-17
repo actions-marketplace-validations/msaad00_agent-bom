@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from agent_bom.api.auth import (
+    ApiKey,
+    ApiKeyPolicy,
     KeyStore,
     Role,
     create_api_key,
     get_key_store,
+    normalize_api_key_expiry,
+    normalize_rotation_overlap_seconds,
     set_key_store,
     verify_api_key,
 )
@@ -19,6 +25,13 @@ from agent_bom.api.auth import (
 
 
 class TestRoleHierarchy:
+    def test_api_auth_uses_central_role_rank(self):
+        from agent_bom.api import auth as auth_module
+        from agent_bom.rbac import role_rank as central_role_rank
+
+        assert auth_module.role_rank is central_role_rank
+        assert not hasattr(auth_module, "_ROLE_HIERARCHY")
+
     def test_admin_has_all_roles(self):
         _, key = create_api_key("admin", Role.ADMIN)
         assert key.has_role(Role.ADMIN)
@@ -78,12 +91,12 @@ class TestCreateApiKey:
         _, key = create_api_key("scope-test", Role.ANALYST, scopes=["scan", "vex"])
         assert key.scopes == ["scan", "vex"]
 
-    def test_expires_at_optional(self):
+    def test_expires_at_defaults_under_rotation_policy(self):
         _, key = create_api_key("no-expire", Role.VIEWER)
-        assert key.expires_at is None
+        assert key.expires_at is not None
 
     def test_expires_at_set(self):
-        exp = "2099-12-31T23:59:59+00:00"
+        exp = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
         _, key = create_api_key("expire-test", Role.VIEWER, expires_at=exp)
         assert key.expires_at == exp
 
@@ -106,12 +119,25 @@ class TestVerifyApiKey:
         assert result is None
 
     def test_expired_key_returns_none(self):
-        raw, key = create_api_key("expired", Role.ADMIN, expires_at="2020-01-01T00:00:00+00:00")
+        raw, fresh = create_api_key("expired", Role.ADMIN)
+        key = ApiKey(
+            key_id=fresh.key_id,
+            key_hash=fresh.key_hash,
+            key_salt=fresh.key_salt,
+            key_prefix=fresh.key_prefix,
+            name=fresh.name,
+            role=fresh.role,
+            created_at=fresh.created_at,
+            expires_at="2020-01-01T00:00:00+00:00",
+            scopes=fresh.scopes,
+            tenant_id=fresh.tenant_id,
+        )
         result = verify_api_key(raw, [key])
         assert result is None
 
     def test_not_expired_key_works(self):
-        raw, key = create_api_key("future", Role.ADMIN, expires_at="2099-12-31T23:59:59+00:00")
+        exp = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+        raw, key = create_api_key("future", Role.ADMIN, expires_at=exp)
         result = verify_api_key(raw, [key])
         assert result is not None
 
@@ -122,6 +148,37 @@ class TestVerifyApiKey:
         assert verify_api_key(raw2, [key1, key2]) is not None
         assert verify_api_key("abom_nope", [key1, key2]) is None
 
+    def test_rotated_key_remains_valid_during_overlap(self):
+        raw, key = create_api_key("rotate-test", Role.ADMIN)
+        key.replacement_key_id = "next-key"
+        key.rotation_overlap_until = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+        result = verify_api_key(raw, [key])
+        assert result is not None
+
+    def test_rotated_key_fails_after_overlap_window(self):
+        raw, key = create_api_key("rotate-test", Role.ADMIN)
+        key.replacement_key_id = "next-key"
+        key.rotation_overlap_until = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        result = verify_api_key(raw, [key])
+        assert result is None
+
+    def test_prefix_narrows_candidates_before_scrypt(self, monkeypatch):
+        raw1, key1 = create_api_key("key1", Role.ADMIN)
+        _, key2 = create_api_key("key2", Role.VIEWER)
+        calls: list[str] = []
+
+        from agent_bom.api import auth as auth_module
+
+        original = auth_module._derive_key
+
+        def tracked(raw_key: str, salt: bytes) -> str:
+            calls.append(salt.hex())
+            return original(raw_key, salt)
+
+        monkeypatch.setattr(auth_module, "_derive_key", tracked)
+        assert verify_api_key(raw1, [key1, key2]) is not None
+        assert calls == [key1.key_salt]
+
 
 # ---------------------------------------------------------------------------
 # ApiKey.is_expired
@@ -129,16 +186,30 @@ class TestVerifyApiKey:
 
 
 class TestApiKeyExpiry:
-    def test_no_expiry_not_expired(self):
+    def test_default_expiry_not_expired(self):
         _, key = create_api_key("no-exp", Role.VIEWER)
+        assert key.expires_at is not None
         assert not key.is_expired()
 
     def test_past_expiry_is_expired(self):
-        _, key = create_api_key("past", Role.VIEWER, expires_at="2020-01-01T00:00:00+00:00")
+        _, fresh = create_api_key("past", Role.VIEWER)
+        key = ApiKey(
+            key_id=fresh.key_id,
+            key_hash=fresh.key_hash,
+            key_salt=fresh.key_salt,
+            key_prefix=fresh.key_prefix,
+            name=fresh.name,
+            role=fresh.role,
+            created_at=fresh.created_at,
+            expires_at="2020-01-01T00:00:00+00:00",
+            scopes=fresh.scopes,
+            tenant_id=fresh.tenant_id,
+        )
         assert key.is_expired()
 
     def test_future_expiry_not_expired(self):
-        _, key = create_api_key("future", Role.VIEWER, expires_at="2099-12-31T23:59:59+00:00")
+        exp = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+        _, key = create_api_key("future", Role.VIEWER, expires_at=exp)
         assert not key.is_expired()
 
 
@@ -154,6 +225,7 @@ class TestApiKeyToDict:
         assert d["name"] == "dict-test"
         assert d["role"] == "analyst"
         assert d["scopes"] == ["scan"]
+        assert d["state"] == "active"
         assert "key_hash" not in d  # Hash should NOT be exposed
         assert "key_salt" not in d  # Salt should NOT be exposed
 
@@ -175,7 +247,9 @@ class TestKeyStore:
         _, key = create_api_key("rm-test", Role.VIEWER)
         store.add(key)
         assert store.remove(key.key_id)
-        assert len(store.list_keys()) == 0
+        listed = store.list_keys()
+        assert len(listed) == 1
+        assert listed[0].lifecycle_state() == "revoked"
 
     def test_remove_nonexistent(self):
         store = KeyStore()
@@ -194,6 +268,36 @@ class TestKeyStore:
         _, key = create_api_key("hk", Role.VIEWER)
         store.add(key)
         assert store.has_keys()
+
+    def test_mark_rotating_preserves_old_key_until_overlap(self):
+        store = KeyStore()
+        raw, key = create_api_key("rotate-me", Role.ADMIN)
+        store.add(key)
+        overlap_until = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+
+        assert store.mark_rotating(key.key_id, replacement_key_id="new-key", overlap_until=overlap_until)
+        assert store.verify(raw) is not None
+        rotated = store.get(key.key_id)
+        assert rotated is not None
+        assert rotated.replacement_key_id == "new-key"
+        assert rotated.rotation_overlap_until == overlap_until
+
+
+class TestRotationPolicy:
+    def test_policy_default_overlap_is_zero(self, monkeypatch):
+        monkeypatch.delenv("AGENT_BOM_API_KEY_DEFAULT_OVERLAP_SECONDS", raising=False)
+        from agent_bom.api.auth import get_api_key_policy
+
+        assert get_api_key_policy().default_overlap_seconds == 0
+
+    def test_normalize_overlap_uses_policy_default(self):
+        policy = ApiKeyPolicy(default_overlap_seconds=300, max_overlap_seconds=3600)
+        assert normalize_rotation_overlap_seconds(None, policy=policy) == 300
+
+    def test_normalize_overlap_rejects_excessive_window(self):
+        policy = ApiKeyPolicy(default_overlap_seconds=300, max_overlap_seconds=600)
+        with pytest.raises(ValueError, match="maximum allowed overlap window"):
+            normalize_rotation_overlap_seconds(900, policy=policy)
 
 
 # ---------------------------------------------------------------------------
@@ -214,3 +318,28 @@ class TestSingleton:
         assert get_key_store() is new_store
         # Restore
         set_key_store(original)
+
+
+class TestApiKeyRotationPolicy:
+    def test_normalize_expiry_applies_default_ttl(self):
+        now = datetime(2026, 4, 17, 18, 0, tzinfo=timezone.utc)
+        expiry = normalize_api_key_expiry(None, now=now, policy=ApiKeyPolicy(default_ttl_seconds=300, max_ttl_seconds=600))
+        assert expiry == (now + timedelta(seconds=300)).isoformat()
+
+    def test_normalize_expiry_rejects_past(self):
+        now = datetime(2026, 4, 17, 18, 0, tzinfo=timezone.utc)
+        with pytest.raises(ValueError, match="in the future"):
+            normalize_api_key_expiry(
+                "2026-04-17T17:59:00+00:00",
+                now=now,
+                policy=ApiKeyPolicy(default_ttl_seconds=300, max_ttl_seconds=600),
+            )
+
+    def test_normalize_expiry_rejects_over_max(self):
+        now = datetime(2026, 4, 17, 18, 0, tzinfo=timezone.utc)
+        with pytest.raises(ValueError, match="maximum allowed API key lifetime"):
+            normalize_api_key_expiry(
+                "2026-04-17T18:20:01+00:00",
+                now=now,
+                policy=ApiKeyPolicy(default_ttl_seconds=300, max_ttl_seconds=1200),
+            )

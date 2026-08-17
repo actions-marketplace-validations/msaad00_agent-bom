@@ -1,0 +1,314 @@
+import { expect, test, type Page, type TestInfo } from "@playwright/test";
+
+const scanId = "scan-dense-graph";
+const previousScanId = "scan-dense-graph-prev";
+const createdAt = "2026-05-08T16:00:00Z";
+
+type GraphNode = {
+  id: string;
+  entity_type: string;
+  label: string;
+  category_uid: number;
+  class_uid: number;
+  type_uid: number;
+  status: string;
+  risk_score: number;
+  severity: string;
+  severity_id: number;
+  first_seen: string;
+  last_seen: string;
+  attributes: Record<string, unknown>;
+  compliance_tags: string[];
+  data_sources: string[];
+  dimensions: Record<string, string>;
+};
+
+type GraphEdge = {
+  id: string;
+  source: string;
+  target: string;
+  relationship: string;
+  direction: "directed" | "bidirectional";
+  weight: number;
+  traversable: boolean;
+  first_seen: string;
+  last_seen: string;
+  evidence: Record<string, unknown>;
+  activity_id: number;
+};
+
+function node(
+  id: string,
+  entityType: string,
+  label: string,
+  severity = "none",
+  riskScore = 0,
+  attributes: Record<string, unknown> = {},
+): GraphNode {
+  const severityRank: Record<string, number> = { none: 0, low: 1, medium: 2, high: 3, critical: 4 };
+  return {
+    id,
+    entity_type: entityType,
+    label,
+    category_uid: 0,
+    class_uid: 0,
+    type_uid: 0,
+    status: "active",
+    risk_score: riskScore,
+    severity,
+    severity_id: severityRank[severity] ?? 0,
+    first_seen: createdAt,
+    last_seen: createdAt,
+    attributes,
+    compliance_tags: [],
+    data_sources: ["e2e"],
+    dimensions: {},
+  };
+}
+
+function edge(source: string, target: string, relationship: string, weight = 1): GraphEdge {
+  return {
+    id: `${source}->${target}:${relationship}`,
+    source,
+    target,
+    relationship,
+    direction: "directed",
+    weight,
+    traversable: true,
+    first_seen: createdAt,
+    last_seen: createdAt,
+    evidence: {},
+    activity_id: 1,
+  };
+}
+
+function buildDenseGraph() {
+  const nodes: GraphNode[] = [
+    node("agent:desktop", "agent", "Desktop Agent", "high", 8.8, { agent_type: "desktop" }),
+    node("server:filesystem", "server", "filesystem MCP", "high", 8.2, { command: "npx @modelcontextprotocol/server-filesystem" }),
+    node("server:repo", "server", "repository MCP", "high", 7.9, { command: "npx @modelcontextprotocol/server-repository" }),
+    node("cred:repo-token", "credential", "Repository token", "high", 8.4),
+    node("tool:write-file", "tool", "write_file", "medium", 5.8),
+  ];
+  const edges: GraphEdge[] = [
+    edge("agent:desktop", "server:filesystem", "uses"),
+    edge("agent:desktop", "server:repo", "uses"),
+    edge("server:repo", "cred:repo-token", "exposes_cred"),
+    edge("cred:repo-token", "tool:write-file", "reaches_tool"),
+  ];
+
+  for (const server of ["filesystem", "repo"]) {
+    const serverId = `server:${server}`;
+    for (let index = 1; index <= 8; index += 1) {
+      const packageId = `pkg:${server}:${index}`;
+      const vulnId = `cve:${server}:${index}`;
+      const severity = index % 3 === 0 ? "critical" : "high";
+      nodes.push(node(packageId, "package", `${server}-package-${index}`, severity, 7 + index / 10));
+      nodes.push(node(vulnId, "vulnerability", `CVE-2026-${server === "filesystem" ? "10" : "20"}${index}`, severity, 8 + index / 10));
+      edges.push(edge(serverId, packageId, "depends_on"));
+      edges.push(edge(packageId, vulnId, "vulnerable_to", 1.5));
+    }
+  }
+
+  return {
+    scan_id: scanId,
+    tenant_id: "default",
+    created_at: createdAt,
+    nodes,
+    edges,
+    attack_paths: [
+      {
+        source: "agent:desktop",
+        target: "cve:filesystem:3",
+        hops: ["agent:desktop", "server:filesystem", "pkg:filesystem:3", "cve:filesystem:3"],
+        edges: [
+          "agent:desktop->server:filesystem:uses",
+          "server:filesystem->pkg:filesystem:3:depends_on",
+          "pkg:filesystem:3->cve:filesystem:3:vulnerable_to",
+        ],
+        composite_risk: 9.4,
+        summary: "Desktop Agent can reach a critical vulnerable package through filesystem MCP.",
+        credential_exposure: [],
+        tool_exposure: ["write_file"],
+        vuln_ids: ["CVE-2026-103"],
+      },
+    ],
+    interaction_risks: [],
+    stats: {
+      total_nodes: nodes.length,
+      total_edges: edges.length,
+      node_types: { agent: 1, server: 2, package: 16, vulnerability: 16, credential: 1, tool: 1 },
+      severity_counts: { critical: 4, high: 17, medium: 1 },
+      relationship_types: { uses: 2, depends_on: 16, vulnerable_to: 16, exposes_cred: 1, reaches_tool: 1 },
+      attack_path_count: 1,
+      interaction_risk_count: 0,
+      max_attack_path_risk: 9.4,
+      highest_interaction_risk: 0,
+    },
+    pagination: {
+      total: nodes.length,
+      offset: 0,
+      limit: 250,
+      has_more: false,
+    },
+  };
+}
+
+async function routeGraphPage(page: Page) {
+  const graph = buildDenseGraph();
+
+  await page.route("**/health", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
+  });
+  await page.route("**/v1/auth/me", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        authenticated: true,
+        auth_required: false,
+        configured_modes: [],
+        recommended_ui_mode: "no_auth",
+        auth_method: null,
+        subject: null,
+        role: null,
+        role_summary: null,
+        tenant_id: "default",
+        memberships: [],
+        request_id: "req-graph-e2e",
+        trace_id: "trace-graph-e2e",
+        span_id: "span-graph-e2e",
+      }),
+    });
+  });
+  await page.route("**/v1/posture/counts", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ critical: 4, high: 17, medium: 1, low: 0, total: 22, kev: 0, compound_issues: 1 }),
+    });
+  });
+  await page.route("**/v1/graph/snapshots?**", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify([
+        { scan_id: scanId, created_at: createdAt, node_count: graph.nodes.length, edge_count: graph.edges.length, risk_summary: graph.stats.severity_counts },
+        { scan_id: previousScanId, created_at: "2026-05-08T15:00:00Z", node_count: 12, edge_count: 20, risk_summary: { high: 8 } },
+      ]),
+    });
+  });
+  await page.route("**/v1/graph/diff?**", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        nodes_added: ["cve:filesystem:3", "cve:repo:3"],
+        nodes_removed: [],
+        nodes_changed: ["agent:desktop"],
+        edges_added: [["pkg:filesystem:3", "cve:filesystem:3", "vulnerable_to"]],
+        edges_removed: [],
+      }),
+    });
+  });
+  await page.route("**/v1/graph?**", async (route) => {
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(graph) });
+  });
+}
+
+async function captureGraphScreenshot(page: Page, testInfo: TestInfo, theme: "dark" | "light") {
+  await expect(page.getByRole("heading", { name: "Lineage Graph" })).toBeVisible();
+  await expect(page.getByText("Relevant paths", { exact: true }).first()).toBeVisible();
+  // View controls, operator details, and the attack-path queue now live inside
+  // one collapsed-by-default "Advanced controls" shelf so the canvas owns the
+  // fold (#3932). The shelf summary stays visible; its contents open on demand.
+  await expect(page.getByText("Advanced controls", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("graph-compression-summary")).toContainText(/compressed|rendered/);
+
+  const largeOverview = page.getByTestId("large-graph-overview");
+  const application = page.getByRole("application");
+  const desktopNode = application.getByText("Desktop Agent", { exact: true });
+  // Graph mode is selected after the bounded graph finishes loading. Under a
+  // busy CI worker, branching on an immediate `isVisible()` can choose the
+  // React Flow path before either renderer has mounted. Wait for one truthful
+  // renderer signal, then assert against that renderer.
+  await expect.poll(async () =>
+    (await largeOverview.isVisible()) || (await desktopNode.isVisible()),
+  ).toBe(true);
+  if (await largeOverview.isVisible()) {
+    await expect(largeOverview).toBeVisible();
+    await expect(page.getByText("Pan, zoom, search, filter, and select nodes for evidence.")).toBeVisible();
+  } else {
+    await expect(desktopNode).toBeVisible();
+    await expect(application.getByText("CVE-2026-103", { exact: true })).toBeVisible();
+    await expect(page.getByText("Legend").first()).toBeVisible();
+    // Topology with the legend collapsed — proves the nodes fill the canvas
+    // and read clearly at default zoom.
+    await application.screenshot({
+      path: testInfo.outputPath(`lineage-graph-canvas-${theme}.png`),
+    });
+    // Open the on-canvas legend so the per-entity-type icons are captured.
+    const legendToggle = page.getByRole("button", { name: /show legend/i });
+    if (await legendToggle.isVisible()) {
+      await legendToggle.click();
+    }
+    // Graph chrome may render the legend as a details dock (without a
+    // persistent hide button) on focused views. Verify the legend remains
+    // readable after the optional toggle instead of coupling the test to one
+    // control implementation.
+    await expect(page.getByText("Legend").first()).toBeVisible();
+    await application.screenshot({
+      path: testInfo.outputPath(`lineage-graph-legend-${theme}.png`),
+    });
+  }
+  await page.screenshot({
+    path: testInfo.outputPath(`lineage-graph-dense-${theme}.png`),
+    fullPage: true,
+  });
+}
+
+for (const theme of ["dark", "light"] as const) {
+  test(`lineage graph dense ${theme} view stays focused and screenshot-ready`, async ({ page }, testInfo) => {
+    await routeGraphPage(page);
+    await page.addInitScript((selectedTheme) => {
+      window.localStorage.setItem("agent-bom-theme", selectedTheme);
+    }, theme);
+
+    await page.goto("/graph", { waitUntil: "domcontentloaded" });
+    await page.waitForURL((url) => url.pathname === "/graph" && url.searchParams.has("layers"), {
+      waitUntil: "domcontentloaded",
+    });
+    await captureGraphScreenshot(page, testInfo, theme);
+  });
+}
+
+test("lineage graph controls zoom, move, persist, lock, fit, and auto-layout", async ({ page }) => {
+  await routeGraphPage(page);
+  await page.goto("/graph", { waitUntil: "domcontentloaded" });
+  await page.waitForURL((url) => url.pathname === "/graph" && url.searchParams.has("layers"));
+
+  const canvas = page.locator(".react-flow").last();
+  const node = canvas.locator(".react-flow__node").first();
+  await expect(node).toBeVisible();
+  const before = await node.boundingBox();
+  expect(before).not.toBeNull();
+
+  await page.getByRole("button", { name: "Edit layout" }).click();
+  const editableNode = await node.boundingBox();
+  const canvasBox = await canvas.boundingBox();
+  expect(editableNode).not.toBeNull();
+  expect(canvasBox).not.toBeNull();
+  await page.mouse.move(
+    editableNode!.x + editableNode!.width / 2,
+    editableNode!.y + editableNode!.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(canvasBox!.x + 220, canvasBox!.y + 220, { steps: 8 });
+  await page.mouse.up();
+  await expect.poll(() => page.evaluate(() =>
+    Object.keys(localStorage).some((key) => key.startsWith("agent-bom:graph-presentation:v1:")),
+  )).toBe(true);
+
+  await canvas.hover();
+  await page.mouse.wheel(0, -240);
+  await page.getByRole("button", { name: "Fit visible graph" }).click();
+  await page.getByRole("button", { name: "Auto-layout graph" }).click();
+  await page.getByRole("button", { name: "Lock layout" }).click();
+  await expect(page.getByRole("button", { name: "Edit layout" })).toBeVisible();
+});

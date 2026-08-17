@@ -8,11 +8,15 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import quote
 
 from rich.console import Console
 
+from agent_bom.extensions import ExtensionCapabilities, iter_entry_point_registrations
 from agent_bom.models import MCPServer, Package
+from agent_bom.parsers.base import InventoryParserRegistration
+from agent_bom.parsers.beam_parsers import parse_hex_packages, parse_pub_packages  # noqa: F401
 
 # Re-export Go/Maven/Cargo/Gradle/conda/uvx parsers for backward compatibility
 from agent_bom.parsers.compiled_parsers import (  # noqa: F401
@@ -39,6 +43,14 @@ from agent_bom.parsers.node_parsers import (  # noqa: F401
     parse_pnpm_lock,
     parse_yarn_lock,
 )
+
+# Re-export OS package parsers (dpkg/rpm/apk — live system and mounted snapshots)
+from agent_bom.parsers.os_parsers import (  # noqa: F401
+    parse_apk_packages,
+    parse_dpkg_packages,
+    parse_rpm_packages,
+    scan_os_packages,
+)
 from agent_bom.parsers.php_parsers import parse_php_packages  # noqa: F401
 
 # Re-export Python parsers for backward compatibility
@@ -54,6 +66,140 @@ from agent_bom.parsers.python_parsers import (  # noqa: F401
 # Re-export Ruby, PHP, and Swift parsers
 from agent_bom.parsers.ruby_parsers import parse_ruby_packages  # noqa: F401
 from agent_bom.parsers.swift_parsers import parse_swift_packages  # noqa: F401
+from agent_bom.traversal import is_nested_worktree_root
+
+_ENTRY_POINT_GROUP = "agent_bom.inventory_parsers"
+
+
+_BUILTIN_INVENTORY_PARSERS: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    "npm": ("agent_bom.parsers.node_parsers", "parse_npm_packages", ("package.json", "package-lock.json")),
+    "yarn": ("agent_bom.parsers.node_parsers", "parse_yarn_lock", ("yarn.lock",)),
+    "pnpm": ("agent_bom.parsers.node_parsers", "parse_pnpm_lock", ("pnpm-lock.yaml",)),
+    "bun": ("agent_bom.parsers.node_parsers", "parse_bun_packages", ("bun.lockb", "bun.lock")),
+    "pip": ("agent_bom.parsers.python_parsers", "parse_pip_packages", ("requirements.txt", "pyproject.toml", "poetry.lock", "uv.lock")),
+    "pip_compile": ("agent_bom.parsers.python_parsers", "parse_pip_compile_inputs", ("requirements.in",)),
+    "conda_environment": ("agent_bom.parsers.python_parsers", "parse_conda_environment", ("environment.yml", "environment.yaml")),
+    "conda": ("agent_bom.parsers.compiled_parsers", "parse_conda_packages", ("conda-meta",)),
+    "go": ("agent_bom.parsers.compiled_parsers", "parse_go_packages", ("go.mod", "go.sum")),
+    "cargo": ("agent_bom.parsers.compiled_parsers", "parse_cargo_packages", ("Cargo.toml", "Cargo.lock")),
+    "maven": ("agent_bom.parsers.compiled_parsers", "parse_maven_packages", ("pom.xml",)),
+    "gradle": ("agent_bom.parsers.compiled_parsers", "parse_gradle_packages", ("build.gradle", "build.gradle.kts")),
+    "nuget": ("agent_bom.parsers.dotnet_parsers", "parse_nuget_packages", ("*.csproj", "packages.lock.json")),
+    "ruby": ("agent_bom.parsers.ruby_parsers", "parse_ruby_packages", ("Gemfile", "Gemfile.lock")),
+    "php": ("agent_bom.parsers.php_parsers", "parse_php_packages", ("composer.json", "composer.lock")),
+    "swift": ("agent_bom.parsers.swift_parsers", "parse_swift_packages", ("Package.swift", "Package.resolved")),
+    "hex": ("agent_bom.parsers.beam_parsers", "parse_hex_packages", ("mix.lock",)),
+    "pub": ("agent_bom.parsers.beam_parsers", "parse_pub_packages", ("pubspec.lock",)),
+    "apk": ("agent_bom.parsers.os_parsers", "parse_apk_packages", ("lib/apk/db/installed",)),
+    "dpkg": ("agent_bom.parsers.os_parsers", "parse_dpkg_packages", ("var/lib/dpkg/status",)),
+    "rpm": ("agent_bom.parsers.os_parsers", "parse_rpm_packages", ("var/lib/rpm",)),
+}
+
+_INVENTORY_PARSER_REGISTRY: dict[str, InventoryParserRegistration] = {}
+_INVENTORY_PARSER_REGISTRY_WARNINGS: list[str] = []
+_INVENTORY_PARSER_REGISTRY_LOADED = False
+
+
+def _parser_capabilities() -> ExtensionCapabilities:
+    return ExtensionCapabilities(
+        scan_modes=("inventory",),
+        required_scopes=("local_project_read",),
+        outbound_destinations=(),
+        data_boundary="local_manifest_read_only",
+        network_access=False,
+        guarantees=("read_only", "local_files_only"),
+    )
+
+
+def _registration_for_inventory_parser(
+    name: str,
+    module: str,
+    parse_attr: str,
+    manifest_names: tuple[str, ...],
+    *,
+    source: str = "builtin",
+) -> InventoryParserRegistration:
+    return InventoryParserRegistration(
+        name=name,
+        module=module,
+        capabilities=_parser_capabilities(),
+        source=source,
+        parse_attr=parse_attr,
+        manifest_names=manifest_names,
+    )
+
+
+def builtin_inventory_parser_registrations() -> list[InventoryParserRegistration]:
+    """Return built-in package inventory parser registrations."""
+
+    return [
+        _registration_for_inventory_parser(name, module, parse_attr, manifest_names)
+        for name, (module, parse_attr, manifest_names) in _BUILTIN_INVENTORY_PARSERS.items()
+    ]
+
+
+def _coerce_inventory_parser_registration(value: Any, entry_point_name: str) -> InventoryParserRegistration:
+    if isinstance(value, InventoryParserRegistration):
+        return value
+    name = str(getattr(value, "name", entry_point_name)).strip()
+    module = str(getattr(value, "module", "")).strip()
+    if not name or not module:
+        raise ValueError("inventory parser registration must declare name and module")
+    capabilities = getattr(value, "capabilities", ExtensionCapabilities())
+    if not isinstance(capabilities, ExtensionCapabilities):
+        capabilities = ExtensionCapabilities()
+    return InventoryParserRegistration(
+        name=name,
+        module=module,
+        capabilities=capabilities,
+        source=str(getattr(value, "source", "entry_point")),
+        discover_attr=str(getattr(value, "discover_attr", "discover")),
+        parse_attr=str(getattr(value, "parse_attr", "parse")),
+        manifest_names=tuple(str(item) for item in getattr(value, "manifest_names", ())),
+    )
+
+
+def register_inventory_parser(registration: InventoryParserRegistration) -> None:
+    """Register an inventory parser with capability metadata."""
+
+    _INVENTORY_PARSER_REGISTRY[registration.name] = registration
+
+
+def _ensure_inventory_parser_registry_loaded() -> None:
+    global _INVENTORY_PARSER_REGISTRY_LOADED
+    if _INVENTORY_PARSER_REGISTRY_LOADED:
+        return
+    for registration in builtin_inventory_parser_registrations():
+        register_inventory_parser(registration)
+    for registration in iter_entry_point_registrations(
+        group=_ENTRY_POINT_GROUP,
+        coerce=_coerce_inventory_parser_registration,
+        warnings=_INVENTORY_PARSER_REGISTRY_WARNINGS,
+    ):
+        register_inventory_parser(registration)
+    _INVENTORY_PARSER_REGISTRY_LOADED = True
+
+
+def list_registered_inventory_parsers() -> list[InventoryParserRegistration]:
+    """Return registered inventory parsers with capability declarations."""
+
+    _ensure_inventory_parser_registry_loaded()
+    return [_INVENTORY_PARSER_REGISTRY[name] for name in sorted(_INVENTORY_PARSER_REGISTRY)]
+
+
+def inventory_parser_registry_warnings() -> list[str]:
+    """Return sanitized non-fatal registry loading warnings."""
+
+    _ensure_inventory_parser_registry_loaded()
+    return list(_INVENTORY_PARSER_REGISTRY_WARNINGS)
+
+
+def _reset_inventory_parser_registry_for_tests() -> None:
+    _INVENTORY_PARSER_REGISTRY.clear()
+    _INVENTORY_PARSER_REGISTRY_WARNINGS.clear()
+    global _INVENTORY_PARSER_REGISTRY_LOADED
+    _INVENTORY_PARSER_REGISTRY_LOADED = False
+
 
 # Path to bundled MCP registry (parsers/ is a subdir of agent_bom/)
 _REGISTRY_PATH = Path(__file__).parent.parent / "mcp_registry.json"
@@ -93,6 +239,124 @@ def _extract_version_from_args(args: list[str]) -> str | None:
     return None
 
 
+def _registry_pattern_matches(pattern: object, candidate: object) -> bool:
+    pat = str(pattern or "").strip().lower()
+    value = str(candidate or "").strip().lower()
+    if not pat or not value:
+        return False
+    if pat == value:
+        return True
+    return re.search(rf"(^|[\s/@:_-]){re.escape(pat)}($|[\s/@:_-])", value) is not None
+
+
+def _registry_purl(ecosystem: str, package_name: str, version: str) -> str:
+    if ecosystem.lower() == "npm":
+        return _npm_purl(package_name, version)
+    return f"pkg:{ecosystem}/{package_name}@{version}"
+
+
+_CONTAINER_COMMANDS = {"docker", "podman"}
+_CONTAINER_RUN_VALUE_FLAGS = {
+    "-a",
+    "--add-host",
+    "--attach",
+    "--cap-add",
+    "--cap-drop",
+    "--cidfile",
+    "--cpus",
+    "--dns",
+    "--entrypoint",
+    "-e",
+    "--env",
+    "--env-file",
+    "--expose",
+    "-h",
+    "--hostname",
+    "--ip",
+    "--label",
+    "--label-file",
+    "-m",
+    "--memory",
+    "--mount",
+    "--name",
+    "--network",
+    "--platform",
+    "-p",
+    "--publish",
+    "--security-opt",
+    "--user",
+    "-u",
+    "-v",
+    "--volume",
+    "-w",
+    "--workdir",
+}
+
+
+def _split_container_image_ref(image_ref: str) -> tuple[str, str]:
+    image = image_ref.strip()
+    if "@sha256:" in image:
+        name, digest = image.split("@", 1)
+        return name, digest
+    last_segment = image.rsplit("/", 1)[-1]
+    if ":" in last_segment:
+        name, version = image.rsplit(":", 1)
+        return name, version
+    return image, "latest"
+
+
+def _docker_purl(name: str, version: str) -> str:
+    return f"pkg:docker/{quote(name, safe='/')}@{quote(version, safe='')}"
+
+
+def _docker_run_image_arg(args: list[str]) -> str | None:
+    index = 0
+    if index < len(args) and args[index] == "container":
+        index += 1
+    if index >= len(args) or args[index] != "run":
+        return None
+    index += 1
+
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            return args[index + 1] if index + 1 < len(args) else None
+        if not arg.startswith("-"):
+            return arg
+        if "=" in arg:
+            index += 1
+            continue
+        if arg in _CONTAINER_RUN_VALUE_FLAGS:
+            index += 2
+            continue
+        index += 1
+    return None
+
+
+def detect_docker_image_package(server: MCPServer) -> list[Package]:
+    """Extract the image reference from docker/podman MCP server commands."""
+    surface = getattr(getattr(server, "surface", ""), "value", getattr(server, "surface", ""))
+    if surface == "container-image":
+        return []
+    command = Path(server.command or "").name
+    if command not in _CONTAINER_COMMANDS:
+        return []
+    image_ref = _docker_run_image_arg(server.args)
+    if not image_ref:
+        return []
+    name, version = _split_container_image_ref(image_ref)
+    return [
+        Package(
+            name=name,
+            version=version,
+            ecosystem="docker",
+            purl=_docker_purl(name, version),
+            is_direct=True,
+            version_source="detected",
+        )
+    ]
+
+
 def lookup_mcp_registry(server: MCPServer) -> list[Package]:
     """Look up an MCP server's packages using the bundled registry.
 
@@ -115,7 +379,7 @@ def lookup_mcp_registry(server: MCPServer) -> list[Package]:
         patterns = entry.get("command_patterns", [pkg_name])
         for candidate in candidates:
             for pattern in patterns:
-                if pattern in candidate or candidate in pkg_name:
+                if _registry_pattern_matches(pattern, candidate) or _registry_pattern_matches(pkg_name, candidate):
                     ecosystem = entry.get("ecosystem", "npm")
                     registry_version = entry.get("latest_version", "latest")
                     risk_level = entry.get("risk_level")
@@ -127,9 +391,10 @@ def lookup_mcp_registry(server: MCPServer) -> list[Package]:
                         version = detected_version
                         version_source = "detected"
                     else:
-                        # Set to "latest" so resolver queries npm/PyPI
-                        # for the actual current version
-                        version = "latest"
+                        # Use the bundled registry version when we have it so
+                        # MCP package coverage does not depend on a live npm
+                        # lookup succeeding under rate limits.
+                        version = registry_version if registry_version not in ("", "latest", "unknown", "{{VERSION}}") else "latest"
                         version_source = "registry_fallback"
 
                     # Log warnings for unverified or high-risk servers
@@ -149,7 +414,7 @@ def lookup_mcp_registry(server: MCPServer) -> list[Package]:
                             name=entry["package"],
                             version=version,
                             ecosystem=ecosystem,
-                            purl=f"pkg:{ecosystem}/{entry['package']}@{version}",
+                            purl=_registry_purl(ecosystem, entry["package"], version),
                             is_direct=True,
                             resolved_from_registry=True,
                             registry_version=registry_version,
@@ -171,7 +436,7 @@ def get_registry_entry(server: MCPServer) -> dict | None:
         patterns = entry.get("command_patterns", [pkg_name])
         for candidate in candidates:
             for pattern in patterns:
-                if pattern in candidate or candidate in pkg_name:
+                if _registry_pattern_matches(pattern, candidate) or _registry_pattern_matches(pkg_name, candidate):
                     return entry
     return None
 
@@ -233,11 +498,13 @@ def extract_packages(
     """
     packages = []
 
-    # Try npx/uvx command extraction first
+    # Try direct command extraction first
     npx_packages = detect_npx_package(server)
     uvx_packages = detect_uvx_package(server)
+    docker_packages = detect_docker_image_package(server)
     packages.extend(npx_packages)
     packages.extend(uvx_packages)
+    packages.extend(docker_packages)
 
     # Try to find local directory and parse manifests
     server_dir = find_server_directory(server)
@@ -255,6 +522,11 @@ def extract_packages(
         packages.extend(parse_maven_packages(server_dir))
         packages.extend(parse_gradle_packages(server_dir))
         packages.extend(parse_nuget_packages(server_dir))
+        packages.extend(parse_ruby_packages(server_dir))
+        packages.extend(parse_php_packages(server_dir))
+        packages.extend(parse_swift_packages(server_dir))
+        packages.extend(parse_hex_packages(server_dir))
+        packages.extend(parse_pub_packages(server_dir))
 
     # If we only got npx/uvx packages (no local directory), resolve transitive deps
     if resolve_transitive and (npx_packages or uvx_packages) and not server_dir:
@@ -270,7 +542,7 @@ def extract_packages(
             console.print(f"  [green]✓[/green] Found {len(transitive_deps)} transitive dependencies")
 
     # Registry fallback: if we still have no packages, look up by server name/args
-    if not packages:
+    if not packages and server.allows_registry_resolution:
         registry_packages = lookup_mcp_registry(server)
         if registry_packages:
             console.print(f"  [dim cyan]→ {server.name}: resolved from MCP registry ({registry_packages[0].name})[/dim cyan]")
@@ -298,7 +570,7 @@ def extract_packages(
         packages.extend(registry_packages)
 
     # Official MCP Registry fallback: free API, no auth required
-    if not packages and mcp_registry:
+    if not packages and mcp_registry and server.allows_registry_resolution:
         try:
             from agent_bom.mcp_official_registry import official_registry_lookup_sync
 
@@ -310,7 +582,7 @@ def extract_packages(
             logger.debug("Official MCP Registry lookup failed for %s: %s", server.name, exc)
 
     # Smithery fallback: if local registry also missed, try Smithery API
-    if not packages and smithery_token:
+    if not packages and smithery_token and server.allows_registry_resolution:
         try:
             from agent_bom.smithery import smithery_lookup_sync
 
@@ -368,6 +640,33 @@ _MANIFEST_FILES = frozenset(
         "composer.json",
         "composer.lock",
         "Package.resolved",
+        "mix.lock",
+        "pubspec.lock",
+    }
+)
+
+#: Lockfile / resolved-dependency artifacts that should count as stronger
+#: package-evidence than manifest-only declarations in project scans.
+_LOCKFILE_FILES = frozenset(
+    {
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lock",
+        "bun.lockb",
+        "Pipfile.lock",
+        "poetry.lock",
+        "uv.lock",
+        "conda-lock.yml",
+        "go.sum",
+        "Cargo.lock",
+        "gradle.lockfile",
+        "packages.lock.json",
+        "Gemfile.lock",
+        "composer.lock",
+        "Package.resolved",
+        "mix.lock",
+        "pubspec.lock",
     }
 )
 
@@ -391,6 +690,8 @@ _SKIP_DIRS = frozenset(
         ".pytest_cache",
         "target",  # Rust/Maven
         ".cargo",
+        ".claude",  # Claude Code worktrees
+        ".codex",  # Codex worktrees
     }
 )
 
@@ -400,9 +701,112 @@ def _has_manifest(directory: Path) -> bool:
     return any((directory / name).exists() for name in _MANIFEST_FILES)
 
 
+def _manifest_file_names(directory: Path) -> list[str]:
+    """Return sorted manifest-like files present in *directory*."""
+    return sorted(name for name in _MANIFEST_FILES if (directory / name).exists())
+
+
+def summarize_project_inventory(
+    root: Path,
+    dir_map: dict[Path, list[Package]],
+) -> dict[str, object]:
+    """Summarize manifest/lockfile coverage for a project scan.
+
+    This keeps lockfile-driven project scanning visible in CLI/JSON output so
+    users can tell whether a project scan was backed by resolved lockfiles or
+    only manifest declarations.
+    """
+    root = Path(root).resolve()
+    directories: list[dict[str, object]] = []
+    ecosystems: dict[str, int] = {}
+    total_packages = 0
+    total_direct = 0
+    total_transitive = 0
+    manifest_file_total = 0
+    lockfile_total = 0
+    lockfile_directories = 0
+    declaration_only_directories = 0
+    lockfile_backed_packages = 0
+    declaration_only_packages = 0
+    lockfile_backed_direct_packages = 0
+    lockfile_backed_transitive_packages = 0
+    declaration_only_direct_packages = 0
+    declaration_only_transitive_packages = 0
+
+    for directory, packages in sorted(dir_map.items(), key=lambda item: str(item[0])):
+        manifest_files = _manifest_file_names(directory)
+        lockfiles = [name for name in manifest_files if name in _LOCKFILE_FILES]
+        manifests = [name for name in manifest_files if name not in _LOCKFILE_FILES]
+        direct_count = sum(1 for pkg in packages if pkg.is_direct)
+        transitive_count = len(packages) - direct_count
+        advisory_evidence = "lockfile_backed" if lockfiles else "declaration_only"
+
+        rel_path = "." if directory == root else str(directory.relative_to(root))
+        eco_breakdown: dict[str, int] = {}
+        for pkg in packages:
+            eco_breakdown[pkg.ecosystem] = eco_breakdown.get(pkg.ecosystem, 0) + 1
+            ecosystems[pkg.ecosystem] = ecosystems.get(pkg.ecosystem, 0) + 1
+
+        directories.append(
+            {
+                "path": rel_path,
+                "package_count": len(packages),
+                "direct_packages": direct_count,
+                "transitive_packages": transitive_count,
+                "manifest_files": manifest_files,
+                "lockfile_files": lockfiles,
+                "declaration_files": manifests,
+                "advisory_evidence": advisory_evidence,
+                "ecosystems": eco_breakdown,
+            }
+        )
+        total_packages += len(packages)
+        total_direct += direct_count
+        total_transitive += transitive_count
+        manifest_file_total += len(manifest_files)
+        lockfile_total += len(lockfiles)
+        if lockfiles:
+            lockfile_directories += 1
+            lockfile_backed_packages += len(packages)
+            lockfile_backed_direct_packages += direct_count
+            lockfile_backed_transitive_packages += transitive_count
+        else:
+            declaration_only_directories += 1
+            declaration_only_packages += len(packages)
+            declaration_only_direct_packages += direct_count
+            declaration_only_transitive_packages += transitive_count
+
+    advisory_depth_pct = round(lockfile_backed_packages / total_packages * 100) if total_packages else 0
+
+    return {
+        "root": str(root),
+        "manifest_directories": len(dir_map),
+        "lockfile_directories": lockfile_directories,
+        "declaration_only_directories": declaration_only_directories,
+        "manifest_files": manifest_file_total,
+        "lockfiles": lockfile_total,
+        "declaration_only_files": manifest_file_total - lockfile_total,
+        "package_count": total_packages,
+        "direct_packages": total_direct,
+        "transitive_packages": total_transitive,
+        "lockfile_backed_packages": lockfile_backed_packages,
+        "declaration_only_packages": declaration_only_packages,
+        "lockfile_backed_direct_packages": lockfile_backed_direct_packages,
+        "lockfile_backed_transitive_packages": lockfile_backed_transitive_packages,
+        "declaration_only_direct_packages": declaration_only_direct_packages,
+        "declaration_only_transitive_packages": declaration_only_transitive_packages,
+        "advisory_depth_pct": advisory_depth_pct,
+        "ecosystems": ecosystems,
+        "directories": directories,
+    }
+
+
 def scan_project_directory(
     root: Path,
     max_depth: int = 5,
+    *,
+    follow_symlinks: bool = False,
+    warnings: list[str] | None = None,
 ) -> dict[Path, list[Package]]:
     """Recursively walk *root* for package manifests and parse all packages.
 
@@ -414,6 +818,8 @@ def scan_project_directory(
     Args:
         root: Project root directory to scan.
         max_depth: Maximum directory depth to descend (default 5).
+        follow_symlinks: Whether to descend into symlinked directories.
+        warnings: Optional list populated with skipped or cross-boundary paths.
 
     Returns:
         Dict mapping each manifest-bearing directory to its parsed packages.
@@ -422,9 +828,30 @@ def scan_project_directory(
     root = Path(root).resolve()
     results: dict[Path, list[Package]] = {}
 
+    visited_real: set[str] = set()
+
+    def _warn(message: str) -> None:
+        if warnings is not None:
+            warnings.append(message)
+
+    def _is_within_root(path: Path) -> bool:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
     def _walk(directory: Path, depth: int) -> None:
         if depth > max_depth:
             return
+        resolved_dir = directory.resolve()
+        if not _is_within_root(resolved_dir):
+            _warn(f"skipping path outside project root: {directory} -> {resolved_dir}")
+            return
+        real = str(resolved_dir)
+        if real in visited_real:
+            return
+        visited_real.add(real)
 
         if _has_manifest(directory):
             pkgs: list[Package] = []
@@ -444,6 +871,8 @@ def scan_project_directory(
             pkgs.extend(parse_ruby_packages(directory))
             pkgs.extend(parse_php_packages(directory))
             pkgs.extend(parse_swift_packages(directory))
+            pkgs.extend(parse_hex_packages(directory))
+            pkgs.extend(parse_pub_packages(directory))
 
             # Deduplicate within this directory
             seen: set[tuple] = set()
@@ -459,9 +888,24 @@ def scan_project_directory(
 
         # Recurse into subdirectories
         try:
-            subdirs = [
-                d for d in directory.iterdir() if d.is_dir() and d.name not in _SKIP_DIRS and not (d.name.startswith(".") and depth > 0)
-            ]
+            subdirs = []
+            for candidate in directory.iterdir():
+                if candidate.name in _SKIP_DIRS or (candidate.name.startswith(".") and depth > 0):
+                    continue
+                # A linked worktree/submodule is a second copy of the project;
+                # descending into it counts every manifest twice.
+                if is_nested_worktree_root(candidate):
+                    _warn(f"skipping nested checkout: {candidate}")
+                    continue
+                if candidate.is_symlink():
+                    if not follow_symlinks:
+                        _warn(f"skipping symlinked directory: {candidate}")
+                        continue
+                    resolved_candidate = candidate.resolve()
+                    if not _is_within_root(resolved_candidate):
+                        _warn(f"following symlink outside project root: {candidate} -> {resolved_candidate}")
+                if candidate.is_dir():
+                    subdirs.append(candidate)
         except PermissionError:
             return
 

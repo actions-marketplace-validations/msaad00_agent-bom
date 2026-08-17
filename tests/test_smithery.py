@@ -294,6 +294,9 @@ def test_sync_skips_existing(mock_client_factory, mock_request, tmp_path):
         assert result.added == 1
         assert result.skipped == 1
 
+        data = json.loads(reg_file.read_text())
+        assert data["_total_servers"] == len(data["servers"])
+
 
 def test_sync_no_token():
     """Sync without token returns empty result."""
@@ -315,7 +318,7 @@ def test_cli_scan_smithery_flags():
     from agent_bom.cli import main
 
     runner = CliRunner()
-    result = runner.invoke(main, ["scan", "--help"])
+    result = runner.invoke(main, ["scan", "--help-all"])
     assert result.exit_code == 0
     assert "--smithery" in result.output
     assert "--smithery-token" in result.output

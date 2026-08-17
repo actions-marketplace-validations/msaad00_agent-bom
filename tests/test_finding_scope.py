@@ -1,0 +1,362 @@
+"""Tests for first-class finding scope + security-domain taxonomy (issue #3946)."""
+
+from __future__ import annotations
+
+from agent_bom.finding import (
+    Asset,
+    Finding,
+    FindingSource,
+    FindingType,
+    cloud_cis_check_to_finding,
+    snowflake_governance_finding_to_finding,
+)
+from agent_bom.finding_scope import (
+    account_ref_from_arn,
+    domain_for_row,
+    lenses_for_row,
+    normalize_account_ref,
+    region_from_arn,
+    security_domain_for,
+    security_lenses_for,
+)
+
+# ---------------------------------------------------------------------------
+# Account-ref / ARN normalization
+# ---------------------------------------------------------------------------
+
+
+def test_account_ref_from_aws_arn() -> None:
+    arn = "arn:aws:s3:::my-bucket"
+    # S3 ARNs carry no account segment; fall back to None
+    assert account_ref_from_arn(arn) is None
+    ec2 = "arn:aws:ec2:us-east-1:123456789012:instance/i-0abc"
+    assert account_ref_from_arn(ec2) == "123456789012"
+    assert region_from_arn(ec2) == "us-east-1"
+
+
+def test_normalize_account_ref_adds_provider_prefix() -> None:
+    assert normalize_account_ref("aws", "123456789012") == "aws:123456789012"
+    assert normalize_account_ref("azure", "sub-uuid-1") == "azure:sub-uuid-1"
+    assert normalize_account_ref("gcp", "my-project") == "gcp:my-project"
+
+
+def test_normalize_account_ref_idempotent_when_prefixed() -> None:
+    assert normalize_account_ref("aws", "aws:123456789012") == "aws:123456789012"
+    # provider casing is normalized
+    assert normalize_account_ref("AWS", "123456789012") == "aws:123456789012"
+
+
+def test_normalize_account_ref_none_and_empty() -> None:
+    assert normalize_account_ref("aws", None) is None
+    assert normalize_account_ref("aws", "") is None
+    assert normalize_account_ref("", "123") is None
+
+
+# ---------------------------------------------------------------------------
+# FindingSource / FindingType -> security_domain
+# ---------------------------------------------------------------------------
+
+
+def test_domain_cloud_cis_is_cspm() -> None:
+    assert security_domain_for(FindingSource.CLOUD_CIS, FindingType.CIS_FAIL, {"benchmark": "CIS"}) == "cspm"
+    assert security_domain_for(FindingSource.CLOUD_CIS, FindingType.CIS_ERROR, {"benchmark": "CIS"}) == "cspm"
+
+
+def test_domain_dependency_cve_is_vuln() -> None:
+    assert security_domain_for(FindingSource.MCP_SCAN, FindingType.CVE) == "vuln"
+    assert security_domain_for(FindingSource.SBOM, FindingType.CVE) == "vuln"
+    assert security_domain_for(FindingSource.CONTAINER, FindingType.CVE) == "vuln"
+    assert security_domain_for(FindingSource.MCP_SCAN, FindingType.MALICIOUS_PACKAGE) == "vuln"
+
+
+def test_domain_sast_and_secret_is_aspm() -> None:
+    assert security_domain_for(FindingSource.SAST, FindingType.SAST) == "aspm"
+    assert security_domain_for(FindingSource.SECRET_SCAN, FindingType.CREDENTIAL_EXPOSURE) == "aspm"
+
+
+def test_domain_mcp_agent_signals_are_aispm() -> None:
+    assert security_domain_for(FindingSource.MCP_SCAN, FindingType.TOOL_DRIFT) == "aispm"
+    assert security_domain_for(FindingSource.PROXY, FindingType.EXFILTRATION) == "aispm"
+    assert security_domain_for(FindingSource.SKILL, FindingType.SKILL_RISK) == "aispm"
+    assert security_domain_for(FindingSource.PROMPT_SCAN, FindingType.PROMPT_SECURITY) == "aispm"
+
+
+def test_domain_snowflake_governance_is_dspm() -> None:
+    ev = {"provider": "snowflake", "category": "sensitive-data-access"}
+    assert security_domain_for(FindingSource.CLOUD_CIS, FindingType.CIS_FAIL, ev) == "dspm"
+
+
+def test_domain_is_one_of_the_five() -> None:
+    valid = {"cspm", "vuln", "aspm", "dspm", "aispm"}
+    for source in FindingSource:
+        for ftype in FindingType:
+            assert security_domain_for(source, ftype) in valid
+
+
+def test_legacy_appsec_sca_domain_resolves_to_aspm() -> None:
+    """Rows persisted under the pre-rename key still land in the ASPM lane."""
+    from agent_bom.finding_scope import canonical_domain, domain_for_row
+
+    assert canonical_domain("appsec_sca") == "aspm"
+    assert canonical_domain("aspm") == "aspm"
+    assert canonical_domain("bogus") is None
+    assert domain_for_row({"security_domain": "appsec_sca"}) == "aspm"
+
+
+# ---------------------------------------------------------------------------
+# Overlapping coverage lenses (a finding may belong to several)
+# ---------------------------------------------------------------------------
+
+
+def test_repo_dependency_cve_is_both_vuln_and_aspm() -> None:
+    """A repo/project dependency CVE is both a Vuln-mgmt and an ASPM concern."""
+    assert security_lenses_for(FindingSource.SBOM, FindingType.CVE) == {"vuln", "aspm"}
+    assert security_lenses_for(FindingSource.FILESYSTEM, FindingType.CVE) == {"vuln", "aspm"}
+
+
+def test_container_and_external_cve_is_vuln_only() -> None:
+    """Image / external-registry CVEs are vuln-management, not application-layer."""
+    assert security_lenses_for(FindingSource.CONTAINER, FindingType.CVE) == {"vuln"}
+    assert security_lenses_for(FindingSource.EXTERNAL, FindingType.CVE) == {"vuln"}
+
+
+def test_sast_and_secret_lenses_are_aspm_only() -> None:
+    assert security_lenses_for(FindingSource.SAST, FindingType.SAST) == {"aspm"}
+    assert security_lenses_for(FindingSource.SECRET_SCAN, FindingType.CREDENTIAL_EXPOSURE) == {"aspm"}
+
+
+def test_cloud_cis_lens_is_cspm_only() -> None:
+    assert security_lenses_for(FindingSource.CLOUD_CIS, FindingType.CIS_FAIL, {"benchmark": "CIS"}) == {"cspm"}
+
+
+def test_iac_misconfig_lens_adds_aspm() -> None:
+    """An IaC-template misconfig is application-layer as well as cloud config."""
+    ev = {"benchmark": "CIS", "iac": True, "resource_type": "terraform"}
+    assert security_lenses_for(FindingSource.CLOUD_CIS, FindingType.CIS_FAIL, ev) == {"cspm", "aspm"}
+
+
+def test_ai_signal_lens_is_aispm_only() -> None:
+    assert security_lenses_for(FindingSource.MCP_SCAN, FindingType.TOOL_DRIFT) == {"aispm"}
+
+
+def test_snowflake_governance_lens_is_dspm_only() -> None:
+    ev = {"provider": "snowflake", "category": "sensitive-data-access"}
+    assert security_lenses_for(FindingSource.CLOUD_CIS, FindingType.CIS_FAIL, ev) == {"dspm"}
+
+
+def test_every_lens_set_includes_the_primary_domain() -> None:
+    for source in FindingSource:
+        for ftype in FindingType:
+            primary = security_domain_for(source, ftype)
+            lenses = security_lenses_for(source, ftype)
+            assert primary in lenses
+            assert lenses <= {"cspm", "vuln", "aspm", "dspm", "aispm"}
+
+
+def test_lenses_for_row_unions_stored_domain_source_type_and_cve_id() -> None:
+    # A serialized repo dependency CVE row: parseable source/type + a CVE id.
+    row = {"security_domain": "vuln", "source": "SBOM", "finding_type": "CVE", "cve_id": "CVE-2025-1"}
+    assert lenses_for_row(row) == {"vuln", "aspm"}
+    # A row carrying only the stored primary stays single-lane.
+    assert lenses_for_row({"security_domain": "aispm"}) == {"aispm"}
+    # Legacy stored key still resolves into the ASPM lens.
+    assert lenses_for_row({"security_domain": "appsec_sca"}) == {"aspm"}
+    # A bare CVE id with no parseable source/type still counts under vuln.
+    assert lenses_for_row({"cve_id": "CVE-2025-2"}) == {"vuln"}
+
+
+def test_finding_class_for_row_uses_explicit_unclassified_fallback() -> None:
+    from agent_bom.finding_scope import finding_class_for_row
+
+    assert finding_class_for_row({"finding_type": "CVE", "cve_id": "CVE-2026-1"}) == "vulnerability"
+    assert finding_class_for_row({"finding_type": "CIS_FAIL", "source": "CLOUD_CIS"}) == "misconfiguration"
+    assert finding_class_for_row({"finding_type": "CREDENTIAL_EXPOSURE", "source": "SECRET_SCAN"}) == "secret"
+    assert finding_class_for_row({"finding_type": "CIEM_OVER_PRIVILEGE"}) == "identity"
+    assert finding_class_for_row({"finding_type": "SAST", "source": "SAST"}) == "vulnerability"
+    assert finding_class_for_row({"finding_type": "FUTURE_RUNTIME_SIGNAL", "source": "FUTURE_RUNTIME"}) == "unclassified"
+    assert finding_class_for_row({"id": "untyped-finding"}) == "unclassified"
+
+
+def test_row_scope_can_filter_by_finding_class() -> None:
+    from agent_bom.finding_scope import row_matches_scope
+
+    row = {"finding_type": "CIS_ERROR", "source": "CLOUD_CIS"}
+    assert row_matches_scope(row, {"finding_class": "misconfiguration"})
+    assert not row_matches_scope(row, {"finding_class": "vulnerability"})
+
+
+# ---------------------------------------------------------------------------
+# Finding / Asset carry scope + domain through serialization
+# ---------------------------------------------------------------------------
+
+
+def test_finding_scope_fields_default_none_and_serialize() -> None:
+    f = Finding(
+        finding_type=FindingType.CVE,
+        source=FindingSource.MCP_SCAN,
+        asset=Asset(name="requests", asset_type="package"),
+        severity="high",
+    )
+    assert f.provider is None
+    assert f.account_ref is None
+    assert f.region is None
+    assert f.environment is None
+    payload = f.to_dict()
+    assert payload["provider"] is None
+    assert payload["account_ref"] is None
+    assert payload["region"] is None
+    assert payload["environment"] is None
+    assert payload["security_domain"] == "vuln"
+    # asset scope block present
+    assert payload["asset"]["provider"] is None
+
+
+def test_finding_scope_fields_serialize_when_set() -> None:
+    f = Finding(
+        finding_type=FindingType.CIS_FAIL,
+        source=FindingSource.CLOUD_CIS,
+        asset=Asset(name="root", asset_type="cloud_resource"),
+        severity="high",
+        provider="aws",
+        account_ref="aws:123456789012",
+        region="us-east-1",
+        environment="prod",
+    )
+    payload = f.to_dict()
+    assert payload["provider"] == "aws"
+    assert payload["account_ref"] == "aws:123456789012"
+    assert payload["region"] == "us-east-1"
+    assert payload["environment"] == "prod"
+    assert payload["security_domain"] == "cspm"
+    assert payload["asset"]["account_ref"] == "aws:123456789012"
+
+
+# ---------------------------------------------------------------------------
+# Ingest converters populate scope
+# ---------------------------------------------------------------------------
+
+
+def test_cloud_cis_converter_threads_scope() -> None:
+    check = {
+        "check_id": "2.1.1",
+        "title": "S3 bucket encryption",
+        "severity": "high",
+        "status": "FAIL",
+        "resource_ids": ["arn:aws:ec2:us-west-2:210987654321:instance/i-1"],
+        "account_id": "210987654321",
+        "benchmark": "CIS",
+    }
+    f = cloud_cis_check_to_finding(check, "aws")
+    assert f.provider == "aws"
+    assert f.account_ref == "aws:210987654321"
+    assert f.region == "us-west-2"
+    assert f.security_domain == "cspm"
+    payload = f.to_dict()
+    assert payload["account_ref"] == "aws:210987654321"
+
+
+def test_snowflake_governance_converter_normalizes_account_and_domain() -> None:
+    raw = {
+        "category": "sensitive-data-access",
+        "severity": "high",
+        "title": "Broad SELECT on PII",
+        "object_name": "DB.SCHEMA.CUSTOMERS",
+    }
+    f = snowflake_governance_finding_to_finding(raw, "xy12345")
+    assert f.provider == "snowflake"
+    assert f.account_ref == "snowflake:xy12345"
+    assert f.security_domain == "dspm"
+
+
+def test_domain_derives_from_type_when_source_is_a_connector_label() -> None:
+    """A free-text ``source`` must not discard a perfectly good ``finding_type``.
+
+    ``POST /v1/findings/bulk`` takes ``source`` as a connector provenance label
+    — its default is literally ``"api"`` — while this module parsed the same
+    field as ``FindingSource``. Source and type were parsed in one ``try``, so
+    an unrecognized label threw both away: a row plainly typed ``CVE`` derived
+    no domain and no lenses, and every ``?domain=`` query returned nothing for
+    connector-ingested findings while the same finding from a scan filtered
+    fine.
+    """
+    for label in ("api", "scale-gate", "acme-connector", ""):
+        row = {"source": label, "finding_type": "CVE", "severity": "high"}
+        assert domain_for_row(row) == "vuln", f"source={label!r} lost the CVE type"
+        assert "vuln" in lenses_for_row(row), f"source={label!r} produced no lenses"
+
+    assert domain_for_row({"source": "api", "finding_type": "CREDENTIAL_EXPOSURE"}) == "aspm"
+    assert domain_for_row({"source": "api", "finding_type": "SENSITIVE_DATA"}) == "dspm"
+    assert domain_for_row({"source": "api", "finding_type": "CIEM_OVER_PRIVILEGE"}) == "cspm"
+
+
+def test_unknown_type_still_reports_no_domain_rather_than_guessing() -> None:
+    """Tolerating an unknown source must not become inventing a lane.
+
+    With no parseable type AND no parseable source there is nothing to derive
+    from, so the honest answer is None and the caller picks the default. A
+    fallback lane here would file arbitrary findings under AISPM.
+    """
+    assert domain_for_row({"source": "acme", "finding_type": "NOT_A_TYPE"}) is None
+    assert lenses_for_row({"source": "acme", "finding_type": "NOT_A_TYPE"}) == frozenset()
+
+
+def test_known_source_routing_is_unchanged_by_the_lenient_parse() -> None:
+    """The source-routed fallbacks still apply whenever the source IS known."""
+    assert domain_for_row({"source": "SBOM", "finding_type": "CVE"}) == "vuln"
+    assert lenses_for_row({"source": "SBOM", "finding_type": "CVE"}) == frozenset({"vuln", "aspm"})
+    assert domain_for_row({"source": "MCP_SCAN", "finding_type": "TOOL_DRIFT"}) == "aispm"
+    assert domain_for_row({"source": "CLOUD_CIS", "finding_type": "CIS_FAIL", "evidence": {"benchmark": "CIS"}}) == "cspm"
+
+
+# ---------------------------------------------------------------------------
+# Owner + SLA derivation on the canonical API projection
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_payload_defaults_owner_to_unassigned() -> None:
+    from agent_bom.finding_scope import canonical_finding_payload
+
+    payload = canonical_finding_payload({"severity": "high"})
+    assert payload["owner"] is None
+
+
+def test_canonical_payload_preserves_existing_owner() -> None:
+    from agent_bom.finding_scope import canonical_finding_payload
+
+    payload = canonical_finding_payload({"severity": "high", "owner": "alice@example.com"})
+    assert payload["owner"] == "alice@example.com"
+
+
+def test_canonical_payload_derives_sla_from_first_seen() -> None:
+    from datetime import datetime
+
+    from agent_bom.finding_scope import canonical_finding_payload
+    from agent_bom.graph.sla import SEVERITY_SLA_DAYS
+
+    payload = canonical_finding_payload({"severity": "high", "first_seen": "2026-08-01T00:00:00+00:00"})
+    assert payload["sla_due_at"] is not None
+    delta = datetime.fromisoformat(payload["sla_due_at"]) - datetime.fromisoformat("2026-08-01T00:00:00+00:00")
+    assert delta.days == SEVERITY_SLA_DAYS["high"]
+
+
+def test_canonical_payload_sla_falls_back_to_last_seen_anchor() -> None:
+    from agent_bom.finding_scope import canonical_finding_payload
+
+    payload = canonical_finding_payload({"severity": "critical", "last_seen": "2026-08-01T00:00:00+00:00"})
+    assert payload["sla_due_at"] is not None
+
+
+def test_canonical_payload_preserves_precomputed_sla() -> None:
+    from agent_bom.finding_scope import canonical_finding_payload
+
+    payload = canonical_finding_payload(
+        {"severity": "high", "first_seen": "2026-08-01T00:00:00+00:00", "sla_due_at": "2026-08-05T00:00:00+00:00"}
+    )
+    assert payload["sla_due_at"] == "2026-08-05T00:00:00+00:00"
+
+
+def test_canonical_payload_sla_none_without_anchor() -> None:
+    from agent_bom.finding_scope import canonical_finding_payload
+
+    payload = canonical_finding_payload({"severity": "critical"})
+    assert payload["sla_due_at"] is None

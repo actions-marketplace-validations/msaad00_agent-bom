@@ -1,7 +1,7 @@
 """CSV output for spreadsheet/SIEM ingestion and executive reporting.
 
-One row per vulnerability finding with all enrichment data.
-UTF-8 BOM included for Excel compatibility.
+One row per finding — every unified finding type, not just CVEs — with all
+enrichment data. UTF-8 BOM included for Excel compatibility.
 """
 
 from __future__ import annotations
@@ -9,7 +9,19 @@ from __future__ import annotations
 import csv
 import io
 
+from agent_bom.compliance_utils import framework_qualified_finding_tags
+from agent_bom.finding import Finding
 from agent_bom.models import AIBOMReport, BlastRadius
+from agent_bom.output.finding_views import (
+    evidence,
+    is_package_malicious,
+    package_ecosystem,
+    package_name,
+    package_version,
+    severity_value,
+    unified_export_findings,
+    workflow_status,
+)
 
 _COLUMNS = [
     "cve_id",
@@ -20,18 +32,57 @@ _COLUMNS = [
     "cvss_score",
     "epss_score",
     "is_kev",
+    "is_malicious",
+    "malicious_reason",
+    "published_at",
+    "modified_at",
     "fixed_version",
     "cwe_ids",
     "affected_agents",
     "affected_servers",
     "exposed_credentials",
     "summary",
+    "severity_source",
+    "epss_percentile",
+    "kev_date_added",
+    "kev_due_date",
+    "compliance_tags",
+    "reachability",
+    "symbol_reachability",
+    "reachable_affected_symbols",
+    "graph_reachable",
+    "graph_min_hop_distance",
+    # Appended (not inserted) so positional consumers of the original CVE
+    # columns keep working; header-based consumers see them either way.
+    "finding_type",
+    "finding_id",
+    "title",
+    # --verify-integrity verdict. Empty = the check never ran, which is not the
+    # same claim as "no"; a gate must distinguish the two.
+    "integrity_verified",
+    "provenance_attested",
+    "provenance_source",
+    # Why: "unavailable" here beside an empty ``provenance_attested`` is a
+    # registry that never answered, not an attestation that is missing.
+    "provenance_status",
+    "owner",
+    "sla_due_at",
+    "workflow_status",
 ]
+
+
+def _verdict_cell(finding: Finding, key: str) -> str:
+    value = evidence(finding, key, None)
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value)
 
 
 def to_csv(report: AIBOMReport, blast_radii: list[BlastRadius] | None = None) -> str:
     """Convert an AIBOMReport to CSV string with UTF-8 BOM."""
-    brs = blast_radii or report.blast_radii
+    findings = unified_export_findings(report, blast_radii)
 
     buf = io.StringIO()
     # UTF-8 BOM for Excel auto-detection
@@ -40,28 +91,82 @@ def to_csv(report: AIBOMReport, blast_radii: list[BlastRadius] | None = None) ->
     writer = csv.DictWriter(buf, fieldnames=_COLUMNS, quoting=csv.QUOTE_MINIMAL)
     writer.writeheader()
 
-    for br in brs:
-        v = br.vulnerability
-        writer.writerow(
-            {
-                "cve_id": v.id,
-                "package": br.package.name,
-                "version": br.package.version or "",
-                "ecosystem": br.package.ecosystem or "",
-                "severity": v.severity.value,
-                "cvss_score": v.cvss_score if v.cvss_score is not None else "",
-                "epss_score": f"{v.epss_score:.4f}" if v.epss_score is not None else "",
-                "is_kev": "yes" if v.is_kev else "no",
-                "fixed_version": v.fixed_version or "",
-                "cwe_ids": ";".join(v.cwe_ids) if v.cwe_ids else "",
-                "affected_agents": ";".join(a.name for a in br.affected_agents),
-                "affected_servers": ";".join(s.name for s in br.affected_servers),
-                "exposed_credentials": str(len(br.exposed_credentials)),
-                "summary": v.summary or "",
-            }
-        )
+    for finding in findings:
+        row = {
+            "cve_id": finding.cve_id or "",
+            "package": package_name(finding),
+            "version": package_version(finding),
+            "ecosystem": package_ecosystem(finding),
+            "severity": severity_value(finding),
+            "cvss_score": finding.cvss_score if finding.cvss_score is not None else "",
+            "epss_score": f"{finding.epss_score:.4f}" if finding.epss_score is not None else "",
+            "is_kev": "yes" if finding.is_kev else "no",
+            "is_malicious": "yes" if (finding.is_malicious or is_package_malicious(finding)) else "no",
+            "malicious_reason": finding.malicious_reason or evidence(finding, "malicious_reason", ""),
+            "published_at": evidence(finding, "published_at", ""),
+            "modified_at": evidence(finding, "modified_at", ""),
+            "fixed_version": finding.fixed_version or "",
+            "cwe_ids": ";".join(finding.cwe_ids) if finding.cwe_ids else "",
+            "affected_agents": ";".join(finding.affected_agents),
+            "affected_servers": ";".join(finding.affected_servers),
+            "exposed_credentials": str(len(finding.exposed_credentials)),
+            "summary": finding.description or "",
+            "severity_source": evidence(finding, "severity_source", ""),
+            "epss_percentile": _format_optional_float(evidence(finding, "epss_percentile", None)),
+            "kev_date_added": evidence(finding, "kev_date_added", ""),
+            "kev_due_date": evidence(finding, "kev_due_date", ""),
+            "compliance_tags": _compliance_tags_cell(finding),
+            "reachability": finding.reachability,
+            "symbol_reachability": evidence(finding, "symbol_reachability", ""),
+            "reachable_affected_symbols": ";".join(evidence(finding, "reachable_affected_symbols", []) or []),
+            "graph_reachable": evidence(finding, "graph_reachable", ""),
+            "graph_min_hop_distance": evidence(finding, "graph_min_hop_distance", ""),
+            "finding_type": finding.finding_type.value,
+            "finding_id": finding.id,
+            "title": finding.title or "",
+            "integrity_verified": _verdict_cell(finding, "package_integrity_verified"),
+            "provenance_attested": _verdict_cell(finding, "package_provenance_attested"),
+            "provenance_source": _verdict_cell(finding, "package_provenance_source"),
+            "provenance_status": _verdict_cell(finding, "package_provenance_status"),
+            "owner": finding.owner or "",
+            "sla_due_at": finding.to_dict().get("sla_due_at") or "",
+            "workflow_status": workflow_status(finding),
+        }
+        writer.writerow({key: _excel_safe_cell(value) for key, value in row.items()})
 
     return buf.getvalue()
+
+
+def _format_optional_float(value: object) -> str:
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, (int, float, str)):
+        return str(value)
+    try:
+        return f"{float(value):.4f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _excel_safe_cell(value: object) -> object:
+    """Keep untrusted text from being interpreted as a spreadsheet formula.
+
+    CSV is also consumed by SIEMs and scripts, so preserve numeric values and
+    only prefix textual cells whose first non-whitespace character is a
+    spreadsheet formula sigil.  The apostrophe is the conventional Excel
+    text marker and remains visible to non-spreadsheet consumers.
+    """
+    if not isinstance(value, str):
+        return value
+    stripped = value.lstrip(" \t\r\n")
+    if stripped.startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
+def _compliance_tags_cell(finding: object) -> str:
+    """Return framework-qualified tags for one spreadsheet cell."""
+    return ";".join(framework_qualified_finding_tags(finding))
 
 
 def export_csv(report: AIBOMReport, output_path: str, blast_radii: list[BlastRadius] | None = None) -> None:

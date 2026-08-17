@@ -15,15 +15,30 @@ import json
 import logging
 import os
 import zipfile
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from email.parser import Parser as EmailParser
 from pathlib import Path
 from typing import Any
 
+from agent_bom.discovery_envelope import DiscoveryEnvelope, RedactionStatus, ScanMode
 from agent_bom.models import Agent, AgentType, MCPServer, MCPTool, Package, TransportType
 
 from .base import CloudDiscoveryError
+from .normalization import (
+    build_cloud_origin,
+    build_cloud_principal,
+    build_cloud_state,
+    build_cloud_timestamps,
+    build_package_purl,
+    normalize_cloud_lifecycle_state,
+    parse_container_image_package,
+    sanitize_discovery_warning,
+)
 
 logger = logging.getLogger(__name__)
+
+_MAX_AWS_DISCOVERY_WORKERS = 4
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -35,10 +50,11 @@ def discover(
     profile: str | None = None,
     include_ecs: bool = True,
     include_sagemaker: bool = False,
-    include_lambda: bool = False,
+    include_lambda: bool = True,
     include_eks: bool = False,
     include_step_functions: bool = False,
     include_ec2: bool = False,
+    include_iam: bool = False,
     ec2_tag_filter: dict[str, str] | None = None,
     tag_filter: dict[str, str] | None = None,
 ) -> tuple[list[Agent], list[str]]:
@@ -58,7 +74,7 @@ def discover(
 
     agents: list[Agent] = []
     warnings: list[str] = []
-    ecs_image_refs: list[str] = []
+    ecs_image_refs: list[dict[str, str] | str] = []
 
     session_kwargs: dict[str, Any] = {}
     if region:
@@ -68,106 +84,168 @@ def discover(
 
     session = boto3.Session(**session_kwargs)
     resolved_region = session.region_name or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+    account_id = _resolve_account_id(session)
+
+    discovery_jobs: list[tuple[str, Callable[[], tuple[list[Agent], list[str], list[dict[str, str] | str]]]]] = []
+
+    def _new_discovery_session() -> Any:
+        return boto3.Session(**session_kwargs)
 
     # ── Bedrock Agents ────────────────────────────────────────────────────
-    try:
-        bedrock_agents, bedrock_warnings = _discover_bedrock(session, resolved_region)
-        agents.extend(bedrock_agents)
-        warnings.extend(bedrock_warnings)
-    except NoCredentialsError:
-        warnings.append("AWS credentials not found. Configure via env vars, ~/.aws/credentials, IAM role, or SSO.")
-        return agents, warnings
-    except ClientError as exc:
-        code = exc.response["Error"]["Code"]
-        if code in ("AccessDeniedException", "UnauthorizedAccess"):
-            warnings.append("Access denied for bedrock-agent:ListAgents. Attach the BedrockAgentReadOnly or AmazonBedrockReadOnly policy.")
-        else:
-            warnings.append(f"AWS Bedrock API error: {exc}")
+    def _bedrock_job() -> tuple[list[Agent], list[str], list[dict[str, str] | str]]:
+        bedrock_agents, bedrock_warnings = _discover_bedrock(
+            _new_discovery_session(),
+            resolved_region,
+            account_id=account_id,
+        )
+        return bedrock_agents, bedrock_warnings, []
+
+    discovery_jobs.append(("bedrock", _bedrock_job))
 
     # ── ECS Tasks ─────────────────────────────────────────────────────────
     if include_ecs:
-        try:
-            ecs_refs, ecs_warns = _discover_ecs_images(session, resolved_region)
-            ecs_image_refs.extend(ecs_refs)
-            warnings.extend(ecs_warns)
-        except ClientError as exc:
-            code = exc.response["Error"]["Code"]
-            if code in ("AccessDeniedException", "UnauthorizedAccess"):
-                warnings.append("Access denied for ECS APIs. Attach AmazonECSReadOnlyAccess policy.")
-            else:
-                warnings.append(f"AWS ECS API error: {exc}")
+
+        def _ecs_job() -> tuple[list[Agent], list[str], list[dict[str, str] | str]]:
+            ecs_refs, ecs_warns = _discover_ecs_images(_new_discovery_session(), resolved_region)
+            return [], ecs_warns, list(ecs_refs)
+
+        discovery_jobs.append(("ecs", _ecs_job))
 
     # ── SageMaker Endpoints ───────────────────────────────────────────────
     if include_sagemaker:
-        try:
-            sm_agents, sm_warns = _discover_sagemaker(session, resolved_region)
-            agents.extend(sm_agents)
-            warnings.extend(sm_warns)
-        except ClientError as exc:
-            code = exc.response["Error"]["Code"]
-            if code in ("AccessDeniedException", "UnauthorizedAccess"):
-                warnings.append("Access denied for SageMaker APIs. Attach AmazonSageMakerReadOnly policy.")
-            else:
-                warnings.append(f"AWS SageMaker API error: {exc}")
+
+        def _sagemaker_job() -> tuple[list[Agent], list[str], list[dict[str, str] | str]]:
+            sm_agents, sm_warns = _discover_sagemaker(
+                _new_discovery_session(),
+                resolved_region,
+                account_id=account_id,
+            )
+            return sm_agents, sm_warns, []
+
+        discovery_jobs.append(("sagemaker", _sagemaker_job))
 
     # ── Lambda Functions (direct discovery) ────────────────────────────────
     if include_lambda:
-        try:
-            lambda_agents, lambda_warns = _discover_lambda_functions(session, resolved_region, warnings)
-            agents.extend(lambda_agents)
-            warnings.extend(lambda_warns)
-        except ClientError as exc:
-            code = exc.response["Error"]["Code"]
-            if code in ("AccessDeniedException", "UnauthorizedAccess"):
-                warnings.append("Access denied for Lambda APIs. Attach AWSLambda_ReadOnlyAccess policy.")
-            else:
-                warnings.append(f"AWS Lambda API error: {exc}")
+
+        def _lambda_job() -> tuple[list[Agent], list[str], list[dict[str, str] | str]]:
+            lambda_parent_warnings: list[str] = []
+            lambda_agents, lambda_warns = _discover_lambda_functions(
+                _new_discovery_session(),
+                resolved_region,
+                lambda_parent_warnings,
+                account_id=account_id,
+            )
+            return lambda_agents, [*lambda_parent_warnings, *lambda_warns], []
+
+        discovery_jobs.append(("lambda", _lambda_job))
 
     # ── EKS Clusters ───────────────────────────────────────────────────────
     if include_eks:
-        try:
-            eks_agents, eks_warns = _discover_eks_images(session, resolved_region)
-            agents.extend(eks_agents)
-            warnings.extend(eks_warns)
-        except ClientError as exc:
-            code = exc.response["Error"]["Code"]
-            if code in ("AccessDeniedException", "UnauthorizedAccess"):
-                warnings.append("Access denied for EKS APIs. Attach AmazonEKSReadOnlyAccess policy.")
-            else:
-                warnings.append(f"AWS EKS API error: {exc}")
+
+        def _eks_job() -> tuple[list[Agent], list[str], list[dict[str, str] | str]]:
+            eks_agents, eks_warns = _discover_eks_images(
+                _new_discovery_session(),
+                resolved_region,
+                account_id=account_id,
+            )
+            return eks_agents, eks_warns, []
+
+        discovery_jobs.append(("eks", _eks_job))
 
     # ── Step Functions ─────────────────────────────────────────────────────
     if include_step_functions:
-        try:
-            sfn_agents, sfn_warns = _discover_step_functions(session, resolved_region, warnings)
-            agents.extend(sfn_agents)
-            warnings.extend(sfn_warns)
-        except ClientError as exc:
-            code = exc.response["Error"]["Code"]
-            if code in ("AccessDeniedException", "UnauthorizedAccess"):
-                warnings.append("Access denied for Step Functions APIs. Attach AWSStepFunctionsReadOnlyAccess policy.")
-            else:
-                warnings.append(f"AWS Step Functions API error: {exc}")
+
+        def _sfn_job() -> tuple[list[Agent], list[str], list[dict[str, str] | str]]:
+            sfn_parent_warnings: list[str] = []
+            sfn_agents, sfn_warns = _discover_step_functions(
+                _new_discovery_session(),
+                resolved_region,
+                sfn_parent_warnings,
+                account_id=account_id,
+            )
+            return sfn_agents, [*sfn_parent_warnings, *sfn_warns], []
+
+        discovery_jobs.append(("step-functions", _sfn_job))
 
     # ── EC2 Instances (tag-filtered) ───────────────────────────────────────
     if include_ec2:
-        try:
-            ec2_agents, ec2_warns = _discover_ec2_instances(session, resolved_region, ec2_tag_filter or {})
-            agents.extend(ec2_agents)
-            warnings.extend(ec2_warns)
-        except ClientError as exc:
-            code = exc.response["Error"]["Code"]
-            if code in ("AccessDeniedException", "UnauthorizedAccess"):
-                warnings.append("Access denied for EC2 APIs. Attach AmazonEC2ReadOnlyAccess policy.")
-            else:
-                warnings.append(f"AWS EC2 API error: {exc}")
+
+        def _ec2_job() -> tuple[list[Agent], list[str], list[dict[str, str] | str]]:
+            ec2_agents, ec2_warns = _discover_ec2_instances(
+                _new_discovery_session(),
+                resolved_region,
+                ec2_tag_filter or {},
+                account_id=account_id,
+            )
+            return ec2_agents, ec2_warns, []
+
+        discovery_jobs.append(("ec2", _ec2_job))
+
+    access_denied_warnings = {
+        "bedrock": "Access denied for bedrock-agent:ListAgents. Attach the BedrockAgentReadOnly or AmazonBedrockReadOnly policy.",
+        "ecs": "Access denied for ECS APIs. Attach AmazonECSReadOnlyAccess policy.",
+        "sagemaker": "Access denied for SageMaker APIs. Attach AmazonSageMakerReadOnly policy.",
+        "lambda": "Access denied for Lambda APIs. Attach AWSLambda_ReadOnlyAccess policy.",
+        "eks": "Access denied for EKS APIs. Attach AmazonEKSReadOnlyAccess policy.",
+        "step-functions": "Access denied for Step Functions APIs. Attach AWSStepFunctionsReadOnlyAccess policy.",
+        "ec2": "Access denied for EC2 APIs. Attach AmazonEC2ReadOnlyAccess policy.",
+    }
+    api_error_labels = {
+        "bedrock": "AWS Bedrock API error",
+        "ecs": "AWS ECS API error",
+        "sagemaker": "AWS SageMaker API error",
+        "lambda": "AWS Lambda API error",
+        "eks": "AWS EKS API error",
+        "step-functions": "AWS Step Functions API error",
+        "ec2": "AWS EC2 API error",
+    }
+
+    if discovery_jobs:
+        with ThreadPoolExecutor(max_workers=min(_MAX_AWS_DISCOVERY_WORKERS, len(discovery_jobs))) as executor:
+            futures_by_service = {service: executor.submit(job) for service, job in discovery_jobs}
+
+            for service, _job in discovery_jobs:
+                future = futures_by_service[service]
+                try:
+                    service_agents, service_warnings, service_ecs_refs = future.result()
+                except NoCredentialsError:
+                    if service == "bedrock":
+                        warnings.append("AWS credentials not found. Configure via env vars, ~/.aws/credentials, IAM role, or SSO.")
+                        return agents, warnings
+                    raise
+                except ClientError as exc:
+                    code = exc.response["Error"]["Code"]
+                    if code in ("AccessDeniedException", "UnauthorizedAccess"):
+                        warnings.append(access_denied_warnings[service])
+                    else:
+                        warnings.append(f"{api_error_labels[service]}: {exc}")
+                    continue
+
+                agents.extend(service_agents)
+                warnings.extend(service_warnings)
+                ecs_image_refs.extend(service_ecs_refs)
+
+    if include_iam:
+        _enrich_agents_with_iam(_new_discovery_session(), agents, account_id=account_id, warnings=warnings)
 
     # ── ECS images as agents ──────────────────────────────────────────────
-    for img_ref in ecs_image_refs:
+    for ecs_ref in ecs_image_refs:
+        if isinstance(ecs_ref, dict):
+            img_ref = ecs_ref.get("image", "")
+            cluster_arn = ecs_ref.get("cluster_arn", "")
+            task_arn = ecs_ref.get("task_arn", "")
+            container_name = ecs_ref.get("container_name", img_ref)
+        else:
+            img_ref = ecs_ref
+            cluster_arn = ""
+            task_arn = ""
+            container_name = img_ref
+        if not img_ref:
+            continue
         ecs_agent = Agent(
             name=f"ecs-image:{img_ref}",
             agent_type=AgentType.CUSTOM,
-            config_path=f"ecs://{img_ref}",
+            config_path=task_arn or f"ecs://{img_ref}",
             source="aws-ecs",
             mcp_servers=[
                 MCPServer(
@@ -175,12 +253,428 @@ def discover(
                     command="docker",
                     args=["run", img_ref],
                     transport=TransportType.STDIO,
+                    packages=[
+                        Package(
+                            name=parts[0],
+                            version=parts[1],
+                            ecosystem="container-image",
+                            purl=build_package_purl(ecosystem="container-image", name=parts[0], version=parts[1]),
+                        )
+                        for parts in [parse_container_image_package(img_ref)]
+                        if parts
+                    ],
                 )
             ],
+            metadata={
+                "cloud_origin": build_cloud_origin(
+                    provider="aws",
+                    service="ecs",
+                    resource_type="container-image",
+                    resource_id=f"{task_arn}/{container_name}" if task_arn else img_ref,
+                    resource_name=container_name or img_ref.split("/")[-1],
+                    location=resolved_region,
+                    account_id=account_id,
+                    raw_identity={
+                        "cluster_arn": cluster_arn,
+                        "task_arn": task_arn,
+                        "container_name": container_name,
+                        "image": img_ref,
+                    },
+                )
+            },
         )
         agents.append(ecs_agent)
 
+    # ── Per-run discovery envelope (#2083) ────────────────────────────────
+    # Capture the trust contract for THIS run: the modes / scope / IAM
+    # permissions actually exercised, plus the redaction posture. The
+    # central sanitizer in `agent_bom.security` is what ultimately scrubs
+    # values before storage, so we report `central_sanitizer_applied`.
+    discovery_scope: list[str] = []
+    if account_id:
+        discovery_scope.append(f"aws:account/{account_id}")
+    if resolved_region:
+        discovery_scope.append(f"aws:region/{resolved_region}")
+    if tag_filter:
+        for k, v in sorted(tag_filter.items()):
+            discovery_scope.append(f"aws:tag/{k}={v}")
+
+    permissions_used = _aws_permissions_for_jobs(
+        include_ecs=include_ecs,
+        include_sagemaker=include_sagemaker,
+        include_lambda=include_lambda,
+        include_eks=include_eks,
+        include_step_functions=include_step_functions,
+        include_ec2=include_ec2,
+        include_iam=include_iam,
+    )
+    envelope = DiscoveryEnvelope(
+        scan_mode=ScanMode.CLOUD_READ_ONLY,
+        discovery_scope=tuple(discovery_scope),
+        permissions_used=permissions_used,
+        redaction_status=RedactionStatus.CENTRAL_SANITIZER_APPLIED,
+    )
+    envelope_payload = envelope.to_dict()
+    for agent in agents:
+        if agent.discovery_envelope is None:
+            agent.discovery_envelope = envelope_payload
+
     return agents, warnings
+
+
+# IAM permissions exercised by AWS provider helpers, by job. Each entry is
+# the read-only API call list the corresponding `_discover_*` function
+# actually issues. Kept here so the per-run envelope `permissions_used`
+# field stays honest -- producers control the catalog, not external docs.
+_AWS_BEDROCK_PERMISSIONS: tuple[str, ...] = (
+    "bedrock-agent:ListAgents",
+    "bedrock-agent:GetAgent",
+    "bedrock-agent:ListAgentActionGroups",
+    "bedrock-agent:GetAgentActionGroup",
+    "bedrock-agent:ListAgentKnowledgeBases",
+)
+_AWS_ECS_PERMISSIONS: tuple[str, ...] = (
+    "ecs:ListClusters",
+    "ecs:ListTasks",
+    "ecs:DescribeTasks",
+    "ecs:DescribeTaskDefinition",
+)
+_AWS_SAGEMAKER_PERMISSIONS: tuple[str, ...] = (
+    "sagemaker:ListEndpoints",
+    "sagemaker:DescribeEndpoint",
+    "sagemaker:DescribeEndpointConfig",
+    "sagemaker:DescribeModel",
+)
+_AWS_LAMBDA_PERMISSIONS: tuple[str, ...] = (
+    "lambda:ListFunctions",
+    "lambda:GetFunction",
+)
+_AWS_EKS_PERMISSIONS: tuple[str, ...] = (
+    "eks:ListClusters",
+    "eks:DescribeCluster",
+)
+_AWS_STEP_FUNCTIONS_PERMISSIONS: tuple[str, ...] = (
+    "states:ListStateMachines",
+    "states:DescribeStateMachine",
+)
+_AWS_EC2_PERMISSIONS: tuple[str, ...] = ("ec2:DescribeInstances",)
+_AWS_IAM_PERMISSIONS: tuple[str, ...] = (
+    "iam:GetRole",
+    "iam:ListAttachedRolePolicies",
+)
+_AWS_BASELINE_PERMISSIONS: tuple[str, ...] = ("sts:GetCallerIdentity",)
+
+
+def _aws_permissions_for_jobs(
+    *,
+    include_ecs: bool,
+    include_sagemaker: bool,
+    include_lambda: bool,
+    include_eks: bool,
+    include_step_functions: bool,
+    include_ec2: bool,
+    include_iam: bool = False,
+) -> tuple[str, ...]:
+    """Return the IAM action list this run is allowed to exercise.
+
+    Bedrock + the baseline `sts:GetCallerIdentity` are always in scope
+    because `discover()` always tries to resolve the account and list agents.
+    Other services are gated on the include_* flags.
+    """
+    perms: list[str] = list(_AWS_BASELINE_PERMISSIONS) + list(_AWS_BEDROCK_PERMISSIONS)
+    if include_ecs:
+        perms.extend(_AWS_ECS_PERMISSIONS)
+    if include_sagemaker:
+        perms.extend(_AWS_SAGEMAKER_PERMISSIONS)
+    if include_lambda:
+        perms.extend(_AWS_LAMBDA_PERMISSIONS)
+    if include_eks:
+        perms.extend(_AWS_EKS_PERMISSIONS)
+    if include_step_functions:
+        perms.extend(_AWS_STEP_FUNCTIONS_PERMISSIONS)
+    if include_ec2:
+        perms.extend(_AWS_EC2_PERMISSIONS)
+    if include_iam:
+        perms.extend(_AWS_IAM_PERMISSIONS)
+    return tuple(sorted(set(perms)))
+
+
+def _resolve_account_id(session: Any) -> str | None:
+    """Resolve the AWS account once for normalized origin scope.
+
+    STS can be unavailable or explicitly denied in least-privilege audit roles;
+    inventory discovery should continue and simply omit account scope.
+    """
+    try:
+        identity = session.client("sts").get_caller_identity()
+    except Exception as exc:
+        logger.debug("Could not resolve AWS account ID via STS: %s", exc)
+        return None
+    account_id = str(identity.get("Account", "")).strip()
+    return account_id or None
+
+
+def _role_name_from_arn(role_arn: str) -> str:
+    """Extract the IAM role name/path segment accepted by GetRole."""
+    marker = ":role/"
+    if marker not in role_arn:
+        return role_arn.rsplit("/", 1)[-1].strip()
+    return role_arn.split(marker, 1)[1].strip()
+
+
+def _account_id_from_arn(arn: str) -> str:
+    parts = arn.split(":")
+    return parts[4] if len(parts) > 4 else ""
+
+
+def _principal_type_from_aws_principal(principal_id: str) -> str:
+    if principal_id.endswith(":root"):
+        return "account"
+    if ":role/" in principal_id:
+        return "iam-role"
+    if ":user/" in principal_id:
+        return "user"
+    return "account" if principal_id.isdigit() else "federated-identity"
+
+
+def _principal_name_from_id(principal_id: str) -> str:
+    if principal_id.endswith(":root"):
+        account_id = _account_id_from_arn(principal_id)
+        return account_id or principal_id
+    return principal_id.rsplit("/", 1)[-1]
+
+
+def _principal_values(value: Any) -> list[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item or "").strip()]
+    return [str(value)]
+
+
+def _extract_trust_principals(policy_document: Any, *, account_id: str | None) -> list[dict[str, str]]:
+    """Extract low-risk trust principals from an AssumeRole policy document."""
+    if not isinstance(policy_document, dict):
+        return []
+    statements = policy_document.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+    if not isinstance(statements, list):
+        return []
+
+    entries: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for statement in statements:
+        if not isinstance(statement, dict) or statement.get("Effect") != "Allow":
+            continue
+        principal = statement.get("Principal")
+        if not isinstance(principal, dict):
+            continue
+        for raw_value in _principal_values(principal.get("AWS")):
+            if raw_value == "*":
+                continue
+            principal_type = _principal_type_from_aws_principal(raw_value)
+            principal_account = raw_value if raw_value.isdigit() else _account_id_from_arn(raw_value)
+            relationship = "cross_account_trust" if account_id and principal_account and principal_account != account_id else "trusts"
+            key = (principal_type, raw_value)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append(
+                {
+                    "principal_type": principal_type,
+                    "principal_id": principal_account if principal_type == "account" and principal_account else raw_value,
+                    "principal_name": _principal_name_from_id(raw_value),
+                    "relationship": relationship,
+                    "source_field": "AssumeRolePolicyDocument.Principal.AWS",
+                }
+            )
+        for raw_value in _principal_values(principal.get("Service")):
+            key = ("service-principal", raw_value)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append(
+                {
+                    "principal_type": "service-principal",
+                    "principal_id": raw_value,
+                    "principal_name": raw_value,
+                    "relationship": "trusts",
+                    "source_field": "AssumeRolePolicyDocument.Principal.Service",
+                }
+            )
+        for raw_value in _principal_values(principal.get("Federated")):
+            key = ("federated-identity", raw_value)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append(
+                {
+                    "principal_type": "federated-identity",
+                    "principal_id": raw_value,
+                    "principal_name": _principal_name_from_id(raw_value),
+                    "relationship": "trusts",
+                    "source_field": "AssumeRolePolicyDocument.Principal.Federated",
+                }
+            )
+    return entries
+
+
+# Canonical AWS-managed policy → privilege level (name is authoritative, no fetch needed).
+_AWS_MANAGED_PRIVILEGE: dict[str, str] = {
+    "administratoraccess": "admin",
+    "iamfullaccess": "admin",
+    "poweruseraccess": "write",
+    "readonlyaccess": "read",
+    "viewonlyaccess": "read",
+    "securityaudit": "read",
+}
+# Action verbs that imply write/mutate (vs read).
+_WRITE_VERBS = ("create", "delete", "put", "update", "modify", "write", "attach", "detach", "remove", "set", "tag", "untag", "run")
+
+
+def _classify_policy_actions(actions: list[str]) -> str:
+    """Classify an action list as admin / write / read."""
+    admin = {"*", "*:*", "iam:*"}
+    has_write = False
+    for raw in actions:
+        action = str(raw).lower()
+        if action in admin or action.endswith(":*") and action.startswith("iam"):
+            return "admin"
+        if action == "*":
+            return "admin"
+        verb = action.split(":", 1)[-1]
+        if any(verb.startswith(w) for w in _WRITE_VERBS) or action.endswith(":*"):
+            has_write = True
+    return "write" if has_write else "read"
+
+
+def _policy_actions_from_document(document: Any) -> list[str]:
+    """Extract the Action strings from an IAM policy document (Allow statements)."""
+    actions: list[str] = []
+    statements = document.get("Statement", []) if isinstance(document, dict) else []
+    if isinstance(statements, dict):
+        statements = [statements]
+    for stmt in statements:
+        if not isinstance(stmt, dict) or stmt.get("Effect") != "Allow":
+            continue
+        raw = stmt.get("Action", [])
+        actions.extend([raw] if isinstance(raw, str) else [a for a in raw if isinstance(a, str)])
+    return actions
+
+
+def _policy_privilege(iam: Any, policy_arn: str, policy_name: str, *, warnings: list[str]) -> tuple[str, list[str], dict[str, Any] | None]:
+    """Return (privilege_level, sampled_actions, raw_document) for an attached policy.
+
+    AWS-managed policies are classified by their canonical name (no API call) and
+    carry no document. Customer-managed policies are fetched and classified by
+    their actions, and the raw document is returned so the effective-permissions
+    overlay can run real policy evaluation.
+    Degrades to ('unknown', [], None) on any error — never blocks discovery.
+    """
+    name_key = (policy_name or policy_arn).rsplit("/", 1)[-1].lower()
+    if ":aws:policy/" in policy_arn and name_key in _AWS_MANAGED_PRIVILEGE:
+        return _AWS_MANAGED_PRIVILEGE[name_key], [], None
+    if ":aws:policy/" in policy_arn:
+        # Unknown AWS-managed policy — name still hints at privilege.
+        if "fullaccess" in name_key or "admin" in name_key:
+            return "admin", [], None
+        if "readonly" in name_key or "viewonly" in name_key:
+            return "read", [], None
+    try:
+        version_id = iam.get_policy(PolicyArn=policy_arn)["Policy"]["DefaultVersionId"]
+        document = iam.get_policy_version(PolicyArn=policy_arn, VersionId=version_id)["PolicyVersion"]["Document"]
+        actions = _policy_actions_from_document(document)
+        return _classify_policy_actions(actions), sorted(set(actions))[:25], document if isinstance(document, dict) else None
+    except Exception as exc:  # noqa: BLE001
+        warnings.append(f"IAM policy action lookup skipped for {policy_name or policy_arn}: {sanitize_discovery_warning(exc)}")
+        return "unknown", [], None
+
+
+def _enrich_agents_with_iam(session: Any, agents: list[Agent], *, account_id: str | None, warnings: list[str]) -> None:
+    """Attach live IAM role policy/trust metadata to discovered principals."""
+
+    def _cloud_principal_metadata(agent: Agent) -> dict[str, object] | None:
+        value = agent.metadata.get("cloud_principal")
+        return value if isinstance(value, dict) else None
+
+    role_arns = sorted(
+        {
+            str(principal.get("principal_id") or "").strip()
+            for agent in agents
+            if (principal := _cloud_principal_metadata(agent))
+            and str(principal.get("principal_type") or "").lower() in {"iam-role", "role"}
+            and str(principal.get("principal_id") or "").strip()
+        }
+    )
+    if not role_arns:
+        return
+
+    iam = session.client("iam")
+    enriched: dict[str, dict[str, Any]] = {}
+    for role_arn in role_arns:
+        role_name = _role_name_from_arn(role_arn)
+        try:
+            role_detail = iam.get_role(RoleName=role_name).get("Role", {})
+            paginator = iam.get_paginator("list_attached_role_policies")
+            policies = []
+            for page in paginator.paginate(RoleName=role_name):
+                for policy in page.get("AttachedPolicies", []):
+                    policy_arn = str(policy.get("PolicyArn") or "")
+                    policy_name = str(policy.get("PolicyName") or policy_arn or "")
+                    if not (policy_arn or policy_name):
+                        continue
+                    privilege_level, actions, document = _policy_privilege(iam, policy_arn, policy_name, warnings=warnings)
+                    policy_entry: dict[str, Any] = {
+                        "policy_id": policy_arn,
+                        "policy_name": policy_name,
+                        "attachment_type": "managed",
+                        "privilege_level": privilege_level,
+                        "actions": actions,
+                        "source_field": "ListAttachedRolePolicies.AttachedPolicies",
+                    }
+                    # Retain the raw document (customer-managed only) so the graph
+                    # can run real effective-permission evaluation.
+                    if isinstance(document, dict):
+                        policy_entry["policy_document"] = document
+                    policies.append(policy_entry)
+        except Exception as exc:
+            warnings.append(f"IAM role enrichment skipped for {role_name}: {sanitize_discovery_warning(exc)}")
+            continue
+        enriched[role_arn] = {
+            "policies": policies,
+            "trust_principals": _extract_trust_principals(
+                role_detail.get("AssumeRolePolicyDocument"),
+                account_id=account_id,
+            ),
+        }
+
+    for agent in agents:
+        principal_value = agent.metadata.get("cloud_principal")
+        if not isinstance(principal_value, dict):
+            continue
+        principal = principal_value
+        role_arn = str(principal.get("principal_id") or "").strip()
+        payload = enriched.get(role_arn)
+        if not payload:
+            continue
+        existing_policies = principal.get("policies")
+        if not isinstance(existing_policies, list):
+            existing_policies = []
+        by_id = {
+            str(policy.get("policy_id") or policy.get("arn") or policy.get("name") or ""): policy
+            for policy in existing_policies
+            if isinstance(policy, dict)
+        }
+        for policy in payload["policies"]:
+            if policy["policy_id"]:
+                by_id[policy["policy_id"]] = policy
+        principal["policies"] = list(by_id.values())
+        principal["trust_principals"] = payload["trust_principals"]
+        principal["iam_enriched"] = True
+        principal["iam_enrichment_source"] = "aws-iam"
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +682,7 @@ def discover(
 # ---------------------------------------------------------------------------
 
 
-def _discover_bedrock(session: Any, region: str) -> tuple[list[Agent], list[str]]:
+def _discover_bedrock(session: Any, region: str, *, account_id: str | None = None) -> tuple[list[Agent], list[str]]:
     """Discover Bedrock agents and their action groups."""
     client = session.client("bedrock-agent", region_name=region)
     agents: list[Agent] = []
@@ -201,9 +695,12 @@ def _discover_bedrock(session: Any, region: str) -> tuple[list[Agent], list[str]
             agent_id = summary["agentId"]
             agent_name = summary.get("agentName", agent_id)
             agent_status = summary.get("agentStatus", "UNKNOWN")
-
-            if agent_status not in ("PREPARED", "NOT_PREPARED"):
-                continue
+            lifecycle_state = normalize_cloud_lifecycle_state(
+                provider="aws",
+                service="bedrock",
+                resource_type="agent",
+                raw_state=agent_status,
+            )
 
             try:
                 detail = client.get_agent(agentId=agent_id)["agent"]
@@ -213,6 +710,7 @@ def _discover_bedrock(session: Any, region: str) -> tuple[list[Agent], list[str]
 
             agent_arn = detail.get("agentArn", f"arn:aws:bedrock:{region}:agent/{agent_id}")
             foundation_model = detail.get("foundationModel", "unknown")
+            runtime_role_arn = detail.get("agentResourceRoleArn", "")
 
             # Discover action groups → Lambda functions
             mcp_servers = _get_action_group_servers(client, session, agent_id, region, warnings)
@@ -224,7 +722,43 @@ def _discover_bedrock(session: Any, region: str) -> tuple[list[Agent], list[str]
                 source="aws-bedrock",
                 version=foundation_model,
                 mcp_servers=mcp_servers,
+                metadata={
+                    "cloud_origin": build_cloud_origin(
+                        provider="aws",
+                        service="bedrock",
+                        resource_type="agent",
+                        resource_id=agent_arn,
+                        resource_name=agent_name,
+                        location=region,
+                        account_id=account_id,
+                        raw_identity={
+                            "agentId": agent_id,
+                            "agentArn": agent_arn,
+                            "agentName": agent_name,
+                        },
+                    ),
+                },
             )
+            if lifecycle_state:
+                agent.metadata["cloud_state"] = build_cloud_state(
+                    provider="aws",
+                    service="bedrock",
+                    resource_type="agent",
+                    lifecycle_state=lifecycle_state,
+                    raw_state=agent_status,
+                    state_source="agentStatus",
+                )
+            cloud_principal = build_cloud_principal(
+                provider="aws",
+                service="bedrock",
+                resource_type="agent",
+                principal_type="iam-role",
+                principal_id=runtime_role_arn or None,
+                source_field="agentResourceRoleArn",
+                raw_identity={"role_arn": runtime_role_arn},
+            )
+            if cloud_principal:
+                agent.metadata["cloud_principal"] = cloud_principal
             agents.append(agent)
 
     return agents, warnings
@@ -337,9 +871,12 @@ def _extract_lambda_packages(
     """Extract packages from a Lambda function's layers and deployment package."""
     lambda_client = session.client("lambda", region_name=region)
     packages: list[Package] = []
+    get_function = getattr(lambda_client, "get_function", None)
+    if not callable(get_function):
+        return packages
 
     try:
-        func_config = lambda_client.get_function(FunctionName=lambda_arn)
+        func_config = get_function(FunctionName=lambda_arn)
         config = func_config.get("Configuration", {})
         runtime = config.get("Runtime", "")
 
@@ -355,10 +892,27 @@ def _extract_lambda_packages(
             except Exception as exc:
                 warnings.append(f"Could not extract packages from Lambda layer {layer_arn}: {exc}")
 
+        # Extract from the function's own deployment package. Most functions
+        # bundle their dependencies inline (vendored into the zip) rather than
+        # in a layer, so scanning layers alone misses the common case.
+        code_location = func_config.get("Code", {}).get("Location", "")
+        if code_location and ecosystem in ("pypi", "npm"):
+            try:
+                from agent_bom.http_client import fetch_bytes
+
+                code_bytes = fetch_bytes(code_location, timeout=60)
+                with zipfile.ZipFile(io.BytesIO(code_bytes)) as zf:
+                    if ecosystem == "pypi":
+                        packages.extend(_parse_python_packages_from_zip(zf))
+                    else:
+                        packages.extend(_parse_node_packages_from_zip(zf))
+            except Exception as exc:
+                warnings.append(f"Could not extract packages from Lambda deployment package {lambda_arn}: {exc}")
+
     except Exception as exc:
         warnings.append(f"Could not get Lambda function {lambda_arn}: {exc}")
 
-    return packages
+    return _dedupe_packages(packages)
 
 
 def _packages_from_layer(
@@ -376,10 +930,9 @@ def _packages_from_layer(
         return packages
 
     # Download the layer zip
-    import urllib.request
+    from agent_bom.http_client import fetch_bytes
 
-    with urllib.request.urlopen(download_url) as resp:  # noqa: S310 — presigned AWS URL  # nosec B310
-        layer_bytes = resp.read()
+    layer_bytes = fetch_bytes(download_url, timeout=60)
 
     # Parse the zip for package metadata
     with zipfile.ZipFile(io.BytesIO(layer_bytes)) as zf:
@@ -389,6 +942,20 @@ def _packages_from_layer(
             packages = _parse_node_packages_from_zip(zf)
 
     return packages
+
+
+def _dedupe_packages(packages: list[Package]) -> list[Package]:
+    """Drop duplicate packages when the same dep appears in a layer and the
+    function's own zip (or across multiple layers)."""
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[Package] = []
+    for pkg in packages:
+        key = (pkg.ecosystem, pkg.name.lower(), pkg.version)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(pkg)
+    return unique
 
 
 def _parse_python_packages_from_zip(zf: zipfile.ZipFile) -> list[Package]:
@@ -411,6 +978,7 @@ def _parse_python_packages_from_zip(zf: zipfile.ZipFile) -> list[Package]:
                             name=pkg_name,
                             version=pkg_version,
                             ecosystem="pypi",
+                            purl=build_package_purl(ecosystem="pypi", name=pkg_name, version=pkg_version),
                         )
                     )
             except Exception:
@@ -438,6 +1006,7 @@ def _parse_node_packages_from_zip(zf: zipfile.ZipFile) -> list[Package]:
                             name=pkg_name,
                             version=pkg_version,
                             ecosystem="npm",
+                            purl=build_package_purl(ecosystem="npm", name=pkg_name, version=pkg_version),
                         )
                     )
             except Exception:
@@ -451,21 +1020,27 @@ def _parse_node_packages_from_zip(zf: zipfile.ZipFile) -> list[Package]:
 # ---------------------------------------------------------------------------
 
 
-def _discover_ecs_images(session: Any, region: str) -> tuple[list[str], list[str]]:
+def _discover_ecs_images(session: Any, region: str) -> tuple[list[dict[str, str]], list[str]]:
     """Discover container image refs from running ECS tasks."""
     ecs = session.client("ecs", region_name=region)
-    image_refs: list[str] = []
+    image_refs: list[dict[str, str]] = []
     warnings: list[str] = []
     seen: set[str] = set()
 
     try:
-        cluster_arns = ecs.list_clusters().get("clusterArns", [])
+        cluster_arns: list[str] = []
+        paginator = ecs.get_paginator("list_clusters")
+        for page in paginator.paginate():
+            cluster_arns.extend(page.get("clusterArns", []))
     except Exception as exc:
         return [], [f"Could not list ECS clusters: {exc}"]
 
     for cluster_arn in cluster_arns:
         try:
-            task_arns = ecs.list_tasks(cluster=cluster_arn, desiredStatus="RUNNING").get("taskArns", [])
+            task_arns: list[str] = []
+            task_paginator = ecs.get_paginator("list_tasks")
+            for page in task_paginator.paginate(cluster=cluster_arn, desiredStatus="RUNNING"):
+                task_arns.extend(page.get("taskArns", []))
             if not task_arns:
                 continue
 
@@ -474,11 +1049,20 @@ def _discover_ecs_images(session: Any, region: str) -> tuple[list[str], list[str
                 batch = task_arns[i : i + 100]
                 tasks = ecs.describe_tasks(cluster=cluster_arn, tasks=batch).get("tasks", [])
                 for task in tasks:
+                    task_arn = task.get("taskArn", "")
                     for container in task.get("containers", []):
                         image = container.get("image", "")
+                        container_name = container.get("name", "") or image
                         if image and image not in seen:
                             seen.add(image)
-                            image_refs.append(image)
+                            image_refs.append(
+                                {
+                                    "cluster_arn": cluster_arn,
+                                    "task_arn": task_arn,
+                                    "container_name": container_name,
+                                    "image": image,
+                                }
+                            )
         except Exception as exc:
             warnings.append(f"Could not list tasks in ECS cluster {cluster_arn}: {exc}")
 
@@ -490,14 +1074,17 @@ def _discover_ecs_images(session: Any, region: str) -> tuple[list[str], list[str
 # ---------------------------------------------------------------------------
 
 
-def _discover_sagemaker(session: Any, region: str) -> tuple[list[Agent], list[str]]:
+def _discover_sagemaker(session: Any, region: str, *, account_id: str | None = None) -> tuple[list[Agent], list[str]]:
     """Discover SageMaker endpoints and their container images."""
     sm = session.client("sagemaker", region_name=region)
     agents: list[Agent] = []
     warnings: list[str] = []
 
     try:
-        endpoints = sm.list_endpoints(StatusEquals="InService").get("Endpoints", [])
+        endpoints: list[dict] = []
+        paginator = sm.get_paginator("list_endpoints")
+        for page in paginator.paginate(StatusEquals="InService"):
+            endpoints.extend(page.get("Endpoints", []))
     except Exception as exc:
         return [], [f"Could not list SageMaker endpoints: {exc}"]
 
@@ -518,14 +1105,26 @@ def _discover_sagemaker(session: Any, region: str) -> tuple[list[Agent], list[st
                 model_desc = sm.describe_model(ModelName=model_name)
                 container = model_desc.get("PrimaryContainer", {})
                 image = container.get("Image", "")
+                execution_role = model_desc.get("ExecutionRoleArn", "")
 
                 if image:
+                    image_parts = parse_container_image_package(image)
                     server = MCPServer(
                         name=f"sagemaker-model:{model_name}",
                         command="docker",
                         args=["run", image],
                         transport=TransportType.STDIO,
                         env={"AWS_REGION": region},
+                        packages=[
+                            Package(
+                                name=image_parts[0],
+                                version=image_parts[1],
+                                ecosystem="container-image",
+                                purl=build_package_purl(ecosystem="container-image", name=image_parts[0], version=image_parts[1]),
+                            )
+                        ]
+                        if image_parts
+                        else [],
                     )
                     agent = Agent(
                         name=f"sagemaker:{ep_name}",
@@ -533,7 +1132,41 @@ def _discover_sagemaker(session: Any, region: str) -> tuple[list[Agent], list[st
                         config_path=ep_desc.get("EndpointArn", f"sagemaker://{ep_name}"),
                         source="aws-sagemaker",
                         mcp_servers=[server],
+                        metadata={
+                            "cloud_origin": build_cloud_origin(
+                                provider="aws",
+                                service="sagemaker",
+                                resource_type="endpoint",
+                                resource_id=ep_desc.get("EndpointArn", ep_name),
+                                resource_name=ep_name,
+                                location=region,
+                                account_id=account_id,
+                                raw_identity={"endpoint": ep_name, "model": model_name, "image": image},
+                            )
+                        },
                     )
+                    cloud_timestamps = build_cloud_timestamps(
+                        provider="aws",
+                        service="sagemaker",
+                        resource_type="endpoint",
+                        created_at=ep_desc.get("CreationTime"),
+                        updated_at=ep_desc.get("LastModifiedTime"),
+                        created_source="CreationTime",
+                        updated_source="LastModifiedTime",
+                    )
+                    if cloud_timestamps:
+                        agent.metadata["cloud_timestamps"] = cloud_timestamps
+                    cloud_principal = build_cloud_principal(
+                        provider="aws",
+                        service="sagemaker",
+                        resource_type="endpoint",
+                        principal_type="iam-role",
+                        principal_id=execution_role or None,
+                        source_field="Model.ExecutionRoleArn",
+                        raw_identity={"execution_role_arn": execution_role},
+                    )
+                    if cloud_principal:
+                        agent.metadata["cloud_principal"] = cloud_principal
                     agents.append(agent)
 
         except Exception as exc:
@@ -562,6 +1195,8 @@ def _discover_lambda_functions(
     session: Any,
     region: str,
     parent_warnings: list[str],
+    *,
+    account_id: str | None = None,
 ) -> tuple[list[Agent], list[str]]:
     """Discover standalone Lambda functions (not just Bedrock action group Lambdas).
 
@@ -578,6 +1213,7 @@ def _discover_lambda_functions(
             func_name = func.get("FunctionName", "unknown")
             func_arn = func.get("FunctionArn", "")
             runtime = func.get("Runtime", "")
+            role_arn = func.get("Role", "")
 
             if runtime not in _AI_RUNTIMES:
                 continue
@@ -600,7 +1236,39 @@ def _discover_lambda_functions(
                 source="aws-lambda",
                 version=runtime,
                 mcp_servers=[server],
+                metadata={
+                    "cloud_origin": build_cloud_origin(
+                        provider="aws",
+                        service="lambda",
+                        resource_type="function",
+                        resource_id=func_arn,
+                        resource_name=func_name,
+                        location=region,
+                        account_id=account_id,
+                        raw_identity={"function_name": func_name, "function_arn": func_arn, "runtime": runtime},
+                    )
+                },
             )
+            cloud_timestamps = build_cloud_timestamps(
+                provider="aws",
+                service="lambda",
+                resource_type="function",
+                updated_at=func.get("LastModified"),
+                updated_source="LastModified",
+            )
+            if cloud_timestamps:
+                agent.metadata["cloud_timestamps"] = cloud_timestamps
+            cloud_principal = build_cloud_principal(
+                provider="aws",
+                service="lambda",
+                resource_type="function",
+                principal_type="iam-role",
+                principal_id=role_arn or None,
+                source_field="Role",
+                raw_identity={"role_arn": role_arn},
+            )
+            if cloud_principal:
+                agent.metadata["cloud_principal"] = cloud_principal
             agents.append(agent)
 
     return agents, warnings
@@ -614,6 +1282,8 @@ def _discover_lambda_functions(
 def _discover_eks_images(
     session: Any,
     region: str,
+    *,
+    account_id: str | None = None,
 ) -> tuple[list[Agent], list[str]]:
     """Discover EKS clusters and reuse k8s.discover_images() for pod scanning.
 
@@ -630,7 +1300,10 @@ def _discover_eks_images(
         return agents, warnings
 
     try:
-        cluster_names = eks_client.list_clusters().get("clusters", [])
+        cluster_names: list[str] = []
+        paginator = eks_client.get_paginator("list_clusters")
+        for page in paginator.paginate():
+            cluster_names.extend(page.get("clusters", []))
     except Exception as exc:
         return [], [f"Could not list EKS clusters: {exc}"]
 
@@ -638,11 +1311,22 @@ def _discover_eks_images(
         try:
             image_records = discover_images(all_namespaces=True, context=cluster_name)
             for image_ref, pod_name, container_name in image_records:
+                image_parts = parse_container_image_package(image_ref)
                 server = MCPServer(
                     name=image_ref,
                     command="docker",
                     args=["run", image_ref],
                     transport=TransportType.STDIO,
+                    packages=[
+                        Package(
+                            name=image_parts[0],
+                            version=image_parts[1],
+                            ecosystem="container-image",
+                            purl=build_package_purl(ecosystem="container-image", name=image_parts[0], version=image_parts[1]),
+                        )
+                    ]
+                    if image_parts
+                    else [],
                 )
                 agent = Agent(
                     name=f"eks:{cluster_name}/{pod_name}/{container_name}",
@@ -650,6 +1334,23 @@ def _discover_eks_images(
                     config_path=f"eks://{cluster_name}/{pod_name}",
                     source="aws-eks",
                     mcp_servers=[server],
+                    metadata={
+                        "cloud_origin": build_cloud_origin(
+                            provider="aws",
+                            service="eks",
+                            resource_type="pod-image",
+                            resource_id=f"{cluster_name}/{pod_name}/{container_name}",
+                            resource_name=pod_name,
+                            location=region,
+                            account_id=account_id,
+                            raw_identity={
+                                "cluster": cluster_name,
+                                "pod": pod_name,
+                                "container": container_name,
+                                "image": image_ref,
+                            },
+                        )
+                    },
                 )
                 agents.append(agent)
 
@@ -671,6 +1372,8 @@ def _discover_step_functions(
     session: Any,
     region: str,
     parent_warnings: list[str],
+    *,
+    account_id: str | None = None,
 ) -> tuple[list[Agent], list[str]]:
     """Discover Step Functions state machines and extract referenced service ARNs.
 
@@ -691,6 +1394,7 @@ def _discover_step_functions(
                 detail = sfn_client.describe_state_machine(stateMachineArn=sm_arn)
                 definition_str = detail.get("definition", "{}")
                 definition = json.loads(definition_str)
+                role_arn = detail.get("roleArn", "")
             except Exception as exc:
                 warnings.append(f"Could not describe Step Function {sm_name}: {exc}")
                 continue
@@ -739,7 +1443,40 @@ def _discover_step_functions(
                 config_path=sm_arn,
                 source="aws-step-functions",
                 mcp_servers=servers,
+                metadata={
+                    "cloud_origin": build_cloud_origin(
+                        provider="aws",
+                        service="step-functions",
+                        resource_type="state-machine",
+                        resource_id=sm_arn,
+                        resource_name=sm_name,
+                        location=region,
+                        account_id=account_id,
+                        raw_identity={"state_machine_arn": sm_arn, "name": sm_name},
+                    )
+                },
             )
+            cloud_timestamps = build_cloud_timestamps(
+                provider="aws",
+                service="step-functions",
+                resource_type="state-machine",
+                created_at=sm.get("creationDate") or detail.get("creationDate"),
+                updated_source=None,
+                created_source="creationDate",
+            )
+            if cloud_timestamps:
+                agent.metadata["cloud_timestamps"] = cloud_timestamps
+            cloud_principal = build_cloud_principal(
+                provider="aws",
+                service="step-functions",
+                resource_type="state-machine",
+                principal_type="iam-role",
+                principal_id=role_arn or None,
+                source_field="roleArn",
+                raw_identity={"role_arn": role_arn},
+            )
+            if cloud_principal:
+                agent.metadata["cloud_principal"] = cloud_principal
             agents.append(agent)
 
     return agents, warnings
@@ -779,10 +1516,38 @@ def _extract_sfn_task_resources(definition: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _aws_instance_network(instance: dict) -> dict[str, Any]:
+    """Extract low-risk network placement (subnet/VPC/SG ids, IPs, AZ) from a
+    describe_instances Instance. Identifiers only — no rules, no credentials."""
+    sg_ids: list[str] = []
+    for group in instance.get("SecurityGroups", []) or []:
+        gid = group.get("GroupId") if isinstance(group, dict) else None
+        if gid and gid not in sg_ids:
+            sg_ids.append(gid)
+    for nic in instance.get("NetworkInterfaces", []) or []:
+        for group in (nic.get("Groups", []) if isinstance(nic, dict) else []) or []:
+            gid = group.get("GroupId") if isinstance(group, dict) else None
+            if gid and gid not in sg_ids:
+                sg_ids.append(gid)
+    placement_raw = instance.get("Placement")
+    placement = placement_raw if isinstance(placement_raw, dict) else {}
+    network = {
+        "subnet_id": instance.get("SubnetId", ""),
+        "vpc_id": instance.get("VpcId", ""),
+        "public_ip": instance.get("PublicIpAddress", ""),
+        "private_ip": instance.get("PrivateIpAddress", ""),
+        "availability_zone": placement.get("AvailabilityZone", ""),
+        "security_group_ids": sg_ids,
+    }
+    return {k: v for k, v in network.items() if v}
+
+
 def _discover_ec2_instances(
     session: Any,
     region: str,
     tag_filter: dict[str, str],
+    *,
+    account_id: str | None = None,
 ) -> tuple[list[Agent], list[str]]:
     """Discover EC2 instances matching tag filters.
 
@@ -812,6 +1577,7 @@ def _discover_ec2_instances(
                     instance_id = instance.get("InstanceId", "unknown")
                     instance_type = instance.get("InstanceType", "")
                     ami_id = instance.get("ImageId", "")
+                    launch_time = instance.get("LaunchTime")
 
                     tags = {t["Key"]: t["Value"] for t in instance.get("Tags", [])}
                     name = tags.get("Name", instance_id)
@@ -829,7 +1595,29 @@ def _discover_ec2_instances(
                         source="aws-ec2",
                         version=f"{instance_type} ({ami_id})",
                         mcp_servers=[server],
+                        metadata={
+                            "cloud_origin": build_cloud_origin(
+                                provider="aws",
+                                service="ec2",
+                                resource_type="instance",
+                                resource_id=instance_id,
+                                resource_name=name,
+                                location=region,
+                                account_id=account_id,
+                                raw_identity={"instance_id": instance_id, "instance_type": instance_type, "ami_id": ami_id},
+                                network=_aws_instance_network(instance),
+                            )
+                        },
                     )
+                    cloud_timestamps = build_cloud_timestamps(
+                        provider="aws",
+                        service="ec2",
+                        resource_type="instance",
+                        created_at=launch_time,
+                        created_source="LaunchTime",
+                    )
+                    if cloud_timestamps:
+                        agent.metadata["cloud_timestamps"] = cloud_timestamps
                     agents.append(agent)
 
     except Exception as exc:

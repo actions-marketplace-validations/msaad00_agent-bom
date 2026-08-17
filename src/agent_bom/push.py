@@ -8,18 +8,90 @@ Sanitizes results before push:
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import logging
+import os
 import platform
+import uuid
+from typing import Any, Literal, overload
 
 import httpx
 
+from agent_bom.security import sanitize_command_args, sanitize_env_vars, sanitize_security_warnings, sanitize_text, sanitize_url
+
 logger = logging.getLogger(__name__)
+
+_LOCAL_CONTROL_PLANE_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+SCAN_PUSH_PATH = "/v1/results/push"
+
+
+def normalize_scan_push_url(push_url: str) -> str:
+    """Resolve a control-plane URL to the scan-report ingest endpoint.
+
+    Mirrors ``agent_bom.fleet.sync_client._default_fleet_sync_url``: a base URL —
+    including one behind a reverse-proxy path prefix — grows
+    :data:`SCAN_PUSH_PATH`, while a URL that already names a versioned API path
+    is left alone so ``/v1/fleet/sync`` inventory pushes keep working. Anything
+    that is not an absolute http(s) URL is returned untouched for the outbound
+    URL policy to reject with its own message.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    candidate = (push_url or "").strip()
+    parsed = urlsplit(candidate)
+    if not parsed.scheme or not parsed.netloc:
+        return candidate
+
+    path = parsed.path.rstrip("/")
+    segments = [segment for segment in path.split("/") if segment]
+    if "v1" not in segments:
+        path += SCAN_PUSH_PATH
+    elif segments[-1] == "v1":
+        path += SCAN_PUSH_PATH[len("/v1") :]
+    return urlunsplit(parsed._replace(path=path))
+
+
+def _validate_push_destination_url(push_url: str) -> None:
+    """Validate fleet/scan push URLs with the same local-pilot carve-out as findings push."""
+    from urllib.parse import urlparse
+
+    from agent_bom.security import validate_url
+
+    host = (urlparse(push_url).hostname or "").lower()
+    allow_local = host in _LOCAL_CONTROL_PLANE_HOSTS
+    validate_url(
+        push_url,
+        allowed_schemes=("https", "http") if allow_local else ("https",),
+        allow_private=allow_local,
+    )
+
+
+def _csv_env(name: str) -> list[str]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _endpoint_identity_from_env() -> dict[str, str | list[str]]:
+    return {
+        "source_id": generate_source_id(),
+        "enrollment_name": os.environ.get("AGENT_BOM_PUSH_ENROLLMENT_NAME", "").strip(),
+        "owner": os.environ.get("AGENT_BOM_PUSH_OWNER", "").strip(),
+        "environment": os.environ.get("AGENT_BOM_PUSH_ENVIRONMENT", "").strip(),
+        "mdm_provider": os.environ.get("AGENT_BOM_PUSH_MDM_PROVIDER", "").strip(),
+        "tags": _csv_env("AGENT_BOM_PUSH_TAGS"),
+    }
 
 
 def generate_source_id() -> str:
     """Generate a stable machine identifier (hostname SHA256[:12])."""
+    configured = os.environ.get("AGENT_BOM_PUSH_SOURCE_ID", "").strip()
+    if configured:
+        return configured
     hostname = platform.node() or "unknown"
     return hashlib.sha256(hostname.encode()).hexdigest()[:12]
 
@@ -32,18 +104,24 @@ def sanitize_results(results: dict) -> dict:
     - Adds source_id
     """
     sanitized = copy.deepcopy(results)
+    sanitized = _redact_nested_secrets(sanitized)
+
+    endpoint_identity = _endpoint_identity_from_env()
 
     # Strip config_path from agents
     for agent in sanitized.get("agents", []):
         agent.pop("config_path", None)
-        # Redact env vars in metadata
-        meta = agent.get("metadata", {})
-        for key, val in list(meta.items()):
-            if isinstance(val, str) and _looks_like_secret(key):
-                meta[key] = "***REDACTED***"
+        for key in ("source_id", "enrollment_name", "owner", "environment", "mdm_provider"):
+            value = endpoint_identity.get(key, "")
+            if value and not agent.get(key):
+                agent[key] = value
+        tags = endpoint_identity.get("tags", [])
+        if tags and not agent.get("tags"):
+            agent["tags"] = tags
 
     # Add source identifier
-    sanitized["source_id"] = generate_source_id()
+    sanitized["source_id"] = str(endpoint_identity["source_id"])
+    sanitized["idempotency_key"] = str(uuid.uuid4())
 
     return sanitized
 
@@ -55,30 +133,190 @@ def _looks_like_secret(key: str) -> bool:
     return any(p in lower for p in patterns)
 
 
-async def _push_async(push_url: str, results: dict, api_key: str | None = None) -> bool:
-    """POST sanitized results to central dashboard."""
+def _redact_nested_secrets(value):
+    if isinstance(value, dict):
+        redacted: dict[object, object] = {}
+        for key, child in value.items():
+            key_text = str(key)
+            if key_text == "args" and isinstance(child, list):
+                redacted[key] = sanitize_command_args(child)
+            elif key_text == "command" and isinstance(child, str):
+                redacted[key] = sanitize_text(child, max_len=200)
+            elif key_text == "url" and isinstance(child, str):
+                redacted[key] = sanitize_url(child)
+            elif key_text == "env" and isinstance(child, dict):
+                redacted[key] = sanitize_env_vars(child)
+            elif key_text == "security_warnings" and isinstance(child, list):
+                redacted[key] = sanitize_security_warnings(child)
+            elif _looks_like_secret(key_text) and isinstance(child, (str, int, float, bool)):
+                redacted[key] = "***REDACTED***"
+            else:
+                redacted[key] = _redact_nested_secrets(child)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_nested_secrets(item) for item in value]
+    return value
+
+
+def _push_tls_cert() -> str | tuple[str, str] | None:
+    cert_file = os.environ.get("AGENT_BOM_PUSH_TLS_CERT_FILE", "").strip()
+    key_file = os.environ.get("AGENT_BOM_PUSH_TLS_KEY_FILE", "").strip()
+    if cert_file and key_file:
+        return cert_file, key_file
+    if cert_file or key_file:
+        logger.warning("Ignoring partial collector push TLS config; set both AGENT_BOM_PUSH_TLS_CERT_FILE and AGENT_BOM_PUSH_TLS_KEY_FILE")
+    return None
+
+
+def _push_tls_verify() -> bool | str:
+    ca_file = os.environ.get("AGENT_BOM_PUSH_TLS_CA_FILE", "").strip()
+    return ca_file if ca_file else True
+
+
+_DEFAULT_PUSH_MAX_ATTEMPTS = 3
+_DEFAULT_PUSH_BASE_DELAY = 1.0
+_DEFAULT_PUSH_MAX_DELAY = 30.0
+
+
+def _push_retry_delay(attempt: int, base: float, cap: float) -> float:
+    """Exponential backoff with small jitter bounded by cap."""
+    import random
+
+    exp = base * (2 ** (attempt - 1))
+    jitter = random.uniform(0, exp * 0.1)
+    return min(cap, exp + jitter)
+
+
+@overload
+async def _push_async(
+    push_url: str,
+    results: dict,
+    api_key: str | None = None,
+    *,
+    max_attempts: int = _DEFAULT_PUSH_MAX_ATTEMPTS,
+    base_delay_seconds: float = _DEFAULT_PUSH_BASE_DELAY,
+    max_delay_seconds: float = _DEFAULT_PUSH_MAX_DELAY,
+    return_body: Literal[False] = False,
+) -> bool: ...
+
+
+@overload
+async def _push_async(
+    push_url: str,
+    results: dict,
+    api_key: str | None = None,
+    *,
+    max_attempts: int = _DEFAULT_PUSH_MAX_ATTEMPTS,
+    base_delay_seconds: float = _DEFAULT_PUSH_BASE_DELAY,
+    max_delay_seconds: float = _DEFAULT_PUSH_MAX_DELAY,
+    return_body: Literal[True],
+) -> tuple[bool, dict[str, Any] | None]: ...
+
+
+async def _push_async(
+    push_url: str,
+    results: dict,
+    api_key: str | None = None,
+    *,
+    max_attempts: int = _DEFAULT_PUSH_MAX_ATTEMPTS,
+    base_delay_seconds: float = _DEFAULT_PUSH_BASE_DELAY,
+    max_delay_seconds: float = _DEFAULT_PUSH_MAX_DELAY,
+    return_body: bool = False,
+) -> bool | tuple[bool, dict[str, Any] | None]:
+    """POST sanitized results to the central dashboard with bounded retries.
+
+    Retries on network errors (``httpx.HTTPError``, ``OSError``) and on
+    retryable server responses (408, 425, 429, 5xx). Non-retryable 4xx
+    responses short-circuit immediately to avoid hammering misconfigured
+    endpoints. Matches the backoff contract used by the proxy audit delivery
+    controller so both egress paths degrade the same way.
+    """
     from agent_bom.http_client import create_client
+    from agent_bom.security import SecurityError
 
     sanitized = sanitize_results(results)
+    try:
+        _validate_push_destination_url(push_url)
+    except SecurityError as exc:
+        logger.error("Push URL rejected by outbound URL policy: %s", exc)
+        return (False, None) if return_body else False
+
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    async with create_client(timeout=30.0) as client:
-        try:
-            resp = await client.post(push_url, json=sanitized, headers=headers)
-            if resp.status_code < 300:
-                logger.info("Results pushed to %s (status=%d)", push_url, resp.status_code)
-                return True
-            logger.warning("Push failed: HTTP %d — %s", resp.status_code, resp.text[:200])
-            return False
-        except (httpx.HTTPError, ValueError, OSError):
-            logger.exception("Push to %s failed", push_url)
-            return False
+    retryable_status = {408, 425, 429, 500, 502, 503, 504}
+    last_status: int | None = None
+    last_error: str | None = None
+
+    async with create_client(timeout=30.0, cert=_push_tls_cert(), verify=_push_tls_verify()) as client:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = await client.post(push_url, json=sanitized, headers=headers)
+            except (httpx.HTTPError, ValueError, OSError) as exc:
+                from agent_bom.security import sanitize_error
+
+                last_error = f"{type(exc).__name__}: {sanitize_error(exc)}"
+                logger.warning(
+                    "Push attempt %d/%d failed with %s",
+                    attempt,
+                    max_attempts,
+                    last_error,
+                )
+            else:
+                last_status = resp.status_code
+                if resp.status_code < 300:
+                    logger.info(
+                        "Results pushed to configured endpoint (status=%d, attempt=%d)",
+                        resp.status_code,
+                        attempt,
+                    )
+                    if return_body:
+                        try:
+                            parsed = resp.json()
+                        except ValueError:
+                            parsed = {}
+                        return True, parsed if isinstance(parsed, dict) else {}
+                    return True
+                if resp.status_code not in retryable_status:
+                    logger.warning(
+                        "Push rejected with non-retryable status %d — %s",
+                        resp.status_code,
+                        sanitize_text(resp.text[:200]),
+                    )
+                    return (False, None) if return_body else False
+                last_error = sanitize_text(resp.text[:200])
+                logger.warning(
+                    "Push attempt %d/%d returned retryable status %d",
+                    attempt,
+                    max_attempts,
+                    resp.status_code,
+                )
+
+            if attempt < max_attempts:
+                await asyncio.sleep(_push_retry_delay(attempt, base_delay_seconds, max_delay_seconds))
+
+    logger.error(
+        "Push failed after %d attempts (last_status=%s, last_error=%s)",
+        max_attempts,
+        last_status,
+        last_error,
+    )
+    if return_body:
+        return False, None
+    return False
 
 
 def push_results(push_url: str, results: dict, api_key: str | None = None) -> bool:
     """Synchronous wrapper for pushing results to a dashboard."""
-    import asyncio
+    result = asyncio.run(_push_async(push_url, results, api_key))
+    return bool(result)
 
-    return asyncio.run(_push_async(push_url, results, api_key))
+
+def push_json(push_url: str, results: dict, api_key: str | None = None) -> dict | None:
+    """POST sanitized JSON and return the parsed response body on success."""
+    pushed = asyncio.run(_push_async(push_url, results, api_key, return_body=True))
+    if not isinstance(pushed, tuple):
+        return None
+    ok, body = pushed
+    return body if ok else None

@@ -1,0 +1,56 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $egress := .Values.networkPolicy.egress | default list }}
+{{- $additionalEgress := .Values.networkPolicy.additionalEgress | default list }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "agent-bom.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agent-bom.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    {{- with .Values.networkPolicy.podSelector }}
+    {{- toYaml . | nindent 4 }}
+    {{- else }}
+    matchLabels:
+      app.kubernetes.io/name: {{ include "agent-bom.name" . }}
+    {{- end }}
+  policyTypes:
+    - Egress
+    {{- if or .Values.networkPolicy.restrictIngress (gt (len .Values.networkPolicy.ingress) 0) }}
+    - Ingress
+    {{- end }}
+  {{- if or .Values.networkPolicy.restrictIngress (gt (len .Values.networkPolicy.ingress) 0) }}
+  ingress:
+    {{- if gt (len .Values.networkPolicy.ingress) 0 }}
+    {{- toYaml .Values.networkPolicy.ingress | nindent 4 }}
+    {{- else }}
+    []
+    {{- end }}
+  {{- end }}
+  egress:
+    {{- if .Values.networkPolicy.allowDns }}
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+    {{- with $egress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if .Values.networkPolicy.allowWeb }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        {{- range .Values.networkPolicy.webPorts }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
+    {{- with $additionalEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

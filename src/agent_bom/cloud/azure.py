@@ -14,11 +14,67 @@ import logging
 import os
 from typing import Any
 
+from agent_bom.discovery_envelope import RedactionStatus, ScanMode, attach_envelope_to_agents
 from agent_bom.models import Agent, AgentType, MCPServer, Package, TransportType
 
 from .base import CloudDiscoveryError
+from .normalization import build_cloud_origin, build_cloud_principal, build_cloud_scope, build_cloud_timestamps, build_package_purl
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_azure_resource_group(resource_id: str) -> str:
+    """Extract Azure resource group name from a resource ID."""
+    if not resource_id:
+        return ""
+    rg_parts = resource_id.split("/resourceGroups/")
+    if len(rg_parts) < 2:
+        return ""
+    return rg_parts[1].split("/")[0]
+
+
+def _build_azure_principal(
+    *,
+    service: str,
+    resource_type: str,
+    identity: Any,
+) -> dict[str, Any] | None:
+    """Normalize Azure workload identity metadata when present."""
+    if not identity:
+        return None
+    identity_type = getattr(identity, "type", "") or ""
+    principal_id = getattr(identity, "principal_id", "") or ""
+    tenant_id = getattr(identity, "tenant_id", "") or ""
+    user_assigned = getattr(identity, "user_assigned_identities", None) or {}
+    principal_name = ""
+    if not principal_id and user_assigned:
+        first_identity = next(iter(user_assigned.keys()), "")
+        principal_id = first_identity
+        principal_name = first_identity
+    normalized_type = (
+        {
+            "SystemAssigned": "system-assigned-managed-identity",
+            "UserAssigned": "user-assigned-managed-identity",
+            "SystemAssigned, UserAssigned": "mixed-managed-identity",
+        }.get(identity_type)
+        or identity_type.lower().replace("_", "-").replace(" ", "-")
+        or "managed-identity"
+    )
+    return build_cloud_principal(
+        provider="azure",
+        service=service,
+        resource_type=resource_type,
+        principal_type=normalized_type,
+        principal_id=principal_id or None,
+        principal_name=principal_name or None,
+        tenant_id=tenant_id or None,
+        source_field="identity",
+        raw_identity={
+            "type": identity_type,
+            "principal_id": principal_id,
+            "tenant_id": tenant_id,
+        },
+    )
 
 
 def discover(
@@ -103,6 +159,26 @@ def discover(
     except Exception as exc:
         warnings.append(f"Azure ML endpoints discovery error: {exc}")
 
+    # Per-run discovery envelope (#2083 PR B).
+    scope: list[str] = []
+    if resolved_sub:
+        scope.append(f"azure:subscription/{resolved_sub}")
+    if resource_group:
+        scope.append(f"azure:resource-group/{resource_group}")
+    attach_envelope_to_agents(
+        agents,
+        scan_mode=ScanMode.CLOUD_READ_ONLY,
+        discovery_scope=tuple(scope),
+        permissions_used=(
+            "Microsoft.App/containerApps/read",
+            "Microsoft.CognitiveServices/accounts/read",
+            "Microsoft.CognitiveServices/accounts/deployments/read",
+            "Microsoft.Web/sites/read",
+            "Microsoft.ContainerInstance/containerGroups/read",
+            "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/read",
+        ),
+        redaction_status=RedactionStatus.CENTRAL_SANITIZER_APPLIED,
+    )
     return agents, warnings
 
 
@@ -156,7 +232,52 @@ def _discover_container_apps(
                         config_path=app.id or f"azure://{app_name}",
                         source="azure-container-apps",
                         mcp_servers=[server],
+                        metadata={
+                            "cloud_origin": build_cloud_origin(
+                                provider="azure",
+                                service="container-apps",
+                                resource_type="container-app",
+                                resource_id=app.id or f"azure://{app_name}",
+                                resource_name=app_name,
+                                subscription_id=subscription_id,
+                                raw_identity={"id": app.id or "", "name": app_name},
+                            )
+                        },
                     )
+                    rg_name = resource_group or _extract_azure_resource_group(app.id or "")
+                    cloud_scope = build_cloud_scope(
+                        provider="azure",
+                        service="container-apps",
+                        resource_type="container-app",
+                        scope_type="resource-group",
+                        scope_id=rg_name,
+                        scope_name=rg_name or None,
+                        parent_scope_type="subscription",
+                        parent_scope_id=subscription_id,
+                        location=getattr(app, "location", None),
+                        source_fields=["id", "location"],
+                    )
+                    if cloud_scope:
+                        agent.metadata["cloud_scope"] = cloud_scope
+                    system_data = getattr(app, "system_data", None)
+                    cloud_timestamps = build_cloud_timestamps(
+                        provider="azure",
+                        service="container-apps",
+                        resource_type="container-app",
+                        created_at=getattr(system_data, "created_at", None) if system_data else None,
+                        updated_at=getattr(system_data, "last_modified_at", None) if system_data else None,
+                        created_source="system_data.created_at",
+                        updated_source="system_data.last_modified_at",
+                    )
+                    if cloud_timestamps:
+                        agent.metadata["cloud_timestamps"] = cloud_timestamps
+                    cloud_principal = _build_azure_principal(
+                        service="container-apps",
+                        resource_type="container-app",
+                        identity=getattr(app, "identity", None),
+                    )
+                    if cloud_principal:
+                        agent.metadata["cloud_principal"] = cloud_principal
                     agents.append(agent)
 
     except Exception as exc:
@@ -180,9 +301,13 @@ def _discover_ai_foundry(
         warnings.append("azure-ai-projects not installed. Skipping AI Foundry agent discovery. Install with: pip install azure-ai-projects")
         return agents, warnings
 
-    # AI Foundry requires a project endpoint — discover via resource graph
+    # AI Foundry requires a project endpoint — discover via resource graph.
+    # Import from the ``.resources`` submodule: azure-mgmt-resource 26.x dropped
+    # the top-level ResourceManagementClient re-export, so the bare top-level
+    # import raises ImportError on a current install. The submodule path is
+    # stable across the whole pinned range (>=23.0).
     try:
-        from azure.mgmt.resource import ResourceManagementClient
+        from azure.mgmt.resource.resources import ResourceManagementClient
 
         rm_client = ResourceManagementClient(credential, subscription_id)
 
@@ -201,7 +326,45 @@ def _discover_ai_foundry(
                 config_path=resource.id or f"azure://{ws_name}",
                 source="azure-ai-foundry",
                 mcp_servers=[],
+                metadata={
+                    "cloud_origin": build_cloud_origin(
+                        provider="azure",
+                        service="ai-foundry",
+                        resource_type="workspace",
+                        resource_id=resource.id or f"azure://{ws_name}",
+                        resource_name=ws_name,
+                        subscription_id=subscription_id,
+                        raw_identity={"id": resource.id or "", "name": ws_name},
+                    )
+                },
             )
+            rg_name = resource_group or _extract_azure_resource_group(resource.id or "")
+            cloud_scope = build_cloud_scope(
+                provider="azure",
+                service="ai-foundry",
+                resource_type="workspace",
+                scope_type="resource-group",
+                scope_id=rg_name,
+                scope_name=rg_name or None,
+                parent_scope_type="subscription",
+                parent_scope_id=subscription_id,
+                location=getattr(resource, "location", None),
+                source_fields=["id", "location"],
+            )
+            if cloud_scope:
+                agent.metadata["cloud_scope"] = cloud_scope
+            system_data = getattr(resource, "system_data", None)
+            cloud_timestamps = build_cloud_timestamps(
+                provider="azure",
+                service="ai-foundry",
+                resource_type="workspace",
+                created_at=getattr(system_data, "created_at", None) if system_data else None,
+                updated_at=getattr(system_data, "last_modified_at", None) if system_data else None,
+                created_source="system_data.created_at",
+                updated_source="system_data.last_modified_at",
+            )
+            if cloud_timestamps:
+                agent.metadata["cloud_timestamps"] = cloud_timestamps
             agents.append(agent)
 
     except Exception as exc:
@@ -244,6 +407,8 @@ def _discover_openai_deployments(
                 continue
             rg_name = rg_parts[1].split("/")[0]
 
+            account_location = str(getattr(account, "location", "") or "").strip().lower()
+
             # List deployments for this OpenAI account
             try:
                 for deployment in client.deployments.list(rg_name, account_name):
@@ -256,6 +421,7 @@ def _discover_openai_deployments(
                     sku_name = getattr(sku, "name", "") if sku else ""
 
                     label = f"{model_name}@{model_version}" if model_version else model_name
+                    deployment_resource_id = deployment.id or f"azure://openai/{account_name}/{deploy_name}"
                     server = MCPServer(
                         name=f"openai-deployment:{deploy_name}",
                         command=f"azure://openai/{account_name}/{deploy_name}",
@@ -265,11 +431,47 @@ def _discover_openai_deployments(
                     agent = Agent(
                         name=f"azure-openai:{account_name}/{deploy_name}",
                         agent_type=AgentType.CUSTOM,
-                        config_path=deployment.id or f"azure://openai/{account_name}/{deploy_name}",
+                        config_path=deployment_resource_id,
                         source="azure-openai",
+                        version=label,
                         mcp_servers=[server],
-                        metadata={"model": label, "sku": sku_name},
+                        metadata={
+                            "model": label,
+                            "sku": sku_name,
+                            "cloud_origin": build_cloud_origin(
+                                provider="azure",
+                                service="openai",
+                                resource_type="deployment",
+                                resource_id=deployment_resource_id,
+                                resource_name=deploy_name,
+                                location=account_location,
+                                subscription_id=subscription_id,
+                                raw_identity={
+                                    "subscription_id": subscription_id,
+                                    "resource_group": rg_name,
+                                    "account_name": account_name,
+                                    "deployment_name": deploy_name,
+                                    "model_name": model_name,
+                                    "model_version": model_version,
+                                },
+                            ),
+                        },
                     )
+                    cloud_scope = build_cloud_scope(
+                        provider="azure",
+                        service="openai",
+                        resource_type="deployment",
+                        scope_type="account",
+                        scope_id=account_id,
+                        scope_name=account_name,
+                        parent_scope_type="resource-group",
+                        parent_scope_id=rg_name,
+                        parent_scope_name=rg_name,
+                        location=account_location or None,
+                        source_fields=["account.id", "account.location", "deployment.id"],
+                    )
+                    if cloud_scope:
+                        agent.metadata["cloud_scope"] = cloud_scope
                     agents.append(agent)
             except Exception as exc:
                 warnings.append(f"Could not list deployments for OpenAI account {account_name}: {exc}")
@@ -347,11 +549,18 @@ def _discover_azure_functions(
                                 name=rt_name,
                                 version=rt_ver,
                                 ecosystem="azure-runtime",
+                                purl=build_package_purl(ecosystem="azure-runtime", name=rt_name, version=rt_ver),
                             )
                         )
                 except Exception as exc:
                     # Site config read is best-effort
                     logger.debug("Could not read site config for function app %s: %s", app_name, exc)
+
+            from agent_bom.cloud.serverless_zip import extract_azure_function_packages
+
+            dep_packages = extract_azure_function_packages(client, rg_name, app_name, runtime_stack, warnings)
+            if dep_packages:
+                packages.extend(dep_packages)
 
             server = MCPServer(
                 name=f"function-app:{app_name}",
@@ -366,8 +575,42 @@ def _discover_azure_functions(
                 config_path=app_id,
                 source="azure-functions",
                 mcp_servers=[server],
-                metadata={"runtime": runtime_stack, "location": location},
+                metadata={
+                    "runtime": runtime_stack,
+                    "location": location,
+                    "cloud_origin": build_cloud_origin(
+                        provider="azure",
+                        service="functions",
+                        resource_type="function-app",
+                        resource_id=app_id,
+                        resource_name=app_name,
+                        location=location or None,
+                        subscription_id=subscription_id,
+                        raw_identity={"id": app_id, "name": app_name, "runtime": runtime_stack},
+                    ),
+                },
             )
+            cloud_scope = build_cloud_scope(
+                provider="azure",
+                service="functions",
+                resource_type="function-app",
+                scope_type="resource-group",
+                scope_id=rg_name,
+                scope_name=rg_name or None,
+                parent_scope_type="subscription",
+                parent_scope_id=subscription_id,
+                location=location or None,
+                source_fields=["id", "location"],
+            )
+            if cloud_scope:
+                agent.metadata["cloud_scope"] = cloud_scope
+            cloud_principal = _build_azure_principal(
+                service="functions",
+                resource_type="function-app",
+                identity=getattr(app, "identity", None),
+            )
+            if cloud_principal:
+                agent.metadata["cloud_principal"] = cloud_principal
             agents.append(agent)
 
     except Exception as exc:
@@ -398,6 +641,8 @@ def _discover_container_instances(
         for group in client.container_groups.list():
             group_name = group.name or "unknown"
             group_id = group.id or f"azure://aci/{group_name}"
+            group_location = getattr(group, "location", "") or ""
+            rg_name = _extract_azure_resource_group(group_id)
             containers = getattr(group, "containers", []) or []
 
             for container in containers:
@@ -418,8 +663,34 @@ def _discover_container_instances(
                     config_path=group_id,
                     source="azure-container-instances",
                     mcp_servers=[server],
-                    metadata={"image": image},
+                    metadata={
+                        "image": image,
+                        "cloud_origin": build_cloud_origin(
+                            provider="azure",
+                            service="container-instances",
+                            resource_type="container",
+                            resource_id=f"{group_id}/{container_name}",
+                            resource_name=container_name,
+                            location=group_location or None,
+                            subscription_id=subscription_id,
+                            raw_identity={"group_id": group_id, "group_name": group_name, "container": container_name, "image": image},
+                        ),
+                    },
                 )
+                cloud_scope = build_cloud_scope(
+                    provider="azure",
+                    service="container-instances",
+                    resource_type="container",
+                    scope_type="resource-group",
+                    scope_id=rg_name,
+                    scope_name=rg_name or None,
+                    parent_scope_type="subscription",
+                    parent_scope_id=subscription_id,
+                    location=group_location or None,
+                    source_fields=["id", "location"],
+                )
+                if cloud_scope:
+                    agent.metadata["cloud_scope"] = cloud_scope
                 agents.append(agent)
 
     except Exception as exc:
@@ -445,6 +716,18 @@ def _discover_ml_endpoints(
         )
         return agents, warnings
 
+    # Workspaces are a control-plane resource and stay on the mgmt SDK, but
+    # online endpoints and their deployments moved to the v2 plane: no stable
+    # release of azure-mgmt-machinelearningservices exposes them, so reading
+    # them through that client found nothing and reported a warning per
+    # workspace. MLClient is scoped to one workspace, hence the per-workspace
+    # construction below.
+    try:
+        from azure.ai.ml import MLClient
+    except ImportError:
+        warnings.append("azure-ai-ml not installed. Skipping ML endpoint discovery. Install with: pip install azure-ai-ml")
+        return agents, warnings
+
     try:
         client = MachineLearningServicesMgmtClient(credential, subscription_id)
 
@@ -460,20 +743,27 @@ def _discover_ml_endpoints(
             rg_name = rg_parts[1].split("/")[0]
 
             try:
-                for endpoint in client.online_endpoints.list(rg_name, ws_name):
+                ml_client = MLClient(
+                    credential=credential,
+                    subscription_id=subscription_id,
+                    resource_group_name=rg_name,
+                    workspace_name=ws_name,
+                )
+                for endpoint in ml_client.online_endpoints.list():
                     ep_name = endpoint.name or "unknown"
-                    ep_id = endpoint.id or f"azure://ml/{ws_name}/{ep_name}"
-                    properties = getattr(endpoint, "properties", None)
-                    scoring_uri = getattr(properties, "scoring_uri", "") if properties else ""
+                    ep_id = getattr(endpoint, "id", "") or f"azure://ml/{ws_name}/{ep_name}"
+                    endpoint_location = getattr(endpoint, "location", "") or getattr(ws, "location", "") or ""
+                    # v2 entities expose these flat; the mgmt shapes nested them
+                    # under ``.properties``.
+                    scoring_uri = getattr(endpoint, "scoring_uri", "") or ""
 
                     # List deployments under this endpoint
                     deploy_meta: list[dict[str, str]] = []
                     try:
-                        for deployment in client.online_deployments.list(rg_name, ws_name, ep_name):
+                        for deployment in ml_client.online_deployments.list(endpoint_name=ep_name):
                             d_name = deployment.name or "unknown"
-                            d_props = getattr(deployment, "properties", None)
-                            model_id = getattr(d_props, "model", "") if d_props else ""
-                            instance_type = getattr(d_props, "instance_type", "") if d_props else ""
+                            model_id = str(getattr(deployment, "model", "") or "")
+                            instance_type = str(getattr(deployment, "instance_type", "") or "")
                             deploy_meta.append(
                                 {
                                     "deployment": d_name,
@@ -500,8 +790,33 @@ def _discover_ml_endpoints(
                         metadata={
                             "workspace": ws_name,
                             "deployments": deploy_meta,
+                            "cloud_origin": build_cloud_origin(
+                                provider="azure",
+                                service="machine-learning",
+                                resource_type="online-endpoint",
+                                resource_id=ep_id,
+                                resource_name=ep_name,
+                                location=endpoint_location or None,
+                                subscription_id=subscription_id,
+                                raw_identity={"id": ep_id, "workspace": ws_name, "name": ep_name},
+                            ),
                         },
                     )
+                    cloud_scope = build_cloud_scope(
+                        provider="azure",
+                        service="machine-learning",
+                        resource_type="online-endpoint",
+                        scope_type="workspace",
+                        scope_id=ws_id or ws_name,
+                        scope_name=ws_name,
+                        parent_scope_type="resource-group",
+                        parent_scope_id=rg_name,
+                        parent_scope_name=rg_name,
+                        location=endpoint_location or None,
+                        source_fields=["workspace.id", "endpoint.id", "endpoint.location"],
+                    )
+                    if cloud_scope:
+                        agent.metadata["cloud_scope"] = cloud_scope
                     agents.append(agent)
 
             except Exception as exc:

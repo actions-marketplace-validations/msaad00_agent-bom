@@ -117,7 +117,7 @@ class TestLogToolCall:
         buf.seek(0)
         record = json.loads(buf.read().strip())
         assert record["policy"] == "blocked"
-        assert record["reason"] == "policy violation"
+        assert "reason" not in record
 
     def test_with_metadata(self):
         buf = io.StringIO()
@@ -212,7 +212,7 @@ class TestReplayDetector:
         detector = ReplayDetector(max_entries=10)
         for i in range(20):
             detector.check({"id": i})
-        assert len(detector._seen) <= 10
+        assert detector.memory_bytes > 0
 
 
 # -- Policy checking --
@@ -269,6 +269,27 @@ class TestCheckPolicy:
         policy = {"rules": [{"action": "fail", "arg_pattern": {"x": "a" * 600}}]}
         allowed, _ = check_policy(policy, "test", {"x": "hello"})
         assert allowed
+
+    def test_deny_tool_classes_blocks_network_tool(self):
+        policy = {"rules": [{"id": "net", "action": "block", "deny_tool_classes": ["network"]}]}
+        allowed, reason = check_policy(policy, "web_fetch", {"url": "https://api.example.com"})
+        assert not allowed
+        assert "tool class" in reason.lower()
+
+    def test_block_unknown_egress_allows_subdomain(self):
+        policy = {
+            "rules": [
+                {
+                    "id": "egress",
+                    "action": "block",
+                    "block_unknown_egress": True,
+                    "allowed_hosts": ["example.com"],
+                }
+            ]
+        }
+        allowed, reason = check_policy(policy, "web_fetch", {"url": "https://api.example.com/v1"})
+        assert allowed
+        assert reason == ""
 
 
 # -- Regex helpers --
@@ -386,6 +407,21 @@ class TestRotatingAuditLog:
             os.unlink(link_path)
             os.unlink(real_path)
 
+    def test_fsync_mode_flushes_to_disk(self, monkeypatch):
+        calls: list[int] = []
+        monkeypatch.setattr(os, "fsync", lambda fileno: calls.append(fileno))
+
+        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+            path = f.name
+
+        try:
+            log = RotatingAuditLog(path, fsync=True)
+            log.write('{"test": 1}\n')
+            log.close()
+            assert calls
+        finally:
+            os.unlink(path)
+
 
 # -- Gateway evaluator --
 
@@ -420,6 +456,28 @@ class TestRotatingAuditLogRotation:
         log.close()
 
         assert Path(path).exists()
+
+    def test_rotation_preserves_more_than_one_backup(self):
+        from pathlib import Path
+
+        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+            path = f.name
+        os.unlink(path)
+
+        try:
+            log = RotatingAuditLog(path, max_bytes=20, max_rotated_files=3)
+            for i in range(8):
+                log.write(f'{{"i": {i}, "payload": "xxxx"}}\n')
+            log.close()
+
+            assert Path(path).exists()
+            assert Path(path + ".1").exists()
+            assert Path(path + ".2").exists()
+        finally:
+            for suffix in ("", ".1", ".2", ".3"):
+                candidate = path + suffix
+                if os.path.exists(candidate):
+                    os.unlink(candidate)
 
 
 class TestProxyMetricsSummaryNoLatency:

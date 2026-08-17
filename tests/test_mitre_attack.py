@@ -1,7 +1,7 @@
 """Tests for mitre_attack.py — MITRE ATT&CK Enterprise technique mapping.
 
-All technique IDs come from the live MITRE catalog (mitre_fetch.py).
-Tests mock the catalog fetch so they work offline and are fast.
+Technique IDs come from the shipped ATT&CK catalog and STIX-derived mappings.
+Tests mock catalog helpers so they work offline and stay deterministic.
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ _MOCK_TECHNIQUES: dict[str, dict] = {
     # Execution
     "T1059": {"name": "Command and Scripting Interpreter", "tactics": ["execution"], "description": "", "platforms": []},
     "T1059.004": {"name": "Unix Shell", "tactics": ["execution"], "description": "", "platforms": []},
+    "T1203": {"name": "Exploitation for Client Execution", "tactics": ["execution"], "description": "", "platforms": []},
     # Initial Access
     "T1078": {
         "name": "Valid Accounts",
@@ -52,6 +53,7 @@ _MOCK_TECHNIQUES: dict[str, dict] = {
     "T1195": {"name": "Supply Chain Compromise", "tactics": ["initial-access"], "description": "", "platforms": []},
     "T1195.002": {"name": "Compromise Software Supply Chain", "tactics": ["initial-access"], "description": "", "platforms": []},
     # Credential Access
+    "T1003.001": {"name": "LSASS Memory", "tactics": ["credential-access"], "description": "", "platforms": []},
     "T1552": {"name": "Unsecured Credentials", "tactics": ["credential-access"], "description": "", "platforms": []},
     "T1556": {
         "name": "Modify Authentication Process",
@@ -63,6 +65,7 @@ _MOCK_TECHNIQUES: dict[str, dict] = {
     "T1562": {"name": "Impair Defenses", "tactics": ["defense-evasion"], "description": "", "platforms": []},
     "T1562.008": {"name": "Disable Cloud Logs", "tactics": ["defense-evasion"], "description": "", "platforms": []},
     # Collection / Exfiltration
+    "T1040": {"name": "Network Sniffing", "tactics": ["credential-access", "collection"], "description": "", "platforms": []},
     "T1530": {"name": "Data from Cloud Storage", "tactics": ["collection"], "description": "", "platforms": []},
     "T1537": {"name": "Transfer Data to Cloud Account", "tactics": ["exfiltration"], "description": "", "platforms": []},
     # Privilege Escalation
@@ -91,6 +94,7 @@ _MOCK_CWE_TO_ATTACK: dict[str, list[str]] = {
     "CWE-502": ["T1059", "T1190"],
     "CWE-400": ["T1499"],
     "CWE-494": ["T1195.002"],
+    "CWE-787": ["T1203"],
 }
 
 
@@ -252,6 +256,14 @@ def test_unknown_section_falls_back_to_initial_access():
     assert len(tags) > 0
 
 
+def test_unknown_cis_section_limits_broad_tactic_fallback():
+    """A context-only tactic must not imply every technique in that tactic."""
+    with _mock_catalog():
+        c = _check("99.99", "99 - Unrecognised Section")
+        tags = tag_cis_check(c)
+    assert len(tags) <= 3
+
+
 def test_mfa_keyword_in_title():
     with _mock_catalog():
         check = CISCheckResult(
@@ -305,6 +317,13 @@ def test_provenance_multiple_flags():
     assert len(tags) > 0
 
 
+def test_provenance_limits_broad_tactic_fallbacks():
+    """Broad provenance signals select representatives, not whole tactics."""
+    with _mock_catalog():
+        tags = tag_provenance_finding({"risk_flags": ["unsafe_format:.pt"]})
+    assert len(tags) <= 6  # Two observed tactics, at most three representatives each.
+
+
 # ─── tag_blast_radius — CWE-based mapping ─────────────────────────────────────
 
 
@@ -355,32 +374,68 @@ def test_unknown_cwe_no_error():
     assert isinstance(tags, list)
 
 
-# ─── tag_blast_radius — context-based signals ─────────────────────────────────
+def test_unmapped_cwe_synthesizes_no_technique():
+    """An unrecognized CWE is not evidence for any technique.
+
+    This used to fall back to a representative "initial-access" set, asserting
+    concrete adversary techniques off nothing but a severity label.
+    """
+    with _mock_catalog():
+        tags = tag_blast_radius(_br(cwe_ids=["CWE-99999"], severity=Severity.HIGH))
+    assert tags == []
 
 
-def test_exposed_credentials_adds_credential_access_techniques():
+def test_heap_overflow_cwe_does_not_broadcast_unrelated_attack_tactics():
+    with _mock_catalog():
+        tags = tag_blast_radius(_br(cwe_ids=["CWE-787"], severity=Severity.CRITICAL, tools=[], creds=[]))
+
+    assert "T1203" in tags
+    assert "T1003.001" not in tags
+    assert "T1059.004" not in tags
+    assert "T1040" not in tags
+
+
+# ─── tag_blast_radius — context signals no longer synthesize techniques ──────
+#
+# A blast radius is tagged ONLY from MITRE's own CWE → CAPEC → ATT&CK data. The
+# broad context signals below (a credential exists, the CVE is severe, the CVE
+# is in KEV, an exec-capable tool is reachable) each used to be expanded into a
+# representative technique set. That asserted specific adversary behaviour —
+# "T1110 Brute Force", "T1195 Supply Chain Compromise" — off no evidence that
+# the behaviour occurred, and it fanned every such CVE out across dozens of
+# ATT&CK rows.
+
+
+def test_exposed_credentials_synthesize_no_technique():
     with _mock_catalog():
         tags = tag_blast_radius(_br(creds=["OPENAI_API_KEY"]))
-    assert "T1552" in tags or "T1556" in tags
+    assert tags == []
 
 
-def test_critical_severity_adds_initial_access_techniques():
+def test_critical_severity_synthesizes_no_technique():
     with _mock_catalog():
         tags = tag_blast_radius(_br(severity=Severity.CRITICAL))
-    assert any(t in tags for t in ("T1190", "T1078", "T1195", "T1195.002"))
+    assert tags == []
 
 
-def test_kev_adds_initial_access_techniques():
+def test_kev_status_synthesizes_no_technique():
     with _mock_catalog():
         tags = tag_blast_radius(_br(is_kev=True, severity=Severity.MEDIUM))
-    assert len(tags) > 0
+    assert tags == []
 
 
-def test_exec_tool_adds_execution_techniques():
+def test_exec_tool_synthesizes_no_technique():
     exec_tool = MCPTool(name="run_shell", description="Execute shell commands on the server")
     with _mock_catalog():
         tags = tag_blast_radius(_br(tools=[exec_tool]))
-    assert "T1059" in tags or "T1059.004" in tags
+    assert tags == []
+
+
+def test_cwe_mapped_techniques_still_resolve():
+    """The evidenced path is untouched: a real CWE still yields its techniques."""
+    with _mock_catalog():
+        tags = tag_blast_radius(_br(cwe_ids=["CWE-787"], severity=Severity.CRITICAL))
+    assert "T1203" in tags
 
 
 def test_non_exec_tool_does_not_add_execution():

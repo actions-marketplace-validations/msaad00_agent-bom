@@ -1,0 +1,168 @@
+"""Custom Click group that renders help with categorized commands."""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+from difflib import get_close_matches
+
+import click
+
+# Define command categories and which commands belong to each.
+# Order matters — first match wins, unlisted commands go to "Other".
+COMMAND_CATEGORIES: OrderedDict[str, list[str]] = OrderedDict(
+    [
+        (
+            "Get started",
+            ["connect", "scan", "graph", "report", "up", "quickstart", "demo", "capabilities", "doctor", "samples"],
+        ),
+        (
+            "Scanning",
+            ["skills", "image", "fs", "iac", "sbom", "ingest", "cloud", "check", "verify", "secrets", "code", "manifest", "scanners"],
+        ),
+        (
+            "Runtime",
+            ["proxy", "watch", "audit", "gateway", "firewall", "proxy-bootstrap", "sidecar-injector"],
+        ),
+        (
+            "MCP",
+            ["mcp", "where"],
+        ),
+        (
+            "Reporting",
+            ["graph", "graph-paths", "mesh", "report", "compliance"],
+        ),
+        (
+            "Governance",
+            [
+                "policy",
+                "trust",
+                "fleet",
+                "cost",
+                "identity",
+                "auth",
+                "serve",
+                "schedule",
+                "remediate",
+                "teardown",
+                "findings",
+                "campaigns",
+                "ticket",
+                "export",
+                "attest",
+                "audit-drain-dlq",
+            ],
+        ),
+        (
+            "Database",
+            ["db"],
+        ),
+        (
+            "Utilities",
+            ["upgrade", "completions", "plugins", "profiles", "interactive", "graph-evidence"],
+        ),
+    ]
+)
+
+CATEGORY_DESCRIPTIONS: dict[str, str] = {
+    "Get started": "The front door: connect a source (read-only) → scan → graph → report. `up` runs the platform locally.",
+    "Scanning": "Inventory, package, image, IaC, cloud, and skills scanning entry points.",
+    "Runtime": "Live MCP enforcement, replay, and runtime monitoring surfaces.",
+    "MCP": "Discovery, inventory, introspection, and MCP server operations.",
+    "Reporting": "Graph, mesh, dashboard, history, and narrative reporting workflows.",
+    "Governance": "Policy, trust boundaries, fleet, FinOps, identity, API, scheduling, and operational control-plane commands.",
+    "Database": "Local cache, vuln database, and framework catalog maintenance.",
+    "Utilities": "Shell completions and upgrade helpers.",
+    "Other": "Additional commands that do not fit a primary workflow bucket.",
+}
+
+
+class SuggestingGroup(click.Group):
+    """A Click group that suggests nearby subcommands on typos."""
+
+    def resolve_command(self, ctx: click.Context, args: list[str]):
+        try:
+            return super().resolve_command(ctx, args)
+        except click.UsageError as exc:
+            if args:
+                suggestion = self._suggest_command(ctx, args[0])
+                if suggestion and "No such command" in exc.message:
+                    raise click.UsageError(f"{exc.message}\n\nDid you mean '{suggestion}'?", ctx=ctx) from exc
+            raise
+
+    def _suggest_command(self, ctx: click.Context, command_name: str) -> str | None:
+        visible_commands = []
+        for name in self.list_commands(ctx):
+            command = self.get_command(ctx, name)
+            if command is None:
+                continue
+            visible_commands.append(name)
+        matches = get_close_matches(command_name, visible_commands, n=1, cutoff=0.62)
+        return matches[0] if matches else None
+
+
+class GroupedGroup(SuggestingGroup):
+    """A Click group that displays commands organized by category.
+
+    Pass ``command_categories`` to override the default category mapping.
+    Each product (agent-bom, agent-shield, etc.) provides its own categories.
+    """
+
+    def __init__(self, *args, command_categories=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._command_categories = command_categories or COMMAND_CATEGORIES
+
+    def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        # Collect all available commands
+        commands: dict[str, click.Command] = {}
+        for subcommand in self.list_commands(ctx):
+            cmd = self.get_command(ctx, subcommand)
+            if cmd is None or cmd.hidden:
+                continue
+            # get_command returns BaseCommand but we need Command for get_short_help_str
+            if not isinstance(cmd, click.Command):
+                continue
+            commands[subcommand] = cmd
+
+        if not commands:
+            return
+
+        # Track which commands have been placed in a category
+        placed: set[str] = set()
+
+        for category, cmd_names in self._command_categories.items():
+            rows: list[tuple[str, str]] = []
+            for name in cmd_names:
+                if name in commands:
+                    cmd = commands[name]
+                    help_text = cmd.get_short_help_str(limit=48)
+                    rows.append((name, help_text))
+                    placed.add(name)
+
+            if rows:
+                with formatter.section(category):
+                    description = CATEGORY_DESCRIPTIONS.get(category)
+                    if description:
+                        formatter.write_text(description)
+                    formatter.write_dl(rows)
+
+        # Any commands not in a category go under "Other"
+        other: list[tuple[str, str]] = []
+        for name in sorted(commands):
+            if name not in placed:
+                help_text = commands[name].get_short_help_str(limit=48)
+                other.append((name, help_text))
+
+        if other:
+            with formatter.section("Other"):
+                description = CATEGORY_DESCRIPTIONS.get("Other")
+                if description:
+                    formatter.write_text(description)
+                formatter.write_dl(other)
+
+    def format_epilog(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        formatter.write_paragraph()
+        formatter.write_text(
+            "Navigation tips: get started with connect → scan → graph → report. "
+            "Run `agent-bom doctor` for readiness, `agent-bom scan --demo` for a "
+            "reproducible local run, and `agent-bom COMMAND --help` for command-specific flags."
+        )

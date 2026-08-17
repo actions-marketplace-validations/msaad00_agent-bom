@@ -1,0 +1,424 @@
+"""End-to-end tests for 5 CLI entry points.
+
+Verifies:
+- Each product's Click group renders --help correctly
+- --version shows correct product name
+- Subcommand dispatch works for each product
+- Backward compatibility: agent-bom still exposes runtime/cloud/iac/policy groups
+- No import errors or circular dependencies
+"""
+
+from __future__ import annotations
+
+from click.testing import CliRunner
+
+# ── agent-bom (original) ────────────────────────────────────────────────────
+
+
+class TestAgentBom:
+    def test_help(self):
+        from agent_bom.cli import main
+
+        r = CliRunner().invoke(main, ["--help"])
+        assert r.exit_code == 0
+        assert "agent-bom" in r.output
+        assert "Core readiness" not in r.output
+        assert "Navigation tips:" in r.output
+
+    def test_unknown_command_suggests_nearest_command(self):
+        from agent_bom.cli import main
+
+        r = CliRunner().invoke(main, ["scna"])
+        assert r.exit_code != 0
+        assert "No such command 'scna'" in r.output
+        assert "Did you mean 'scan'?" in r.output
+
+    def test_nested_unknown_command_suggests_nearest_command(self):
+        from agent_bom.cli import main
+
+        r = CliRunner().invoke(main, ["mcp", "valdte"])
+        assert r.exit_code != 0
+        assert "No such command 'valdte'" in r.output
+        assert "Did you mean 'validate'?" in r.output
+
+    def test_version(self):
+        from agent_bom.cli import main
+
+        r = CliRunner().invoke(main, ["--version"])
+        assert r.exit_code == 0
+        assert "agent-bom" in r.output
+
+    def test_agents_help(self):
+        from agent_bom.cli import main
+
+        r = CliRunner().invoke(main, ["agents", "--help"])
+        assert r.exit_code == 0
+        assert "OpenSSF Scorecard" in r.output
+        assert "--page" in r.output
+
+    def test_report_dashboard_help_points_to_serve_for_next_ui(self):
+        from agent_bom.cli import main
+
+        r = CliRunner().invoke(main, ["report", "--help"])
+        assert r.exit_code == 0
+        assert "agent-bom serve" in r.output
+        assert "legacy Streamlit compatibility" in r.output
+
+    def test_scan_backward_compat(self):
+        from agent_bom.cli import main
+
+        r = CliRunner().invoke(main, ["scan", "--help"])
+        assert r.exit_code == 0
+
+    def test_check_help(self):
+        from agent_bom.cli import main
+
+        r = CliRunner().invoke(main, ["check", "--help"])
+        assert r.exit_code == 0
+
+    def test_watch_is_visible_runtime_workflow(self):
+        from agent_bom.cli import main
+
+        help_result = CliRunner().invoke(main, ["--help"])
+        assert help_result.exit_code == 0
+        assert "watch" in help_result.output
+
+        watch_result = CliRunner().invoke(main, ["watch", "--help"])
+        assert watch_result.exit_code == 0
+        assert "Watch MCP configs" in watch_result.output
+
+    def test_backward_compat_runtime_group(self):
+        from agent_bom.cli import main
+
+        r = CliRunner().invoke(main, ["runtime", "--help"])
+        assert r.exit_code == 0
+        assert "proxy" in r.output
+        assert "watch" not in r.output
+
+        watch_result = CliRunner().invoke(main, ["runtime", "watch", "--help"])
+        assert watch_result.exit_code == 0
+        assert "Watch MCP configs" in watch_result.output
+
+    def test_backward_compat_cloud_group(self):
+        from agent_bom.cli import main
+
+        r = CliRunner().invoke(main, ["cloud", "--help"])
+        assert r.exit_code == 0
+        assert "aws" in r.output
+
+    def test_backward_compat_mcp_group(self):
+        from agent_bom.cli import main
+
+        r = CliRunner().invoke(main, ["mcp", "--help"])
+        assert r.exit_code == 0
+
+    def test_mcp_server_help_is_workflow_first(self):
+        from agent_bom.cli import main
+
+        r = CliRunner().invoke(main, ["mcp", "server", "--help"])
+        assert r.exit_code == 0
+        assert "Workflow prompts first" in r.output
+        assert "quick-audit" in r.output
+        assert "gateway-fleet-live-demo" in r.output
+        assert "full tool catalog" in r.output
+        assert "Exposes 81 security tools via MCP protocol" in r.output
+        assert "organized behind 8 workflow" in r.output
+
+    def test_secrets_help_has_common_output_flags(self):
+        from agent_bom.cli import main
+
+        r = CliRunner().invoke(main, ["secrets", "--help"])
+        assert r.exit_code == 0
+        for flag in ("--no-color", "--log-json", "--log-file"):
+            assert flag in r.output
+
+    def test_skills_scan_help_has_common_output_flags(self):
+        from agent_bom.cli import main
+
+        r = CliRunner().invoke(main, ["skills", "scan", "--help"])
+        assert r.exit_code == 0
+        for flag in ("--no-color", "--log-json", "--log-file"):
+            assert flag in r.output
+
+
+# ── agent-shield ─────────────────────────────────────────────────────────────
+
+
+class TestAgentShield:
+    def test_help(self):
+        from agent_bom.cli.shield import shield
+
+        r = CliRunner().invoke(shield, ["--help"])
+        assert r.exit_code == 0
+        assert "agent-shield" in r.output
+        assert "Runtime" in r.output
+
+    def test_version(self):
+        from agent_bom.cli.shield import shield
+
+        r = CliRunner().invoke(shield, ["--version"])
+        assert r.exit_code == 0
+        assert "agent-shield" in r.output
+
+    def test_proxy_help(self):
+        from agent_bom.cli.shield import shield
+
+        r = CliRunner().invoke(shield, ["proxy", "--help"])
+        assert r.exit_code == 0
+        assert "proxy" in r.output.lower()
+
+    def test_audit_help(self):
+        from agent_bom.cli.shield import shield
+
+        r = CliRunner().invoke(shield, ["audit", "--help"])
+        assert r.exit_code == 0
+
+
+# ── agent-cloud ──────────────────────────────────────────────────────────────
+
+
+class TestAgentCloud:
+    def test_help(self):
+        from agent_bom.cli.cloud import cloud
+
+        r = CliRunner().invoke(cloud, ["--help"])
+        assert r.exit_code == 0
+        assert "agent-cloud" in r.output
+        assert "Cloud Providers" in r.output
+
+    def test_version(self):
+        from agent_bom.cli.cloud import cloud
+
+        r = CliRunner().invoke(cloud, ["--version"])
+        assert r.exit_code == 0
+        assert "agent-cloud" in r.output
+
+    def test_aws_help(self):
+        from agent_bom.cli.cloud import cloud
+
+        r = CliRunner().invoke(cloud, ["aws", "--help"])
+        assert r.exit_code == 0
+        assert "--region" in r.output
+
+    def test_azure_help(self):
+        from agent_bom.cli.cloud import cloud
+
+        r = CliRunner().invoke(cloud, ["azure", "--help"])
+        assert r.exit_code == 0
+        assert "--subscription" in r.output
+
+    def test_gcp_help(self):
+        from agent_bom.cli.cloud import cloud
+
+        r = CliRunner().invoke(cloud, ["gcp", "--help"])
+        assert r.exit_code == 0
+        assert "--project" in r.output
+
+    def test_cloud_provider_wrappers_enable_auto_db_refresh(self, monkeypatch):
+        from agent_bom.cli.cloud import cloud
+
+        seen = []
+
+        def fake_scan(**kwargs):
+            seen.append(kwargs)
+
+        monkeypatch.setattr("agent_bom.cli.agents.scan.callback", fake_scan)
+
+        for command in ("aws", "azure", "gcp"):
+            r = CliRunner().invoke(cloud, [command])
+            assert r.exit_code == 0
+
+        assert [item["auto_update_db"] for item in seen] == [True, True, True]
+
+    def test_snowflake_help(self):
+        from agent_bom.cli.cloud import cloud
+
+        r = CliRunner().invoke(cloud, ["snowflake", "--help"])
+        assert r.exit_code == 0
+
+    def test_databricks_help(self):
+        from agent_bom.cli.cloud import cloud
+
+        r = CliRunner().invoke(cloud, ["databricks", "--help"])
+        assert r.exit_code == 0
+
+    def test_huggingface_help(self):
+        from agent_bom.cli.cloud import cloud
+
+        r = CliRunner().invoke(cloud, ["huggingface", "--help"])
+        assert r.exit_code == 0
+
+    def test_ollama_help(self):
+        from agent_bom.cli.cloud import cloud
+
+        r = CliRunner().invoke(cloud, ["ollama", "--help"])
+        assert r.exit_code == 0
+
+    def test_posture_help(self):
+        from agent_bom.cli.cloud import cloud
+
+        r = CliRunner().invoke(cloud, ["posture", "--help"])
+        assert r.exit_code == 0
+
+
+# ── agent-iac ────────────────────────────────────────────────────────────────
+
+
+class TestAgentIac:
+    def test_help(self):
+        from agent_bom.cli.iac import iac
+
+        r = CliRunner().invoke(iac, ["--help"])
+        assert r.exit_code == 0
+        assert "agent-iac" in r.output
+        assert "Scanning" in r.output
+
+    def test_version(self):
+        from agent_bom.cli.iac import iac
+
+        r = CliRunner().invoke(iac, ["--version"])
+        assert r.exit_code == 0
+        assert "agent-iac" in r.output
+
+    def test_scan_help(self):
+        from agent_bom.cli.iac import iac
+
+        r = CliRunner().invoke(iac, ["scan", "--help"])
+        assert r.exit_code == 0
+
+    def test_policy_help(self):
+        from agent_bom.cli.iac import iac
+
+        r = CliRunner().invoke(iac, ["policy", "--help"])
+        assert r.exit_code == 0
+        assert "template" in r.output
+
+    def test_validate_help(self):
+        from agent_bom.cli.iac import iac
+
+        r = CliRunner().invoke(iac, ["validate", "--help"])
+        assert r.exit_code == 0
+
+
+# ── agent-claw ───────────────────────────────────────────────────────────────
+
+
+class TestAgentClaw:
+    def test_help(self):
+        from agent_bom.cli.claw import claw
+
+        r = CliRunner().invoke(claw, ["--help"])
+        assert r.exit_code == 0
+        assert "agent-claw" in r.output
+        assert "Fleet" in r.output
+
+    def test_version(self):
+        from agent_bom.cli.claw import claw
+
+        r = CliRunner().invoke(claw, ["--version"])
+        assert r.exit_code == 0
+        assert "agent-claw" in r.output
+
+    def test_serve_help(self):
+        from agent_bom.cli.claw import claw
+
+        r = CliRunner().invoke(claw, ["serve", "--help"])
+        assert r.exit_code == 0
+
+    def test_api_help(self):
+        from agent_bom.cli.claw import claw
+
+        r = CliRunner().invoke(claw, ["api", "--help"])
+        assert r.exit_code == 0
+
+    def test_fleet_help(self):
+        from agent_bom.cli.claw import claw
+
+        r = CliRunner().invoke(claw, ["fleet", "--help"])
+        assert r.exit_code == 0
+        assert "sync" in r.output
+        assert "list" in r.output
+        assert "stats" in r.output
+        assert "reconcile-k8s" in r.output
+        fleet = claw.get_command(None, "fleet")
+        assert fleet.get_command(None, "state") is None
+
+    def test_fleet_sync_requires_push_url(self):
+        from agent_bom.cli.claw import claw
+
+        r = CliRunner().invoke(claw, ["fleet", "sync"])
+        assert r.exit_code != 0
+        assert "AGENT_BOM_PUSH_URL" in r.output
+
+    def test_fleet_list_and_stats_fail_closed(self):
+        from agent_bom.cli.claw import claw
+
+        for command in ("list", "stats"):
+            r = CliRunner().invoke(claw, ["fleet", command])
+            assert r.exit_code != 0
+            assert "agent-bom api" in r.output
+            assert "agent-claw api" not in r.output
+            assert "not available as a local-only command" in r.output
+
+    def test_schedule_help(self):
+        from agent_bom.cli.claw import claw
+
+        r = CliRunner().invoke(claw, ["schedule", "--help"])
+        assert r.exit_code == 0
+
+    def test_report_help(self):
+        from agent_bom.cli.claw import claw
+
+        r = CliRunner().invoke(claw, ["report", "--help"])
+        assert r.exit_code == 0
+
+    def test_connectors_help(self):
+        from agent_bom.cli.claw import claw
+
+        r = CliRunner().invoke(claw, ["connectors", "--help"])
+        assert r.exit_code == 0
+
+
+# ── Cross-product: same command object, no duplication ───────────────────────
+
+
+class TestNoDuplication:
+    def test_proxy_cmd_is_same_object(self):
+        """proxy_cmd registered on both shield and main must be the same Python object."""
+        from agent_bom.cli._runtime import proxy_cmd as bom_proxy
+        from agent_bom.cli.shield import shield
+
+        shield_proxy = shield.get_command(None, "proxy")
+        assert shield_proxy is bom_proxy
+
+    def test_policy_check_is_guard(self):
+        """guard_cmd registered as policy check must be the same object."""
+        from agent_bom.cli import main
+
+        policy = main.get_command(None, "policy")
+        check_cmd = policy.get_command(None, "check") if policy else None
+        assert check_cmd is not None
+
+    def test_policy_group_help_describes_check_as_install_guard(self):
+        from agent_bom.cli import main
+
+        r = CliRunner().invoke(main, ["policy", "--help"])
+
+        assert r.exit_code == 0
+        assert "Pre-install package guard" in r.output
+        assert "agent-bom agents --policy PATH" in r.output
+
+    def test_aws_cmd_is_same_object(self):
+        """aws_cmd registered on both cloud module and cloud_group must be the same object."""
+        from agent_bom.cli._cloud_group import aws_cmd as group_aws
+        from agent_bom.cli.cloud import cloud
+
+        cloud_aws = cloud.get_command(None, "aws")
+        assert cloud_aws is group_aws
+
+    def test_audit_cmd_is_same_object(self):
+        from agent_bom.cli._runtime import audit_replay_cmd as bom_audit
+        from agent_bom.cli.shield import shield
+
+        shield_audit = shield.get_command(None, "audit")
+        assert shield_audit is bom_audit

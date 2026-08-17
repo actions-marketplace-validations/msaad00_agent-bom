@@ -25,9 +25,11 @@ import os
 import re
 from typing import Any, Optional
 
+from agent_bom.discovery_envelope import RedactionStatus, ScanMode, attach_envelope_to_agents
 from agent_bom.models import Agent, AgentType, MCPServer, Package, TransportType
 
 from .base import CloudDiscoveryError
+from .normalization import build_cloud_origin, build_cloud_state, build_package_purl, normalize_cloud_lifecycle_state
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +89,13 @@ def discover(
 
         # Only scan running or terminated (recently used) clusters
         state_str = str(state).upper() if state else ""
-        if state_str not in ("RUNNING", "TERMINATED", "RESIZING"):
+        lifecycle_state = normalize_cloud_lifecycle_state(
+            provider="databricks",
+            service="clusters",
+            resource_type="cluster",
+            raw_state=state_str,
+        )
+        if lifecycle_state is None:
             continue
 
         packages = _get_cluster_packages(ws, cluster_id, warnings)
@@ -107,6 +115,24 @@ def discover(
             config_path=f"{resolved_host}/#/setting/clusters/{cluster_id}/configuration",
             source="databricks",
             mcp_servers=[server],
+            metadata={
+                "cloud_origin": build_cloud_origin(
+                    provider="databricks",
+                    service="clusters",
+                    resource_type="cluster",
+                    resource_id=cluster_id,
+                    resource_name=cluster_name,
+                    raw_identity={"cluster_id": cluster_id, "cluster_name": cluster_name},
+                ),
+                "cloud_state": build_cloud_state(
+                    provider="databricks",
+                    service="clusters",
+                    resource_type="cluster",
+                    lifecycle_state=lifecycle_state,
+                    raw_state=state_str,
+                    state_source="cluster.state",
+                ),
+            },
         )
         agents.append(agent)
 
@@ -120,7 +146,13 @@ def discover(
             # the raw string ("READY" / "NOT_READY") rather than the repr.
             ready_enum = getattr(ep_state, "ready", None) if ep_state else None
             state_str = getattr(ready_enum, "value", str(ready_enum or "")).upper()
-            if state_str not in ("READY", "NOT_READY"):
+            lifecycle_state = normalize_cloud_lifecycle_state(
+                provider="databricks",
+                service="model-serving",
+                resource_type="serving-endpoint",
+                raw_state=state_str,
+            )
+            if lifecycle_state is None:
                 continue
 
             server = MCPServer(
@@ -134,6 +166,24 @@ def discover(
                 config_path=f"{resolved_host}/ml/endpoints/{ep_name}",
                 source="databricks",
                 mcp_servers=[server],
+                metadata={
+                    "cloud_origin": build_cloud_origin(
+                        provider="databricks",
+                        service="model-serving",
+                        resource_type="serving-endpoint",
+                        resource_id=ep_name,
+                        resource_name=ep_name,
+                        raw_identity={"name": ep_name},
+                    ),
+                    "cloud_state": build_cloud_state(
+                        provider="databricks",
+                        service="model-serving",
+                        resource_type="serving-endpoint",
+                        lifecycle_state=lifecycle_state,
+                        raw_state=state_str,
+                        state_source="state.ready",
+                    ),
+                },
             )
             agents.append(agent)
 
@@ -142,6 +192,23 @@ def discover(
     except Exception as exc:
         warnings.append(f"Could not list Databricks serving endpoints: {exc}")
 
+    # Per-run discovery envelope (#2083 PR B).
+    scope: list[str] = []
+    if host:
+        scope.append(f"databricks:workspace/{host}")
+    attach_envelope_to_agents(
+        agents,
+        scan_mode=ScanMode.SAAS_READ_ONLY,
+        discovery_scope=tuple(scope),
+        permissions_used=(
+            "clusters:list",
+            "clusters:get",
+            "libraries:cluster_status:get",
+            "serving-endpoints:list",
+            "serving-endpoints:get",
+        ),
+        redaction_status=RedactionStatus.CENTRAL_SANITIZER_APPLIED,
+    )
     return agents, warnings
 
 
@@ -206,7 +273,7 @@ def _parse_pypi_spec(spec: str) -> Optional[Package]:
     version = match.group(2) or "unknown"
     # Clean version — take first version if comma-separated
     version = version.split(",")[0].strip()
-    return Package(name=name, version=version, ecosystem="pypi")
+    return Package(name=name, version=version, ecosystem="pypi", purl=build_package_purl(ecosystem="pypi", name=name, version=version))
 
 
 def _parse_maven_coords(coords: str) -> Optional[Package]:
@@ -217,9 +284,16 @@ def _parse_maven_coords(coords: str) -> Optional[Package]:
     if len(parts) >= 3:
         group_artifact = f"{parts[0]}:{parts[1]}"
         version = parts[2]
-        return Package(name=group_artifact, version=version, ecosystem="maven")
+        return Package(
+            name=group_artifact,
+            version=version,
+            ecosystem="maven",
+            purl=build_package_purl(ecosystem="maven", name=group_artifact, version=version),
+        )
     if len(parts) == 2:
-        return Package(name=parts[0], version=parts[1], ecosystem="maven")
+        return Package(
+            name=parts[0], version=parts[1], ecosystem="maven", purl=build_package_purl(ecosystem="maven", name=parts[0], version=parts[1])
+        )
     return None
 
 
@@ -232,5 +306,10 @@ def _parse_jar_path(path: str) -> Optional[Package]:
     # Try pattern: name-version
     match = re.match(r"^(.+?)-(\d+\..+)$", filename)
     if match:
-        return Package(name=match.group(1), version=match.group(2), ecosystem="maven")
+        return Package(
+            name=match.group(1),
+            version=match.group(2),
+            ecosystem="maven",
+            purl=build_package_purl(ecosystem="maven", name=match.group(1), version=match.group(2)),
+        )
     return Package(name=filename, version="unknown", ecosystem="maven")

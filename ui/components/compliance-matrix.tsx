@@ -1,16 +1,21 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { flexRender } from "@tanstack/react-table";
+// v9 removed `useReactTable` and `createColumnHelper` from the package root and
+// moved the row-model factories behind `/legacy`. This component keeps the v8
+// table shape through that compat layer; porting it to v9's `useTable` is a
+// separate change, and doing both at once would leave nothing to bisect if the
+// matrix regressed.
 import {
-  useReactTable,
+  useLegacyTable,
   getCoreRowModel,
   getSortedRowModel,
   getFilteredRowModel,
-  flexRender,
-  createColumnHelper,
-  SortingState,
-  ColumnFiltersState,
-} from "@tanstack/react-table";
+  legacyCreateColumnHelper,
+  type LegacyColumnDef,
+} from "@tanstack/react-table/legacy";
+import type { SortingState, ColumnFiltersState } from "@tanstack/table-core";
 import {
   ComplianceResponse,
   ComplianceControl,
@@ -44,6 +49,17 @@ interface MatrixRow {
   low: number;
   affectedPackages: string[];
   affectedAgents: string[];
+  // Carried (not rendered as columns) so a row click can open the shared
+  // ComplianceControlDrawer with the original control + its framework catalog.
+  control: ComplianceControl;
+  catalog: Record<string, string>;
+}
+
+/** Payload emitted when a matrix row is drilled into, shaped for the drawer. */
+export interface ComplianceMatrixSelection {
+  control: ComplianceControl;
+  frameworkLabel: string;
+  catalog: Record<string, string>;
 }
 
 // ─── Data transform ──────────────────────────────────────────────────────────
@@ -78,6 +94,8 @@ function flattenControls(data: ComplianceResponse): MatrixRow[] {
         low: c.severity_breakdown.low ?? 0,
         affectedPackages: c.affected_packages,
         affectedAgents: c.affected_agents,
+        control: c,
+        catalog,
       });
     }
   }
@@ -86,13 +104,13 @@ function flattenControls(data: ComplianceResponse): MatrixRow[] {
 
 // ─── Column definitions ──────────────────────────────────────────────────────
 
-const col = createColumnHelper<MatrixRow>();
+const col = legacyCreateColumnHelper<MatrixRow>();
 
 const columns = [
   col.accessor("framework", {
     header: "Framework",
     cell: (info) => (
-      <span className="text-xs font-medium text-zinc-400">
+      <span className="text-xs font-medium text-[color:var(--text-secondary)]">
         {info.getValue()}
       </span>
     ),
@@ -101,7 +119,7 @@ const columns = [
   col.accessor("code", {
     header: "Control",
     cell: (info) => (
-      <span className="font-mono text-xs font-semibold text-zinc-200">
+      <span className="font-mono text-xs font-semibold text-[color:var(--foreground)]">
         {info.getValue()}
       </span>
     ),
@@ -109,7 +127,7 @@ const columns = [
   col.accessor("name", {
     header: "Description",
     cell: (info) => (
-      <span className="text-xs text-zinc-400 leading-snug">
+      <span className="text-xs text-[color:var(--text-secondary)] leading-snug">
         {info.getValue()}
       </span>
     ),
@@ -117,20 +135,35 @@ const columns = [
   col.accessor("status", {
     header: "Status",
     cell: (info) => {
-      const s = info.getValue();
-      const styles = {
+      const status = String(info.getValue() ?? "");
+      // Keyed on every status the API can send, not just the scored three.
+      // #4709 made ATLAS an applicability overlay, so its controls arrive as
+      // `applicable` / `not_applicable`; other frameworks send `not_evaluated`.
+      // Those fell through `styles[s]` / `labels[s]` as `undefined`, rendering
+      // an EMPTY pill with the literal string "undefined" in its class list.
+      const styles: Record<string, string> = {
         pass: "bg-emerald-950 text-emerald-300 border-emerald-800",
         warning: "bg-yellow-950 text-yellow-300 border-yellow-800",
         fail: "bg-red-950 text-red-300 border-red-800",
+        error: "bg-yellow-950 text-yellow-300 border-yellow-800",
+        applicable: "bg-cyan-950 text-cyan-300 border-cyan-800",
+        not_applicable: "bg-[color:var(--surface-muted)] text-[color:var(--text-tertiary)] border-[color:var(--border-subtle)]",
+        not_evaluated: "bg-[color:var(--surface-muted)] text-[color:var(--text-tertiary)] border-[color:var(--border-subtle)]",
       };
-      const labels = { pass: "Pass", warning: "Warning", fail: "Fail" };
-      return (
-        <span
-          className={`text-[10px] px-2 py-0.5 rounded-full border font-medium ${styles[s]}`}
-        >
-          {labels[s]}
-        </span>
-      );
+      const labels: Record<string, string> = {
+        pass: "Pass",
+        warning: "Warning",
+        fail: "Fail",
+        error: "Error",
+        applicable: "Applicable",
+        not_applicable: "Not applicable",
+        not_evaluated: "Not evaluated",
+      };
+      // An unknown status is shown de-namespaced rather than dropped: a blank
+      // cell hides that the API sent something this table does not model.
+      const label = labels[status] ?? status.replace(/_/g, " ") ?? "Unknown";
+      const style = styles[status] ?? styles.not_evaluated;
+      return <span className={`text-[10px] px-2 py-0.5 rounded-full border font-medium ${style}`}>{label}</span>;
     },
     filterFn: "equals",
   }),
@@ -140,7 +173,7 @@ const columns = [
       const v = info.getValue();
       return (
         <span
-          className={`font-mono text-xs ${v > 0 ? "text-zinc-200" : "text-zinc-700"}`}
+          className={`font-mono text-xs ${v > 0 ? "text-[color:var(--foreground)]" : "text-[color:var(--text-tertiary)]"}`}
         >
           {v}
         </span>
@@ -156,7 +189,7 @@ const columns = [
           {v}
         </span>
       ) : (
-        <span className="text-zinc-700">—</span>
+        <span className="text-[color:var(--text-tertiary)]">—</span>
       );
     },
   }),
@@ -169,7 +202,7 @@ const columns = [
           {v}
         </span>
       ) : (
-        <span className="text-zinc-700">—</span>
+        <span className="text-[color:var(--text-tertiary)]">—</span>
       );
     },
   }),
@@ -180,7 +213,7 @@ const columns = [
       return v > 0 ? (
         <span className="font-mono text-xs text-yellow-400">{v}</span>
       ) : (
-        <span className="text-zinc-700">—</span>
+        <span className="text-[color:var(--text-tertiary)]">—</span>
       );
     },
   }),
@@ -191,7 +224,7 @@ const columns = [
       return v > 0 ? (
         <span className="font-mono text-xs text-blue-400">{v}</span>
       ) : (
-        <span className="text-zinc-700">—</span>
+        <span className="text-[color:var(--text-tertiary)]">—</span>
       );
     },
   }),
@@ -199,9 +232,9 @@ const columns = [
     header: "Packages",
     cell: (info) => {
       const pkgs = info.getValue();
-      if (pkgs.length === 0) return <span className="text-zinc-700">—</span>;
+      if (pkgs.length === 0) return <span className="text-[color:var(--text-tertiary)]">—</span>;
       return (
-        <span className="text-xs text-zinc-500" title={pkgs.join(", ")}>
+        <span className="text-xs text-[color:var(--text-tertiary)]" title={pkgs.join(", ")}>
           {pkgs.length} pkg{pkgs.length !== 1 ? "s" : ""}
         </span>
       );
@@ -232,16 +265,28 @@ function exportCsv(rows: MatrixRow[]) {
 
 // ─── Component ───────────────────────────────────────────────────────────────
 
-export function ComplianceMatrix({ data }: { data: ComplianceResponse }) {
+export function ComplianceMatrix({
+  data,
+  onSelectControl,
+}: {
+  data: ComplianceResponse;
+  /** Drill a row into the shared control drawer. When omitted, rows are static. */
+  onSelectControl?: (selection: ComplianceMatrixSelection) => void;
+}) {
   const [sorting, setSorting] = useState<SortingState>([]);
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
   const [globalFilter, setGlobalFilter] = useState("");
 
   const rows = useMemo(() => flattenControls(data), [data]);
 
-  const table = useReactTable({
+  const table = useLegacyTable({
     data: rows,
-    columns,
+    // `ColumnDef` is invariant in its value type, so an array mixing string,
+    // number and string[] columns has no common annotation; the table erases
+    // that type to `unknown` at runtime. v8 tolerated the mismatch, v9 under
+    // `exactOptionalPropertyTypes` does not, so the erasure is stated here
+    // rather than hidden behind `any`.
+    columns: columns as unknown as LegacyColumnDef<MatrixRow>[],
     state: { sorting, columnFilters, globalFilter },
     onSortingChange: setSorting,
     onColumnFiltersChange: setColumnFilters,
@@ -252,7 +297,7 @@ export function ComplianceMatrix({ data }: { data: ComplianceResponse }) {
   });
 
   const frameworks = useMemo(
-    () => [...new Set(rows.map((r) => r.framework))],
+    () => [...new Set(rows?.map((r) => r.framework))],
     [rows]
   );
   const activeFramework =
@@ -262,23 +307,30 @@ export function ComplianceMatrix({ data }: { data: ComplianceResponse }) {
 
   return (
     <div className="space-y-4">
+      <p
+        className="text-xs leading-relaxed text-[color:var(--text-secondary)]"
+        data-testid="compliance-matrix-helper-disclaimer"
+      >
+        Matrix rows are curated control mappings for evidence triage — not a certification claim or complete
+        framework catalog.
+      </p>
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-3">
         {/* Search */}
         <div className="relative flex-1 min-w-[200px] max-w-sm">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-500" />
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-[color:var(--text-tertiary)]" />
           <input
             type="text"
             placeholder="Search controls..."
             value={globalFilter}
             onChange={(e) => setGlobalFilter(e.target.value)}
-            className="w-full bg-zinc-900 border border-zinc-800 rounded-lg pl-9 pr-3 py-2 text-xs text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-zinc-600"
+            className="w-full bg-[color:var(--surface)] border border-[color:var(--border-subtle)] rounded-lg pl-9 pr-3 py-2 text-xs text-[color:var(--foreground)] placeholder-[color:var(--text-tertiary)] focus:outline-none focus:border-[color:var(--border-strong)]"
           />
         </div>
 
         {/* Framework filter */}
         <div className="flex items-center gap-1">
-          <Filter className="w-3.5 h-3.5 text-zinc-500" />
+          <Filter className="w-3.5 h-3.5 text-[color:var(--text-tertiary)]" />
           <select
             value={activeFramework}
             onChange={(e) => {
@@ -288,10 +340,10 @@ export function ComplianceMatrix({ data }: { data: ComplianceResponse }) {
                 return val ? [...without, { id: "framework", value: val }] : without;
               });
             }}
-            className="bg-zinc-900 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-zinc-300 focus:outline-none focus:border-zinc-600"
+            className="bg-[color:var(--surface)] border border-[color:var(--border-subtle)] rounded-lg px-2 py-1.5 text-xs text-[color:var(--text-secondary)] focus:outline-none focus:border-[color:var(--border-strong)]"
           >
             <option value="">All frameworks</option>
-            {frameworks.map((f) => (
+            {frameworks?.map((f) => (
               <option key={f} value={f}>
                 {f}
               </option>
@@ -313,7 +365,7 @@ export function ComplianceMatrix({ data }: { data: ComplianceResponse }) {
               className={`px-2.5 py-1 rounded-lg text-[10px] font-medium border transition-colors ${
                 activeStatus === s
                   ? "bg-emerald-600 text-white border-emerald-600"
-                  : "bg-zinc-900 text-zinc-400 border-zinc-800 hover:border-zinc-600"
+                  : "bg-[color:var(--surface)] text-[color:var(--text-secondary)] border-[color:var(--border-subtle)] hover:border-[color:var(--border-strong)]"
               }`}
             >
               {s === "" ? "All" : s === "pass" ? "Pass" : s === "warning" ? "Warn" : "Fail"}
@@ -323,8 +375,8 @@ export function ComplianceMatrix({ data }: { data: ComplianceResponse }) {
 
         {/* Export */}
         <button
-          onClick={() => exportCsv(table.getFilteredRowModel().rows.map((r) => r.original))}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-800 border border-zinc-700 rounded-lg text-xs text-zinc-300 hover:text-zinc-100 hover:border-zinc-600 transition-colors ml-auto"
+          onClick={() => exportCsv(table.getFilteredRowModel().rows?.map((r) => r.original))}
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-[color:var(--surface-muted)] border border-[color:var(--border-strong)] rounded-lg text-xs text-[color:var(--text-secondary)] hover:text-[color:var(--foreground)] hover:border-[color:var(--border-strong)] transition-colors ml-auto"
         >
           <Download className="w-3.5 h-3.5" />
           CSV
@@ -332,27 +384,35 @@ export function ComplianceMatrix({ data }: { data: ComplianceResponse }) {
       </div>
 
       {/* Count */}
-      <div className="text-xs text-zinc-600">
-        {table.getFilteredRowModel().rows.length} of {rows.length} controls
+      <div className="text-xs text-[color:var(--text-tertiary)]">
+        {table.getFilteredRowModel().rows.length} of {rows.length} controls across{" "}
+        {FRAMEWORK_MAP.length} AI frameworks
+        <span className="ml-2 text-[color:var(--text-tertiary)]">
+          {/* The tiles above count every tracked framework, including the
+              governance and cloud ones this matrix deliberately excludes. Two
+              honest numbers measuring different things need to say so, or the
+              smaller one reads as the larger one shrinking. */}
+          — governance and cloud frameworks are summarised in the tiles above, not in this matrix
+        </span>
       </div>
 
       {/* Table */}
-      <div className="border border-zinc-800 rounded-xl overflow-hidden">
+      <div className="border border-[color:var(--border-subtle)] rounded-xl overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
-            <thead className="bg-zinc-900 border-b border-zinc-800">
+            <thead className="bg-[color:var(--surface)] border-b border-[color:var(--border-subtle)]">
               {table.getHeaderGroups().map((hg) => (
                 <tr key={hg.id}>
-                  {hg.headers.map((header) => (
+                  {hg.headers?.map((header) => (
                     <th
                       key={header.id}
-                      className="text-left px-3 py-2.5 text-[10px] font-medium text-zinc-500 uppercase tracking-wider whitespace-nowrap"
+                      className="text-left px-3 py-2.5 text-[10px] font-medium text-[color:var(--text-tertiary)] uppercase tracking-wider whitespace-nowrap"
                     >
                       {header.isPlaceholder ? null : (
                         <button
                           className={`flex items-center gap-1 ${
                             header.column.getCanSort()
-                              ? "cursor-pointer select-none hover:text-zinc-300"
+                              ? "cursor-pointer select-none hover:text-[color:var(--text-secondary)]"
                               : ""
                           }`}
                           onClick={header.column.getToggleSortingHandler()}
@@ -379,11 +439,36 @@ export function ComplianceMatrix({ data }: { data: ComplianceResponse }) {
                 </tr>
               ))}
             </thead>
-            <tbody className="divide-y divide-zinc-800/50 bg-zinc-950">
-              {table.getRowModel().rows.map((row) => (
+            <tbody className="divide-y divide-[color:var(--border-subtle)] bg-[color:var(--surface-elevated)]">
+              {table.getRowModel().rows?.map((row) => {
+                const select = onSelectControl
+                  ? () =>
+                      onSelectControl({
+                        control: row.original.control,
+                        frameworkLabel: row.original.framework,
+                        catalog: row.original.catalog,
+                      })
+                  : undefined;
+                return (
                 <tr
                   key={row.id}
-                  className="hover:bg-zinc-900/50 transition-colors"
+                  className={`transition-colors hover:bg-[color:var(--surface)]/50 ${
+                    select ? "cursor-pointer" : ""
+                  }`}
+                  {...(select
+                    ? {
+                        role: "button",
+                        tabIndex: 0,
+                        "aria-label": `Open evidence for ${row.original.framework} ${row.original.code}`,
+                        onClick: select,
+                        onKeyDown: (e: React.KeyboardEvent<HTMLTableRowElement>) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            select();
+                          }
+                        },
+                      }
+                    : {})}
                 >
                   {row.getVisibleCells().map((cell) => (
                     <td key={cell.id} className="px-3 py-2.5">
@@ -394,7 +479,8 @@ export function ComplianceMatrix({ data }: { data: ComplianceResponse }) {
                     </td>
                   ))}
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>

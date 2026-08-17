@@ -1,0 +1,633 @@
+"""PostgreSQL-backed gateway policy, source, and schedule stores."""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+
+from agent_bom.api.storage_schema import ensure_postgres_schema_version
+
+from .postgres_common import (
+    _ensure_tenant_rls,
+    _get_pool,
+    _maintenance_connection,
+    _tenant_connection,
+    bypass_tenant_rls,
+)
+
+if TYPE_CHECKING:
+    from psycopg_pool import ConnectionPool
+
+    from .models import CredentialRefRecord, SourceRecord
+    from .policy_store import GatewayPolicy, PolicyAuditEntry
+    from .schedule_store import ScanSchedule
+
+
+class PostgresPolicyStore:
+    """PostgreSQL-backed gateway policy persistence.
+
+    Naming note: the policy tables expose the tenant column as ``team_id`` on
+    Postgres (the platform-wide tenant column name for team-scoped tables and
+    its RLS policies) while the SQLite backend names the same logical column
+    ``tenant_id``. The column is not renamed here to avoid rewriting existing
+    rows and the ``*_tenant_isolation`` RLS policies bound to ``team_id``; the
+    application maps ``tenant_id`` -> ``team_id`` at every query boundary, so
+    the two backends persist and read back the same logical record.
+    """
+
+    def __init__(self, pool: ConnectionPool | None = None) -> None:
+        self._pool = pool or _get_pool()
+        self._init_tables()
+
+    def init_schema(self) -> None:
+        """Idempotently (re)create this store's tables. Satisfies the shared
+        :class:`agent_bom.storage.base.TenantScopedStore` contract."""
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        with self._pool.connection() as conn:
+            if not ensure_postgres_schema_version(conn, "gateway_policies"):
+                return
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS gateway_policies (
+                    policy_id TEXT PRIMARY KEY,
+                    team_id TEXT NOT NULL DEFAULT 'default',
+                    data JSONB NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS policy_audit_log (
+                    id SERIAL PRIMARY KEY,
+                    entry_id TEXT,
+                    logical_entry_id TEXT,
+                    ts TEXT NOT NULL,
+                    team_id TEXT NOT NULL DEFAULT 'default',
+                    data JSONB NOT NULL
+                )
+            """)
+            conn.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'gateway_policies' AND column_name = 'team_id'
+                    ) THEN
+                        ALTER TABLE gateway_policies ADD COLUMN team_id TEXT NOT NULL DEFAULT 'default';
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'policy_audit_log' AND column_name = 'team_id'
+                    ) THEN
+                        ALTER TABLE policy_audit_log ADD COLUMN team_id TEXT NOT NULL DEFAULT 'default';
+                    END IF;
+                    -- entry_id mirrors the SQLite PRIMARY KEY so re-ingesting the
+                    -- same audit event is idempotent across replicas.
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'policy_audit_log' AND column_name = 'entry_id'
+                    ) THEN
+                        ALTER TABLE policy_audit_log ADD COLUMN entry_id TEXT;
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'policy_audit_log' AND column_name = 'logical_entry_id'
+                    ) THEN
+                        ALTER TABLE policy_audit_log ADD COLUMN logical_entry_id TEXT;
+                    END IF;
+                END
+                $$;
+            """)
+            conn.execute("""
+                CREATE OR REPLACE FUNCTION public.abom_policy_audit_key(
+                    tenant_id TEXT,
+                    logical_id TEXT
+                ) RETURNS TEXT
+                LANGUAGE SQL
+                IMMUTABLE
+                STRICT
+                PARALLEL SAFE
+                AS $$
+                    SELECT octet_length(tenant_id)::TEXT || ':' || tenant_id || ':' || logical_id
+                $$
+            """)
+            conn.execute("""
+                CREATE OR REPLACE FUNCTION public.abom_policy_audit_set_key()
+                RETURNS TRIGGER
+                LANGUAGE plpgsql
+                AS $$
+                BEGIN
+                    NEW.logical_entry_id := COALESCE(NEW.logical_entry_id, NEW.entry_id);
+                    IF NEW.logical_entry_id IS NOT NULL THEN
+                        NEW.entry_id := public.abom_policy_audit_key(NEW.team_id, NEW.logical_entry_id);
+                    END IF;
+                    RETURN NEW;
+                END
+                $$
+            """)
+            conn.execute("""
+                DO $$
+                DECLARE
+                    had_rls BOOLEAN;
+                    had_force_rls BOOLEAN;
+                    physical_key_ready BOOLEAN;
+                BEGIN
+                    SELECT COALESCE(
+                        obj_description(to_regclass('public.uq_policy_audit_log_entry'), 'pg_class') =
+                            'agent-bom policy audit tenant key v2',
+                        FALSE
+                    )
+                      INTO physical_key_ready
+                    ;
+
+                    IF NOT COALESCE(physical_key_ready, FALSE) THEN
+                        LOCK TABLE policy_audit_log IN ACCESS EXCLUSIVE MODE;
+                        SELECT relrowsecurity, relforcerowsecurity
+                          INTO had_rls, had_force_rls
+                          FROM pg_class
+                         WHERE oid = 'public.policy_audit_log'::regclass;
+
+                        IF had_rls THEN
+                            ALTER TABLE policy_audit_log DISABLE ROW LEVEL SECURITY;
+                        END IF;
+
+                        DROP INDEX IF EXISTS uq_policy_audit_log_entry;
+                        UPDATE policy_audit_log
+                           SET logical_entry_id = COALESCE(logical_entry_id, entry_id),
+                               entry_id = public.abom_policy_audit_key(
+                                   team_id,
+                                   COALESCE(logical_entry_id, entry_id)
+                               )
+                         WHERE entry_id IS NOT NULL;
+                        CREATE UNIQUE INDEX uq_policy_audit_log_entry
+                            ON policy_audit_log(entry_id);
+                        COMMENT ON INDEX uq_policy_audit_log_entry IS
+                            'agent-bom policy audit tenant key v2';
+
+                        IF had_rls THEN
+                            ALTER TABLE policy_audit_log ENABLE ROW LEVEL SECURITY;
+                        END IF;
+                        IF had_force_rls THEN
+                            ALTER TABLE policy_audit_log FORCE ROW LEVEL SECURITY;
+                        END IF;
+                    END IF;
+
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_trigger
+                         WHERE tgrelid = 'public.policy_audit_log'::regclass
+                           AND tgname = 'policy_audit_set_key'
+                           AND NOT tgisinternal
+                    ) THEN
+                        CREATE TRIGGER policy_audit_set_key
+                            BEFORE INSERT OR UPDATE OF team_id, entry_id, logical_entry_id
+                            ON policy_audit_log
+                            FOR EACH ROW
+                            EXECUTE FUNCTION public.abom_policy_audit_set_key();
+                    END IF;
+                END
+                $$;
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_gateway_policies_team ON gateway_policies(team_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_policy_audit_log_team_ts ON policy_audit_log(team_id, ts DESC)")
+            _ensure_tenant_rls(conn, "gateway_policies", "team_id")
+            _ensure_tenant_rls(conn, "policy_audit_log", "team_id")
+            conn.commit()
+
+    def put_policy(self, policy: GatewayPolicy) -> None:
+        data = policy.model_dump_json()
+        with _tenant_connection(self._pool) as conn:
+            conn.execute(
+                """INSERT INTO gateway_policies (policy_id, team_id, data) VALUES (%s, %s, %s)
+                   ON CONFLICT (policy_id) DO UPDATE SET team_id = EXCLUDED.team_id, data = EXCLUDED.data""",
+                (policy.policy_id, policy.tenant_id, data),
+            )
+            conn.commit()
+
+    def get_policy(self, policy_id: str, tenant_id: str | None = None) -> GatewayPolicy | None:
+        from .policy_store import GatewayPolicy
+
+        sql = "SELECT data FROM gateway_policies WHERE policy_id = %s"
+        params: list[object] = [policy_id]
+        if tenant_id is not None:
+            sql += " AND team_id = %s"
+            params.append(tenant_id)
+        with _tenant_connection(self._pool) as conn:
+            row = conn.execute(sql, params).fetchone()
+            if row is None:
+                return None
+            raw = row[0] if isinstance(row[0], str) else json.dumps(row[0])
+            return GatewayPolicy.model_validate_json(raw)
+
+    def delete_policy(self, policy_id: str, tenant_id: str | None = None) -> bool:
+        sql = "DELETE FROM gateway_policies WHERE policy_id = %s"
+        params: list[object] = [policy_id]
+        if tenant_id is not None:
+            sql += " AND team_id = %s"
+            params.append(tenant_id)
+        with _tenant_connection(self._pool) as conn:
+            cursor = conn.execute(sql, params)
+            conn.commit()
+            return int(cursor.rowcount) > 0
+
+    def list_policies(self, tenant_id: str | None = None, enabled: bool | None = None, mode: str | None = None) -> list:
+        from .policy_store import GatewayPolicy
+
+        sql = "SELECT data FROM gateway_policies"
+        params: list[object] = []
+        if tenant_id is not None:
+            sql += " WHERE team_id = %s"
+            params.append(tenant_id)
+        with _tenant_connection(self._pool) as conn:
+            rows = conn.execute(sql, params).fetchall()
+            policies = [GatewayPolicy.model_validate_json(r[0] if isinstance(r[0], str) else json.dumps(r[0])) for r in rows]
+            if enabled is not None:
+                policies = [p for p in policies if p.enabled == enabled]
+            if mode is not None:
+                policies = [p for p in policies if getattr(p.mode, "value", p.mode) == mode]
+            return policies
+
+    def get_policies_for_agent(
+        self,
+        agent_name: str | None = None,
+        agent_type: str | None = None,
+        environment: str | None = None,
+        tenant_id: str | None = None,
+    ) -> list:
+        policies = self.list_policies(tenant_id=tenant_id, enabled=True)
+        results = []
+        for p in policies:
+            if p.bound_agents and agent_name and agent_name not in p.bound_agents:
+                continue
+            if p.bound_agent_types and agent_type and agent_type not in p.bound_agent_types:
+                continue
+            if p.bound_environments and environment and environment not in p.bound_environments:
+                continue
+            results.append(p)
+        return results
+
+    def put_audit_entry(self, entry: PolicyAuditEntry) -> None:
+        data = entry.model_dump_json() if hasattr(entry, "model_dump_json") else json.dumps(entry)
+        team_id = getattr(entry, "tenant_id", "default")
+        # Persist the caller-supplied timestamp (the moment the policy decision
+        # was made), not insert time, so re-ingesting the same event from a
+        # replica or retry yields an identical row. Fall back to now() only when
+        # the caller did not stamp the entry.
+        ts = getattr(entry, "timestamp", None) or datetime.now(timezone.utc).isoformat()
+        entry_id = getattr(entry, "entry_id", None)
+        with _tenant_connection(self._pool) as conn:
+            if entry_id:
+                # Old and new replicas intentionally retain this conflict target.
+                # The database trigger maps the logical entry ID to a
+                # tenant-derived physical key before uniqueness is evaluated.
+                conn.execute(
+                    """
+                    INSERT INTO policy_audit_log (entry_id, ts, team_id, data)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (entry_id) DO NOTHING
+                    """,
+                    (entry_id, ts, team_id, data),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO policy_audit_log (ts, team_id, data) VALUES (%s, %s, %s)",
+                    (ts, team_id, data),
+                )
+            conn.commit()
+
+    def list_audit_entries(
+        self,
+        policy_id: str | None = None,
+        agent_name: str | None = None,
+        limit: int = 100,
+        tenant_id: str | None = None,
+    ) -> list:
+        from .policy_store import PolicyAuditEntry
+
+        sql = "SELECT data FROM policy_audit_log"
+        clauses: list[str] = []
+        params: list[object] = []
+        if tenant_id is not None:
+            clauses.append("team_id = %s")
+            params.append(tenant_id)
+        if policy_id:
+            clauses.append("data ->> 'policy_id' = %s")
+            params.append(policy_id)
+        if agent_name:
+            clauses.append("data ->> 'agent_name' = %s")
+            params.append(agent_name)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY ts DESC LIMIT %s"
+        params.append(limit)
+        with _tenant_connection(self._pool) as conn:
+            rows = conn.execute(sql, params).fetchall()
+            results = []
+            for r in rows:
+                raw = r[0] if isinstance(r[0], str) else json.dumps(r[0])
+                try:
+                    entry = PolicyAuditEntry.model_validate_json(raw)
+                except Exception:
+                    entry = json.loads(raw)
+                results.append(entry)
+            return results
+
+
+class PostgresScheduleStore:
+    """PostgreSQL-backed recurring scan schedule persistence."""
+
+    def __init__(
+        self,
+        pool: ConnectionPool | None = None,
+        maintenance_pool: ConnectionPool | None = None,
+    ) -> None:
+        self._pool = pool or _get_pool()
+        self._maintenance_pool = maintenance_pool
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        with self._pool.connection() as conn:
+            if not ensure_postgres_schema_version(conn, "schedules"):
+                return
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS scan_schedules (
+                    schedule_id TEXT PRIMARY KEY,
+                    enabled INTEGER DEFAULT 1,
+                    next_run TEXT,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    data JSONB NOT NULL
+                )
+            """)
+            conn.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'scan_schedules' AND column_name = 'tenant_id'
+                    ) THEN
+                        ALTER TABLE scan_schedules ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default';
+                    END IF;
+                END
+                $$;
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sched_tenant_due ON scan_schedules(tenant_id, enabled, next_run)")
+            _ensure_tenant_rls(conn, "scan_schedules", "tenant_id")
+            conn.commit()
+
+    def put(self, schedule: ScanSchedule) -> None:
+        data = schedule.model_dump_json()
+        with _tenant_connection(self._pool) as conn:
+            conn.execute(
+                """INSERT INTO scan_schedules (schedule_id, enabled, next_run, tenant_id, data)
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON CONFLICT (schedule_id) DO UPDATE SET
+                     enabled = EXCLUDED.enabled,
+                     next_run = EXCLUDED.next_run,
+                     tenant_id = EXCLUDED.tenant_id,
+                     data = EXCLUDED.data""",
+                (schedule.schedule_id, int(schedule.enabled), schedule.next_run, schedule.tenant_id, data),
+            )
+            conn.commit()
+
+    def get(self, schedule_id: str, tenant_id: str | None = None) -> ScanSchedule | None:
+        from .schedule_store import ScanSchedule
+
+        with _tenant_connection(self._pool) as conn:
+            if tenant_id is None:
+                row = conn.execute("SELECT data FROM scan_schedules WHERE schedule_id = %s", (schedule_id,)).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT data FROM scan_schedules WHERE schedule_id = %s AND tenant_id = %s",
+                    (schedule_id, tenant_id),
+                ).fetchone()
+            if row is None:
+                return None
+            raw = row[0] if isinstance(row[0], str) else json.dumps(row[0])
+            return ScanSchedule.model_validate_json(raw)
+
+    def delete(self, schedule_id: str, tenant_id: str | None = None) -> bool:
+        with _tenant_connection(self._pool) as conn:
+            if tenant_id is None:
+                cursor = conn.execute("DELETE FROM scan_schedules WHERE schedule_id = %s", (schedule_id,))
+            else:
+                cursor = conn.execute(
+                    "DELETE FROM scan_schedules WHERE schedule_id = %s AND tenant_id = %s",
+                    (schedule_id, tenant_id),
+                )
+            conn.commit()
+            return int(cursor.rowcount) > 0
+
+    def list_all(self, tenant_id: str | None = None) -> list:
+        from .schedule_store import ScanSchedule
+
+        with _tenant_connection(self._pool) as conn:
+            if tenant_id is None:
+                rows = conn.execute("SELECT data FROM scan_schedules ORDER BY schedule_id").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT data FROM scan_schedules WHERE tenant_id = %s ORDER BY schedule_id",
+                    (tenant_id,),
+                ).fetchall()
+            return [ScanSchedule.model_validate_json(r[0] if isinstance(r[0], str) else json.dumps(r[0])) for r in rows]
+
+    def list_due(self, now_iso: str) -> list:
+        from .schedule_store import ScanSchedule
+
+        with bypass_tenant_rls():
+            with _maintenance_connection(self._maintenance_pool) as conn:
+                rows = conn.execute(
+                    "SELECT data FROM scan_schedules WHERE enabled = 1 AND next_run IS NOT NULL AND next_run <= %s",
+                    (now_iso,),
+                ).fetchall()
+                return [ScanSchedule.model_validate_json(r[0] if isinstance(r[0], str) else json.dumps(r[0])) for r in rows]
+
+
+class PostgresSourceStore:
+    """PostgreSQL-backed hosted product source registry."""
+
+    def __init__(self, pool: ConnectionPool | None = None) -> None:
+        self._pool = pool or _get_pool()
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        with self._pool.connection() as conn:
+            if not ensure_postgres_schema_version(conn, "sources"):
+                return
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS control_plane_sources (
+                    source_id TEXT PRIMARY KEY,
+                    enabled INTEGER DEFAULT 1,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    updated_at TEXT NOT NULL,
+                    data JSONB NOT NULL
+                )
+            """)
+            conn.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'control_plane_sources' AND column_name = 'tenant_id'
+                    ) THEN
+                        ALTER TABLE control_plane_sources ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default';
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'control_plane_sources' AND column_name = 'updated_at'
+                    ) THEN
+                        ALTER TABLE control_plane_sources ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
+                    END IF;
+                END
+                $$;
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_control_plane_sources_tenant_updated ON control_plane_sources(tenant_id, updated_at DESC)"
+            )
+            _ensure_tenant_rls(conn, "control_plane_sources", "tenant_id")
+            conn.commit()
+
+    def put(self, source: SourceRecord) -> None:
+        data = source.model_dump_json()
+        with _tenant_connection(self._pool) as conn:
+            conn.execute(
+                """INSERT INTO control_plane_sources (source_id, enabled, tenant_id, updated_at, data)
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON CONFLICT (source_id) DO UPDATE SET
+                     enabled = EXCLUDED.enabled,
+                     tenant_id = EXCLUDED.tenant_id,
+                     updated_at = EXCLUDED.updated_at,
+                     data = EXCLUDED.data""",
+                (source.source_id, int(source.enabled), source.tenant_id, source.updated_at, data),
+            )
+            conn.commit()
+
+    def get(self, source_id: str) -> SourceRecord | None:
+        from .models import SourceRecord
+
+        with _tenant_connection(self._pool) as conn:
+            row = conn.execute("SELECT data FROM control_plane_sources WHERE source_id = %s", (source_id,)).fetchone()
+            if row is None:
+                return None
+            raw = row[0] if isinstance(row[0], str) else json.dumps(row[0])
+            return SourceRecord.model_validate_json(raw)
+
+    def delete(self, source_id: str) -> bool:
+        with _tenant_connection(self._pool) as conn:
+            cursor = conn.execute("DELETE FROM control_plane_sources WHERE source_id = %s", (source_id,))
+            conn.commit()
+            return int(cursor.rowcount) > 0
+
+    def list_all(self, tenant_id: str | None = None) -> list:
+        from .models import SourceRecord
+
+        with _tenant_connection(self._pool) as conn:
+            if tenant_id is None:
+                rows = conn.execute("SELECT data FROM control_plane_sources ORDER BY updated_at DESC, source_id").fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT data FROM control_plane_sources
+                       WHERE tenant_id = %s
+                       ORDER BY updated_at DESC, source_id""",
+                    (tenant_id,),
+                ).fetchall()
+            return [SourceRecord.model_validate_json(row[0] if isinstance(row[0], str) else json.dumps(row[0])) for row in rows]
+
+
+class PostgresCredentialRefStore:
+    """PostgreSQL-backed credential reference registry."""
+
+    def __init__(self, pool: ConnectionPool | None = None) -> None:
+        self._pool = pool or _get_pool()
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        with self._pool.connection() as conn:
+            if not ensure_postgres_schema_version(conn, "credential_refs"):
+                return
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS credential_refs (
+                    credential_ref_id TEXT PRIMARY KEY,
+                    enabled INTEGER DEFAULT 1,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    updated_at TEXT NOT NULL,
+                    data JSONB NOT NULL
+                )
+            """)
+            conn.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'credential_refs' AND column_name = 'tenant_id'
+                    ) THEN
+                        ALTER TABLE credential_refs ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default';
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'credential_refs' AND column_name = 'updated_at'
+                    ) THEN
+                        ALTER TABLE credential_refs ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
+                    END IF;
+                END
+                $$;
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_credential_refs_tenant_updated ON credential_refs(tenant_id, updated_at DESC)")
+            _ensure_tenant_rls(conn, "credential_refs", "tenant_id")
+            conn.commit()
+
+    def put(self, credential: CredentialRefRecord) -> None:
+        data = credential.model_dump_json()
+        with _tenant_connection(self._pool) as conn:
+            conn.execute(
+                """INSERT INTO credential_refs (credential_ref_id, enabled, tenant_id, updated_at, data)
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON CONFLICT (credential_ref_id) DO UPDATE SET
+                     enabled = EXCLUDED.enabled,
+                     tenant_id = EXCLUDED.tenant_id,
+                     updated_at = EXCLUDED.updated_at,
+                     data = EXCLUDED.data""",
+                (
+                    credential.credential_ref_id,
+                    int(credential.enabled),
+                    credential.tenant_id,
+                    credential.updated_at,
+                    data,
+                ),
+            )
+            conn.commit()
+
+    def get(self, credential_ref_id: str, *, tenant_id: str) -> CredentialRefRecord | None:
+        from .models import CredentialRefRecord
+
+        with _tenant_connection(self._pool) as conn:
+            row = conn.execute(
+                "SELECT data FROM credential_refs WHERE credential_ref_id = %s AND tenant_id = %s",
+                (credential_ref_id, tenant_id),
+            ).fetchone()
+            if row is None:
+                return None
+            raw = row[0] if isinstance(row[0], str) else json.dumps(row[0])
+            return CredentialRefRecord.model_validate_json(raw)
+
+    def delete(self, credential_ref_id: str, *, tenant_id: str) -> bool:
+        with _tenant_connection(self._pool) as conn:
+            cursor = conn.execute(
+                "DELETE FROM credential_refs WHERE credential_ref_id = %s AND tenant_id = %s",
+                (credential_ref_id, tenant_id),
+            )
+            conn.commit()
+            return int(cursor.rowcount) > 0
+
+    def list_all(self, tenant_id: str | None = None) -> list:
+        from .models import CredentialRefRecord
+
+        with _tenant_connection(self._pool) as conn:
+            if tenant_id is None:
+                rows = conn.execute("SELECT data FROM credential_refs ORDER BY updated_at DESC, credential_ref_id").fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT data FROM credential_refs
+                       WHERE tenant_id = %s
+                       ORDER BY updated_at DESC, credential_ref_id""",
+                    (tenant_id,),
+                ).fetchall()
+            return [CredentialRefRecord.model_validate_json(row[0] if isinstance(row[0], str) else json.dumps(row[0])) for row in rows]

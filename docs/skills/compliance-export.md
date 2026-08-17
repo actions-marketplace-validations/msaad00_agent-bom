@@ -2,22 +2,33 @@
 
 > Generate audit-ready AI-BOM documents in CycloneDX, SPDX, and SARIF with OWASP LLM Top 10 + MITRE ATLAS coverage matrix.
 
+```yaml
+capabilities:
+  read_findings: true
+  read_inventory: true
+  read_audit_log: false
+  write_findings: true
+  outbound_http: true
+  shell_exec: true
+```
+
 ## Goal
 
-Produce compliance-ready artifacts for auditors, regulators, and security teams: standardized SBOM formats (CycloneDX 1.6, SPDX 3.0), SARIF for GitHub Security, threat framework coverage reports, and an interactive HTML dashboard.
+Produce compliance-ready artifacts for auditors, regulators, and security teams: standardized SBOM formats (CycloneDX 1.7, SPDX 3.0), SARIF for GitHub Security, threat framework coverage reports, and an interactive HTML dashboard.
 
 ## Prerequisites
 
 ```bash
 pip install agent-bom
-# For cloud providers: pip install 'agent-bom[cloud]'
+# For cloud providers: pip install 'agent-bom[cloud]'  # core providers; install mlflow separately if needed
 ```
 
 ## Steps
 
-### 1. Full Inventory Scan
+### 1. Target-Scoped Inventory Scan
 
-Run the most comprehensive scan available for your environment:
+Run the broadest scan available for the environment and credentials you
+explicitly configure:
 
 ```bash
 agent-bom scan \
@@ -31,7 +42,7 @@ Key flags for compliance:
 - `--enrich` — adds NVD CVSS scores, EPSS probabilities, CISA KEV status
 - `--verify-integrity` — checks SHA256/SRI hashes and SLSA provenance against registries
 
-### 2. CycloneDX 1.6 Export
+### 2. CycloneDX 1.7 Export
 
 The industry standard SBOM format for AI supply chain:
 
@@ -44,7 +55,7 @@ Includes:
 - Vulnerability list with CVSS + references
 - Dependency relationships
 - License information
-- CycloneDX 1.6 `formulation` for AI components
+- CycloneDX 1.7 `formulation` for AI components
 
 ### 3. SPDX 3.0 Export
 
@@ -85,7 +96,7 @@ gh api repos/<owner>/<repo>/code-scanning/sarifs \
 Or via GitHub Actions:
 
 ```yaml
-- uses: github/codeql-action/upload-sarif@v3
+- uses: github/codeql-action/upload-sarif@v4
   with:
     sarif_file: results.sarif
 ```
@@ -150,6 +161,11 @@ This checks:
 - SLSA provenance attestations
 - SRI (Subresource Integrity) values
 
+The verdict is machine-readable in JSON, CycloneDX, SPDX, SARIF, CSV and
+`GET /v1/findings`. See
+[Supply Chain — scanned-package integrity and provenance verdict](../SUPPLY_CHAIN.md#scanned-package-integrity-and-provenance-verdict)
+for the exact field in each format.
+
 ### 8. Scan History for Audit Trail
 
 Save every scan for historical tracking:
@@ -192,7 +208,7 @@ agent-bom scan [your flags] --enrich --otel-endpoint http://collector:4318
 
 | Artifact | Format | Audience |
 |----------|--------|----------|
-| `ai-bom.cdx.json` | CycloneDX 1.6 | SBOM consumers, compliance tools |
+| `ai-bom.cdx.json` | CycloneDX 1.7 | SBOM consumers, compliance tools |
 | `ai-bom.spdx.json` | SPDX 3.0 | ISO auditors |
 | `results.sarif` | SARIF | GitHub Security, SAST tools |
 | `report.json` | AI-BOM JSON | Programmatic analysis |

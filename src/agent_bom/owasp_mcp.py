@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from agent_bom.constants import high_risk_severities
-from agent_bom.risk_analyzer import ToolCapability, classify_tool
+from agent_bom.risk_analyzer import ToolCapability, classify_mcp_tool
 
 if TYPE_CHECKING:
     from agent_bom.models import BlastRadius
@@ -58,7 +58,16 @@ def tag_blast_radius(br: BlastRadius) -> list[str]:
     if not br.affected_servers:
         return []
 
-    tags: set[str] = {"MCP04"}  # supply chain attack surface (within MCP context)
+    tags: set[str] = set()
+
+    # MCP04 (supply chain) — only for direct dependencies, HIGH+ vulns,
+    # or packages with credentials/tools exposed. Previously applied to ALL
+    # findings in any MCP server, even LOW-severity transitive deps.
+    is_direct = br.package.is_direct
+    is_high = br.vulnerability.severity in _HIGH_RISK_SEVERITIES
+    has_context = bool(br.exposed_credentials) or bool(br.exposed_tools)
+    if is_direct or is_high or has_context or br.package.is_malicious:
+        tags.add("MCP04")
 
     # MCP01 — token/secret exposure via credential env vars
     if br.exposed_credentials:
@@ -91,7 +100,7 @@ def tag_blast_radius(br: BlastRadius) -> list[str]:
     has_read = False
     has_execute = False
     for tool in br.exposed_tools:
-        caps = classify_tool(tool.name, tool.description)
+        caps = classify_mcp_tool(tool)
         if ToolCapability.EXECUTE in caps:
             has_execute = True
         if ToolCapability.READ in caps:

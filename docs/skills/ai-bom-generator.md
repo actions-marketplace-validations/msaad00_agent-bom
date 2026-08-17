@@ -1,10 +1,20 @@
 # AI-BOM Generator
 
-> Security scanner for AI infrastructure — full asset discovery, vulnerability scanning, threat mapping, and SBOM generation.
+> Security scanner for AI infrastructure — target-scoped asset discovery, vulnerability scanning, threat mapping, and SBOM generation.
+
+```yaml
+capabilities:
+  read_findings: true
+  read_inventory: true
+  read_audit_log: false
+  write_findings: false
+  outbound_http: true
+  shell_exec: true
+```
 
 ## Goal
 
-Produce a complete **AI infrastructure security report** — a structured inventory of every AI agent, MCP server, package, credential, and tool in the target environment, enriched with CVE data, blast radius analysis, OWASP LLM Top 10, and MITRE ATLAS threat mappings.
+Produce a target-scoped **AI infrastructure security report** — a structured inventory of AI agents, MCP servers, packages, credential references, and tools visible through the configured inputs, enriched with CVE data, blast radius analysis, OWASP LLM Top 10, and MITRE ATLAS threat mappings.
 
 ## Prerequisites
 
@@ -13,7 +23,7 @@ pip install agent-bom
 # For cloud providers (install only what you need):
 pip install 'agent-bom[aws]'       # AWS Bedrock, Lambda, EKS, SageMaker
 pip install 'agent-bom[snowflake]'  # Cortex Agents, MCP Servers, Snowpark
-pip install 'agent-bom[cloud]'      # All providers
+pip install 'agent-bom[cloud]'      # Core cloud providers (install MLflow separately if needed)
 ```
 
 ## Steps
@@ -67,12 +77,12 @@ agent-bom scan --k8s --all-namespaces --enrich -f json -o ai-bom-k8s.json
 Run discovery for each cloud in scope. Combine flags for a single unified scan:
 
 ```bash
-# AWS — full depth
+# AWS — credential-scoped discovery
 agent-bom scan --aws --aws-region us-east-1 \
   --aws-include-lambda --aws-include-eks --aws-include-step-functions \
   --enrich -f json -o ai-bom-aws.json
 
-# Snowflake — Cortex Agents, MCP Servers, Search, Snowpark, Streamlit
+# Snowflake — Cortex Agents, MCP Servers, Search, Snowpark, optional Streamlit-native surfaces
 agent-bom scan --snowflake --enrich -f json -o ai-bom-snowflake.json
 
 # Azure AI Foundry + Container Apps
@@ -124,7 +134,7 @@ agent-bom scan --agent-project ./my-agent-app --enrich -f json -o ai-bom-agent.j
 
 ### 7. Unified AI-BOM Generation
 
-Combine everything into one comprehensive scan:
+Combine the selected inputs into one target-scoped scan:
 
 ```bash
 agent-bom scan \
@@ -144,7 +154,7 @@ agent-bom scan \
 Generate compliance-ready exports:
 
 ```bash
-# CycloneDX 1.6 (machine-readable, SBOM standard)
+# CycloneDX 1.7 (machine-readable, SBOM standard)
 agent-bom scan [your flags] -f cyclonedx -o ai-bom.cdx.json
 
 # SPDX 3.0 (ISO standard)
@@ -191,8 +201,8 @@ The AI-BOM JSON output includes:
 
 | Artifact | Format | Purpose |
 |----------|--------|---------|
-| `ai-bom-complete.json` | AI-BOM JSON | Machine-readable full inventory |
-| `ai-bom.cdx.json` | CycloneDX 1.6 | SBOM standard for compliance |
+| `ai-bom-complete.json` | AI-BOM JSON | Machine-readable target-scoped inventory |
+| `ai-bom.cdx.json` | CycloneDX 1.7 | SBOM standard for compliance |
 | `ai-bom.spdx.json` | SPDX 3.0 | ISO standard for auditors |
 | `results.sarif` | SARIF | GitHub Security tab integration |
 | `report.html` | HTML | Interactive dashboard + graph |

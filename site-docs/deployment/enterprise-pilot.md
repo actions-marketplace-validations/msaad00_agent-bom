@@ -1,0 +1,126 @@
+# Enterprise MCP / Endpoint Pilot
+
+> **You do not need to read this unless** you are scoping an
+> open-source pilot that combines endpoint fleet, server-side MCP
+> visibility, gateway policy, and selected proxy enforcement. For the
+> paved production paths use [Deployment Overview](overview.md).
+
+This is the canonical `agent-bom` pilot shape for a company that wants one
+open-source control plane for:
+
+- employee endpoint fleet visibility
+- server-side MCP visibility in EKS
+- gateway policy management
+- selected inline proxy enforcement
+
+If you still need to choose between pilot and production rollout paths, start
+with [Deployment Overview](overview.md). This page is the narrower pilot guide
+once you have already chosen that shape.
+
+It is intentionally not an EDR-style managed agent product. The current
+contract is opt-in endpoint scans plus self-hosted control-plane and proxy
+surfaces.
+
+## Scope
+
+This pilot keeps the product surface narrow on purpose:
+
+- employee endpoints push fleet and discovery state into the control plane
+- scheduled scan jobs cover cluster, package, image, and MCP discovery
+- selected MCP workloads get `agent-bom proxy` sidecars or local wrappers
+- the control plane hosts API, UI, findings, audit, and gateway policy
+- Postgres is required; ClickHouse stays optional
+
+## Enterprise deployment topology
+
+The canonical self-hosted topology and runtime/data-flow diagrams now live in
+[Deployment Overview](overview.md#enterprise-self-hosted-diagrams).
+
+Use that page first when you need the high-level shape:
+
+- what runs in the customer VPC / EKS environment
+- how scans, fleet, proxy, and gateway feed the control plane
+- where auth, tenant scope, and audit are enforced
+
+This pilot page stays focused on the narrower pilot contract:
+
+- what is in scope for the endpoint + MCP pilot
+- what is intentionally out of scope
+- which rollout steps and security properties matter for a focused first deployment
+
+## What is in scope
+
+| Surface | Included in the pilot | Why |
+|---|---|---|
+| Endpoint fleet | Yes | Employee laptops push MCP and agent discovery into the shared control plane |
+| Runtime fleet | Yes | EKS scanner + selected sidecars cover server-side MCPs |
+| Gateway policies | Yes | Control-plane policy management is now linked to proxy pull |
+| Proxy audit push | Yes | SOC sees blocks and warnings centrally |
+| Same-origin UI | Yes | One ingress, one internal control plane |
+| Postgres | Yes | Primary transactional backend for multi-replica pilots |
+| ClickHouse | Optional | OSS server in your VPC or optional ClickHouse Cloud; canonical analytics rows only (not OCSF storage). Bring it in once pilot event volume justifies it |
+| Snowflake backend | No | Not part of the focused pilot contract |
+| Managed endpoint agent | No | Still roadmap, not current product contract |
+| MDM integration | No | Still roadmap |
+
+## Security properties
+
+- self-hosted API, UI, audit log, and Postgres stay in the company's infra
+- OIDC, API keys, RBAC, and Postgres RLS are the control-plane boundary
+- proxy policy pull and audit push are now real, not cosmetic
+- gateway can now require an incoming bearer/API-key token for remote MCP clients
+- screenshot OCR enforcement now fails closed when explicitly enabled without the visual runtime
+- `AGENT_BOM_AUDIT_HMAC_KEY` is required for pilot sign-off
+- the EKS pilot path assumes Pod Security Admission `restricted`
+- focused pilot values lock ingress down instead of leaving it wide open
+
+Finding, scan, and graph payloads are **not** application-layer encrypted.
+Confidentiality at rest is delegated to Postgres/RDS volume encryption, optional
+object-store encryption for exports/backups, and tenant RLS — not to an
+in-control-plane payload cipher. API tokens are hashed, audit chains are
+HMAC-signed, and cloud-connection secrets use envelope encryption; finding
+bodies rely on your storage encryption. See
+[`docs/ENTERPRISE_DEPLOYMENT.md`](https://github.com/msaad00/agent-bom/blob/main/docs/ENTERPRISE_DEPLOYMENT.md#finding-and-scan-payload-encryption-at-rest-deployment-prerequisite)
+for the full buyer checklist.
+
+## Scale properties
+
+- API is horizontally scalable behind Postgres-backed state
+- scheduler leader election uses Postgres advisory locking
+- endpoint fleet is batch-driven and scales to pilot size without a managed agent
+- ClickHouse is available when pilot volume grows beyond what Postgres should carry for analytics (OSS self-hosted or optional ClickHouse Cloud; see [Backend and Security-Lake Strategy](backend-and-security-lakes.md))
+- sidecar proxy rollout stays workload-by-workload instead of forcing universal inline routing
+
+For concrete sizing, autoscaling, and load-test guidance, use
+[Performance, Sizing, and Benchmarks](performance-and-sizing.md).
+
+## Required rollout steps
+
+1. Install the Helm control plane with the focused pilot values (Postgres
+   migrations run automatically via the chart's pre-upgrade hook).
+2. Label the namespace for Pod Security Admission `restricted`.
+3. Start endpoint fleet scan-and-push on employee workstations.
+4. Add proxy sidecars only to the MCP workloads you want inline enforcement on.
+
+## Migration contract
+
+Long-lived control-plane databases have an Alembic baseline, and the Helm chart
+applies migrations automatically: the `pre-install,pre-upgrade` hook
+(`controlPlane.migrations.enabled`, on by default) runs `alembic upgrade head`
+before the new API pods roll. A `helm upgrade` needs no manual migration step.
+
+If a database was already initialized from
+[deploy/supabase/postgres/init.sql](https://github.com/msaad00/agent-bom/blob/main/deploy/supabase/postgres/init.sql),
+stamp it once so the auto-hook has a revision to upgrade from:
+
+```bash
+alembic -c deploy/supabase/postgres/alembic.ini stamp 20260416_01
+```
+
+Use `init.sql` for disposable bootstrap paths and local compose. For non-Helm or
+externally managed databases, disable the hook with
+`controlPlane.migrations.enabled=false` and run `upgrade head` yourself:
+
+```bash
+alembic -c deploy/supabase/postgres/alembic.ini upgrade head
+```

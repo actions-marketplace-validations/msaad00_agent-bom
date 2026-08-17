@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import logging
 import math
 import os
@@ -11,20 +12,53 @@ import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
-# Allowed executables for MCP servers (security allowlist)
-ALLOWED_COMMANDS = {
+# Recognized MCP server launcher binaries (package managers, runtimes, and
+# container tools commonly used to launch MCP servers).
+#
+# This list is a misconfiguration/typo guard for the stdio proxy spawn path —
+# it is NOT a sandbox and NOT an isolation boundary. Every binary here can
+# execute arbitrary code with the proxy's full host privileges; membership
+# only means the command *shape* looks like a plausible MCP launcher. The
+# actual execution control is container isolation via
+# ``agent_bom.proxy_sandbox`` (``--isolate`` / AGENT_BOM_MCP_SANDBOX).
+KNOWN_MCP_LAUNCHERS = {
+    # JavaScript/TypeScript runtimes & package managers
     "npx",
-    "uvx",
-    "python",
-    "python3",
+    "npm",
     "node",
     "deno",
     "bun",
-    "npm",
+    "tsx",
+    # Python runtimes & package managers
+    "python",
+    "python3",
+    "uvx",
     "uv",
+    "pipx",
+    # Go
+    "go",
+    # Java/JVM
+    "java",
+    "mvn",
+    "gradle",
+    # .NET
+    "dotnet",
+    # Ruby
+    "ruby",
+    "bundle",
+    # Rust
+    "cargo",
+    # Container tools (MCP servers often run in containers)
+    "docker",
+    "podman",
+    # Common MCP server launchers
+    "mcp",
+    "mcp-server",
 }
 
 # Dangerous environment variables that should never be set
@@ -35,7 +69,10 @@ DANGEROUS_ENV_VARS = {
     "NODE_OPTIONS",  # Can inject malicious code
 }
 
-# Shell metacharacters that indicate potential injection
+# Shell metacharacters rejected by validate_arguments. agent-bom itself spawns
+# MCP servers via an exec array (never a shell), so these characters are not
+# interpreted on our spawn path; the check flags configs that appear to expect
+# shell interpolation. Config hygiene, not an execution control.
 SHELL_METACHARACTERS = {";", "|", "&", "$", "`", "<", ">", "\n", "\r"}
 
 # Patterns for sensitive data (for redaction)
@@ -51,36 +88,63 @@ SENSITIVE_PATTERNS = [
 ]
 
 
+def sanitize_log_label(value: object, max_len: int = 500) -> str:
+    """Return a single-line, ANSI-free label for logs and terminal output."""
+    text = ANSI_ESCAPE_RE.sub("", str(value))
+    text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    text = "".join(ch for ch in text if ch >= " " and ch != "\x7f")
+    return re.sub(r" {2,}", " ", text).strip()[:max_len]
+
+
 class SecurityError(Exception):
     """Raised when a security validation fails."""
 
     pass
 
 
-def validate_command(command: str) -> None:
+def require_recognized_launcher(command: str) -> None:
     """
-    Validate that a command is in the allowed list.
+    Require that *command* is a recognized MCP launcher binary.
+
+    This is a launch-hygiene check that catches typos and obviously
+    misconfigured server commands before the proxy spawns them. It provides
+    NO isolation: every recognized launcher (``python``, ``node``,
+    ``docker``, …) can still execute arbitrary code as the host user.
+    Passing this check must never be read as "the server is sandboxed" —
+    the real execution control is container isolation via
+    ``agent_bom.proxy_sandbox`` (``--isolate``).
 
     Args:
-        command: The command to validate
+        command: The launcher command to check
 
     Raises:
-        SecurityError: If command is not allowed
+        SecurityError: If command is not a recognized MCP launcher
     """
-    if command not in ALLOWED_COMMANDS:
-        raise SecurityError(f"Command '{command}' is not in the allowed list. Allowed commands: {', '.join(sorted(ALLOWED_COMMANDS))}")
-    logger.debug(f"Command '{command}' validated successfully")
+    if command not in KNOWN_MCP_LAUNCHERS:
+        raise SecurityError(
+            f"Command '{command}' is not a recognized MCP launcher. Recognized launchers: "
+            f"{', '.join(sorted(KNOWN_MCP_LAUNCHERS))}. This check guards against misconfigured "
+            "server commands only — it is not a sandbox. Use container isolation (--isolate) "
+            "to restrict what a server can do."
+        )
+    logger.debug(f"Command '{command}' is a recognized MCP launcher")
 
 
 def validate_arguments(args: list[str]) -> None:
     """
-    Validate command arguments for shell metacharacters.
+    Reject command arguments containing shell metacharacters.
+
+    Config-hygiene check: agent-bom spawns MCP servers via an exec array
+    (never through a shell), so these characters are not interpreted on our
+    spawn path. An argument that contains them was almost certainly written
+    for shell interpolation and indicates a misconfigured server entry.
+    This is not an execution control and confers no isolation.
 
     Args:
         args: List of command arguments
 
     Raises:
-        SecurityError: If dangerous characters found
+        SecurityError: If shell metacharacters found
     """
     for arg in args:
         for char in SHELL_METACHARACTERS:
@@ -153,7 +217,11 @@ _VALUE_CREDENTIAL_PATTERNS = [
     re.compile(r"(?:sk|pk|rk)[-_](?:live|test|prod)[-_]\w{10,}", re.I),  # Stripe/service keys
     re.compile(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{30,}"),  # GitHub tokens
     re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{16}"),  # AWS access key IDs
-    re.compile(r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----"),  # Private keys
+    # Any PEM private-key label, not an enumerated few: `OPENSSH` (ssh-keygen's
+    # default since OpenSSH 7.8), `ENCRYPTED` and `PGP … BLOCK` were all missing,
+    # so those keys reached reports verbatim. Requiring the literal `PRIVATE KEY`
+    # keeps public material (`-----BEGIN CERTIFICATE-----`, `PUBLIC KEY`) out.
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----"),  # Private keys
     re.compile(r"eyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]{20,}"),  # JWTs
     re.compile(r"xox[bpsar]-[A-Za-z0-9-]{10,}"),  # Slack tokens
     re.compile(r"\w+://[^:]+:[^@]+@"),  # Connection strings with embedded credentials
@@ -172,6 +240,8 @@ _B64_MIN_LEN = 28
 _HIGH_ENTROPY_THRESHOLD = 4.5
 _HIGH_ENTROPY_MIN_LEN = 24
 _HIGH_ENTROPY_SHORT_THRESHOLD = 5.0  # stricter for shorter strings (24-39 chars)
+
+_STRUCTURED_EDGE_ID_RE = re.compile(r"^[^\s>]+->[A-Za-z][A-Za-z0-9_.:-]*->[^\s>]+$")
 
 
 def _shannon_entropy(s: str) -> float:
@@ -224,11 +294,30 @@ def _is_obfuscated_credential(value: str) -> bool:
     return False
 
 
+def env_key_is_credential(key: str) -> bool:
+    """Whether an environment-variable *name* denotes a credential.
+
+    Environment variable names are classified product-wide by
+    ``constants.is_credential_key`` — it backs ``MCPServer.credential_names``
+    and therefore every surface that reports an exposed credential.  Redaction
+    has to cover at least those names, or a report can list a variable as an
+    exposed credential in one field while publishing its value in another.
+    ``SENSITIVE_PATTERNS`` adds forms that are not env-var-shaped (``api-key``,
+    ``jwt``); it stays regex-based and is not widened, because
+    :func:`_key_looks_sensitive` applies it to arbitrary payload keys where
+    over-matching collapses distinct graph nodes.
+    """
+    from agent_bom.constants import is_credential_key
+
+    low = key.lower()
+    return is_credential_key(key) or any(re.search(pattern, low) for pattern in SENSITIVE_PATTERNS)
+
+
 def sanitize_env_vars(env: dict[str, Any]) -> dict[str, str]:
     """
     Sanitize environment variables by redacting sensitive values.
 
-    Checks both key names (via SENSITIVE_PATTERNS) and values (via
+    Checks both key names (via :func:`env_key_is_credential`) and values (via
     _VALUE_CREDENTIAL_PATTERNS) to catch hardcoded credentials in
     custom-named variables.
 
@@ -240,10 +329,7 @@ def sanitize_env_vars(env: dict[str, Any]) -> dict[str, str]:
     """
     sanitized = {}
     for key, value in env.items():
-        # Check if key matches sensitive pattern
-        is_sensitive = any(re.search(pattern, key.lower()) for pattern in SENSITIVE_PATTERNS)
-
-        if is_sensitive:
+        if env_key_is_credential(key):
             sanitized[key] = "***REDACTED***"
         else:
             str_value = str(value)
@@ -257,6 +343,380 @@ def sanitize_env_vars(env: dict[str, Any]) -> dict[str, str]:
                 sanitized[key] = str_value
 
     return sanitized
+
+
+# Email is sensitive PII. We mask the local part and the domain label while
+# preserving enough shape to keep records correlatable (first char + TLD).
+# Conservative on purpose: only well-formed addresses are masked so legitimate
+# non-PII fields (versions, identifiers containing "@" such as scoped npm
+# package names like "@scope/pkg") are left untouched.
+_EMAIL_RE = re.compile(r"\b([A-Za-z0-9._%+\-]+)@([A-Za-z0-9.\-]+)\.([A-Za-z]{2,})\b")
+
+
+def _mask_email_match(local: str, domain: str, tld: str) -> str:
+    """Mask one parsed email address into ``a***@e***.com`` shape."""
+    local_masked = f"{local[0]}***" if local else "***"
+    domain_masked = f"{domain[0]}***" if domain else "***"
+    return f"{local_masked}@{domain_masked}.{tld}"
+
+
+def mask_email(value: object) -> str:
+    """Mask every email address in *value*, preserving non-email text.
+
+    ``alice@example.com`` → ``a***@e***.com``. Strings without a well-formed
+    address pass through unchanged, so scoped package names (``@scope/pkg``)
+    and version specifiers are not corrupted.
+    """
+    text = str(value)
+    return _EMAIL_RE.sub(lambda m: _mask_email_match(m.group(1), m.group(2), m.group(3)), text)
+
+
+def _contains_email(value: str) -> bool:
+    return bool(_EMAIL_RE.search(value))
+
+
+# Field names whose values are email addresses and must always be masked in
+# operational records (audit metadata, connector identity fields, evidence).
+_EMAIL_KEYS = {
+    "email",
+    "email_address",
+    "user_email",
+    "actor_email",
+    "owner_email",
+    "contact_email",
+    "notify_email",
+    "reporter_email",
+    "assignee_email",
+    "mail",
+}
+
+
+def _key_looks_like_email(key: object) -> bool:
+    key_text = str(key or "").strip().lower().replace("-", "_")
+    return key_text in _EMAIL_KEYS or key_text.endswith("_email")
+
+
+def sanitize_url(value: str | None) -> str | None:
+    """Strip credentials, query strings, and fragments from display/export URLs."""
+    if value is None:
+        return None
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return "<redacted-url>"
+    if not parsed.scheme or not parsed.netloc:
+        return value
+    host = parsed.hostname or parsed.netloc.rsplit("@", 1)[-1]
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+
+
+def redact_secret_url(value: str | None) -> str:
+    """Redact a secret-bearing URL down to scheme+host plus a short fingerprint.
+
+    Unlike :func:`sanitize_url`, this also drops the *path*: for incoming
+    webhooks (Slack-style) the URL path segments carry the secret token, so the
+    URL itself is credential material. The returned form keeps just enough
+    (scheme, host, and a stable 8-char fingerprint of the full URL) for an
+    operator to correlate failures without exposing the secret in logs or an
+    audit export.
+    """
+    if not value:
+        return "<none>"
+    fingerprint = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return f"<redacted-url>#{fingerprint}"
+    if not parsed.scheme or not parsed.netloc:
+        return f"<redacted-url>#{fingerprint}"
+    host = parsed.hostname or parsed.netloc.rsplit("@", 1)[-1]
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    return f"{parsed.scheme}://{host}/…#{fingerprint}"
+
+
+# `KEY = "value"` in the shapes free text actually uses: bare, quoted, spaced,
+# JSON (`"api_key": "…"`), YAML (`api_key: …`). The previous scanner took a run
+# of non-space characters and `rpartition`-ed it, so it found the key only in
+# the single unquoted `KEY=value` form — and on a base64 value it split at the
+# `=` *padding*, leaving an empty candidate. Everything else printed verbatim.
+#
+# Widening happens on the key side only. `[^\s"',;<>]` is the value: a plain run,
+# never entropy-tested on its own, because free text is full of legitimate
+# high-entropy tokens (digests, ARNs, request ids) and a redactor that eats them
+# is one people switch off.
+#
+# A bare `:` with nothing around it is *not* an assignment — it is the delimiter
+# in the graph's own structured identifiers
+# (`credential_ref:credential_ref:credential_reference:redacted`) and in ARNs and
+# digests. Reading one as `key: value` redacts the tail of a node id, and the
+# graph exporter then collapses distinct nodes into one phantom. So a colon has
+# to look like an assignment: quoted as in JSON, or followed by whitespace as
+# YAML requires. `=` needs no such proof; structured ids do not use it.
+_TEXT_KEY_VALUE_RE = re.compile(
+    r"""(?P<key>[A-Za-z][A-Za-z0-9_.\-]{1,63})   # key name
+        (?P<sep>["']?[ \t]*=[ \t]*               # `KEY=v`, `KEY = v`, `"KEY"=v`
+             |["'][ \t]*:[ \t]*                  # `"key": v`
+             |[ \t]*:[ \t]*(?=["'])              # `key:"v"`
+             |[ \t]*:[ \t]+)                     # `key: v`
+        (?P<quote>["']?)                         # optional opening quote on the value
+        (?P<value>[^\s"',;<>]+)                  # the value
+    """,
+    re.VERBOSE,
+)
+
+# Values that are plainly not credential material. The key name cannot tell a
+# secret from a count or a placeholder, and redacting these makes logs
+# unreadable without making anything safer.
+_NON_SECRET_VALUE_RE = re.compile(
+    r"^(?:\d+(?:\.\d+)*|true|false|yes|on|off|none|null|nil|unset|unknown|missing|empty|n/?a|redacted|\*+redacted\*+|\*+|-+)$",
+    re.I,
+)
+
+# An env-var *name* is an identifier, not a secret. Reports carry
+# `credential_names=OPENAI_API_KEY` as evidence; redacting the name loses the
+# finding and protects nothing — only the value of a credential is sensitive.
+_CREDENTIAL_IDENTIFIER_VALUE_RE = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
+
+# Below this a value is an enum or a flag, not authentication material.
+_MIN_SECRET_VALUE_LEN = 4
+
+
+def sanitize_text(value: object, max_len: int = 1000) -> str:
+    """Redact credential-shaped substrings, credential-bearing URLs, and emails in text."""
+    text = sanitize_log_label(value, max_len=max_len)
+    text = re.sub(r"https?://[^\s\"'<>]+", lambda match: str(sanitize_url(match.group(0)) or ""), text)
+    for pattern in _VALUE_CREDENTIAL_PATTERNS:
+        text = pattern.sub("<redacted>", text)
+    # The pattern list carries AWS access key *ids* but nothing for the 40-char
+    # secret access key, so the harmless half was redacted while the dangerous
+    # half was printed verbatim. Anything the shapes above miss is caught by the
+    # variable *name* it is written under, using the product-wide predicate.
+    text = _TEXT_KEY_VALUE_RE.sub(_redact_keyed_value, text)
+    # Email is sensitive PII — mask any addresses left in free text.
+    text = mask_email(text)
+    return text[:max_len]
+
+
+def _redact_keyed_value(match: re.Match[str]) -> str:
+    """Redact the value of a `key: value` pair when the *key* names a credential.
+
+    Requiring the key is what keeps this usable. The entropy fallback that
+    `sanitize_env_vars` applies is safe there, because a high-entropy env var
+    value is almost certainly a secret — but free text is full of high-entropy
+    tokens that are not: content hashes, ARNs, request ids, digests. Applying it
+    to bare tokens redacted a `hash_ref` and a GuardDuty ARN in the runtime
+    taxonomy. So the two paths share the *predicate for names* and deliberately
+    do not share the bare-value heuristic.
+
+    A named credential's value is redacted on the strength of the name alone —
+    a 64-char hex API key scores below every value threshold there is, and
+    waiting for the value to look secret is what let it through.
+    """
+    value = match.group("value")
+    if not env_key_is_credential(match.group("key")) or not _is_credential_material(value):
+        return match.group(0)
+    prefix = f"{match.group('key')}{match.group('sep')}{match.group('quote')}"
+    # A connection URL is evidence: the host says which system was reached. Keep
+    # that and drop the credential, rather than blanking the whole line.
+    if "://" in value:
+        return f"{prefix}{sanitize_url(value) or '<redacted>'}"
+    return f"{prefix}<redacted>"
+
+
+def _is_credential_material(value: str) -> bool:
+    """Whether a value under a credential-named key could be the credential."""
+    if len(value) < _MIN_SECRET_VALUE_LEN or _NON_SECRET_VALUE_RE.match(value):
+        return False
+    return not (_CREDENTIAL_IDENTIFIER_VALUE_RE.match(value) and env_key_is_credential(value))
+
+
+def _looks_sensitive_value(value: str) -> bool:
+    return sanitize_env_vars({"ARG": value}).get("ARG") == "***REDACTED***"
+
+
+def sanitize_command_args(args: list[Any] | tuple[Any, ...]) -> list[str]:
+    """Redact secret-bearing command arguments while preserving launch shape."""
+    sanitized: list[str] = []
+    redact_next = False
+    for raw_arg in args:
+        arg = str(raw_arg)
+        if redact_next:
+            sanitized.append("<redacted>")
+            redact_next = False
+            continue
+
+        if "=" in arg:
+            key, _sep, raw_value = arg.partition("=")
+            if any(re.search(pattern, key.lower()) for pattern in SENSITIVE_PATTERNS):
+                sanitized.append(f"{key}=<redacted>")
+                continue
+            if "://" in raw_value:
+                sanitized.append(f"{key}={sanitize_url(raw_value)}")
+                continue
+            if _looks_sensitive_value(raw_value):
+                sanitized.append(f"{key}=<redacted>")
+                continue
+
+        if "://" in arg:
+            sanitized.append(str(sanitize_url(arg) or ""))
+            continue
+
+        if _looks_sensitive_value(arg):
+            sanitized.append("<redacted>")
+            continue
+
+        if arg.startswith("-") and any(re.search(pattern, arg.lower()) for pattern in SENSITIVE_PATTERNS):
+            sanitized.append(arg)
+            redact_next = True
+            continue
+
+        sanitized.append(arg)
+    return sanitized
+
+
+def sanitize_launch_command(command: object, args: list[Any] | tuple[Any, ...] | None = None, *, max_args: int | None = None) -> str:
+    """Return a safe command label for display/export surfaces."""
+    safe_command = sanitize_text(command, max_len=200)
+    raw_args = list(args or [])
+    if max_args is not None:
+        raw_args = raw_args[:max_args]
+    safe_args = sanitize_command_args(raw_args)
+    return " ".join([part for part in [safe_command, *safe_args] if part]).strip()
+
+
+def sanitize_security_warnings(values: list[Any] | tuple[Any, ...]) -> list[str]:
+    """Redact warning text before persistence or UI/API export."""
+    return [sanitize_text(value) for value in values if str(value or "").strip()]
+
+
+def _key_looks_sensitive(key: object) -> bool:
+    return any(re.search(pattern, str(key).lower()) for pattern in SENSITIVE_PATTERNS)
+
+
+# Fields whose string members are credential *env-var names* — identifiers such
+# as ``OPENAI_API_KEY`` — not secret values.  The key text ("credential…")
+# matches SENSITIVE_PATTERNS, so without this exception every name would redact
+# to ``***REDACTED***``; downstream the graph exporter mints node IDs from these
+# labels and set-dedups them, collapsing distinct credentials into one phantom
+# node and inventing cross-agent ``reaches_tool``/``exposes_cred`` edges.  Only
+# the VALUE of a credential is sensitive, and values are never carried here.
+_CREDENTIAL_IDENTIFIER_KEYS = frozenset({"credential_env_vars", "credential_env_var", "credential_names", "credential_refs"})
+
+
+def _key_is_credential_identifier(key: object) -> bool:
+    return str(key or "").strip().lower().replace("-", "_") in _CREDENTIAL_IDENTIFIER_KEYS
+
+
+def _key_looks_like_url(key: object) -> bool:
+    key_text = str(key).lower()
+    return key_text in {"url", "uri", "endpoint", "webhook"} or key_text.endswith(("_url", "_uri", "_endpoint", "_webhook"))
+
+
+def _key_looks_like_path(key: object) -> bool:
+    key_text = str(key).lower()
+    path_terms = ("path", "file", "dir", "directory", "cwd", "workspace", "config_path", "source_path")
+    return any(term in key_text for term in path_terms)
+
+
+def _looks_like_path_value(value: str) -> bool:
+    if not value or "://" in value:
+        return False
+    return value.startswith("/") or value.startswith("~/") or bool(re.match(r"^[A-Za-z]:[\\/]", value))
+
+
+_CLOUD_IDENTITY_KEYS = {
+    "account_id",
+    "arn",
+    "cloud_principal",
+    "endpoint_id",
+    "location",
+    "principal_arn",
+    "project_id",
+    "region",
+    "resource_group",
+    "resource_id",
+    "resource_name",
+    "service",
+    "subscription_id",
+    "tenant_id",
+}
+
+
+def _key_looks_like_cloud_identity(key: object) -> bool:
+    key_text = str(key or "").strip().lower().replace("-", "_")
+    return key_text in _CLOUD_IDENTITY_KEYS or key_text.endswith("_arn") or key_text.endswith("_resource_id")
+
+
+def sanitize_path_label(value: object) -> str:
+    """Return a non-revealing label for local filesystem paths."""
+    text = sanitize_log_label(value, max_len=1000)
+    if re.fullmatch(r"<path:[^<>]+>", text):
+        return text
+    basename = re.split(r"[\\/]+", text.rstrip("/\\"))[-1] if text else ""
+    basename = sanitize_text(basename or "path", max_len=80)
+    if not basename or _key_looks_sensitive(basename) or _looks_sensitive_value(basename):
+        basename = "path"
+    return f"<path:{basename}>"
+
+
+def sanitize_sensitive_payload(value: object, *, key: object | None = None, max_str_len: int = 1000, depth: int = 0) -> object:
+    """Recursively redact sensitive runtime/audit payloads before persistence/export."""
+    if depth >= 24:
+        return "[truncated]"
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, str):
+        # A credential env-var NAME is an identifier, not a secret value.  Keep
+        # it intact so distinct credentials stay distinct graph nodes; still
+        # redact defensively if the string itself looks like a leaked secret.
+        if _key_is_credential_identifier(key) and not _looks_sensitive_value(value):
+            return sanitize_text(value, max_len=max_str_len)
+        if key is not None and _key_looks_sensitive(key):
+            return "***REDACTED***"
+        if key is not None and _key_looks_like_email(key):
+            return mask_email(value)
+        if key is not None and _key_looks_like_url(key):
+            return sanitize_url(value)
+        if key is not None and _key_looks_like_cloud_identity(key):
+            if _looks_sensitive_value(value):
+                return "***REDACTED***"
+            return sanitize_text(value, max_len=max_str_len)
+        # Graph edge identifiers are deterministic relationship coordinates,
+        # not opaque credentials.  Their punctuation and length can otherwise
+        # trip the entropy detector.  Keep the exception deliberately narrow:
+        # only ID fields with the canonical ``source->relation->target`` shape,
+        # and never values matching a known credential pattern.
+        key_text = str(key or "").strip().lower().replace("-", "_")
+        edge_parts = value.split("->")
+        if (
+            key_text in {"id", "canonical_id"}
+            and _STRUCTURED_EDGE_ID_RE.fullmatch(value)
+            and len(edge_parts) == 3
+            and not _looks_sensitive_value(edge_parts[0])
+            and not _looks_sensitive_value(edge_parts[2])
+        ):
+            return sanitize_text(value, max_len=max_str_len)
+        if "://" in value:
+            return sanitize_text(value, max_len=max_str_len)
+        if key is not None and _key_looks_like_path(key) and _looks_like_path_value(value):
+            return sanitize_path_label(value)
+        if _looks_like_path_value(value):
+            return sanitize_path_label(value)
+        if _looks_sensitive_value(value):
+            return "***REDACTED***"
+        return sanitize_text(value, max_len=max_str_len)
+    if isinstance(value, dict):
+        sanitized: dict[str, object] = {}
+        for raw_key, raw_value in value.items():
+            clean_key = sanitize_text(raw_key, max_len=200)
+            sanitized[clean_key] = sanitize_sensitive_payload(raw_value, key=clean_key, max_str_len=max_str_len, depth=depth + 1)
+        return sanitized
+    if isinstance(value, list | tuple | set):
+        return [sanitize_sensitive_payload(item, key=key, max_str_len=max_str_len, depth=depth + 1) for item in list(value)]
+    return sanitize_text(value, max_len=max_str_len)
 
 
 def validate_file_size(path: Path, max_size_bytes: int = 10 * 1024 * 1024) -> None:
@@ -312,7 +772,7 @@ def validate_json_file(path: Path) -> dict:
         raise SecurityError(f"Cannot read file {path}: {e}")
 
 
-def validate_url(url: str) -> None:
+def validate_url(url: str, *, allowed_schemes: tuple[str, ...] = ("https",), allow_private: bool = False) -> None:
     """
     Validate a URL for safety, including DNS rebinding protection.
 
@@ -336,14 +796,29 @@ def validate_url(url: str) -> None:
     except Exception as e:
         raise SecurityError(f"Invalid URL '{url}': {e}")
 
-    # Only allow HTTPS (not HTTP or other protocols)
-    if parsed.scheme not in ("https",):
-        raise SecurityError(f"Only HTTPS URLs are allowed, got: {parsed.scheme}")
+    allow_private = allow_private or os.environ.get("AGENT_BOM_ALLOW_PRIVATE_EGRESS_URLS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    http_private_override = allow_private and parsed.scheme == "http" and allowed_schemes == ("https",)
+
+    if parsed.scheme not in allowed_schemes and not http_private_override:
+        if allowed_schemes == ("https",):
+            raise SecurityError(f"URL must use HTTPS; got: {parsed.scheme}")
+        expected = ", ".join(f"{scheme}://" for scheme in allowed_schemes)
+        raise SecurityError(f"URL must use one of {expected}; got: {parsed.scheme}")
 
     # Validate domain is not localhost or internal IP
     hostname = parsed.hostname or ""
+    if not hostname:
+        raise SecurityError("URL must include a hostname")
     if hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):  # nosec B104 - checking FOR these values to reject them, not binding to them
-        raise SecurityError(f"Cannot connect to localhost/internal IPs: {hostname}")
+        if not allow_private:
+            raise SecurityError(f"Cannot connect to localhost/internal IPs: {hostname}")
+        logger.warning("Private egress URL allowed by operator override")
+        return
 
     # Block cloud metadata endpoints (AWS/GCP/Azure)
     if hostname in ("169.254.169.254", "metadata.google.internal"):
@@ -353,7 +828,10 @@ def validate_url(url: str) -> None:
     try:
         addr = ipaddress.ip_address(hostname)
         if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
-            raise SecurityError(f"Cannot connect to private/reserved IP: {hostname}")
+            if not allow_private:
+                raise SecurityError(f"Cannot connect to private/reserved IP: {hostname}")
+            logger.warning("Private egress URL allowed by operator override")
+            return
     except ValueError:
         pass  # hostname is a domain name — resolve below
 
@@ -368,11 +846,20 @@ def validate_url(url: str) -> None:
         try:
             addr = ipaddress.ip_address(resolved_ip)
             if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
-                raise SecurityError(f"Hostname '{hostname}' resolves to private/reserved IP: {resolved_ip}")
+                if not allow_private:
+                    raise SecurityError(f"Hostname '{hostname}' resolves to private/reserved IP: {resolved_ip}")
+                logger.warning("Private egress URL allowed by operator override")
+                return
         except ValueError:
             continue
 
-    logger.debug("URL validated: %s", url.replace("\n", "").replace("\r", ""))
+    if http_private_override:
+        raise SecurityError("HTTP URLs are only allowed for private egress targets when AGENT_BOM_ALLOW_PRIVATE_EGRESS_URLS is enabled")
+
+    # Static log — no user-controlled values to prevent both cleartext
+    # credential logging and log injection (CodeQL py/clear-text-logging,
+    # py/log-injection).
+    logger.debug("URL validated successfully")
 
 
 def validate_package_name(name: str, ecosystem: str) -> None:
@@ -436,19 +923,24 @@ def create_safe_subprocess_env() -> dict[str, str]:
 
 def validate_mcp_server_config(server_config: dict) -> None:
     """
-    Validate an MCP server configuration for security issues.
+    Validate an MCP server configuration for hygiene issues before launch.
+
+    Checks launcher recognition, argument shape, and dangerous environment
+    variables. These are misconfiguration guards, not isolation — a config
+    that passes still runs with full host privileges unless container
+    isolation (``agent_bom.proxy_sandbox``, ``--isolate``) is enabled.
 
     Args:
         server_config: MCP server configuration dictionary
 
     Raises:
-        SecurityError: If configuration has security issues
+        SecurityError: If configuration fails a hygiene check
     """
-    # Validate command (remote/URL-based servers don't require a local command)
+    # Check the launcher (remote/URL-based servers don't require a local command)
     command = server_config.get("command", "")
     has_url = bool(server_config.get("url") or server_config.get("uri"))
     if not has_url:
-        validate_command(command)
+        require_recognized_launcher(command)
 
     # Validate arguments
     args = server_config.get("args", [])
@@ -462,7 +954,7 @@ def validate_mcp_server_config(server_config: dict) -> None:
         raise SecurityError("Server env must be a dictionary")
     validate_environment(env)
 
-    logger.info(f"MCP server config validated: {command or server_config.get('url', 'unknown')}")
+    logger.info("MCP server config validated: %s", sanitize_text(command or server_config.get("url", "unknown")))
 
 
 # Docker/OCI image reference pattern — must start with alphanum, no shell metacharacters
@@ -486,12 +978,18 @@ def validate_image_ref(ref: str) -> str:
     return ref
 
 
-def sanitize_error(exc: Exception | str, generic: bool = False) -> str:
+def sanitize_error(exc: Exception | str, generic: bool = False, *, max_length: int = 200) -> str:
     """Return a safe error message suitable for API consumers.
 
     Strips sensitive data (file paths, URLs) from exception messages while
     preserving safe, actionable text.  Set ``generic=True`` to always return
     a fixed non-diagnostic string regardless of the exception content.
+
+    ``max_length`` caps arbitrary SDK/exception text so a pathological message
+    cannot flood a response or a terminal. Callers passing text this codebase
+    *authored* (curated remediation guidance, which is bounded by construction)
+    may raise the cap so multi-sentence guidance is not chopped mid-word — the
+    redaction above always still applies.
     """
     if generic:
         return "An internal error occurred. Please contact support."
@@ -499,19 +997,33 @@ def sanitize_error(exc: Exception | str, generic: bool = False) -> str:
     msg = str(exc)
     # Strip URLs first (before path regex matches the path portion)
     msg = re.sub(r"https?://[^\s\"']+", "<url>", msg)
+    # Strip inline credential assignments commonly included in SDK error strings.
+    msg = re.sub(
+        r"(?i)\b(token|secret|password|passwd|api[_-]?key|access[_-]?key|session[_-]?token)\s*=\s*[^\s,;]+",
+        lambda match: f"{match.group(1)}=<redacted>",
+        msg,
+    )
     # Strip absolute file paths
     msg = re.sub(r"(/[^\s:\"']+)+", "<path>", msg)
-    return msg[:200] if len(msg) > 200 else msg
+    return msg[:max_length] if len(msg) > max_length else msg
 
 
 # Export all validation functions
 __all__ = [
     "SecurityError",
-    "validate_command",
+    "require_recognized_launcher",
     "validate_arguments",
     "validate_environment",
     "validate_path",
     "sanitize_env_vars",
+    "sanitize_command_args",
+    "sanitize_launch_command",
+    "sanitize_security_warnings",
+    "sanitize_sensitive_payload",
+    "sanitize_path_label",
+    "sanitize_text",
+    "sanitize_url",
+    "mask_email",
     "validate_file_size",
     "validate_json_file",
     "validate_url",

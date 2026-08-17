@@ -1,0 +1,216 @@
+import { describe, expect, it } from "vitest";
+
+import { buildUnifiedFlowGraph } from "@/lib/unified-graph-flow";
+import { createFocusedGraphFilters } from "@/components/lineage-filter";
+import {
+  EntityType,
+  RelationshipType,
+  type UnifiedEdge,
+  type UnifiedGraphData,
+  type UnifiedNode,
+} from "@/lib/graph-schema";
+
+const createdAt = "2026-06-01T00:00:00Z";
+
+function node(id: string, entityType: EntityType, label: string, severity = "none"): UnifiedNode {
+  return {
+    id,
+    entity_type: entityType,
+    label,
+    category_uid: 0,
+    class_uid: 0,
+    type_uid: 0,
+    status: "active",
+    risk_score: severity === "critical" ? 9.4 : 0,
+    severity,
+    severity_id: severity === "critical" ? 5 : 0,
+    first_seen: createdAt,
+    last_seen: createdAt,
+    attributes: {},
+    compliance_tags: [],
+    data_sources: ["test"],
+    dimensions: {},
+  };
+}
+
+function edge(source: string, target: string, relationship: RelationshipType): UnifiedEdge {
+  return {
+    id: `${source}->${relationship}->${target}`,
+    source,
+    target,
+    relationship,
+    direction: "directed",
+    weight: 1,
+    traversable: true,
+    first_seen: createdAt,
+    last_seen: createdAt,
+    evidence: {},
+    activity_id: 1,
+  };
+}
+
+describe("buildUnifiedFlowGraph", () => {
+  it("keeps agent and finding endpoints in focused relevant-path windows", () => {
+    const graph: UnifiedGraphData = {
+      scan_id: "scan-path",
+      tenant_id: "default",
+      created_at: createdAt,
+      nodes: [
+        node("agent:desktop", EntityType.AGENT, "Desktop Agent", "high"),
+        node("server:filesystem", EntityType.SERVER, "filesystem MCP", "high"),
+        node("pkg:filesystem", EntityType.PACKAGE, "filesystem-package", "high"),
+        node("cve:filesystem", EntityType.VULNERABILITY, "CVE-2026-1001", "critical"),
+      ],
+      edges: [
+        edge("agent:desktop", "server:filesystem", RelationshipType.USES),
+        edge("server:filesystem", "pkg:filesystem", RelationshipType.DEPENDS_ON),
+        edge("pkg:filesystem", "cve:filesystem", RelationshipType.VULNERABLE_TO),
+      ],
+      attack_paths: [
+        {
+          source: "agent:desktop",
+          target: "cve:filesystem",
+          hops: ["agent:desktop", "server:filesystem", "pkg:filesystem", "cve:filesystem"],
+          edges: [],
+          composite_risk: 9.4,
+          summary: "Desktop Agent can reach a critical package vulnerability.",
+          credential_exposure: [],
+          tool_exposure: [],
+          vuln_ids: ["CVE-2026-1001"],
+        },
+      ],
+      interaction_risks: [],
+      stats: {
+        total_nodes: 4,
+        total_edges: 3,
+        node_types: {},
+        severity_counts: {},
+        relationship_types: {},
+        attack_path_count: 1,
+        interaction_risk_count: 0,
+        max_attack_path_risk: 9.4,
+        highest_interaction_risk: 0,
+      },
+    };
+
+    const flow = buildUnifiedFlowGraph(graph, createFocusedGraphFilters("Desktop Agent"));
+    expect(flow.nodes.map((entry) => entry.id).sort()).toEqual([
+      "agent:desktop",
+      "cve:filesystem",
+      "pkg:filesystem",
+      "server:filesystem",
+    ]);
+    expect(flow.summary).toMatchObject({ agents: 1, findings: 1, critical: 1 });
+    expect(flow.edges.find((entry) => entry.id.includes("vulnerable_to"))?.data).toMatchObject({
+      relationship: "vulnerable_to",
+      relationshipLabel: "Has CVE",
+      evidenceMode: "static",
+    });
+  });
+
+  it("retains application entities through the existing container renderer", () => {
+    const graph: UnifiedGraphData = {
+      scan_id: "scan-application",
+      tenant_id: "default",
+      created_at: createdAt,
+      nodes: [
+        node("agent:checkout", EntityType.AGENT, "Checkout Agent"),
+        node("application:checkout", EntityType.APPLICATION, "Checkout"),
+      ],
+      edges: [
+        edge(
+          "agent:checkout",
+          "application:checkout",
+          RelationshipType.USES,
+        ),
+      ],
+      attack_paths: [],
+      interaction_risks: [],
+      stats: {
+        total_nodes: 2,
+        total_edges: 1,
+        node_types: { agent: 1, application: 1 },
+        severity_counts: {},
+        relationship_types: {},
+        attack_path_count: 0,
+        interaction_risk_count: 0,
+        max_attack_path_risk: 0,
+        highest_interaction_risk: 0,
+      },
+    };
+    const filters = createFocusedGraphFilters();
+    filters.layers.container = true;
+
+    const flow = buildUnifiedFlowGraph(graph, filters);
+
+    expect(flow.nodes).toHaveLength(2);
+    expect(flow.nodes.find((entry) => entry.id === "application:checkout")).toMatchObject({
+      id: "application:checkout",
+      type: "containerNode",
+      data: { nodeType: "container", entityType: "application" },
+    });
+  });
+});
+
+describe("cost summary", () => {
+  function costGraph(attrs: Record<string, unknown>[]): UnifiedGraphData {
+    const nodes = attrs.map((a, i) => ({
+      ...node(`agent:a${i}`, EntityType.AGENT, `agent-${i}`),
+      attributes: a as Record<string, never>,
+    }));
+    return {
+      scan_id: "scan-cost",
+      tenant_id: "default",
+      created_at: createdAt,
+      nodes,
+      edges: [],
+      attack_paths: [],
+      interaction_risks: [],
+      stats: {
+        total_nodes: nodes.length,
+        total_edges: 0,
+        node_types: {},
+        severity_counts: {},
+        relationship_types: {},
+        attack_path_count: 0,
+        interaction_risk_count: 0,
+        max_attack_path_risk: 0,
+        highest_interaction_risk: 0,
+        analysis_status: {},
+      },
+    } as unknown as UnifiedGraphData;
+  }
+
+  it("sums windowed spend across visible nodes", () => {
+    const flow = buildUnifiedFlowGraph(
+      costGraph([{ cost_usd_30d: 12.5 }, { cost_usd_30d: 7.25 }, {}]),
+      createFocusedGraphFilters(""),
+    );
+    expect(flow.summary.costUsd30d).toBeCloseTo(19.75, 5);
+  });
+
+  it("counts nodes that are both expensive and exposed", () => {
+    const flow = buildUnifiedFlowGraph(
+      costGraph([
+        { cost_usd_30d: 500, cost_risk_priority: "expensive_and_exposed" },
+        { cost_usd_30d: 10 },
+      ]),
+      createFocusedGraphFilters(""),
+    );
+    expect(flow.summary.expensiveExposed).toBe(1);
+  });
+
+  it("reports zero when no node carries cost, so the strip stays hidden", () => {
+    const flow = buildUnifiedFlowGraph(costGraph([{}, {}]), createFocusedGraphFilters(""));
+    expect(flow.summary.costUsd30d).toBe(0);
+    expect(flow.summary.expensiveExposed).toBe(0);
+  });
+
+  it("ignores a non-numeric cost attribute rather than rendering NaN", () => {
+    const flow = buildUnifiedFlowGraph(
+      costGraph([{ cost_usd_30d: "not-a-number" }, { cost_usd_30d: 5 }]),
+      createFocusedGraphFilters(""),
+    );
+    expect(flow.summary.costUsd30d).toBe(5);
+  });
+});

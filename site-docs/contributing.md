@@ -12,18 +12,14 @@ Please read and follow our [Code of Conduct](https://github.com/msaad00/agent-bo
 git clone https://github.com/msaad00/agent-bom.git
 cd agent-bom
 
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install in development mode
-pip install -e ".[dev]"
+uv sync --extra dev-all
+uv run agent-bom --version
 ```
 
 ## Running Tests
 
 ```bash
-pytest tests/ -v
+uv run pytest tests/ -x -q
 ```
 
 ## Code Style
@@ -31,8 +27,8 @@ pytest tests/ -v
 We use `ruff` for linting:
 
 ```bash
-ruff check src/
-ruff format src/
+uv run ruff check src tests
+uv run ruff format --check src tests
 ```
 
 ## Areas to Contribute
@@ -47,8 +43,8 @@ ruff format src/
 
 1. Fork the repo and create your branch from `main`
 2. Add tests for any new functionality
-3. Ensure all tests pass: `pytest tests/ -x -q`
-4. Ensure linting passes: `ruff check src/`
+3. Ensure all tests pass: `uv run pytest tests/ -x -q`
+4. Ensure linting passes: `uv run ruff check src tests`
 5. Update the README if needed
 6. Submit your PR with a clear description
 
@@ -63,7 +59,7 @@ When preparing a release, update the version in all of these files:
 3. `Dockerfile` — version label
 4. `deploy/docker/Dockerfile.sse` — `ARG VERSION=X.Y.Z`
 5. `integrations/mcp-registry/server.json` — `version`
-6. `integrations/openclaw/*/SKILL.md` — version in frontmatter (scan, compliance, registry, runtime)
+6. `integrations/openclaw/*/SKILL.md` — version in frontmatter for the published ClawHub skills (scan, compliance, registry, runtime)
 7. `action.yml` — version in description + branding
 8. `README.md` — version references in examples
 9. `docs/PUBLISHING.md` — version references

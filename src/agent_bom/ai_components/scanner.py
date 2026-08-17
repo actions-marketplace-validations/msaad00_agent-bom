@@ -9,7 +9,7 @@ Usage::
 
     report = scan_source("/path/to/project")
     for comp in report.components:
-        print(f"{comp.component_type.value}: {comp.name} in {comp.file_path}:{comp.line_number}")
+        summary = f"{comp.component_type.value}: {comp.name} in {comp.file_path}:{comp.line_number}"
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from agent_bom.ai_components.patterns import (
     MODEL_PATTERNS,
     SDK_PATTERNS_BY_LANGUAGE,
 )
+from agent_bom.traversal import is_nested_worktree_root
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,8 @@ _SKIP_DIRS: frozenset[str] = frozenset(
         ".next",  # Next.js
         ".nuxt",  # Nuxt.js
         "coverage",
+        ".claude",  # Claude Code worktrees
+        ".codex",  # Codex worktrees
     }
 )
 
@@ -101,8 +104,19 @@ def scan_source(
     report.shadow_ai = [c for c in report.components if c.is_shadow]
     report.deprecated_models = [c for c in report.components if c.component_type == AIComponentType.DEPRECATED_MODEL]
     report.api_keys = [c for c in report.components if c.component_type == AIComponentType.API_KEY]
+    report.framework_agents = _scan_framework_relationships(*paths)
 
     return report
+
+
+def _scan_framework_relationships(*paths: str | Path) -> list[dict]:
+    """Attach first-class non-MCP agent framework relationships."""
+    try:
+        from agent_bom.ai_components.framework_agents import scan_framework_agents
+    except Exception:
+        logger.debug("framework-agent scanner unavailable", exc_info=True)
+        return []
+    return [agent.to_dict() for agent in scan_framework_agents(*paths)]
 
 
 def _walk_directory(
@@ -114,7 +128,14 @@ def _walk_directory(
     """Walk directory tree, scanning source files."""
     for dirpath, dirnames, filenames in os.walk(root):
         # Prune skip directories in-place
-        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.endswith(".egg-info")]
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in _SKIP_DIRS
+            and not d.endswith(".egg-info")
+            # A linked worktree is a second copy of the project.
+            and not is_nested_worktree_root(Path(dirpath) / d)
+        ]
 
         for filename in filenames:
             filepath = Path(dirpath) / filename

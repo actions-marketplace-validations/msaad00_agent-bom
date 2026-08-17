@@ -1,36 +1,80 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# agent-bom dashboard
 
-## Getting Started
+This is the Next.js dashboard for `agent-bom`.
 
-First, run the development server:
+## Recommended local run
+
+If you want the same product surface users get from the CLI, run:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+pip install 'agent-bom[ui]'
+agent-bom serve
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+That starts the API on `http://localhost:8422` and serves the bundled dashboard.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## UI development
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Run the dashboard and API separately when working on frontend changes:
 
-## Learn More
+```bash
+agent-bom api
+npm run dev
+```
 
-To learn more about Next.js, take a look at the following resources:
+The UI reads `NEXT_PUBLIC_API_URL`.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+- in development, the Next server uses it for local rewrites
+- in containers, the runtime entrypoint writes it into `public/runtime-config.js`
+  so the same image can be pointed at a different API endpoint at startup
+  without baking the endpoint into the Docker build
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+If it is unset, the dev server proxies `/v1/*`, `/health`, and `/ws/*` to `http://localhost:8422`.
 
-## Deploy on Vercel
+For same-origin ingress in Kubernetes or other reverse-proxy setups, set:
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```bash
+NEXT_PUBLIC_API_URL=
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+That keeps browser requests relative (`/v1/...`) so the ingress can route API
+paths to the backend service without rebuilding the UI image.
+
+## Browser auth model
+
+The dashboard supports two browser auth modes:
+
+- Recommended: same-origin reverse-proxy OIDC/session auth. The proxy keeps the browser session and injects trusted `X-Agent-Bom-Role` plus `X-Agent-Bom-Tenant-ID` headers to the API. Enable `AGENT_BOM_TRUST_PROXY_AUTH=1` on the backend for this mode.
+- Local-only fallback: a short-lived API key entered into the dashboard. The UI exchanges it for a same-origin `httpOnly` browser session cookie and never stores or forwards the raw key from browser storage.
+
+All browser fetches and EventSource streams use same-origin URLs plus `credentials: "include"` so proxy-managed sessions work without custom patches and runtime config cannot redirect browser credentials to a different origin.
+
+## Frontend quality gates
+
+The UI now ships with two extra release guards:
+
+- `npm run bundle:check` verifies the checked-in client bundle budget against the built `.next/` output.
+- `npm run test:e2e` runs the packaged browser path (`scan -> result -> export`) with Playwright.
+
+For local E2E runs, build first:
+
+```bash
+npm run build
+npm run test:e2e
+```
+
+If you see `Failed to fetch`:
+
+1. Make sure `agent-bom api` is running.
+2. Check the browser console for CORS or network errors.
+3. Confirm `NEXT_PUBLIC_API_URL` points at the backend you expect.
+
+## Offline demo path
+
+Use the built-in demo to exercise the dashboard without scanning a real project:
+
+```bash
+agent-bom agents --demo --offline -f json -o report.json
+```
+
+Then import `report.json` from the dashboard home page.

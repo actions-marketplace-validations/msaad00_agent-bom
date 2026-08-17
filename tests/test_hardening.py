@@ -45,6 +45,53 @@ def test_jobs_get_missing_returns_none():
     assert _jobs_get("nonexistent") is None
 
 
+def test_compact_terminal_job_preserves_scan_timestamp_metadata():
+    from agent_bom.api.server import JobStatus, ScanJob, ScanRequest
+    from agent_bom.api.stores import _compact_terminal_job
+
+    job = ScanJob(job_id="compact-time", created_at="2025-01-01T00:00:00Z", request=ScanRequest())
+    job.status = JobStatus.DONE
+    job.result = {
+        "summary": {"total_agents": 1},
+        "generated_at": "2026-01-01T00:00:00+00:00",
+        "scan_run": {
+            "scan_id": "scan-123",
+            "generated_at": "2026-01-01T00:00:00+00:00",
+        },
+        "agents": [{"name": "large payload"}],
+    }
+
+    compact = _compact_terminal_job(job)
+
+    assert compact.result is not None
+    assert compact.result["generated_at"] == "2026-01-01T00:00:00+00:00"
+    assert compact.result["scan_timestamp"] == "2026-01-01T00:00:00+00:00"
+    assert compact.result["scan_run"]["scan_id"] == "scan-123"
+    assert "agents" not in compact.result
+
+
+def test_job_summary_payload_aliases_generated_at_to_scan_timestamp():
+    from agent_bom.api.routes.scan import _job_summary_payload
+    from agent_bom.api.server import JobStatus, ScanJob, ScanRequest
+
+    job = ScanJob(job_id="summary-time", created_at="2025-01-01T00:00:00Z", request=ScanRequest())
+    job.status = JobStatus.DONE
+    job.result = {
+        "summary": {"total_agents": 1},
+        "generated_at": "2026-01-01T00:00:00+00:00",
+        "scan_run": {
+            "scan_id": "scan-123",
+            "generated_at": "2026-01-01T00:00:00+00:00",
+        },
+    }
+
+    payload = _job_summary_payload(job)
+
+    assert payload["generated_at"] == "2026-01-01T00:00:00+00:00"
+    assert payload["scan_timestamp"] == "2026-01-01T00:00:00+00:00"
+    assert payload["scan_run"]["scan_id"] == "scan-123"
+
+
 def test_jobs_bounded_eviction():
     """When _jobs exceeds _MAX_IN_MEMORY_JOBS, oldest completed jobs are evicted."""
     from agent_bom.api import stores as _stores
@@ -74,6 +121,82 @@ def test_jobs_bounded_eviction():
             for k in list(_jobs.keys()):
                 if k.startswith("evict-"):
                     del _jobs[k]
+
+
+def test_jobs_bounded_eviction_keeps_none_completed_at_until_real_oldest_removed():
+    """Jobs missing completed_at should not evict ahead of genuinely older completed jobs."""
+    from agent_bom.api import stores as _stores
+    from agent_bom.api.server import JobStatus, ScanJob, ScanRequest, _jobs, _jobs_lock, _jobs_put
+
+    original_max = _stores._MAX_IN_MEMORY_JOBS
+    try:
+        _stores._MAX_IN_MEMORY_JOBS = 2
+        with _jobs_lock:
+            _jobs.clear()
+
+        old = ScanJob(job_id="evict-old", created_at="2025-01-01T00:00:00Z", request=ScanRequest())
+        old.status = JobStatus.DONE
+        old.completed_at = "2025-01-01T00:01:00Z"
+
+        missing = ScanJob(job_id="evict-missing", created_at="2025-01-01T00:00:00Z", request=ScanRequest())
+        missing.status = JobStatus.DONE
+        missing.completed_at = None
+
+        newest = ScanJob(job_id="evict-new", created_at="2025-01-01T00:00:00Z", request=ScanRequest())
+        newest.status = JobStatus.DONE
+        newest.completed_at = "2025-01-01T00:02:00Z"
+
+        _jobs_put("evict-old", old)
+        _jobs_put("evict-missing", missing)
+        _jobs_put("evict-new", newest)
+
+        with _jobs_lock:
+            assert "evict-old" not in _jobs
+            assert "evict-missing" in _jobs
+            assert "evict-new" in _jobs
+    finally:
+        _stores._MAX_IN_MEMORY_JOBS = original_max
+        with _jobs_lock:
+            for k in list(_jobs.keys()):
+                if k.startswith("evict-"):
+                    del _jobs[k]
+
+
+def test_jobs_bounded_eviction_removes_evicted_job_locks():
+    """Evicted hot-cache jobs should not leave per-job locks behind forever."""
+    from agent_bom.api import stores as _stores
+    from agent_bom.api.server import JobStatus, ScanJob, ScanRequest, _jobs, _jobs_lock, _jobs_put
+
+    original_max = _stores._MAX_IN_MEMORY_JOBS
+    try:
+        _stores._MAX_IN_MEMORY_JOBS = 1
+        with _jobs_lock:
+            _jobs.clear()
+            _stores._job_locks.clear()
+
+        old = ScanJob(job_id="lock-old", created_at="2025-01-01T00:00:00Z", request=ScanRequest())
+        old.status = JobStatus.DONE
+        old.completed_at = "2025-01-01T00:01:00Z"
+        new = ScanJob(job_id="lock-new", created_at="2025-01-01T00:00:00Z", request=ScanRequest())
+        new.status = JobStatus.DONE
+        new.completed_at = "2025-01-01T00:02:00Z"
+
+        _stores._job_lock("lock-old")
+        _jobs_put("lock-old", old)
+        _jobs_put("lock-new", new)
+
+        with _jobs_lock:
+            assert "lock-old" not in _jobs
+            assert "lock-old" not in _stores._job_locks
+    finally:
+        _stores._MAX_IN_MEMORY_JOBS = original_max
+        with _jobs_lock:
+            for k in list(_jobs.keys()):
+                if k.startswith("lock-"):
+                    del _jobs[k]
+            for k in list(_stores._job_locks.keys()):
+                if k.startswith("lock-"):
+                    del _stores._job_locks[k]
 
 
 def test_jobs_concurrent_access():
@@ -111,6 +234,36 @@ def test_store_lock_exists():
     assert isinstance(_store_lock, type(threading.Lock()))
 
 
+def test_get_schedule_store_raises_runtime_error_when_uninitialized():
+    from agent_bom.api import stores as _stores
+
+    old = _stores._schedule_store
+    try:
+        _stores._schedule_store = None
+        try:
+            _stores._get_schedule_store()
+            assert False, "expected RuntimeError"
+        except RuntimeError as exc:
+            assert "not initialized" in str(exc)
+    finally:
+        _stores._schedule_store = old
+
+
+def test_get_source_store_raises_runtime_error_when_uninitialized():
+    from agent_bom.api import stores as _stores
+
+    old = _stores._source_store
+    try:
+        _stores._source_store = None
+        try:
+            _stores._get_source_store()
+            assert False, "expected RuntimeError"
+        except RuntimeError as exc:
+            assert "not initialized" in str(exc)
+    finally:
+        _stores._source_store = old
+
+
 # ── Pagination ──────────────────────────────────────────────────────────────
 
 
@@ -124,7 +277,8 @@ def test_list_jobs_pagination():
 
     mock_store = MagicMock()
     # Return 10 summary items
-    mock_store.list_summary.return_value = [{"job_id": f"j-{i}"} for i in range(10)]
+    mock_store.count_summary.return_value = 10
+    mock_store.list_summary.return_value = [{"job_id": f"j-{i}"} for i in range(2, 5)]
 
     with patch("agent_bom.api.routes.scan._get_store", return_value=mock_store):
         client = TestClient(app)
@@ -139,7 +293,7 @@ def test_list_jobs_pagination():
 
 
 def test_list_jobs_clamps_limit():
-    """Limit is clamped to max 200."""
+    """GET /v1/jobs accepts the shared 1000-row list ceiling."""
     from unittest.mock import patch
 
     from starlette.testclient import TestClient
@@ -153,7 +307,7 @@ def test_list_jobs_clamps_limit():
         client = TestClient(app)
         resp = client.get("/v1/jobs?limit=999")
         assert resp.status_code == 200
-        assert resp.json()["limit"] == 200
+        assert resp.json()["limit"] == 999
 
 
 def test_list_fleet_pagination():
@@ -172,6 +326,7 @@ def test_list_fleet_pagination():
         a.trust_score = 0.5
         a.model_dump.return_value = {"agent_id": f"a-{i}"}
     mock_store.list_all.return_value = agents
+    mock_store.list_by_tenant.return_value = agents
 
     with patch("agent_bom.api.routes.fleet._get_fleet_store", return_value=mock_store):
         client = TestClient(app)
@@ -270,6 +425,11 @@ def test_docker_rm_failure_logged(caplog):
 
     from agent_bom.image import _scan_with_docker
 
+    save_result = MagicMock()
+    save_result.returncode = 0
+    save_result.stdout = ""
+    save_result.stderr = ""
+
     create_result = MagicMock()
     create_result.returncode = 0
     create_result.stdout = "container-abc\n"
@@ -281,8 +441,12 @@ def test_docker_rm_failure_logged(caplog):
     rm_result.returncode = 1
     rm_result.stderr = "Error: No such container"
 
-    with patch("agent_bom.image.subprocess.run") as mock_run, patch("agent_bom.image._docker_inspect"):
-        mock_run.side_effect = [create_result, export_result, rm_result]
+    with (
+        patch("agent_bom.image.subprocess.run") as mock_run,
+        patch("agent_bom.image._docker_inspect"),
+        patch("agent_bom.oci_parser.scan_oci", return_value=([], "oci-tarball")),
+    ):
+        mock_run.side_effect = [save_result, create_result, export_result, rm_result]
         try:
             _scan_with_docker("test:latest")
         except Exception:

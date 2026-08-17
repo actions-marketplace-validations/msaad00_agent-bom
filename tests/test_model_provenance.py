@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-import json
-import urllib.error
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
+
+import httpx
 
 from agent_bom.model_files import (
     check_huggingface_provenance,
     check_sigstore_signature,
+    evaluate_model_provenance_policy,
+    summarize_model_supply_chain,
     verify_model_hash,
 )
 
@@ -112,21 +114,119 @@ class TestCheckSigstoreSignature:
         assert result["security_flags"] == []  # silently skip, no model found
 
 
+class TestSummarizeModelSupplyChain:
+    def test_builds_operator_summary(self):
+        summary = summarize_model_supply_chain(
+            model_files=[
+                {
+                    "filename": "model.safetensors",
+                    "extension": ".safetensors",
+                    "format": "SafeTensors",
+                    "ecosystem": "HuggingFace",
+                    "size_bytes": 1024,
+                    "signed": True,
+                    "security_flags": [],
+                },
+                {
+                    "filename": "adapter.pkl",
+                    "extension": ".pkl",
+                    "format": "Pickle",
+                    "ecosystem": "Python",
+                    "size_bytes": 512,
+                    "signed": False,
+                    "security_flags": [{"type": "PICKLE_DESERIALIZATION"}],
+                },
+            ],
+            model_provenance=[
+                {"model": "org/model-a", "sha256_available": True, "gated": True, "security_flags": []},
+                {"model": "org/model-b", "sha256_available": False, "gated": False, "security_flags": [{"type": "NO_AUTHOR"}]},
+            ],
+            model_hash_verification={"scanned": 2, "verified": 1, "tampered": 1, "unverified": 0, "offline": 0, "has_tampering": True},
+            model_manifests=[
+                {"manifest_type": "weight_index", "repo_id": "org/model-a", "base_model_id": None, "shard_count": 2, "security_flags": []},
+                {
+                    "manifest_type": "adapter",
+                    "repo_id": None,
+                    "base_model_id": "org/base-model",
+                    "shard_count": 0,
+                    "security_flags": [{"type": "MISSING_BASE_MODEL"}],
+                },
+            ],
+        )
+        assert summary["model_files"] == 2
+        assert summary["signed_files"] == 1
+        assert summary["unsigned_files"] == 1
+        assert summary["unsafe_format_files"] == 1
+        assert summary["files_with_security_flags"] == 1
+        assert summary["provenance_checks"] == 2
+        assert summary["provenance_with_digest"] == 1
+        assert summary["gated_models"] == 1
+        assert summary["provenance_with_security_flags"] == 1
+        assert summary["manifest_files"] == 2
+        assert summary["sharded_bundles"] == 1
+        assert summary["adapter_lineage_refs"] == 1
+        assert summary["manifests_with_security_flags"] == 1
+        assert summary["hash_verification"]["tampered"] == 1
+        assert summary["ai_model_advisories"]["count"] == 0
+
+
+class TestEvaluateModelProvenancePolicy:
+    def test_enforce_blocks_unsigned_model(self):
+        result = evaluate_model_provenance_policy(
+            [{"filename": "model.safetensors", "extension": ".safetensors", "signed": False}],
+            mode="enforce",
+            require_signatures=True,
+        )
+        assert result["passed"] is False
+        assert result["violations"][0]["type"] == "UNSIGNED_MODEL"
+
+    def test_enforce_blocks_unsafe_format(self):
+        result = evaluate_model_provenance_policy(
+            [{"filename": "adapter.pkl", "extension": ".pkl", "signed": True}],
+            mode="enforce",
+            block_unsafe_formats=True,
+        )
+        assert result["passed"] is False
+        assert result["violations"][0]["type"] == "UNSAFE_MODEL_FORMAT"
+
+    def test_safe_signed_model_passes(self):
+        result = evaluate_model_provenance_policy(
+            [{"filename": "model.onnx", "extension": ".onnx", "signed": True}],
+            mode="enforce",
+            require_signatures=True,
+            block_unsafe_formats=True,
+        )
+        assert result["passed"] is True
+        assert result["violations"] == []
+
+    def test_warn_mode_reports_without_blocking(self):
+        result = evaluate_model_provenance_policy(
+            [{"filename": "model.bin", "extension": ".bin", "signed": False}],
+            mode="warn",
+            require_signatures=True,
+            block_unsafe_formats=True,
+        )
+        assert result["passed"] is True
+        assert result["violations"] == []
+        assert {warning["type"] for warning in result["warnings"]} == {"UNSIGNED_MODEL", "UNSAFE_MODEL_FORMAT"}
+
+
 # ── check_huggingface_provenance ─────────────────────────────────
 
 
-class TestCheckHuggingFaceProvenance:
-    def _mock_response(self, data: dict):
-        """Create a mock urllib response."""
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps(data).encode()
-        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        return mock_resp
+def _mock_hf_response(data: dict, status_code: int = 200) -> httpx.Response:
+    """Create a mock httpx.Response for sync_get."""
+    return httpx.Response(
+        status_code=status_code,
+        json=data,
+        request=httpx.Request("GET", "https://huggingface.co/api/models/test"),
+    )
 
-    @patch("agent_bom.model_files.urllib.request.urlopen")
-    def test_success_full_metadata(self, mock_urlopen):
-        mock_urlopen.return_value = self._mock_response(
+
+class TestCheckHuggingFaceProvenance:
+    @patch("agent_bom.http_client.sync_get")
+    def test_success_full_metadata(self, mock_sync_get):
+        mock_sync_get.return_value = _mock_hf_response(
             {
                 "author": "meta-llama",
                 "cardData": {"license": "llama3.1"},
@@ -146,10 +246,28 @@ class TestCheckHuggingFaceProvenance:
         assert result["gated"] is True
         assert result["downloads"] == 500000
         assert result["security_flags"] == []
+        assert result["model_advisory_feed"]["status"] == "available"
 
-    @patch("agent_bom.model_files.urllib.request.urlopen")
-    def test_no_model_card_flags(self, mock_urlopen):
-        mock_urlopen.return_value = self._mock_response(
+    @patch("agent_bom.http_client.sync_get")
+    def test_model_card_custom_code_advisory_is_separate_from_security_flags(self, mock_sync_get):
+        mock_sync_get.return_value = _mock_hf_response(
+            {
+                "author": "org",
+                "cardData": {"license": "apache-2.0"},
+                "gated": False,
+                "downloads": 100,
+                "tags": ["custom_code"],
+                "siblings": [{"rfilename": "model.safetensors", "lfs": {"sha256": "abc123"}}],
+            }
+        )
+        result = check_huggingface_provenance("org/custom-model")
+        assert result["security_flags"] == []
+        assert result["model_advisories"]
+        assert result["model_advisories"][0]["risk_type"] == "remote_code_on_model_load"
+
+    @patch("agent_bom.http_client.sync_get")
+    def test_no_model_card_flags(self, mock_sync_get):
+        mock_sync_get.return_value = _mock_hf_response(
             {
                 "author": "someone",
                 "gated": False,
@@ -163,9 +281,9 @@ class TestCheckHuggingFaceProvenance:
         flag_types = [f["type"] for f in result["security_flags"]]
         assert "NO_MODEL_CARD" in flag_types
 
-    @patch("agent_bom.model_files.urllib.request.urlopen")
-    def test_no_author_flags(self, mock_urlopen):
-        mock_urlopen.return_value = self._mock_response(
+    @patch("agent_bom.http_client.sync_get")
+    def test_no_author_flags(self, mock_sync_get):
+        mock_sync_get.return_value = _mock_hf_response(
             {
                 "cardData": {"license": "mit"},
                 "gated": False,
@@ -179,43 +297,39 @@ class TestCheckHuggingFaceProvenance:
         flag_types = [f["type"] for f in result["security_flags"]]
         assert "NO_AUTHOR" in flag_types
 
-    @patch("agent_bom.model_files.urllib.request.urlopen")
-    def test_model_not_found_404(self, mock_urlopen):
-        mock_urlopen.side_effect = urllib.error.HTTPError(
-            url="https://huggingface.co/api/models/nope/nope",
-            code=404,
-            msg="Not Found",
-            hdrs=None,
-            fp=None,
+    @patch("agent_bom.http_client.sync_get")
+    def test_model_not_found_404(self, mock_sync_get):
+        mock_sync_get.return_value = httpx.Response(
+            status_code=404,
+            json={"error": "Not Found"},
+            request=httpx.Request("GET", "https://huggingface.co/api/models/nope/nope"),
         )
         result = check_huggingface_provenance("nope/nope")
         assert result["author"] is None
         assert len(result["security_flags"]) == 1
         assert result["security_flags"][0]["type"] == "NO_PROVENANCE"
 
-    @patch("agent_bom.model_files.urllib.request.urlopen")
-    def test_api_error_500(self, mock_urlopen):
-        mock_urlopen.side_effect = urllib.error.HTTPError(
-            url="https://huggingface.co/api/models/err/err",
-            code=500,
-            msg="Internal Server Error",
-            hdrs=None,
-            fp=None,
+    @patch("agent_bom.http_client.sync_get")
+    def test_api_error_500(self, mock_sync_get):
+        mock_sync_get.return_value = httpx.Response(
+            status_code=500,
+            text="Internal Server Error",
+            request=httpx.Request("GET", "https://huggingface.co/api/models/err/err"),
         )
         result = check_huggingface_provenance("err/err")
         assert len(result["security_flags"]) == 1
         assert result["security_flags"][0]["type"] == "PROVENANCE_CHECK_FAILED"
 
-    @patch("agent_bom.model_files.urllib.request.urlopen")
-    def test_network_error(self, mock_urlopen):
-        mock_urlopen.side_effect = urllib.error.URLError("Connection refused")
+    @patch("agent_bom.http_client.sync_get")
+    def test_network_error(self, mock_sync_get):
+        mock_sync_get.return_value = None  # sync_get returns None on failure
         result = check_huggingface_provenance("some/model")
         assert len(result["security_flags"]) == 1
         assert result["security_flags"][0]["type"] == "PROVENANCE_CHECK_FAILED"
 
-    @patch("agent_bom.model_files.urllib.request.urlopen")
-    def test_sha256_not_available(self, mock_urlopen):
-        mock_urlopen.return_value = self._mock_response(
+    @patch("agent_bom.http_client.sync_get")
+    def test_sha256_not_available(self, mock_sync_get):
+        mock_sync_get.return_value = _mock_hf_response(
             {
                 "author": "test",
                 "cardData": {"license": "mit"},
@@ -281,7 +395,7 @@ class TestCLIFlags:
         from agent_bom.cli import scan
 
         runner = CliRunner()
-        result = runner.invoke(scan, ["--help"])
+        result = runner.invoke(scan, ["--help-all"])
         assert "--model-provenance" in result.output
 
     def test_hf_model_in_help(self):
@@ -290,5 +404,5 @@ class TestCLIFlags:
         from agent_bom.cli import scan
 
         runner = CliRunner()
-        result = runner.invoke(scan, ["--help"])
+        result = runner.invoke(scan, ["--help-all"])
         assert "--hf-model" in result.output

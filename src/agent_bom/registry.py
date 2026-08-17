@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from agent_bom.mcp_registry_text import dumps_registry_json
 from agent_bom.models import Package
 
 logger = logging.getLogger(__name__)
@@ -40,6 +43,55 @@ class RegistryUpdateResult:
     details: list[dict] = field(default_factory=list)
 
 
+@dataclass
+class RegistryFreshnessStatus:
+    """Operator-facing MCP registry freshness posture."""
+
+    status: str
+    last_synced_at: str | None
+    age_days: int | None
+    stale_after_days: int
+    server_count: int
+    sources: list[str]
+    airgapped: bool = False
+    error: str = ""
+
+    @property
+    def is_fresh(self) -> bool:
+        return self.status == "fresh"
+
+    @property
+    def needs_refresh(self) -> bool:
+        return self.status in {"stale", "never_synced"}
+
+    @property
+    def recommended_action(self) -> str:
+        if self.status == "fresh":
+            return "none"
+        if self.status == "airgapped":
+            return "verify bundled registry through your offline promotion process"
+        if self.status == "airgapped_stale":
+            return "refresh the bundled registry through your offline promotion process"
+        if self.status == "never_synced":
+            return "run agent-bom registry sync-all before relying on registry-derived evidence"
+        return "run agent-bom registry sync-all"
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "is_fresh": self.is_fresh,
+            "needs_refresh": self.needs_refresh,
+            "last_synced_at": self.last_synced_at,
+            "age_days": self.age_days,
+            "stale_after_days": self.stale_after_days,
+            "server_count": self.server_count,
+            "sources": self.sources,
+            "airgapped": self.airgapped,
+            "recommended_action": self.recommended_action,
+            "error": self.error,
+        }
+
+
 def _load_registry() -> dict:
     """Load the bundled MCP registry JSON."""
     try:
@@ -56,6 +108,88 @@ def _load_registry_full() -> dict:
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("Failed to load full MCP registry from %s: %s", _REGISTRY_PATH, exc)
         return {"servers": {}}
+
+
+def registry_server_count() -> int:
+    """Number of MCP servers in the bundled registry.
+
+    Single source of truth for every surface that advertises the registry's
+    size. Advertised counts must be derived from this, never hardcoded — the
+    bundled registry grows every sync and hardcoded copies go stale silently.
+    Returns 0 if the registry cannot be read, so a callable description string
+    never fails server construction.
+    """
+    return len(_load_registry())
+
+
+def _parse_registry_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        pass
+    try:
+        return datetime.strptime(value.strip(), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def registry_freshness_status(
+    *,
+    stale_after_days: int = 14,
+    data: dict | None = None,
+    now: datetime | None = None,
+) -> RegistryFreshnessStatus:
+    """Return freshness posture for the bundled MCP registry.
+
+    The registry can be refreshed from several sources, but normal scans should
+    stay offline/read-only. This summarizes the local catalog's age so operators
+    can decide whether to refresh before relying on registry-derived evidence.
+    """
+    stale_after_days = max(int(stale_after_days), 0)
+    registry_data = data if data is not None else _load_registry_full()
+    servers = registry_data.get("servers", {})
+    if not isinstance(servers, dict):
+        servers = {}
+
+    raw_sources = registry_data.get("_sources", [])
+    sources = [str(source) for source in raw_sources] if isinstance(raw_sources, list) else []
+    airgapped = os.environ.get("AGENT_BOM_REGISTRY_AIRGAPPED", "").strip().lower() in {"1", "true", "yes", "on"}
+    raw_synced = registry_data.get("_last_synced_at") or registry_data.get("_updated")
+    parsed = _parse_registry_timestamp(raw_synced)
+    if parsed is None:
+        return RegistryFreshnessStatus(
+            status="airgapped" if airgapped else "never_synced",
+            last_synced_at=str(raw_synced) if raw_synced else None,
+            age_days=None,
+            stale_after_days=stale_after_days,
+            server_count=len(servers),
+            sources=sources,
+            airgapped=airgapped,
+            error="missing_or_invalid_last_synced_at",
+        )
+
+    current = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+    age_days = max((current - parsed).days, 0)
+    status = "fresh" if age_days <= stale_after_days else "stale"
+    if airgapped and status == "stale":
+        status = "airgapped_stale"
+    return RegistryFreshnessStatus(
+        status=status,
+        last_synced_at=parsed.isoformat(),
+        age_days=age_days,
+        stale_after_days=stale_after_days,
+        server_count=len(servers),
+        sources=sources,
+        airgapped=airgapped,
+    )
 
 
 def _parse_version(version: str) -> Optional[tuple[int, ...]]:
@@ -295,7 +429,7 @@ async def update_registry_versions(
         from datetime import datetime, timezone
 
         data["_updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        _REGISTRY_PATH.write_text(json.dumps(data, indent=2) + "\n")
+        _REGISTRY_PATH.write_text(dumps_registry_json(data), encoding="utf-8")
 
     return result
 
@@ -507,7 +641,7 @@ def enrich_registry_entries(dry_run: bool = False) -> EnrichResult:
         from datetime import datetime, timezone
 
         data["_updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        _REGISTRY_PATH.write_text(json.dumps(data, indent=2) + "\n")
+        _REGISTRY_PATH.write_text(dumps_registry_json(data), encoding="utf-8")
 
     return result
 
@@ -522,6 +656,8 @@ class CVEEnrichResult:
     total: int = 0
     scannable: int = 0
     enriched: int = 0
+    updated: int = 0
+    cleared: int = 0
     total_cves: int = 0
     total_critical: int = 0
     total_kev: int = 0
@@ -617,7 +753,24 @@ async def enrich_registry_with_cves(
         vulns = osv_results.get(key, [])
 
         if not vulns:
-            if not dry_run and entry.get("known_cves"):
+            had_cve_metadata = bool(entry.get("known_cves") or entry.get("cve_summary"))
+            if had_cve_metadata:
+                result.updated += 1
+                result.cleared += 1
+                result.details.append(
+                    {
+                        "server": name,
+                        "package": pkg_name,
+                        "cve_count": 0,
+                        "ghsa_count": 0,
+                        "critical": 0,
+                        "kev": 0,
+                        "cves": [],
+                        "changed": True,
+                        "change_type": "cleared",
+                    }
+                )
+            if not dry_run and had_cve_metadata:
                 entry["known_cves"] = []
                 entry["cve_summary"] = {}
             continue
@@ -689,8 +842,12 @@ async def enrich_registry_with_cves(
             "fix_versions": fix_versions[:5],
         }
 
+        known_cves = cve_ids + [g for g in ghsa_ids if g not in cve_ids]
+        metadata_changed = entry.get("known_cves", []) != known_cves or entry.get("cve_summary", {}) != summary
+        if metadata_changed:
+            result.updated += 1
         if not dry_run:
-            entry["known_cves"] = cve_ids + [g for g in ghsa_ids if g not in cve_ids]
+            entry["known_cves"] = known_cves
             entry["cve_summary"] = summary
 
         result.enriched += 1
@@ -706,16 +863,18 @@ async def enrich_registry_with_cves(
                 "critical": critical_count,
                 "kev": kev_count,
                 "cves": cve_ids[:10],
+                "changed": metadata_changed,
+                "change_type": "updated" if metadata_changed else "unchanged",
             }
         )
 
     # Write updated registry
-    if not dry_run and result.enriched > 0:
+    if not dry_run and result.updated > 0:
         from datetime import datetime, timezone
 
         data["_cve_enriched"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         data["_updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        _REGISTRY_PATH.write_text(json.dumps(data, indent=2) + "\n")
+        _REGISTRY_PATH.write_text(dumps_registry_json(data), encoding="utf-8")
 
     return result
 

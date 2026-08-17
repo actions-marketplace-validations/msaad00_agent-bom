@@ -2,38 +2,42 @@
 
 from __future__ import annotations
 
-import re
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 if TYPE_CHECKING:
+    from agent_bom.ai_schemas import AIFindingAssessment
     from agent_bom.finding import Finding
 
-# ─── Package name normalization ──────────────────────────────────────────────
-# PEP 503: https://peps.python.org/pep-0503/#normalized-names
-# Ensures consistent matching across parsers, scanners, and cache.
-_NORMALIZE_RE = re.compile(r"[-_.]+")
+from agent_bom.advisory_sources import merge_advisory_sources
+from agent_bom.canonical_ids import (
+    canonical_agent_id,
+    canonical_mcp_prompt_id,
+    canonical_mcp_resource_id,
+    canonical_mcp_server_id,
+    canonical_mcp_tool_id,
+    canonical_package_id,
+    legacy_agent_id_v1,
+)
+from agent_bom.evidence.scan_run import ScanRun
+from agent_bom.package_utils import (
+    host_matches_domain as _host_matches_domain,
+)
+from agent_bom.package_utils import (
+    normalize_package_name,
+)
+from agent_bom.package_utils import parse_debian_source_name as parse_debian_source_name  # noqa: F401
+from agent_bom.package_utils import (
+    reference_host_and_path as _reference_host_and_path,
+)
 
 
-def normalize_package_name(name: str, ecosystem: str = "") -> str:
-    """Normalize a package name for consistent matching.
-
-    - **PyPI**: PEP 503 — lowercases and collapses ``-``, ``_``, ``.`` runs
-      to a single ``-``.  (e.g. ``Requests_OAuthlib`` → ``requests-oauthlib``)
-    - **npm**: lowercases only (scoped names preserved, e.g. ``@scope/Pkg`` → ``@scope/pkg``)
-    - **Other ecosystems**: lowercases only.
-
-    This is the single source of truth for name normalization across the
-    entire scanner pipeline (parsers → cache → OSV queries → result matching).
-    """
-    if not name:
-        return name
-    eco = ecosystem.lower()
-    if eco == "pypi":
-        return _NORMALIZE_RE.sub("-", name).lower()
-    return name.lower()
+def _utc_now_iso() -> str:
+    """Return a UTC ISO-8601 timestamp for discovery lifecycle defaults."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class Severity(str, Enum):
@@ -62,12 +66,19 @@ class AgentType(str, Enum):
     OPENCLAW = "openclaw"  # OpenClaw AI agent
     ROO_CODE = "roo-code"  # Roo Code (VS Code extension)
     AMAZON_Q = "amazon-q"  # Amazon Q Developer (VS Code)
-    TOOLHIVE = "toolhive"  # ToolHive MCP server manager
     DOCKER_MCP = "docker-mcp"  # Docker Desktop MCP Toolkit
     JETBRAINS_AI = "jetbrains-ai"  # JetBrains AI Assistant (IntelliJ, PyCharm, etc.)
     JUNIE = "junie"  # JetBrains Junie coding agent
     COPILOT_CLI = "copilot-cli"  # GitHub Copilot CLI (standalone)
     TABNINE = "tabnine"  # Tabnine AI assistant
+    SOURCEGRAPH_CODY = "sourcegraph-cody"  # Sourcegraph Cody AI assistant
+    AIDER = "aider"  # Aider AI pair programming
+    REPLIT_AGENT = "replit-agent"  # Replit Agent
+    VOID_EDITOR = "void"  # Void editor (open-source Cursor alternative)
+    AIDE = "aide"  # Aide AI IDE (VS Code fork)
+    TRAE = "trae"  # Trae AI IDE (ByteDance)
+    PIECES = "pieces"  # Pieces for Developers
+    MCP_CLI = "mcp-cli"  # mcp-cli standalone tool
     CUSTOM = "custom"
 
 
@@ -76,6 +87,19 @@ class TransportType(str, Enum):
     SSE = "sse"
     STREAMABLE_HTTP = "streamable-http"
     UNKNOWN = "unknown"
+
+
+class ServerSurface(str, Enum):
+    MCP = "mcp-server"
+    CONTAINER_IMAGE = "container-image"
+    OCI_TARBALL = "oci-tarball"
+    FILESYSTEM = "filesystem"
+    SBOM = "sbom"
+    EXTERNAL_SCAN = "external-scan"
+    OS_PACKAGES = "os-packages"
+    SAST = "sast"
+    AI_INVENTORY = "ai-inventory"
+    OTHER = "other"
 
 
 class AgentStatus(str, Enum):
@@ -90,6 +114,8 @@ class Vulnerability:
     id: str  # CVE or OSV ID
     summary: str
     severity: Severity
+    severity_source: Optional[str] = None  # "cvss", "osv_database", "osv_ecosystem", "ghsa_heuristic", etc.
+    confidence: float | None = None  # Data quality confidence score (0.0-1.0)
     cvss_score: Optional[float] = None
     fixed_version: Optional[str] = None
     references: list[str] = field(default_factory=list)
@@ -100,6 +126,8 @@ class Vulnerability:
     is_kev: bool = False  # CISA Known Exploited Vulnerability
     kev_date_added: Optional[str] = None  # Date added to KEV catalog
     kev_due_date: Optional[str] = None  # Remediation due date
+    published_at: Optional[str] = None  # Canonical advisory publish date
+    modified_at: Optional[str] = None  # Canonical advisory modified date
     nvd_published: Optional[str] = None  # NVD publish date
     nvd_modified: Optional[str] = None  # NVD last modified date
     nvd_status: Optional[str] = (
@@ -113,6 +141,52 @@ class Vulnerability:
     compliance_tags: dict[str, list[str]] = field(
         default_factory=dict
     )  # CVE-level framework tags, e.g. {"nist_csf": ["ID.RA-01"], "cis": ["CIS-02.3"]}
+    advisory_sources: list[str] = field(default_factory=list)  # osv / ghsa / nvidia_csaf / nvd / epss / cisa_kev
+    # distro_confirmed | osv_range | osv_ecosystem | unfixed_distro |
+    # ambiguous_distro_release | nvd_cpe_candidate
+    match_confidence_tier: Optional[str] = None
+    cvss_vector: Optional[str] = None
+    attack_vector: Optional[str] = None
+    attack_complexity: Optional[str] = None
+    privileges_required: Optional[str] = None
+    user_interaction: Optional[str] = None
+    network_exploitable: bool = False
+    # Affected functions/symbols the advisory names (OSV/GHSA
+    # ecosystem_specific.imports[].symbols). Optional — most advisories carry
+    # none. Consumed by agent_bom.reachability_cve to upgrade a finding to
+    # function-level reachability when one of these symbols is actually reached.
+    affected_symbols: list[str] = field(default_factory=list)
+    # Same affected symbols grouped by the advisory's import sub-package
+    # (OSV ``ecosystem_specific.imports[].path``), e.g.
+    # {"github.com/aws/aws-sdk-go/service/s3/s3crypto": ["Client.Do"]}.
+    # Populated only when the advisory carries import-path data (Go). Lets
+    # agent_bom.reachability_cve constrain a ``function_reachable`` upgrade to
+    # the sub-package the advisory names, instead of unioning identically
+    # named symbols across every sub-package of a large module.
+    affected_symbols_by_path: dict[str, list[str]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Sanitize fixed_version — filter git SHAs and non-version strings."""
+        self.advisory_sources = merge_advisory_sources(*self.advisory_sources)
+        from agent_bom.exploitability import parse_cvss_vector_signals
+
+        signals = parse_cvss_vector_signals(self.cvss_vector)
+        self.attack_vector = self.attack_vector or signals.attack_vector
+        self.attack_complexity = self.attack_complexity or signals.attack_complexity
+        self.privileges_required = self.privileges_required or signals.privileges_required
+        self.user_interaction = self.user_interaction or signals.user_interaction
+        self.network_exploitable = bool(self.network_exploitable or signals.network_exploitable)
+        if self.fixed_version:
+            v = self.fixed_version.lstrip("v")
+            # Git SHA (40 hex chars)
+            if len(v) == 40 and all(c in "0123456789abcdef" for c in v):
+                self.fixed_version = None
+            # Short SHA (7-12 hex only, no dots/dashes)
+            elif 7 <= len(v) <= 12 and all(c in "0123456789abcdef" for c in v):
+                self.fixed_version = None
+            # No digits at all
+            elif not any(c.isdigit() for c in v):
+                self.fixed_version = None
 
     @property
     def is_actively_exploited(self) -> bool:
@@ -125,6 +199,91 @@ class Vulnerability:
         from agent_bom.config import EPSS_ACTIVE_EXPLOITATION_THRESHOLD
 
         return self.is_kev or (self.epss_score is not None and self.epss_score > EPSS_ACTIVE_EXPLOITATION_THRESHOLD)
+
+    @property
+    def exploit_likelihood(self) -> str:
+        """Graded exploit-likelihood signal derived from CISA KEV + EPSS
+        percentile + EPSS probability (issue #486 scope-cut).
+
+        Returns one of:
+
+        - ``"actively_exploited"`` — present in CISA KEV (observed
+          exploitation in the wild).
+        - ``"likely_exploited"`` — EPSS probability at or above the
+          ``EPSS_ACTIVE_EXPLOITATION_THRESHOLD`` (default 0.5) OR EPSS
+          percentile ≥ 95. Sophisticated attackers are known to be
+          working on (or using) exploits.
+        - ``"public_exploit"`` — EPSS percentile ≥ 80. Public exploit
+          code exists but widespread exploitation not yet observed.
+        - ``"theoretical"`` — no KEV, but EPSS *is* present and low.
+          Exploitation is assessed as possible-but-not-evidenced.
+        - ``"unassessed"`` — no KEV, no EPSS score, and no EPSS
+          percentile. There is no basis for any exploit assessment, so
+          no assessed-sounding label is fabricated from absent signal.
+
+        The monotonic ordering means the highest-severity signal wins
+        (KEV always beats EPSS-only signals) and never double-counts.
+
+        Not a replacement for ``is_actively_exploited`` (boolean); this
+        property provides the four-level gradation downstream consumers
+        (HTML, SARIF, dashboards) use for prioritization and
+        triage-ordering.
+        """
+        from agent_bom.config import EPSS_ACTIVE_EXPLOITATION_THRESHOLD
+
+        if self.is_kev:
+            return "actively_exploited"
+        if self.epss_score is None and self.epss_percentile is None:
+            return "unassessed"  # no signal → no fabricated assessment
+        epss = self.epss_score or 0.0
+        pct = self.epss_percentile or 0.0
+        if epss >= EPSS_ACTIVE_EXPLOITATION_THRESHOLD or pct >= 95.0:
+            return "likely_exploited"
+        if pct >= 80.0:
+            return "public_exploit"
+        return "theoretical"
+
+    @property
+    def all_advisory_sources(self) -> list[str]:
+        """Return advisory + enrichment sources that contributed to this finding."""
+        derived_sources: list[str | None] = []
+        if self.id.startswith("GHSA-") or any(alias.startswith("GHSA-") for alias in self.aliases):
+            derived_sources.append("ghsa")
+        if self.references:
+            ref_hosts_paths = [_reference_host_and_path(ref) for ref in self.references]
+            if any(
+                host == "github.com" and (path.startswith("/advisories/") or path.startswith("/advisory/"))
+                for host, path in ref_hosts_paths
+            ):
+                derived_sources.append("ghsa")
+            if any(
+                _host_matches_domain(host, "nvidia.com") or _host_matches_domain(host, "nvidia.github.io")
+                for host, _path in ref_hosts_paths
+            ):
+                derived_sources.append("nvidia_csaf")
+            if any(host == "nvd.nist.gov" for host, _path in ref_hosts_paths):
+                derived_sources.append("nvd")
+        if self.nvd_status or self.nvd_published or self.nvd_modified:
+            derived_sources.append("nvd")
+        if self.epss_score is not None:
+            derived_sources.append("epss")
+        if self.is_kev:
+            derived_sources.append("cisa_kev")
+        return merge_advisory_sources(*self.advisory_sources, *derived_sources)
+
+    @property
+    def advisory_coverage_state(self) -> str:
+        """Summarize whether the finding is primary-only or enrichment-backed."""
+        sources = self.all_advisory_sources
+        has_primary = any(source in {"osv", "ghsa", "nvidia_csaf"} for source in sources)
+        has_enrichment = any(source in {"nvd", "epss", "cisa_kev"} for source in sources)
+        if has_primary and has_enrichment:
+            return "enriched"
+        if has_primary:
+            return "primary_only"
+        if has_enrichment:
+            return "enrichment_only"
+        return "unknown"
 
     @property
     def risk_level(self) -> str:
@@ -146,6 +305,49 @@ class Vulnerability:
         return "LOW"
 
 
+def compute_confidence(vuln: Vulnerability) -> float:
+    """Compute 0.0-1.0 data quality confidence for a vulnerability."""
+    score = 0.0
+    if vuln.cvss_score is not None:
+        score += 0.25
+    if vuln.cvss_vector:
+        score += 0.05
+    if vuln.epss_score is not None:
+        score += 0.20
+    if vuln.severity_source and vuln.severity_source != "unknown":
+        score += 0.15
+    if getattr(vuln, "cwe_ids", None):
+        score += 0.15
+    if vuln.fixed_version:
+        score += 0.10
+    if vuln.cvss_score is not None and vuln.severity_source == "cvss":
+        score += 0.15  # NVD-analyzed quality
+    return min(score, 1.0)
+
+
+@dataclass
+class PackageOccurrence:
+    """Concrete package observation metadata for layered/container surfaces."""
+
+    layer_index: int
+    layer_id: str
+    package_path: Optional[str] = None
+    layer_path: Optional[str] = None
+    created_by: Optional[str] = None
+    dockerfile_instruction: Optional[str] = None
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable representation."""
+        return {
+            "layer_index": self.layer_index,
+            "layer_id": self.layer_id,
+            "layer_path": self.layer_path,
+            "package_path": self.package_path,
+            "created_by": self.created_by,
+            "dockerfile_instruction": self.dockerfile_instruction,
+        }
+
+
 @dataclass
 class Package:
     """A software package dependency."""
@@ -154,13 +356,26 @@ class Package:
     version: str
     ecosystem: str  # npm, pypi, cargo, go, etc.
     purl: Optional[str] = None  # Package URL
+    source_package: Optional[str] = None  # Debian/OS source package name for advisory matching
+    distro_name: Optional[str] = None  # OS distribution family for OS packages (e.g. debian, ubuntu, alpine)
+    distro_version: Optional[str] = None  # OS distribution version for OS packages (e.g. 13, 24.04, 3.21)
     vulnerabilities: list[Vulnerability] = field(default_factory=list)
     is_direct: bool = True  # vs transitive dependency
     parent_package: Optional[str] = None  # Name of parent package (for transitive deps)
     dependency_depth: int = 0  # 0 for direct, 1+ for transitive
+    dependency_scope: str = "runtime"  # runtime, optional, peer, extra, conditional, dev, unknown
+    reachability_evidence: str = "runtime_dependency"  # runtime_dependency, declaration_only, lockfile, unknown
     resolved_from_registry: bool = False  # True if resolved dynamically vs from lock file
     registry_version: Optional[str] = None  # Latest version from registry (for drift comparison)
     version_source: str = "detected"  # "detected" | "manifest" | "registry_fallback"
+    declared_version: Optional[str] = None  # Version/ref declared by command or manifest (may be latest/floating)
+    resolved_version: Optional[str] = None  # Exact version selected after resolution, when known
+    version_confidence: Optional[str] = None  # ADR-007 confidence enum for the resolved version
+    version_resolved_at: Optional[str] = None  # Timestamp when version was resolved
+    version_evidence: list[dict[str, Any]] = field(default_factory=list)  # Structured evidence for version source
+    version_conflicts: list[dict[str, Any]] = field(default_factory=list)  # Conflicting source/version observations
+    floating_reference: bool = False  # True when the package/source ref is mutable (latest/main/no digest)
+    floating_reference_reason: Optional[str] = None  # Why the ref is mutable
     is_malicious: bool = False  # True if flagged as known malicious (MAL- prefix in OSV)
     malicious_reason: Optional[str] = None  # Why this package is flagged (e.g. "MAL-2024-1234")
     license: Optional[str] = None  # SPDX license identifier (e.g. "MIT", "Apache-2.0")
@@ -179,12 +394,32 @@ class Package:
     # OpenSSF Scorecard enrichment (populated by --scorecard flag)
     scorecard_score: Optional[float] = None  # 0.0-10.0 overall score
     scorecard_checks: dict[str, int] = field(default_factory=dict)  # check_name -> score (-1 to 10)
+    scorecard_repo: Optional[str] = None  # Resolved GitHub owner/repo when available
+    scorecard_lookup_state: Optional[str] = None  # enriched | unresolved | failed
+    scorecard_lookup_reason: Optional[str] = None  # why enrichment did not succeed
+
+    # Per-component checksums keyed by canonical algorithm (e.g. "SHA-512"),
+    # value is lowercase hex. Populated from lockfile integrity / registry
+    # digests where the source provides them; surfaced in SBOM output.
+    checksums: dict[str, str] = field(default_factory=dict)
+
+    # Provenance / supply chain attestation (populated by --verify-integrity)
+    integrity_verified: Optional[bool] = None  # SHA256/SRI verified against registry
+    # ``None`` = the registry never answered (not asked, or asked and it was
+    # unreachable). ``provenance_status`` says which; see
+    # ``integrity.PROVENANCE_UNKNOWN_STATUSES``.
+    provenance_attested: Optional[bool] = None  # SLSA/PEP740/sum.golang.org attestation found
+    provenance_source: Optional[str] = None  # "npm_slsa", "pypi_pep740", "go_sumdb"
+    # Registry's own answer: verified | not_published | not_provenance | partial | unavailable
+    provenance_status: Optional[str] = None
 
     # Auto-discovery metadata (populated when not in bundled registry)
     auto_risk_level: Optional[str] = None
     auto_risk_justification: Optional[str] = None
     maintainer_count: Optional[int] = None
     source_repo: Optional[str] = None
+    occurrences: list[PackageOccurrence] = field(default_factory=list)  # Layer/file provenance for concrete package observations
+    discovery_provenance: Optional[dict[str, Any]] = None  # Sanitized discovery provenance contract for this package asset
 
     @property
     def stable_id(self) -> str:
@@ -193,16 +428,57 @@ class Package:
         Same ecosystem/name/version (or purl when available) always produces
         the same ID across scans — enables first-seen/last-seen tracking.
         """
-        import uuid as _uuid
+        return canonical_package_id(self.name, self.version, self.ecosystem, self.purl)
 
-        _ns = _uuid.UUID("7f3e4b2a-9c1d-5f8e-a0b4-12c3d4e5f6a7")
-        purl = self.purl or f"pkg:{self.ecosystem}/{self.name}@{self.version}"
-        fingerprint = f"package:{purl.lower().strip()}"
-        return str(_uuid.uuid5(_ns, fingerprint))
+    @property
+    def canonical_id(self) -> str:
+        """Canonical alias for stable_id used by report and graph consumers."""
+        return self.stable_id
+
+    @property
+    def lookup_names(self) -> list[str]:
+        """Candidate package names for vulnerability matching."""
+        names: list[str] = []
+
+        def add_name(candidate: str | None) -> None:
+            candidate = (candidate or "").strip()
+            if not candidate:
+                return
+            norm_candidate = normalize_package_name(candidate, self.ecosystem)
+            if all(normalize_package_name(existing, self.ecosystem) != norm_candidate for existing in names):
+                names.append(candidate)
+
+        add_name(self.name)
+        if self.ecosystem.lower() == "maven" and self.purl:
+            try:
+                from packageurl import PackageURL
+
+                parsed = PackageURL.from_string(self.purl)
+            except Exception:
+                parsed = None
+            if parsed is not None and (parsed.type or "").lower() == "maven" and parsed.namespace and parsed.name:
+                add_name(f"{parsed.namespace}:{parsed.name}")
+        if self.source_package:
+            source_name = self.source_package.strip()
+            if source_name and normalize_package_name(source_name, self.ecosystem) != normalize_package_name(self.name, self.ecosystem):
+                add_name(source_name)
+        return names
 
     @property
     def has_vulnerabilities(self) -> bool:
         return len(self.vulnerabilities) > 0
+
+    @property
+    def primary_occurrence(self) -> Optional[PackageOccurrence]:
+        """First observed occurrence in deterministic layer order."""
+        if not self.occurrences:
+            return None
+        return min(self.occurrences, key=lambda occ: (occ.layer_index, occ.layer_id, occ.package_path or ""))
+
+    @property
+    def layer_count(self) -> int:
+        """Number of unique image layers that contributed this package."""
+        return len({(occ.layer_index, occ.layer_id) for occ in self.occurrences})
 
     @property
     def max_severity(self) -> Severity:
@@ -221,7 +497,42 @@ class MCPTool:
 
     name: str
     description: str
-    input_schema: Optional[dict] = None
+    discovery_source: Optional[str] = None
+    discovery_confidence: Optional[str] = None
+    input_schema: Optional[dict[str, Any]] = None
+    declared_capabilities: list[str] = field(default_factory=list)
+    schema_findings: list[str] = field(default_factory=list)
+    schema_rule_findings: list[dict[str, Any]] = field(default_factory=list)
+    server_canonical_id: Optional[str] = None  # Owning server scope (stamped by MCPServer)
+
+    @property
+    def stable_id(self) -> str:
+        """Deterministic ID for this MCP tool, scoped to its owning server."""
+        return canonical_mcp_tool_id(self.name, self.input_schema, server_id=self.server_canonical_id)
+
+    @property
+    def canonical_id(self) -> str:
+        """Canonical alias for stable_id used by report and graph consumers."""
+        return self.stable_id
+
+    @property
+    def fingerprint(self) -> str:
+        return self.stable_id
+
+    @property
+    def risk_score(self) -> int:
+        """Heuristic risk score for the tool based on schema findings."""
+        score = 0
+        for finding in self.schema_findings:
+            if "shell-execution-capability" in finding:
+                score += 4
+            elif "network-egress-capability" in finding:
+                score += 3
+            elif "filesystem-capability" in finding:
+                score += 2
+            else:
+                score += 1
+        return min(score, 10)
 
 
 @dataclass
@@ -232,6 +543,73 @@ class MCPResource:
     name: str
     description: str = ""
     mime_type: Optional[str] = None
+    content_findings: list[str] = field(default_factory=list)
+    server_canonical_id: Optional[str] = None  # Owning server scope (stamped by MCPServer)
+
+    @property
+    def stable_id(self) -> str:
+        """Deterministic ID for this MCP resource, scoped to its owning server."""
+        return canonical_mcp_resource_id(self.uri, self.mime_type, server_id=self.server_canonical_id)
+
+    @property
+    def canonical_id(self) -> str:
+        """Canonical alias for stable_id used by report and graph consumers."""
+        return self.stable_id
+
+    @property
+    def fingerprint(self) -> str:
+        return self.stable_id
+
+    @property
+    def risk_score(self) -> int:
+        """Heuristic risk score for the resource based on content findings."""
+        score = 0
+        for finding in self.content_findings:
+            if "hidden-instruction-surface" in finding or "prompt-bearing-resource" in finding:
+                score += 3
+            elif "mutable-resource" in finding:
+                score += 2
+            else:
+                score += 1
+        return min(score, 10)
+
+
+@dataclass
+class MCPPrompt:
+    """A prompt template exposed by an MCP server."""
+
+    name: str
+    description: str = ""
+    arguments: list[dict[str, object]] = field(default_factory=list)
+    content_findings: list[str] = field(default_factory=list)
+    server_canonical_id: Optional[str] = None  # Owning server scope (stamped by MCPServer)
+
+    @property
+    def stable_id(self) -> str:
+        """Deterministic ID for this MCP prompt descriptor, scoped to its owning server."""
+        return canonical_mcp_prompt_id(self.name, self.arguments, server_id=self.server_canonical_id)
+
+    @property
+    def canonical_id(self) -> str:
+        """Canonical alias for stable_id used by report and graph consumers."""
+        return self.stable_id
+
+    @property
+    def fingerprint(self) -> str:
+        return self.stable_id
+
+    @property
+    def risk_score(self) -> int:
+        """Heuristic risk score for prompt metadata findings."""
+        score = 0
+        for finding in self.content_findings:
+            if "system-prompt-surface" in finding or "hidden-instruction-surface" in finding:
+                score += 3
+            elif "required-freeform-argument" in finding:
+                score += 2
+            else:
+                score += 1
+        return min(score, 10)
 
 
 @dataclass
@@ -276,6 +654,7 @@ class MCPServer:
     url: Optional[str] = None  # For SSE/HTTP transports
     tools: list[MCPTool] = field(default_factory=list)
     resources: list[MCPResource] = field(default_factory=list)
+    prompts: list[MCPPrompt] = field(default_factory=list)
     packages: list[Package] = field(default_factory=list)
     config_path: Optional[str] = None  # Where this server was discovered
     working_dir: Optional[str] = None  # Server's working directory
@@ -285,20 +664,91 @@ class MCPServer:
     permission_profile: Optional[PermissionProfile] = None
     security_blocked: bool = False  # True if server was rejected for security reasons
     security_warnings: list[str] = field(default_factory=list)  # Security issues found during discovery
+    security_intelligence: list[dict[str, object]] = field(default_factory=list)
+    surface: ServerSurface = ServerSurface.MCP
+    discovery_sources: list[str] = field(default_factory=list)
+    discovery_provenance: Optional[dict[str, Any]] = None  # Sanitized discovery provenance contract for this server asset
+
+    def __post_init__(self) -> None:
+        """Scope child tool/resource/prompt identities to this server."""
+        self.stamp_child_identities()
+
+    def stamp_child_identities(self) -> None:
+        """Stamp owned tools/resources/prompts with this server's canonical id.
+
+        Child ids are scoped to their owning server so a same-named tool on two
+        different servers never collides onto one identity. Call again after
+        mutating ``command``/``url``/``registry_id`` or appending children.
+        """
+        scope = self.canonical_id
+        for child in (*self.tools, *self.resources, *self.prompts):
+            # Some legacy paths populate these lists with plain dicts; only model
+            # objects carry the scope field.
+            if hasattr(child, "server_canonical_id"):
+                child.server_canonical_id = scope
 
     @property
     def stable_id(self) -> str:
         """Deterministic ID for this MCP server.
 
         Uses registry_id when available (most stable identifier), otherwise
-        falls back to name+command so the same server is always the same ID.
+        falls back to a url/command/args discriminator that mirrors discovery's
+        dedup identity so distinct servers (e.g. two remote SSE servers with no
+        command but different urls) never collapse onto one ID.
         """
+        return canonical_mcp_server_id(
+            self.name,
+            self.command,
+            registry_id=self.registry_id,
+            url=self.url,
+            args=self.args,
+        )
+
+    @property
+    def canonical_id(self) -> str:
+        """Canonical alias for stable_id used by report and graph consumers."""
+        return self.stable_id
+
+    @property
+    def auth_mode(self) -> str:
+        """Best-effort auth posture classification for the server."""
+        credential_names = self.credential_names
+        if credential_names:
+            return "env-credentials"
+        if self.url and "@" in self.url:
+            return "url-embedded-credentials"
+        if self.url:
+            return "network-no-auth-observed"
+        return "local-stdio"
+
+    @property
+    def fingerprint(self) -> str:
+        """Deterministic runtime/config fingerprint for the server."""
         import uuid as _uuid
 
         _ns = _uuid.UUID("7f3e4b2a-9c1d-5f8e-a0b4-12c3d4e5f6a7")
-        identifier = self.registry_id or f"{self.name}:{self.command}"
-        fingerprint = f"mcp_server:{identifier.lower().strip()}"
-        return str(_uuid.uuid5(_ns, fingerprint))
+        tool_ids = sorted(t.stable_id for t in self.tools)
+        resource_ids = sorted(r.stable_id for r in self.resources)
+        prompt_ids = sorted(p.stable_id for p in self.prompts)
+        env_keys = sorted(self.credential_names)
+        raw = json.dumps(
+            {
+                "registry_id": self.registry_id,
+                "name": self.name,
+                "command": self.command,
+                "args": self.args,
+                "url": self.url,
+                "transport": self.transport.value,
+                "auth_mode": self.auth_mode,
+                "credential_refs": env_keys,
+                "tool_ids": tool_ids,
+                "resource_ids": resource_ids,
+                "prompt_ids": prompt_ids,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return str(_uuid.uuid5(_ns, f"mcp_server_fingerprint:{raw}"))
 
     @property
     def vulnerable_packages(self) -> list[Package]:
@@ -311,16 +761,26 @@ class MCPServer:
     @property
     def has_credentials(self) -> bool:
         """Check if env vars suggest credentials are present."""
-        from agent_bom.constants import SENSITIVE_PATTERNS
+        from agent_bom.constants import is_credential_key
 
-        return any(any(pat in k.lower() for pat in SENSITIVE_PATTERNS) for k in self.env)
+        return any(is_credential_key(key) for key in self.env)
 
     @property
     def credential_names(self) -> list[str]:
         """Return names of env vars that look like credentials."""
-        from agent_bom.constants import SENSITIVE_PATTERNS
+        from agent_bom.constants import is_credential_key
 
-        return [k for k in self.env if any(pat in k.lower() for pat in SENSITIVE_PATTERNS)]
+        return [key for key in self.env if is_credential_key(key)]
+
+    @property
+    def is_mcp_surface(self) -> bool:
+        """True only for real MCP servers, not synthetic scan wrappers."""
+        return self.surface == ServerSurface.MCP
+
+    @property
+    def allows_registry_resolution(self) -> bool:
+        """Whether MCP registry/marketplace fallback is valid for this surface."""
+        return self.surface == ServerSurface.MCP
 
 
 @dataclass
@@ -334,21 +794,64 @@ class Agent:
     version: Optional[str] = None
     source: Optional[str] = None  # Inventory source (e.g. "snowflake", "aws", "local")
     status: AgentStatus = AgentStatus.CONFIGURED
+    discovered_at: str = field(default_factory=_utc_now_iso)
+    last_seen: Optional[str] = None
     parent_agent: Optional[str] = None  # Parent agent name (for spawn tree / delegation)
-    metadata: dict = field(default_factory=dict)  # Extra config data (permissions, hooks, etc.)
+    metadata: dict[str, object] = field(default_factory=dict)  # Extra config data (permissions, hooks, etc.)
+    automation_settings: list[Any] = field(default_factory=list)  # Risky automation settings (scheduled tasks, etc.)
+    discovery_provenance: Optional[dict[str, Any]] = None  # Sanitized discovery provenance contract for this agent asset
+    # Per-run discovery envelope (#2083): trust contract for THIS scan run
+    # -- scan_mode, discovery_scope, permissions_used, redaction_status.
+    # Stored as a dict so the model stays JSON-friendly without dragging
+    # `discovery_envelope.DiscoveryEnvelope` into the import path; producers
+    # populate via `DiscoveryEnvelope.to_dict()` and consumers can re-hydrate
+    # via `DiscoveryEnvelope.from_dict()`.
+    discovery_envelope: Optional[dict[str, Any]] = None
+    # Strong external/device identities are distinct from ``source``, which is
+    # only collector/provider provenance (for example ``aws-bedrock``).
+    source_id: Optional[str] = None
+    device_fingerprint: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        """Backfill lifecycle fields for legacy Agent construction paths."""
+        if not self.discovered_at:
+            self.discovered_at = _utc_now_iso()
+        if not self.last_seen:
+            self.last_seen = self.discovered_at
 
     @property
     def stable_id(self) -> str:
         """Deterministic ID for this agent.
 
-        Canonical identity: agent_type + name. Same agent configuration
-        always resolves to the same ID across scans.
+        Device evidence wins over an explicit endpoint/source ID. Otherwise,
+        identity is agent_type + name + install location. Collector provenance
+        is deliberately excluded because one provider scan returns many agents.
         """
-        import uuid as _uuid
+        return canonical_agent_id(
+            self.agent_type.value,
+            self.name,
+            source_id=self.source_id or "",
+            device_fingerprint=self.device_fingerprint or "",
+            config_path=self.config_path,
+        )
 
-        _ns = _uuid.UUID("7f3e4b2a-9c1d-5f8e-a0b4-12c3d4e5f6a7")
-        fingerprint = f"agent:{self.agent_type.value}:{self.name.lower().strip()}"
-        return str(_uuid.uuid5(_ns, fingerprint))
+    @property
+    def previous_canonical_ids(self) -> list[str]:
+        """Pre-v2 aliases used to migrate persisted rows and historical joins."""
+        if self.source_id or self.device_fingerprint:
+            return []
+        legacy_id = legacy_agent_id_v1(
+            self.agent_type.value,
+            self.name,
+            source=self.source or "",
+            config_path=self.config_path,
+        )
+        return [] if legacy_id == self.stable_id else [legacy_id]
+
+    @property
+    def canonical_id(self) -> str:
+        """Canonical alias for stable_id used by report and graph consumers."""
+        return self.stable_id
 
     @property
     def total_packages(self) -> int:
@@ -376,7 +879,8 @@ class BlastRadius:
     affected_servers: list[MCPServer]
     affected_agents: list[Agent]
     exposed_credentials: list[str]  # Credential env var names at risk
-    exposed_tools: list[MCPTool]  # Tools accessible through compromised path
+    exposed_tools: list[MCPTool]  # Introspected / confirmed tools on the impacted path
+    phantom_tools: list[MCPTool] = field(default_factory=list)  # Registry-only, unverified tools (listed, not scored)
     risk_score: float = 0.0  # 0-10
     ai_risk_context: Optional[str] = None  # AI-native risk explanation when relevant
     owasp_tags: list[str] = field(default_factory=list)  # OWASP LLM Top 10 codes, e.g. ["LLM05", "LLM06"]
@@ -391,14 +895,46 @@ class BlastRadius:
     soc2_tags: list[str] = field(default_factory=list)  # SOC 2 TSC, e.g. ["CC7.1"]
     cis_tags: list[str] = field(default_factory=list)  # CIS Controls v8, e.g. ["CIS-07.1"]
     cmmc_tags: list[str] = field(default_factory=list)  # CMMC 2.0 Level 2, e.g. ["RA.L2-3.11.2"]
+    nist_800_53_tags: list[str] = field(default_factory=list)  # NIST 800-53 Rev 5, e.g. ["RA-5", "SI-2"]
+    fedramp_tags: list[str] = field(default_factory=list)  # FedRAMP Moderate baseline, e.g. ["RA-5"]
+    pci_dss_tags: list[str] = field(default_factory=list)  # PCI DSS v4.0, e.g. ["Req-6.3"]
     ai_summary: Optional[str] = None  # LLM-generated contextual risk narrative
+    suppressed: bool = False  # True when a tenant suppression/feedback rule covers this finding
+    suppression_id: Optional[str] = None
+    suppression_state: Optional[str] = None
+    suppression_reason: Optional[str] = None
+    unsuppressed_risk_score: Optional[float] = None
+
+    # CWE-aware impact context
+    impact_category: str = "code-execution"  # CWE-derived: code-execution, file-access, availability, etc.
+    all_server_credentials: list[str] = field(default_factory=list)  # Full credential set before CWE filtering
+    all_server_tools: list[MCPTool] = field(default_factory=list)  # Full tool set before CWE filtering
+    attack_vector_summary: Optional[str] = None  # Human-readable attack path description
 
     # Multi-hop delegation fields
     hop_depth: int = 1  # How many hops from the vulnerable package (1 = direct)
     delegation_chain: list[str] = field(default_factory=list)  # e.g. ["server1→agent1→server2→agent2"]
-    transitive_agents: list[dict] = field(default_factory=list)  # Agents reached via delegation
+    transitive_agents: list[dict[str, Any]] = field(default_factory=list)  # Agents reached via delegation
     transitive_credentials: list[str] = field(default_factory=list)  # Credentials exposed transitively
     transitive_risk_score: float = 0.0  # Risk score weighted by hop distance
+
+    # Graph-walk reachability (populated by agent_bom.graph.dependency_reach
+    # via apply_dependency_reachability_to_blast_radii after the unified
+    # graph is built). ``None`` means the engine did not run for this scan;
+    # ``False`` means the package sits in the closure but no agent traversal
+    # along USES / DEPENDS_ON / CONTAINS / PROVIDES_TOOL reaches it.
+    graph_reachable: Optional[bool] = None
+    graph_min_hop_distance: Optional[int] = None
+    graph_reachable_from_agents: list[str] = field(default_factory=list)
+
+    # Function-level symbol reachability (populated by
+    # agent_bom.reachability_cve via apply_symbol_reachability_to_blast_radii
+    # after AST symbol-reach is available). ``None`` means the join did not
+    # run. Otherwise one of "function_reachable" / "package_reachable" /
+    # "unreachable"; ``reachable_affected_symbols`` carries the matched
+    # advisory symbols when function-reachable.
+    symbol_reachability: Optional[str] = None
+    reachable_affected_symbols: list[str] = field(default_factory=list)
 
     def calculate_risk_score(self) -> float:
         """Calculate contextual risk score based on blast radius.
@@ -407,6 +943,18 @@ class BlastRadius:
         environment variables.  See :mod:`agent_bom.config` for defaults and
         documentation.
         """
+        from agent_bom.vex import is_vex_suppressed
+
+        if self.suppressed:
+            self.risk_score = 0.0
+            self.transitive_risk_score = 0.0
+            return self.risk_score
+
+        if is_vex_suppressed(self.vulnerability):
+            self.risk_score = 0.0
+            self.transitive_risk_score = 0.0
+            return self.risk_score
+
         from agent_bom.config import (
             EPSS_CRITICAL_THRESHOLD,
             RISK_AGENT_CAP,
@@ -461,11 +1009,117 @@ class BlastRadius:
             elif self.package.scorecard_score < RISK_SCORECARD_TIER3_THRESHOLD:
                 scorecard_boost = RISK_SCORECARD_TIER3_BOOST
 
-        self.risk_score = min(
-            base + agent_factor + cred_factor + tool_factor + ai_boost + kev_boost + epss_boost + scorecard_boost,
-            10.0,
+        # Graph-walk reachability adjustment. When the engine has run AND
+        # produced a definitive answer, apply a small contextual nudge so
+        # operators triaging by score see reachable findings rise above
+        # otherwise-equivalent unreachable ones. ``None`` (engine did not
+        # run) leaves scoring unchanged so non-graph callsites stay stable.
+        from agent_bom.config import (
+            RISK_REACHABLE_BOOST,
+            RISK_UNREACHABLE_PENALTY,
+        )
+
+        reach_adjustment = 0.0
+        if self.graph_reachable is True:
+            reach_adjustment = RISK_REACHABLE_BOOST
+        elif self.graph_reachable is False:
+            reach_adjustment = -RISK_UNREACHABLE_PENALTY
+
+        sym = getattr(self, "symbol_reachability", None)
+        if sym == "function_reachable":
+            reach_adjustment = max(reach_adjustment, RISK_REACHABLE_BOOST)
+        elif sym == "unreachable":
+            reach_adjustment = min(reach_adjustment, -RISK_UNREACHABLE_PENALTY)
+
+        self.risk_score = max(
+            0.0,
+            min(
+                base + agent_factor + cred_factor + tool_factor + ai_boost + kev_boost + epss_boost + scorecard_boost + reach_adjustment,
+                10.0,
+            ),
         )
         return self.risk_score
+
+    @property
+    def reachability(self) -> str:
+        """Classify how reachable this vulnerability is through the blast radius.
+
+        Returns:
+            "confirmed"  — credentials OR tools exposed + direct dependency
+            "likely"     — credentials OR tools exposed OR direct dep with agents
+            "unlikely"   — transitive dep, no creds, no tools, LOW severity
+            "unknown"    — insufficient data to determine
+        """
+        has_creds = bool(self.exposed_credentials)
+        has_tools = bool(self.exposed_tools)
+        is_direct = self.package.is_direct
+        is_high = self.vulnerability.severity in (Severity.CRITICAL, Severity.HIGH)
+        has_agents = bool(self.affected_agents)
+        declaration_only = self.package.reachability_evidence == "declaration_only"
+
+        if (has_creds or has_tools) and is_direct:
+            return "confirmed"
+        if declaration_only and not has_creds and not has_tools:
+            return "unknown"
+        if has_creds or has_tools or (is_direct and has_agents) or is_high:
+            return "likely"
+        if not is_direct and not has_creds and not has_tools:
+            return "unlikely"
+        return "unknown"
+
+    @property
+    def is_actionable(self) -> bool:
+        """Whether this finding warrants user attention in default output.
+
+        LOW/MEDIUM transitive deps with no blast radius context are noise.
+        Users can still see them with --verbose.
+        """
+        from agent_bom.vex import is_vex_suppressed
+
+        if self.suppressed:
+            return False
+        if is_vex_suppressed(self.vulnerability):
+            return False
+        if self.vulnerability.is_kev:
+            return True  # KEV = always actionable
+        if self.vulnerability.severity in (Severity.CRITICAL, Severity.HIGH):
+            return True
+        if self.exposed_credentials or self.exposed_tools:
+            return True
+        if self.package.is_direct:
+            return True
+        if self.package.is_malicious:
+            return True
+        return False
+
+    @property
+    def layer_attribution(self) -> list[PackageOccurrence]:
+        """Concrete package occurrences that carry this vulnerability."""
+        return sorted(self.package.occurrences, key=lambda occ: (occ.layer_index, occ.layer_id, occ.package_path or ""))
+
+
+def classify_agent_kind(agent: "Agent") -> str:
+    """Display-only classification of a discovered agent record.
+
+    Distinguishes what "agent" actually means to avoid overstating autonomy:
+
+    - ``"client"`` — an AI **client/host** application discovered from config
+      (Cursor, Claude Desktop, VS Code/Copilot, Codex CLI, …). Signalled by a
+      specific ``agent_type`` (not ``CUSTOM``).
+    - ``"background"`` — a **framework/service agent** *definition* discovered
+      from code (CrewAI/LangChain/LangGraph, ``agent_type == CUSTOM`` with a
+      ``source``/name shaped like ``"langchain:orders"``).
+    - ``"synthetic"`` — an SBOM/image ingest wrapper (``agent_type == CUSTOM``
+      with a ``sbom:``/``image:`` name), not a real agent at all.
+
+    Layers vocabulary on top of the existing ``agent_type`` field; changes no
+    stored data, enum value, route, or API key.
+    """
+    if agent.agent_type != AgentType.CUSTOM:
+        return "client"
+    if (agent.name or "").startswith(("sbom:", "image:")):
+        return "synthetic"
+    return "background"
 
 
 @dataclass
@@ -475,36 +1129,95 @@ class AIBOMReport:
     agents: list[Agent] = field(default_factory=list)
     blast_radii: list[BlastRadius] = field(default_factory=list)
     generated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    scan_id: str = ""  # Deterministic UUID v5 from scan inputs (set by CLI after discovery)
     tool_version: str = ""
     executive_summary: Optional[str] = None  # LLM-generated executive summary
     ai_threat_chains: list[str] = field(default_factory=list)  # LLM-generated threat chain analyses
-    mcp_config_analysis: Optional[dict] = None  # LLM-powered MCP config security analysis
-    skill_audit_data: Optional[dict] = None  # Serialized SkillAuditResult (set by CLI)
-    trust_assessment_data: Optional[dict] = None  # Serialized TrustAssessmentResult (set by CLI)
-    prompt_scan_data: Optional[dict] = None  # Serialized PromptScanResult (set by CLI)
-    model_files: list[dict] = field(default_factory=list)
-    model_provenance: list[dict] = field(default_factory=list)  # HuggingFace provenance results
-    enforcement_data: Optional[dict] = None  # Serialized EnforcementReport (set by CLI)
-    context_graph_data: Optional[dict] = None  # Serialized context graph (set by CLI)
-    license_report: Optional[dict] = None  # Serialized license compliance report
-    vex_data: Optional[dict] = None  # Serialized VEX document
-    toxic_combinations: Optional[list] = None  # Serialized ToxicCombination list
-    prioritized_findings: Optional[list] = None  # Priority-ordered findings
-    sast_data: Optional[dict] = None  # Serialized SAST scan results (Semgrep)
-    cis_benchmark_data: Optional[dict] = None  # Serialized CIS AWS Benchmark results
-    snowflake_cis_benchmark_data: Optional[dict] = None  # Serialized CIS Snowflake Benchmark results
-    azure_cis_benchmark_data: Optional[dict] = None  # Serialized CIS Azure Benchmark results
-    gcp_cis_benchmark_data: Optional[dict] = None  # Serialized CIS GCP Benchmark results
-    databricks_cis_benchmark_data: Optional[dict] = None  # Serialized Databricks Security Best Practices results
-    aisvs_benchmark_data: Optional[dict] = None  # Serialized AISVS compliance results
-    vector_db_scan_data: Optional[list] = None  # Serialized vector DB security assessments
-    gpu_infra_data: Optional[dict] = None  # Serialized GPU/AI compute infra scan results
-    runtime_correlation: Optional[dict] = None  # Runtime ↔ scan correlation (proxy audit vs CVE findings)
-    training_pipelines: Optional[dict] = None  # Serialized TrainingPipelineScanResult
-    dataset_cards: Optional[dict] = None  # Serialized DatasetScanResult
-    serving_configs: Optional[list] = None  # Serialized ServingConfig list
-    browser_extensions: Optional[dict] = None  # Serialized browser extension scan results
-    ai_inventory_data: Optional[dict] = None  # AI component source scan results (SDK imports, models, keys)
+    mcp_config_analysis: Optional[dict[str, Any]] = None  # LLM-powered MCP config security analysis
+    ai_enrichment_metadata: Optional[dict[str, Any]] = None  # Non-secret provider/model provenance for AI-generated fields
+    ai_finding_assessments: list[AIFindingAssessment] = field(default_factory=list)
+    skill_audit_data: Optional[dict[str, Any]] = None  # Serialized SkillAuditResult (set by CLI)
+    trust_assessment_data: Optional[dict[str, Any]] = None  # Serialized TrustAssessmentResult (set by CLI)
+    prompt_scan_data: Optional[dict[str, Any]] = None  # Serialized PromptScanResult (set by CLI)
+    model_files: list[dict[str, Any]] = field(default_factory=list)
+    model_manifests: list[dict[str, Any]] = field(default_factory=list)
+    model_provenance: list[dict[str, Any]] = field(default_factory=list)  # HuggingFace provenance results
+    model_hash_verification_data: Optional[dict[str, Any]] = None  # Serialized model hash verification report
+    model_supply_chain_data: Optional[dict[str, Any]] = None  # Consolidated model file/provenance/hash summary
+    enforcement_data: Optional[dict[str, Any]] = None  # Serialized EnforcementReport (set by CLI)
+    context_graph_data: Optional[dict[str, Any]] = None  # Serialized context graph (set by CLI)
+    license_report: Optional[dict[str, Any]] = None  # Serialized license compliance report
+    vex_data: Optional[dict[str, Any]] = None  # Serialized VEX document
+    toxic_combinations: Optional[list[Any]] = None  # Serialized ToxicCombination list
+    prioritized_findings: Optional[list[Any]] = None  # Priority-ordered findings
+    sast_data: Optional[dict[str, Any]] = None  # Serialized SAST scan results (Semgrep)
+    aws_organization_data: Optional[dict[str, Any]] = None  # AWS Organizations: org/OUs/accounts/SCPs hierarchy
+    cis_benchmark_data: Optional[dict[str, Any]] = None  # Serialized CIS AWS Benchmark results
+    snowflake_cis_benchmark_data: Optional[dict[str, Any]] = None  # Serialized CIS Snowflake Benchmark results
+    snowflake_object_graph_data: Optional[dict[str, Any]] = None  # Snowflake tables/views + OBJECT_DEPENDENCIES lineage
+    snowflake_login_anomalies_data: Optional[dict[str, Any]] = None  # Snowflake impossible-travel / login-anomaly detection
+    snowflake_exfil_graph_data: Optional[dict[str, Any]] = None  # Snowflake egress: outbound shares, external stages, sensitive objects
+    snowflake_auth_posture_data: Optional[dict[str, Any]] = (
+        None  # Snowflake per-user auth matrix + network policies (MFA/key-pair/password)
+    )
+    snowflake_services_data: Optional[dict[str, Any]] = None  # Snowflake compute (warehouses) + database/schema containment hierarchy
+    snowflake_pipeline_data: Optional[dict[str, Any]] = None  # Snowflake data-pipeline objects: tasks, streams, pipes
+    snowflake_integrations_data: Optional[dict[str, Any]] = (
+        None  # Snowflake account integrations: storage/API/external-access/security/catalog
+    )
+    snowflake_external_data_data: Optional[dict[str, Any]] = None  # Snowflake open-table-format + external data: iceberg + external tables
+    snowflake_governance_data: Optional[dict[str, Any]] = (
+        None  # Snowflake governance: ACCESS_HISTORY reads + Cortex agent telemetry + derived findings
+    )
+    snowflake_activity_data: Optional[dict[str, Any]] = (
+        None  # Snowflake activity timeline: QUERY_HISTORY (365d) + AI observability events (summarized)
+    )
+    azure_cis_benchmark_data: Optional[dict[str, Any]] = None  # Serialized CIS Azure Benchmark results
+    gcp_cis_benchmark_data: Optional[dict[str, Any]] = None  # Serialized CIS GCP Benchmark results
+    databricks_security_data: Optional[dict[str, Any]] = None  # Serialized Databricks Security Best Practices results (canonical)
+    aisvs_benchmark_data: Optional[dict[str, Any]] = None  # Serialized AISVS compliance results
+    vector_db_scan_data: Optional[list[Any]] = None  # Serialized vector DB security assessments
+    gpu_infra_data: Optional[dict[str, Any]] = None  # Serialized GPU/AI compute infra scan results
+    # Serialized IaC misconfiguration findings. Set by the CLI scan path and by the
+    # API repo_url tree scan (api/repo_tree_scan.py). NOT yet populated for API
+    # local-estate/inventory scans or the MCP scan tool — those surfaces do not run
+    # the IaC scanner, so /v1/findings shows the IaC category only for repo scans.
+    iac_findings_data: Optional[dict[str, Any]] = None
+    # Graph toxic-combination findings (serialized Finding dicts; set at the graph-build call site).
+    # Rehydrated into the unified Finding stream by to_findings() so they reach --fail-on-severity.
+    toxic_combination_findings_data: Optional[list[Any]] = None
+    # NHI/CIEM governance findings (over-grant, dormant/orphaned, high-risk NHIs)
+    # materialized from the unified graph at the scan call site. Held as Finding
+    # objects (not serialized directly); folded into the unified stream by
+    # to_findings() so the API path reaches CLI parity for identity governance.
+    nhi_governance_findings: list["Finding"] = field(default_factory=list)
+    # CIEM over-privilege findings (serialized Finding dicts; set at the graph-build call site).
+    # Right-sizing from AWS Access-Advisor usage evidence; rehydrated by to_findings().
+    ciem_over_privilege_findings_data: Optional[list[Any]] = None
+    # Estate-wide cloud asset inventory; one provider payload or a per-provider list (opt-in AGENT_BOM_CLOUD_INVENTORY)
+    cloud_inventory_data: Optional[Union[dict[str, Any], list[Any]]] = None
+    identity_discovery_data: Optional[dict[str, Any]] = None  # Discovered non-human identities (opt-in AGENT_BOM_OKTA/ENTRA_DISCOVERY)
+    # Cloud audit-trail behavioral payload(s); per-provider list of aggregated
+    # (principal, resource, action) edges + findings (opt-in AGENT_BOM_AUDIT_TRAIL, read-only)
+    cloud_audit_trail_data: Optional[Union[dict[str, Any], list[Any]]] = None
+    runtime_correlation: Optional[dict[str, Any]] = None  # Runtime ↔ scan correlation (proxy audit vs CVE findings)
+    delta_data: Optional[dict[str, Any]] = None  # Baseline/delta comparison metadata for CI gate outputs
+    scan_performance_data: Optional[dict[str, Any]] = None  # Cache coverage / scan latency metadata
+    vuln_data_freshness: Optional[dict[str, Any]] = None  # Vuln-data source/age/staleness snapshot (set by CLI; surfaced to API/MCP)
+    training_pipelines: Optional[dict[str, Any]] = None  # Serialized TrainingPipelineScanResult
+    dataset_cards: Optional[dict[str, Any]] = None  # Serialized DatasetScanResult
+    serving_configs: Optional[list[Any]] = None  # Serialized ServingConfig list
+    browser_extensions: Optional[dict[str, Any]] = None  # Serialized browser extension scan results
+    endpoint_inventory_data: Optional[dict[str, Any]] = None  # Bounded workstation app/process/service/runtime inventory
+    ai_inventory_data: Optional[dict[str, Any]] = None  # AI component source scan results (SDK imports, models, keys)
+    project_inventory_data: Optional[dict[str, Any]] = None  # Project manifest / lockfile inventory summary
+    # Optional GitHub trust card from --repo / repo_url scans (stars, contributors,
+    # license, pushed_at, …). Best-effort read-only API metadata — never required
+    # for the security scan itself.
+    repo_trust_data: Optional[dict[str, Any]] = None
+    introspection_data: Optional[dict[str, Any]] = None  # Runtime MCP introspection results (tools, resources, drift)
+    health_check_data: Optional[dict[str, Any]] = None  # MCP server reachability/health results
+    runtime_session_graph: Optional[dict[str, Any]] = None  # Structured runtime session graph/timeline evidence
 
     # Unified Finding stream (issue #566 — Phase 1).
     # Populated alongside blast_radii for backward compatibility.
@@ -516,13 +1229,25 @@ class AIBOMReport:
     # determine which UI panels, compliance frameworks, and graphs apply.
     scan_sources: list[str] = field(default_factory=list)  # e.g. ["agent_discovery", "image", "sbom"]
 
+    # Execution quality is separate from security/policy verdicts. Consumers
+    # must not interpret a complete scan with findings as an incomplete scan.
+    scan_run: ScanRun = field(default_factory=ScanRun)
+
+    # Per-release vulnerability-coverage gaps detected during the scan. Each item
+    # is a serialized agent_bom.coverage.CoverageWarning (ecosystem, release,
+    # reason, detail, package_count, advisory_rows). A non-empty list means the
+    # data source does not carry advisories for an OS release present in the scan
+    # target (typically end-of-life) — a low/zero count there must NOT be read as
+    # a clean bill of health.
+    coverage_warnings: list[dict[str, Any]] = field(default_factory=list)
+
     @property
     def has_mcp_context(self) -> bool:
         """True if scan discovered real MCP servers (not synthetic SBOM/image wrappers).
 
-        A synthetic wrapper has ``command=""`` — real MCP servers always have a command.
+        Uses explicit server surface classification rather than command heuristics.
         """
-        return any(s.command for a in self.agents for s in a.mcp_servers)
+        return any(s.is_mcp_surface for a in self.agents for s in a.mcp_servers)
 
     @property
     def has_agent_context(self) -> bool:
@@ -534,11 +1259,41 @@ class AIBOMReport:
         """
         return any(a.agent_type != AgentType.CUSTOM for a in self.agents)
 
-    def __post_init__(self):
+    @property
+    def agent_class_counts(self) -> dict[str, int]:
+        """Real agents split by display class: AI clients vs background agents.
+
+        Excludes synthetic SBOM/image wrappers. ``client`` = discovered AI
+        host apps; ``background`` = framework/service agent definitions. See
+        :func:`classify_agent_kind`.
+        """
+        counts = {"client": 0, "background": 0}
+        for agent in self.agents:
+            kind = classify_agent_kind(agent)
+            if kind in counts:
+                counts[kind] += 1
+        return counts
+
+    def __post_init__(self) -> None:
         if not self.tool_version:
             from agent_bom import __version__
 
             self.tool_version = __version__
+
+    @property
+    def databricks_cis_benchmark_data(self) -> Optional[dict[str, Any]]:
+        """Deprecated alias for ``databricks_security_data``.
+
+        Databricks has no official CIS benchmark; the canonical field is
+        ``databricks_security_data`` (vendor security best practices). This
+        CIS-named property is retained for backward compatibility with existing
+        clients and delegates both read and write to the canonical field.
+        """
+        return self.databricks_security_data
+
+    @databricks_cis_benchmark_data.setter
+    def databricks_cis_benchmark_data(self, value: Optional[dict[str, Any]]) -> None:
+        self.databricks_security_data = value
 
     @property
     def total_agents(self) -> int:
@@ -558,20 +1313,260 @@ class AIBOMReport:
 
     @property
     def critical_vulns(self) -> list[BlastRadius]:
-        return [br for br in self.blast_radii if br.vulnerability.severity == Severity.CRITICAL]
+        from agent_bom.vex import active_blast_radii
+
+        return [br for br in active_blast_radii(self.blast_radii) if br.vulnerability.severity == Severity.CRITICAL]
+
+    def _secret_findings(self) -> "list[Finding]":
+        """Hardcoded-secret findings, lifted from ``ai_inventory_data['secrets']``.
+
+        The secret scanner stores its results in a side block; surface them in the
+        unified stream so they reach JSON/SARIF/CSV — redacted, never the value.
+        """
+        block = (self.ai_inventory_data or {}).get("secrets") if self.ai_inventory_data else None
+        if not isinstance(block, dict):
+            return []
+        from agent_bom.finding import secret_dict_to_finding
+
+        return [secret_dict_to_finding(s) for s in block.get("findings", []) if isinstance(s, dict)]
+
+    def _toxic_combination_findings(self) -> "list[Finding]":
+        """Graph toxic-combination findings, rehydrated from the side block.
+
+        The graph evaluator (``graph.toxic_findings``) stores serialized Finding
+        dicts on ``toxic_combination_findings_data`` at the graph-build call site.
+        Surfacing them here routes them through ``--fail-on-severity`` and every
+        machine output (JSON/SARIF/CSV), mirroring the secret-finding side block.
+        """
+        if not self.toxic_combination_findings_data:
+            return []
+        from agent_bom.graph.toxic_findings import toxic_combination_findings_from_data
+
+        return toxic_combination_findings_from_data(self.toxic_combination_findings_data)
+
+    def _nhi_governance_findings(self) -> "list[Finding]":
+        """NHI/CIEM governance findings, surfaced from the graph-derived side block.
+
+        The scan call site (CLI + API) computes these over the unified graph and
+        stores the Finding objects on ``nhi_governance_findings``. Surfacing them
+        here routes identity over-grant / dormant / orphaned risks through
+        ``--fail-on-severity`` and every machine output, matching the CLI path.
+        """
+        return list(self.nhi_governance_findings or [])
+
+    def _mcp_tool_rule_findings(self) -> "list[Finding]":
+        """MCP tool-schema rule violations lifted into the unified stream.
+
+        The MCP analyzer stores its violations on each ``MCPTool.schema_rule_findings``
+        and previously only emitted them inside JSON tool blocks — so the severity
+        gate and SARIF never saw them. Convert each stored rule dict to a Finding.
+        Derived on the fly from the report's own tools, so it needs no side block
+        and stays idempotent (stable ids from rule id + tool).
+        """
+        from agent_bom.mcp_tool_rules import mcp_rule_finding_to_finding
+
+        findings: list[Finding] = []
+        seen: set[str] = set()
+        for agent in self.agents:
+            for server in getattr(agent, "mcp_servers", []) or []:
+                for tool in getattr(server, "tools", []) or []:
+                    for raw in getattr(tool, "schema_rule_findings", []) or []:
+                        if not isinstance(raw, dict):
+                            continue
+                        finding = mcp_rule_finding_to_finding(
+                            raw,
+                            tool_name=getattr(tool, "name", ""),
+                            tool_stable_id=getattr(tool, "canonical_id", None),
+                            server_name=getattr(server, "name", ""),
+                            agent_name=getattr(agent, "name", ""),
+                        )
+                        if finding.id in seen:
+                            continue
+                        seen.add(finding.id)
+                        findings.append(finding)
+        return findings
+
+    def _ciem_over_privilege_findings(self) -> "list[Finding]":
+        """CIEM over-privilege findings, rehydrated from the side block.
+
+        Access-Advisor right-sizing findings are serialized on
+        ``ciem_over_privilege_findings_data`` at the graph-build call site;
+        surfacing them here routes them through ``--fail-on-severity`` and every
+        machine output (JSON/SARIF/CSV), mirroring the toxic-combination block.
+        """
+        if not self.ciem_over_privilege_findings_data:
+            return []
+        from agent_bom.graph.nhi_governance import ciem_over_privilege_findings_from_data
+
+        return ciem_over_privilege_findings_from_data(self.ciem_over_privilege_findings_data)
 
     def to_findings(self) -> "list[Finding]":
         """Return the unified findings list, auto-populating from blast_radii if empty.
 
         Phase 1 shim: if ``self.findings`` is already populated (dual-write path),
-        return it directly.  Otherwise convert ``blast_radii`` on the fly so callers
-        can always work with the unified model.
+        use it directly.  Otherwise convert ``blast_radii`` on the fly. Hardcoded-
+        secret findings are always appended so machine consumers (JSON/SARIF/CSV)
+        see them, not just the console.
         """
-        if self.findings:
-            return self.findings
         from agent_bom.finding import blast_radius_to_finding
 
-        return [blast_radius_to_finding(br) for br in self.blast_radii]
+        # Keep explicit non-CVE findings even when the legacy blast-radius
+        # projection is also present. API/VEX paths can update the projection
+        # after the unified stream was built; dropping either side makes JSON
+        # disagree with CSV/SARIF and hides policy findings from consumers.
+        base = list(self.findings)
+        existing_ids = {getattr(f, "canonical_id", getattr(f, "id", None)) for f in base}
+        for br in self.blast_radii:
+            finding = blast_radius_to_finding(br)
+            finding_id = getattr(finding, "canonical_id", getattr(finding, "id", None))
+            if finding_id not in existing_ids:
+                base.append(finding)
+                existing_ids.add(finding_id)
+        # Avoid double-counting if a dual-write path ever adds the same secret
+        # finding, but do not suppress unrelated secret findings in the side block.
+        existing_ids = {getattr(f, "canonical_id", getattr(f, "id", None)) for f in base}
+        base.extend(finding for finding in self._secret_findings() if finding.id not in existing_ids)
+        cis_existing = existing_ids | {getattr(f, "id", None) for f in base}
+        base.extend(finding for finding in self._cloud_cis_findings() if finding.id not in cis_existing)
+        toxic_existing = {getattr(f, "id", None) for f in base}
+        base.extend(finding for finding in self._toxic_combination_findings() if finding.id not in toxic_existing)
+        nhi_existing = {getattr(f, "id", None) for f in base}
+        base.extend(finding for finding in self._nhi_governance_findings() if finding.id not in nhi_existing)
+        ciem_existing = {getattr(f, "id", None) for f in base}
+        base.extend(finding for finding in self._ciem_over_privilege_findings() if finding.id not in ciem_existing)
+        mcp_existing = {getattr(f, "id", None) for f in base}
+        base.extend(finding for finding in self._mcp_tool_rule_findings() if finding.id not in mcp_existing)
+        iac_existing = {getattr(f, "id", None) for f in base}
+        base.extend(finding for finding in self._iac_findings() if finding.id not in iac_existing)
+        gov_existing = {getattr(f, "id", None) for f in base}
+        base.extend(finding for finding in self._snowflake_governance_findings() if finding.id not in gov_existing)
+        org_existing = {getattr(f, "id", None) for f in base}
+        base.extend(finding for finding in self._cloud_org_architecture_findings() if finding.id not in org_existing)
+        malicious_existing = {getattr(f, "id", None) for f in base}
+        base.extend(finding for finding in self._malicious_package_findings() if finding.id not in malicious_existing)
+        return base
+
+    def _malicious_package_findings(self) -> "list[Finding]":
+        """Malicious/typosquat packages with no CVE BlastRadius row."""
+        from agent_bom.finding import malicious_package_to_finding
+
+        covered: set[tuple[str, str, str]] = {
+            (br.package.name, br.package.version or "", br.package.ecosystem or "") for br in self.blast_radii
+        }
+        grouped: dict[tuple[str, str, str], tuple[object, set[str], set[str]]] = {}
+        for agent in self.agents:
+            for server in agent.mcp_servers:
+                for pkg in server.packages:
+                    if not getattr(pkg, "is_malicious", False):
+                        continue
+                    key = (pkg.name, pkg.version or "", pkg.ecosystem or "")
+                    if key in covered:
+                        continue
+                    if key not in grouped:
+                        grouped[key] = (pkg, set(), set())
+                    pkg_ref, agents, servers = grouped[key]
+                    agents.add(agent.name)
+                    servers.add(server.name)
+                    grouped[key] = (pkg_ref, agents, servers)
+        return [
+            malicious_package_to_finding(
+                pkg,
+                affected_agents=sorted(agents),
+                affected_servers=sorted(servers),
+            )
+            for pkg, agents, servers in grouped.values()
+        ]
+
+    def _snowflake_governance_findings(self) -> "list[Finding]":
+        """Snowflake governance findings lifted into the unified findings stream.
+
+        The derived governance findings live in a side block
+        (``snowflake_governance_data['findings']``) and never reached the unified
+        stream — so ``cloud`` scans exited 0 even on HIGH/CRITICAL access risks and
+        ``--fail-on-severity`` was blind to governance posture. Convert each one to a
+        Finding so the gate, SARIF, and severity rollups converge.
+        """
+        from agent_bom.finding import snowflake_governance_finding_to_finding
+
+        data = self.snowflake_governance_data
+        if not isinstance(data, dict):
+            return []
+        account = str(data.get("account", "") or "")
+        findings: list[Finding] = []
+        for raw in data.get("findings", []) or []:
+            if isinstance(raw, dict):
+                findings.append(snowflake_governance_finding_to_finding(raw, account))
+        return findings
+
+    def _cloud_org_architecture_findings(self) -> "list[Finding]":
+        """AWS/GCP org-architecture findings (single-account / flat hierarchy)."""
+        from agent_bom.finding import cloud_org_architecture_finding_to_finding
+
+        payloads: list[tuple[str, dict[str, Any]]] = []
+        aws = self.aws_organization_data
+        if isinstance(aws, dict):
+            payloads.append(("aws", aws))
+        inventory = self.cloud_inventory_data
+        inv_list = inventory if isinstance(inventory, list) else ([inventory] if isinstance(inventory, dict) else [])
+        for entry in inv_list:
+            if isinstance(entry, dict) and isinstance(entry.get("gcp_organization"), dict):
+                payloads.append(("gcp", entry["gcp_organization"]))
+
+        findings: list[Finding] = []
+        for provider, payload in payloads:
+            org_id = str(payload.get("org_id") or "")
+            for raw in payload.get("findings", []) or []:
+                if isinstance(raw, dict):
+                    findings.append(cloud_org_architecture_finding_to_finding(raw, provider=provider, org_id=org_id))
+        return findings
+
+    def _iac_findings(self) -> "list[Finding]":
+        """IaC misconfiguration findings lifted into the unified stream.
+
+        The IaC scanner stores results in the ``iac_findings_data`` side block; they
+        reached only JSON + SARIF's dedicated IaC loop, so exec ``total_findings``,
+        ``--fail-on-severity``, and severity rollups under-counted them. Convert each
+        to a Finding (mirrors the CIS / secret side-block pattern). SARIF continues
+        to render IaC via its dedicated loop and skips these in the unified loop, so
+        each IaC finding appears exactly once.
+        """
+        from agent_bom.finding import iac_finding_to_finding
+
+        data = self.iac_findings_data
+        if not isinstance(data, dict):
+            return []
+        findings: list[Finding] = []
+        for raw in data.get("findings", []) or []:
+            if isinstance(raw, dict):
+                findings.append(iac_finding_to_finding(raw))
+        return findings
+
+    def _cloud_cis_findings(self) -> "list[Finding]":
+        """Cloud CIS failures and evaluation errors lifted into findings.
+
+        Each provider's CIS results live in a side block (``*_cis_benchmark_data``)
+        and never reached the unified stream. Convert FAILED controls and ERROR
+        controls to distinct CLOUD_CIS findings so severity gates fail closed on
+        unevaluable high-risk controls. Genuine NOT_APPLICABLE controls remain
+        outside the findings stream.
+        """
+        from agent_bom.finding import cloud_cis_check_to_finding
+
+        findings: list[Finding] = []
+        for provider, data in (
+            ("aws", self.cis_benchmark_data),
+            ("azure", self.azure_cis_benchmark_data),
+            ("gcp", self.gcp_cis_benchmark_data),
+            ("snowflake", self.snowflake_cis_benchmark_data),
+            ("databricks", self.databricks_security_data),
+        ):
+            if not isinstance(data, dict):
+                continue
+            for check in data.get("checks", []) or []:
+                if isinstance(check, dict) and str(check.get("status", "")).upper() in {"FAIL", "ERROR"}:
+                    check_with_version = {**check, "benchmark_version": data.get("benchmark_version")}
+                    findings.append(cloud_cis_check_to_finding(check_with_version, provider))
+        return findings
 
     def cve_findings(self) -> "list[Finding]":
         """Return only CVE-type findings from the unified stream."""

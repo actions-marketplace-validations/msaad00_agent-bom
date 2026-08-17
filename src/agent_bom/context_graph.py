@@ -7,18 +7,51 @@ servers, credentials, tools, and vulnerabilities.  Answers the question:
 Works with raw JSON dicts (same as output/attack_flow.py) so both CLI and
 API can call it without model reconstruction.  Zero new dependencies —
 stdlib ``collections.deque`` for BFS.
+
+Types and severity constants are sourced from :mod:`graph_schema` — the
+single source of truth for the entire graph subsystem.
 """
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Iterable, Optional
 
 from agent_bom.constants import is_credential_key as _is_credential_key
+from agent_bom.graph import (
+    EDGE_KIND_TO_RELATIONSHIP as _EDGE_KIND_TO_RELATIONSHIP,
+)
+from agent_bom.graph import (
+    NODE_KIND_TO_ENTITY as _NODE_KIND_TO_ENTITY,
+)
+from agent_bom.graph import (
+    SEVERITY_RISK_SCORE as _SEVERITY_SCORES,
+)
+from agent_bom.graph import (
+    AttackPath,
+    EntityType,
+    InteractionRisk,
+    NodeDimensions,
+    UnifiedEdge,
+    UnifiedGraph,
+    UnifiedNode,
+)
 
-# ── Enums ─────────────────────────────────────────────────────────────────
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_UNTRUSTED_PREFIX = "[UNTRUSTED MCP METADATA] "
+
+
+def _untrusted_metadata_text(value: object, *, max_length: int = 1000) -> str:
+    text = _CONTROL_CHARS_RE.sub(" ", str(value)).replace("\u2028", " ").replace("\u2029", " ")
+    return f"{_UNTRUSTED_PREFIX}{text[:max_length]}"
+
+
+# ── Enums (backward-compat — existing consumers import these) ────────────
+# These map 1:1 to graph_schema.EntityType / RelationshipType but keep the
+# original string values so serialised JSON is stable.
 
 
 class NodeKind(str, Enum):
@@ -27,6 +60,7 @@ class NodeKind(str, Enum):
     CREDENTIAL = "credential"
     TOOL = "tool"
     VULNERABILITY = "vulnerability"
+    IAM_ROLE = "iam_role"  # Cloud IAM role / workload identity attached to an agent
 
 
 class EdgeKind(str, Enum):
@@ -34,11 +68,14 @@ class EdgeKind(str, Enum):
     EXPOSES = "exposes"  # server → credential
     PROVIDES = "provides"  # server → tool
     VULNERABLE_TO = "vulnerable_to"  # server → vulnerability
-    SHARES_SERVER = "shares_server"  # agent ↔ agent
-    SHARES_CREDENTIAL = "shares_credential"  # agent ↔ agent
+    # Small groups use direct agent↔agent edges.  Large groups use a bounded
+    # shared-resource endpoint so graph construction stays linear.
+    SHARES_SERVER = "shares_server"
+    SHARES_CREDENTIAL = "shares_credential"
+    ATTACHED_TO = "attached_to"  # iam_role → agent (workload identity correlation)
 
 
-# ── Data structures ───────────────────────────────────────────────────────
+# ── Data structures (backward-compat) ────────────────────────────────────
 
 
 @dataclass
@@ -100,34 +137,18 @@ class LateralPath:
     vuln_ids: list[str]
 
 
-@dataclass
-class InteractionRisk:
-    pattern: str
-    agents: list[str]
-    risk_score: float
-    description: str
-    owasp_agentic_tag: Optional[str] = None
-
-
-# ── Severity scoring (mirrors models.BlastRadius.calculate_risk_score) ────
-
-_SEVERITY_SCORES: dict[str, float] = {
-    "critical": 8.0,
-    "high": 6.0,
-    "medium": 4.0,
-    "low": 2.0,
-}
-
-
 # ── Tool capability classification (lazy import to avoid circular) ────────
 
 
-def _classify_tool(name: str, description: str = "") -> list[str]:
+def _classify_tool(name: str, description: str = "", declared_capabilities: object = None) -> list[str]:
     """Classify tool capabilities, returning capability value strings."""
     try:
-        from agent_bom.risk_analyzer import classify_tool
+        from agent_bom.models import MCPTool
+        from agent_bom.risk_analyzer import classify_mcp_tool
 
-        return [c.value for c in classify_tool(name, description)]
+        declared = [str(value) for value in declared_capabilities] if isinstance(declared_capabilities, list) else []
+        tool = MCPTool(name=name, description=description, declared_capabilities=declared)
+        return [c.value for c in classify_mcp_tool(tool)]
     except ImportError:
         return []
 
@@ -150,9 +171,8 @@ def build_context_graph(
     """
     graph = ContextGraph()
 
-    # Track which agents use which server names / credential names
+    # Track which agents use which server names.
     server_to_agents: dict[str, list[str]] = defaultdict(list)
-    cred_to_agents: dict[str, list[str]] = defaultdict(list)
 
     # ── Build agent → server → credential / tool nodes & edges ────────
     for agent_dict in agents_data:
@@ -170,6 +190,36 @@ def build_context_graph(
                 },
             )
         )
+
+        # Wire IAM role / cloud principal → agent edge when cloud providers
+        # have recorded workload identity in agent metadata.
+        cloud_principal = (agent_dict.get("metadata") or {}).get("cloud_principal")
+        if cloud_principal and isinstance(cloud_principal, dict):
+            principal_id = cloud_principal.get("principal_id") or cloud_principal.get("principal_name", "")
+            if principal_id:
+                role_id = f"iam_role:{principal_id}"
+                if role_id not in graph.nodes:
+                    graph.add_node(
+                        GraphNode(
+                            id=role_id,
+                            kind=NodeKind.IAM_ROLE,
+                            label=principal_id,
+                            metadata={
+                                "principal_type": cloud_principal.get("principal_type", ""),
+                                "provider": cloud_principal.get("provider", ""),
+                                "service": cloud_principal.get("service", ""),
+                            },
+                        )
+                    )
+                graph.add_edge(
+                    GraphEdge(
+                        source=role_id,
+                        target=agent_id,
+                        kind=EdgeKind.ATTACHED_TO,
+                        weight=2.0,
+                        metadata={"principal_type": cloud_principal.get("principal_type", "")},
+                    )
+                )
 
         for srv_dict in agent_dict.get("mcp_servers", []):
             srv_name = srv_dict.get("name", "unknown")
@@ -192,46 +242,50 @@ def build_context_graph(
             # Track shared server detection
             server_to_agents[srv_name].append(agent_name)
 
-            # Credentials from env keys
-            env_dict = srv_dict.get("env", {})
-            for env_key in env_dict:
-                if _is_credential_key(env_key):
-                    cred_id = f"cred:{env_key}"
-                    if cred_id not in graph.nodes:
-                        graph.add_node(
-                            GraphNode(
-                                id=cred_id,
-                                kind=NodeKind.CREDENTIAL,
-                                label=env_key,
-                                metadata={"servers": []},
-                            )
-                        )
-                    # Track which servers expose this credential
-                    if srv_id not in graph.nodes[cred_id].metadata["servers"]:
-                        graph.nodes[cred_id].metadata["servers"].append(srv_id)
-                    graph.add_edge(
-                        GraphEdge(
-                            source=srv_id,
-                            target=cred_id,
-                            kind=EdgeKind.EXPOSES,
-                            weight=2.0,
-                        )
+            # Credentials. The serialized scan contract surfaces credential env
+            # var names via ``credential_env_vars`` (the canonical builder writes
+            # them there and leaves ``env`` empty/redacted in output), so reading
+            # only ``env`` produced zero credential nodes on real scan JSON. Read
+            # both the explicit credential list and any credential-looking inline
+            # env keys, deduped within this server.
+            cred_keys = list(srv_dict.get("credential_env_vars", []))
+            cred_keys += [k for k in srv_dict.get("env", {}) if _is_credential_key(k)]
+            for env_key in dict.fromkeys(cred_keys):
+                # The report carries only a credential env-var name, not proof
+                # that two servers resolve it to the same secret.  Keep each
+                # credential slot server-scoped and fail closed on correlation.
+                cred_id = f"cred:{srv_id}:{env_key}"
+                graph.add_node(
+                    GraphNode(
+                        id=cred_id,
+                        kind=NodeKind.CREDENTIAL,
+                        label=env_key,
+                        metadata={"server": srv_id, "servers": [srv_id]},
                     )
-                    cred_to_agents[env_key].append(agent_name)
+                )
+                graph.add_edge(
+                    GraphEdge(
+                        source=srv_id,
+                        target=cred_id,
+                        kind=EdgeKind.EXPOSES,
+                        weight=2.0,
+                    )
+                )
 
             # Tools
             for tool_dict in srv_dict.get("tools", []):
                 tool_name = tool_dict.get("name", "unknown")
                 tool_desc = tool_dict.get("description", "")
                 tool_id = f"tool:{srv_id}:{tool_name}"
-                capabilities = _classify_tool(tool_name, tool_desc)
+                capabilities = _classify_tool(tool_name, tool_desc, tool_dict.get("capabilities"))
                 graph.add_node(
                     GraphNode(
                         id=tool_id,
                         kind=NodeKind.TOOL,
                         label=tool_name,
                         metadata={
-                            "description": tool_desc,
+                            "description": _untrusted_metadata_text(tool_desc),
+                            "description_trust": "untrusted_external_mcp_metadata",
                             "capabilities": capabilities,
                             "server": srv_id,
                             "agent": agent_name,
@@ -270,6 +324,7 @@ def build_context_graph(
                         "is_kev": br_dict.get("is_kev", False),
                         "risk_score": br_dict.get("risk_score", 0),
                         "package": br_dict.get("package", ""),
+                        "symbol_reachability": br_dict.get("symbol_reachability"),
                     },
                 )
             )
@@ -289,38 +344,68 @@ def build_context_graph(
                         )
                     )
 
-    # ── Shared server edges (agent ↔ agent) ───────────────────────────
+    # ── Shared server edges ───────────────────────────────────────────
+    # Pairwise edges are useful for small groups, but become O(N²) for a
+    # common shared MCP server.  Keep the readable direct form up to a fixed
+    # threshold and use one bounded hub node for larger groups.  The hub is
+    # still traversable by the lateral-path BFS and carries the full group in
+    # metadata for risk/reporting consumers.
     for _srv_name, agent_names in server_to_agents.items():
         unique = sorted(set(agent_names))
         if len(unique) >= 2:
-            for i, a1 in enumerate(unique):
-                for a2 in unique[i + 1 :]:
+            if len(unique) > _MAX_PAIRWISE_SHARED_AGENTS:
+                hub_id = f"shared-server:{_srv_name}"
+                graph.add_node(
+                    GraphNode(
+                        id=hub_id,
+                        kind=NodeKind.SERVER,
+                        label=_srv_name,
+                        metadata={
+                            "shared_group": True,
+                            "shared_agent_count": len(unique),
+                            "shared_agents": unique,
+                        },
+                    )
+                )
+                for agent_name in unique:
                     graph.add_edge(
                         GraphEdge(
-                            source=f"agent:{a1}",
-                            target=f"agent:{a2}",
+                            source=f"agent:{agent_name}",
+                            target=hub_id,
                             kind=EdgeKind.SHARES_SERVER,
                             weight=3.0,
-                            metadata={"server": _srv_name},
+                            metadata={
+                                "server": _srv_name,
+                                "shared_group": True,
+                                "shared_agent_count": len(unique),
+                            },
                         )
                     )
+            else:
+                for i, a1 in enumerate(unique):
+                    for a2 in unique[i + 1 :]:
+                        graph.add_edge(
+                            GraphEdge(
+                                source=f"agent:{a1}",
+                                target=f"agent:{a2}",
+                                kind=EdgeKind.SHARES_SERVER,
+                                weight=3.0,
+                                metadata={"server": _srv_name},
+                            )
+                        )
 
-    # ── Shared credential edges (agent ↔ agent) ──────────────────────
-    # Deduplication is now handled by ContextGraph.add_edge() in O(1).
-    for _cred_name, agent_names in cred_to_agents.items():
-        unique = sorted(set(agent_names))
-        if len(unique) >= 2:
-            for i, a1 in enumerate(unique):
-                for a2 in unique[i + 1 :]:
-                    graph.add_edge(
-                        GraphEdge(
-                            source=f"agent:{a1}",
-                            target=f"agent:{a2}",
-                            kind=EdgeKind.SHARES_CREDENTIAL,
-                            weight=4.0,
-                            metadata={"credential": _cred_name},
-                        )
-                    )
+    # ── Effective-reach scoring (issue #2262) ─────────────────────────
+    # Annotate every vulnerability node with a deterministic 0..100
+    # composite that combines CVSS/EPSS/KEV with reachable tool
+    # capability + credential visibility + agent breadth.  Edges
+    # adjacent to scored nodes inherit the higher endpoint score for
+    # the dashboard's edge-thickness signal.
+    try:
+        from agent_bom.effective_reach import annotate_graph
+
+        annotate_graph(graph)
+    except Exception:  # pragma: no cover - defensive: never break the graph build
+        pass
 
     return graph
 
@@ -328,6 +413,36 @@ def build_context_graph(
 # ── Lateral path finder (BFS) ─────────────────────────────────────────────
 
 _MAX_PATHS = 100
+_MAX_QUEUE_SIZE = 10_000  # Prevent OOM on large graphs (100+ agents)
+_MAX_PAIRWISE_SHARED_AGENTS = 64
+_MAX_LATERAL_PATH_SOURCES = 100
+_MAX_LATERAL_PATHS = 1_000
+
+
+def collect_lateral_paths(
+    graph: ContextGraph,
+    source_node_ids: Iterable[str],
+    *,
+    max_depth: int = 4,
+    max_sources: int = _MAX_LATERAL_PATH_SOURCES,
+    max_paths: int = _MAX_LATERAL_PATHS,
+) -> tuple[list[LateralPath], bool]:
+    """Collect paths from a bounded set of sources.
+
+    Large estates can contain thousands of agents. Running a full BFS for
+    every source repeats work and creates an unbounded response. This helper
+    keeps source order deterministic, caps total paths, and reports whether
+    the result is intentionally sampled.
+    """
+    paths: list[LateralPath] = []
+    sources_seen = 0
+    for source_id in source_node_ids:
+        if sources_seen >= max_sources or len(paths) >= max_paths:
+            return paths[:max_paths], True
+        sources_seen += 1
+        remaining = max_paths - len(paths)
+        paths.extend(find_lateral_paths(graph, source_id, max_depth=max_depth)[:remaining])
+    return paths[:max_paths], False
 
 
 def find_lateral_paths(
@@ -355,14 +470,14 @@ def find_lateral_paths(
     source_agent = source_node.label if source_node.kind == NodeKind.AGENT else source_node.metadata.get("agent", "")
 
     paths: list[LateralPath] = []
-    # BFS: queue items are (current_node_id, path_of_node_ids, path_of_edge_kinds)
-    queue: deque[tuple[str, list[str], list[EdgeKind]]] = deque()
-    queue.append((source_node_id, [source_node_id], []))
+    # BFS: queue items are (current_node_id, path_of_node_ids, path_of_edge_kinds, visited_set)
+    queue: deque[tuple[str, list[str], list[EdgeKind], frozenset[str]]] = deque()
+    queue.append((source_node_id, [source_node_id], [], frozenset([source_node_id])))
 
     visited_paths: set[tuple[str, ...]] = set()
 
     while queue and len(paths) < _MAX_PATHS:
-        current_id, path_nodes, path_edges = queue.popleft()
+        current_id, path_nodes, path_edges, visited = queue.popleft()
 
         if len(path_nodes) > max_depth + 1:
             continue
@@ -394,15 +509,18 @@ def find_lateral_paths(
                         paths.append(lp)
                         continue  # Don't expand further from this target
 
-        # Expand neighbors
+        # Expand neighbors (bounded queue prevents OOM on dense graphs)
+        if len(queue) >= _MAX_QUEUE_SIZE:
+            continue
         for edge in graph.adjacency.get(current_id, []):
             neighbor = edge.target
-            if neighbor not in path_nodes:  # Avoid cycles
+            if neighbor not in visited:  # O(1) cycle check via frozenset
                 queue.append(
                     (
                         neighbor,
                         path_nodes + [neighbor],
                         path_edges + [edge.kind],
+                        visited | {neighbor},
                     )
                 )
 
@@ -541,17 +659,40 @@ def compute_interaction_risks(graph: ContextGraph) -> list[InteractionRisk]:
     shared_servers: dict[str, list[str]] = defaultdict(list)
     shared_creds: dict[str, list[str]] = defaultdict(list)
 
+    # Large shared groups keep membership once on the shared resource node,
+    # rather than duplicating a full agent list on every linear edge.
+    for node in graph.nodes.values():
+        members = node.metadata.get("shared_agents")
+        if not isinstance(members, list):
+            continue
+        if node.kind == NodeKind.SERVER:
+            shared_servers[node.label].extend(str(name) for name in members)
+        elif node.kind == NodeKind.CREDENTIAL:
+            shared_creds[node.label].extend(str(name) for name in members)
+
     for edge in graph.edges:
         if edge.kind == EdgeKind.SHARES_SERVER:
             srv_name = edge.metadata.get("server", "")
-            a1 = edge.source.removeprefix("agent:")
-            a2 = edge.target.removeprefix("agent:")
-            shared_servers[srv_name].extend([a1, a2])
+            members = edge.metadata.get("shared_agents")
+            if isinstance(members, list):
+                shared_servers[srv_name].extend(str(name) for name in members)
+            elif edge.metadata.get("shared_group"):
+                continue
+            elif edge.source.startswith("agent:") and edge.target.startswith("agent:"):
+                a1 = edge.source.removeprefix("agent:")
+                a2 = edge.target.removeprefix("agent:")
+                shared_servers[srv_name].extend([a1, a2])
         elif edge.kind == EdgeKind.SHARES_CREDENTIAL:
             cred_name = edge.metadata.get("credential", "")
-            a1 = edge.source.removeprefix("agent:")
-            a2 = edge.target.removeprefix("agent:")
-            shared_creds[cred_name].extend([a1, a2])
+            members = edge.metadata.get("shared_agents")
+            if isinstance(members, list):
+                shared_creds[cred_name].extend(str(name) for name in members)
+            elif edge.metadata.get("shared_group"):
+                continue
+            elif edge.source.startswith("agent:") and edge.target.startswith("agent:"):
+                a1 = edge.source.removeprefix("agent:")
+                a2 = edge.target.removeprefix("agent:")
+                shared_creds[cred_name].extend([a1, a2])
 
     # ── Pattern: shared credential ────────────────────────────────────
     for cred_name, agent_names in shared_creds.items():
@@ -679,6 +820,7 @@ def to_serializable(
             {
                 "id": n.id,
                 "kind": n.kind.value,
+                "entity_type": (_NODE_KIND_TO_ENTITY.get(n.kind.value, EntityType.SERVER)).value,
                 "label": n.label,
                 "metadata": n.metadata,
             }
@@ -689,6 +831,7 @@ def to_serializable(
                 "source": e.source,
                 "target": e.target,
                 "kind": e.kind.value,
+                "relationship": (_EDGE_KIND_TO_RELATIONSHIP.get(e.kind.value) or e.kind).value,
                 "weight": e.weight,
                 "metadata": e.metadata,
             }
@@ -730,3 +873,86 @@ def to_serializable(
             "interaction_risk_count": len(risks),
         },
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Unified Graph bridge — converts ContextGraph ↔ UnifiedGraph
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def to_unified_graph(
+    graph: ContextGraph,
+    lateral_paths: Optional[list[LateralPath]] = None,
+    interaction_risks: Optional[list[InteractionRisk]] = None,
+    *,
+    scan_id: str = "",
+    tenant_id: str = "",
+) -> UnifiedGraph:
+    """Convert a ContextGraph to a UnifiedGraph (the canonical representation).
+
+    This is the bridge between the legacy context graph builder and the
+    unified schema.  All downstream consumers (SIEM push, persistence,
+    graph export, UI) should work from the UnifiedGraph.
+    """
+    ug = UnifiedGraph(scan_id=scan_id, tenant_id=tenant_id)
+
+    for node in graph.nodes.values():
+        entity_type = _NODE_KIND_TO_ENTITY.get(node.kind.value, EntityType.SERVER)
+        severity = node.metadata.get("severity", "")
+        ug.add_node(
+            UnifiedNode(
+                id=node.id,
+                entity_type=entity_type,
+                label=node.label,
+                severity=severity if isinstance(severity, str) else "",
+                risk_score=float(node.metadata.get("risk_score", 0)),
+                attributes=node.metadata,
+                dimensions=NodeDimensions(
+                    agent_type=node.metadata.get("agent_type", ""),
+                    surface="mcp-server" if entity_type == EntityType.SERVER else "",
+                ),
+                data_sources=["mcp-scan"],
+            )
+        )
+
+    for edge in graph.edges:
+        rel = _EDGE_KIND_TO_RELATIONSHIP.get(edge.kind.value)
+        if not rel:
+            continue
+        ug.add_edge(
+            UnifiedEdge(
+                source=edge.source,
+                target=edge.target,
+                relationship=rel,
+                direction="bidirectional"
+                if edge.kind
+                in (
+                    EdgeKind.SHARES_SERVER,
+                    EdgeKind.SHARES_CREDENTIAL,
+                )
+                else "directed",
+                weight=edge.weight,
+                evidence=edge.metadata,
+            )
+        )
+
+    # Convert lateral paths → AttackPath
+    for lp in lateral_paths or []:
+        ug.attack_paths.append(
+            AttackPath(
+                source=lp.source,
+                target=lp.target,
+                hops=lp.hops,
+                edges=[ek.value if isinstance(ek, EdgeKind) else str(ek) for ek in lp.edges],
+                composite_risk=lp.composite_risk,
+                summary=lp.summary,
+                credential_exposure=lp.credential_exposure,
+                tool_exposure=lp.tool_exposure,
+                vuln_ids=lp.vuln_ids,
+            )
+        )
+
+    # InteractionRisk is already imported from graph_schema — same type
+    ug.interaction_risks = list(interaction_risks or [])
+
+    return ug

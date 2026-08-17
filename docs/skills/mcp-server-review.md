@@ -2,6 +2,16 @@
 
 > Evaluate an MCP server before adopting it — registry lookup, package vulnerability scan, tool risk analysis, and trust assessment.
 
+```yaml
+capabilities:
+  read_findings: true
+  read_inventory: true
+  read_audit_log: false
+  write_findings: false
+  outbound_http: true
+  shell_exec: true
+```
+
 ## Goal
 
 Before adding a new MCP server to your AI agent configuration, assess its security posture: Is it in the verified registry? Do its packages have CVEs? What tools does it expose? Does it require dangerous permissions?
@@ -16,11 +26,11 @@ pip install agent-bom
 
 ### 1. Registry Lookup
 
-Check if the server is in agent-bom's curated registry (427+ servers, 375 verified):
+Check if the server is in agent-bom's curated registry (1081 servers, 60 verified):
 
 ```bash
 # Via CLI
-agent-bom registry-lookup <server-name>
+agent-bom mcp scan <server-name>
 
 # Via MCP tool
 registry_lookup(server_name="<server-name>")
@@ -30,7 +40,7 @@ agent-bom api &
 curl http://127.0.0.1:8422/v1/registry/<server-name> | python3 -m json.tool
 ```
 
-Or browse the registry file: [`src/agent_bom/mcp_registry.json`](src/agent_bom/mcp_registry.json)
+Or browse the registry file: [`src/agent_bom/mcp_registry.json`](../../src/agent_bom/mcp_registry.json)
 
 The registry provides:
 - **Verified status** — has the server been independently verified?

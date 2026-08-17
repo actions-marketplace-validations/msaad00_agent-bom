@@ -11,23 +11,34 @@ pipx install agent-bom
 ## With optional extras
 
 ```bash
-pip install "agent-bom[api]"         # REST API server
-pip install "agent-bom[mcp-server]"  # MCP server dependencies
-pip install "agent-bom[dashboard]"   # Streamlit dashboard
-pip install "agent-bom[all]"         # Everything
+pip install "agent-bom[api]"          # REST API server
+pip install "agent-bom[ui]"           # API plus bundled local UI support
+pip install "agent-bom[mcp-server]"   # MCP server dependencies
+pip install "agent-bom[postgres]"     # Postgres-backed control-plane state
+pip install "agent-bom[cloud]"        # AWS, Azure, GCP, Databricks, Snowflake, Nebius, HuggingFace, W&B, OpenAI
+pip install "agent-bom[visual]"       # OCR-backed visual-leak detection; also requires Tesseract on PATH
+pip install "agent-bom[dashboard]"    # Snowflake Streamlit compatibility dashboard
+pip install "agent-bom[lake]"         # Parquet + Apache Iceberg REST-catalog export
+pip install "agent-bom[dev-all]"      # Developer environment used by this repo
 ```
+
+Other supported extras in `pyproject.toml` include `otel`, `aws`, `azure`,
+`gcp`, `coreweave`, `databricks`, `snowflake`, `nebius`, `huggingface`,
+`wandb`, `openai`, `ai-enrich`, `graph`, `pdf`, `watch`, `runtime`, `snyk`,
+`oidc`, `saml`, `docs`, and `dev`. There is no `agent-bom[all]` extra.
 
 ## Docker
 
 ```bash
 # CLI scanning
-docker run --rm ghcr.io/msaad00/agent-bom:latest scan
+docker run --rm agentbom/agent-bom:latest agents
 
 # With host config access (for MCP client discovery)
 docker run --rm \
-  -v "$HOME/.config:/root/.config:ro" \
-  -v "$HOME/Library/Application Support:/root/Library/Application Support:ro" \
-  ghcr.io/msaad00/agent-bom:latest scan
+  -v "$HOME/.config:/home/abom/.config:ro" \
+  -v "$HOME/.agent-bom:/home/abom/.agent-bom" \
+  -v "$HOME/Library/Application Support:/home/abom/Library/Application Support:ro" \
+  agentbom/agent-bom:latest agents
 ```
 
 ## From source
@@ -48,7 +59,7 @@ agent-bom scan --help
 ## Requirements
 
 - Python 3.11+
-- Optional: Docker (for container image scanning via Grype/Syft)
+- Optional: Docker (for container image scanning)
 - Optional: kubectl (for Kubernetes scanning)
 - Optional: semgrep (for SAST code scanning)
 - No external API keys required for basic operation

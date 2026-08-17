@@ -18,23 +18,183 @@ import hmac
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Protocol
+from typing import Any, Protocol
+from urllib.parse import urlparse
 from uuid import uuid4
 
+from agent_bom.api.secret_source import resolve_secret
+from agent_bom.api.storage_schema import ensure_sqlite_schema_version
+from agent_bom.security import sanitize_path_label, sanitize_sensitive_payload
+
 logger = logging.getLogger(__name__)
+_AUDIT_DETAIL_KEY_RE = re.compile(r"[^a-zA-Z0-9_.:-]+")
+_MAX_AUDIT_DETAIL_KEYS = 64
+_MAX_AUDIT_DETAIL_KEY_LENGTH = 96
+_MAX_AUDIT_DETAIL_STRING_LENGTH = 2048
+_MAX_AUDIT_DETAIL_COLLECTION_ITEMS = 32
+_MAX_AUDIT_DETAIL_DEPTH = 4
+_MAX_AUDIT_DETAILS_JSON_BYTES = 16 * 1024
+# Bound on chain-head re-read retries when a concurrent writer wins the race to
+# link the current head; each retry re-reads a strictly newer head, so this only
+# caps pathological contention rather than normal operation.
+_MAX_APPEND_RETRIES = 50
+
+
+def _env_enabled(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str) -> int | None:
+    value = (os.environ.get(name) or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _configured_control_plane_replicas() -> int:
+    raw = (os.environ.get("AGENT_BOM_CONTROL_PLANE_REPLICAS") or "").strip()
+    if not raw:
+        return 1
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 1
+
+
+def _production_audit_hmac_required() -> bool:
+    deployment = (
+        (os.environ.get("AGENT_BOM_ENV") or os.environ.get("AGENT_BOM_DEPLOYMENT_ENV") or os.environ.get("ENVIRONMENT") or "")
+        .strip()
+        .lower()
+    )
+    production_env = deployment in {"prod", "production"}
+    clustered = _configured_control_plane_replicas() > 1
+    return (production_env or clustered) and not _env_enabled("AGENT_BOM_ALLOW_EPHEMERAL_AUDIT_HMAC")
+
+
+def _audit_hmac_required() -> bool:
+    return _env_enabled("AGENT_BOM_REQUIRE_AUDIT_HMAC") or _production_audit_hmac_required()
+
+
+def _describe_rotation_posture(
+    *,
+    configured: bool,
+    last_rotated_env: str,
+    rotation_days_env: str,
+    max_age_days_env: str,
+    subject: str,
+    not_configured_status: str,
+    not_configured_message: str,
+) -> dict[str, object]:
+    rotation_days = _env_int(rotation_days_env)
+    max_age_days = _env_int(max_age_days_env)
+    raw_last_rotated = (os.environ.get(last_rotated_env) or "").strip()
+
+    if not configured:
+        return {
+            "rotation_tracking_supported": True,
+            "rotation_tracking_status": "supported",
+            "rotation_status": not_configured_status,
+            "rotation_method": "env_swap_and_restart",
+            "rotation_days": rotation_days,
+            "max_age_days": max_age_days,
+            "last_rotated": None,
+            "age_days": None,
+            "rotation_message": not_configured_message,
+        }
+
+    if not raw_last_rotated:
+        return {
+            "rotation_tracking_supported": True,
+            "rotation_tracking_status": "supported",
+            "rotation_status": "unknown_age",
+            "rotation_method": "env_swap_and_restart",
+            "rotation_days": rotation_days,
+            "max_age_days": max_age_days,
+            "last_rotated": None,
+            "age_days": None,
+            "rotation_message": (
+                f"{subject} is configured but {last_rotated_env} is unset. Record an ISO-8601 rotation timestamp "
+                "to expose key age in operator surfaces."
+            ),
+        }
+
+    try:
+        rotated = datetime.fromisoformat(raw_last_rotated)
+    except ValueError:
+        return {
+            "rotation_tracking_supported": True,
+            "rotation_tracking_status": "supported",
+            "rotation_status": "unknown_age",
+            "rotation_method": "env_swap_and_restart",
+            "rotation_days": rotation_days,
+            "max_age_days": max_age_days,
+            "last_rotated": raw_last_rotated,
+            "age_days": None,
+            "rotation_message": (
+                f"{last_rotated_env} is set but is not a valid ISO-8601 timestamp. Use a value like '2026-04-17T00:00:00+00:00'."
+            ),
+        }
+
+    if rotated.tzinfo is None:
+        rotated = rotated.replace(tzinfo=timezone.utc)
+    age_days = max(0, int((datetime.now(timezone.utc) - rotated).total_seconds() // 86400))
+
+    if max_age_days is not None and age_days >= max_age_days:
+        status = "max_age_exceeded"
+        message = (
+            f"{subject} is {age_days} days old, exceeding the configured maximum ({max_age_days} days). Rotate the "
+            "secret, restart the control plane, and update the recorded rotation timestamp."
+        )
+    elif rotation_days is not None and age_days >= rotation_days:
+        status = "rotation_due"
+        message = f"{subject} is {age_days} days old, past the configured rotation interval ({rotation_days} days)."
+    else:
+        status = "ok"
+        if rotation_days is not None:
+            message = f"{subject} is {age_days} days old; configured rotation interval is {rotation_days} days."
+        else:
+            message = f"{subject} is {age_days} days old. No explicit rotation interval is configured."
+
+    return {
+        "rotation_tracking_supported": True,
+        "rotation_tracking_status": "supported",
+        "rotation_status": status,
+        "rotation_method": "env_swap_and_restart",
+        "rotation_days": rotation_days,
+        "max_age_days": max_age_days,
+        "last_rotated": rotated.isoformat(),
+        "age_days": age_days,
+        "rotation_message": message,
+    }
+
 
 # HMAC key for audit log tamper detection.  When unset, an ephemeral
 # per-process key is generated — signatures verify within the same process
 # but provide no cross-restart integrity.  Production deployments MUST set
-# AGENT_BOM_AUDIT_HMAC_KEY for meaningful tamper detection.
-_HMAC_ENV_KEY = os.environ.get("AGENT_BOM_AUDIT_HMAC_KEY")
-if _HMAC_ENV_KEY is not None:
+# AGENT_BOM_AUDIT_HMAC_KEY (or AGENT_BOM_AUDIT_HMAC_KEY_FILE) for meaningful
+# tamper detection.
+_HMAC_ENV_KEY = resolve_secret("AGENT_BOM_AUDIT_HMAC_KEY")
+if _HMAC_ENV_KEY:
     _HMAC_KEY = _HMAC_ENV_KEY.encode()
 else:
+    if _audit_hmac_required():
+        raise RuntimeError(
+            "AGENT_BOM_AUDIT_HMAC_KEY is required when AGENT_BOM_REQUIRE_AUDIT_HMAC is enabled, "
+            "AGENT_BOM_ENV/AGENT_BOM_DEPLOYMENT_ENV/ENVIRONMENT is production, or "
+            "AGENT_BOM_CONTROL_PLANE_REPLICAS is greater than 1"
+        )
     import secrets as _secrets
 
     _HMAC_KEY = _secrets.token_bytes(32)
@@ -53,7 +213,8 @@ class AuditEntry:
     action: str = ""  # scan, policy_eval, fleet_change, exception, alert, config
     actor: str = ""  # API key prefix, role, or "system"
     resource: str = ""  # e.g., "job/abc123", "fleet/agent-1", "exception/exc-1"
-    details: dict = field(default_factory=dict)
+    details: dict[str, Any] = field(default_factory=dict)
+    prev_signature: str = ""
     hmac_signature: str = ""
 
     def __post_init__(self) -> None:
@@ -62,9 +223,21 @@ class AuditEntry:
         if not self.timestamp:
             self.timestamp = datetime.now(timezone.utc).isoformat()
 
+    def _canonical_details_json(self) -> str:
+        return json.dumps(self.details or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+    def _legacy_hmac(self) -> str:
+        payload = f"{self.prev_signature}|{self.entry_id}|{self.timestamp}|{self.action}|{self.actor}|{self.resource}"
+        return hmac.new(_HMAC_KEY, payload.encode(), hashlib.sha256).hexdigest()
+
     def compute_hmac(self) -> str:
-        """Compute HMAC-SHA256 signature for tamper detection."""
-        payload = f"{self.entry_id}|{self.timestamp}|{self.action}|{self.actor}|{self.resource}"
+        """Compute HMAC-SHA256 signature for tamper detection (chain-hashed)."""
+        payload = (
+            f"{self.prev_signature}|{self.entry_id}|{self.timestamp}|"
+            f"{self.action}|{self.actor}|{self.resource}|{self._canonical_details_json()}"
+        )
+        # lgtm[py/weak-sensitive-data-hashing] HMAC-SHA256 authenticates an
+        # already-sanitized audit record; it does not derive or store passwords.
         return hmac.new(_HMAC_KEY, payload.encode(), hashlib.sha256).hexdigest()
 
     def sign(self) -> None:
@@ -73,9 +246,11 @@ class AuditEntry:
 
     def verify(self) -> bool:
         """Verify HMAC signature."""
-        return hmac.compare_digest(self.hmac_signature, self.compute_hmac())
+        return hmac.compare_digest(self.hmac_signature, self.compute_hmac()) or hmac.compare_digest(
+            self.hmac_signature, self._legacy_hmac()
+        )
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "entry_id": self.entry_id,
             "timestamp": self.timestamp,
@@ -83,8 +258,75 @@ class AuditEntry:
             "actor": self.actor,
             "resource": self.resource,
             "details": self.details,
+            "prev_signature": self.prev_signature,
             "hmac_signature": self.hmac_signature,
         }
+
+
+def sign_export_payload(payload: bytes) -> str:
+    """Sign an exported audit payload so downstream consumers can verify it."""
+    return hmac.new(_HMAC_KEY, payload, hashlib.sha256).hexdigest()
+
+
+def verify_export_payload(payload: bytes, signature: str) -> bool:
+    """Verify a signed audit export payload without exposing key material."""
+    expected = sign_export_payload(payload)
+    return hmac.compare_digest(signature.strip(), expected)
+
+
+def describe_audit_hmac_status() -> dict[str, object]:
+    """Return operator-facing audit HMAC posture for auth/policy surfaces."""
+    explicit_required = _env_enabled("AGENT_BOM_REQUIRE_AUDIT_HMAC")
+    production_required = _production_audit_hmac_required()
+    required = explicit_required or production_required
+    configured = bool(_HMAC_ENV_KEY)
+    key_id = (os.environ.get("AGENT_BOM_AUDIT_HMAC_KEY_ID") or "").strip()
+    rotation = _describe_rotation_posture(
+        configured=configured,
+        last_rotated_env="AGENT_BOM_AUDIT_HMAC_LAST_ROTATED",
+        rotation_days_env="AGENT_BOM_AUDIT_HMAC_ROTATION_DAYS",
+        max_age_days_env="AGENT_BOM_AUDIT_HMAC_MAX_AGE_DAYS",
+        subject="Audit HMAC secret",
+        not_configured_status="ephemeral",
+        not_configured_message=(
+            "Audit integrity is currently backed by a process-ephemeral secret, so there is no stable rotation history to track."
+        ),
+    )
+    if configured:
+        return {
+            "status": "configured",
+            "configured": True,
+            "required": required,
+            "required_reason": (
+                "explicit" if explicit_required else "production_or_clustered_control_plane" if production_required else "not_required"
+            ),
+            "source": "AGENT_BOM_AUDIT_HMAC_KEY",
+            "persists_across_restart": True,
+            "key_id_configured": bool(key_id),
+            "key_id": key_id or None,
+            "message": (
+                "Audit log tamper detection uses a configured shared secret. "
+                "Signatures remain verifiable across restarts as long as the same key stays in place."
+            ),
+            **rotation,
+        }
+    return {
+        "status": "ephemeral",
+        "configured": False,
+        "required": required,
+        "required_reason": (
+            "explicit" if explicit_required else "production_or_clustered_control_plane" if production_required else "not_required"
+        ),
+        "source": "process_ephemeral",
+        "persists_across_restart": False,
+        "key_id_configured": False,
+        "key_id": None,
+        "message": (
+            "Audit log tamper detection is using an in-process ephemeral secret. "
+            "Integrity checks work only for this process lifetime and reset after restart."
+        ),
+        **rotation,
+    }
 
 
 class AuditLogStore(Protocol):
@@ -98,9 +340,51 @@ class AuditLogStore(Protocol):
         since: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        tenant_id: str | None = None,
     ) -> list[AuditEntry]: ...
-    def count(self, action: str | None = None) -> int: ...
-    def verify_integrity(self, limit: int = 1000) -> tuple[int, int]: ...
+    def count(self, action: str | None = None, tenant_id: str | None = None) -> int: ...
+    def verify_integrity(self, limit: int = 1000, tenant_id: str | None = None) -> tuple[int, int]: ...
+
+
+def _entry_tenant(entry: AuditEntry) -> str:
+    return str((entry.details or {}).get("tenant_id") or "default")
+
+
+def _verify_audit_chain(entries: list[AuditEntry]) -> tuple[int, int]:
+    """Verify HMAC chain from genesis (``prev_signature`` must start at ``""``)."""
+    verified = 0
+    tampered = 0
+    prev_sig = ""
+    for entry in entries:
+        if entry.prev_signature != prev_sig or not entry.verify():
+            tampered += 1
+        else:
+            verified += 1
+        prev_sig = entry.hmac_signature
+    return verified, tampered
+
+
+@dataclass(frozen=True)
+class _AuditChainCheckpoint:
+    entry_count: int
+    head_signature: str
+
+
+def _verify_audit_chain_with_checkpoint(
+    entries: list[AuditEntry],
+    checkpoint: _AuditChainCheckpoint | None,
+) -> tuple[int, int]:
+    """Verify chain integrity and detect tail truncation via signed checkpoint."""
+    verified, tampered = _verify_audit_chain(entries)
+    if checkpoint is None:
+        return verified, tampered
+    if not entries:
+        return verified, tampered + (1 if checkpoint.entry_count > 0 else 0)
+    if len(entries) != checkpoint.entry_count:
+        return verified, tampered + 1
+    if entries[-1].hmac_signature != checkpoint.head_signature:
+        return verified, tampered + 1
+    return verified, tampered
 
 
 class InMemoryAuditLog:
@@ -111,11 +395,28 @@ class InMemoryAuditLog:
     def __init__(self) -> None:
         self._entries: list[AuditEntry] = []
         self._lock = threading.Lock()
+        self._last_sig_by_tenant: dict[str, str] = defaultdict(str)
+        self._checkpoint_by_tenant: dict[str, _AuditChainCheckpoint] = {}
+
+    def _update_checkpoint(self, tenant_id: str, head_signature: str) -> None:
+        current = self._checkpoint_by_tenant.get(tenant_id)
+        self._checkpoint_by_tenant[tenant_id] = _AuditChainCheckpoint(
+            entry_count=(current.entry_count + 1) if current else 1,
+            head_signature=head_signature,
+        )
 
     def append(self, entry: AuditEntry) -> None:
-        entry.sign()
+        tenant_id = _entry_tenant(entry)
+        # The chain-head read, signature, and head write must be atomic with the
+        # list append: doing the read-modify-write outside the lock lets two
+        # threads read the same head and fork the chain (both sign against one
+        # predecessor). Hold the lock across the whole sequence.
         with self._lock:
+            entry.prev_signature = self._last_sig_by_tenant[tenant_id]
+            entry.sign()
+            self._last_sig_by_tenant[tenant_id] = entry.hmac_signature
             self._entries.append(entry)
+            self._update_checkpoint(tenant_id, entry.hmac_signature)
             if len(self._entries) > self._MAX_ENTRIES:
                 self._entries = self._entries[self._MAX_ENTRIES // 2 :]
 
@@ -126,9 +427,12 @@ class InMemoryAuditLog:
         since: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        tenant_id: str | None = None,
     ) -> list[AuditEntry]:
         with self._lock:
             filtered = self._entries
+            if tenant_id is not None:
+                filtered = [e for e in filtered if str((e.details or {}).get("tenant_id", "")) == tenant_id]
             if action:
                 filtered = [e for e in filtered if e.action == action]
             if resource:
@@ -139,19 +443,24 @@ class InMemoryAuditLog:
             filtered = list(reversed(filtered))
             return filtered[offset : offset + limit]
 
-    def count(self, action: str | None = None) -> int:
+    def count(self, action: str | None = None, tenant_id: str | None = None) -> int:
         with self._lock:
+            entries = self._entries
+            if tenant_id is not None:
+                entries = [e for e in entries if str((e.details or {}).get("tenant_id", "")) == tenant_id]
             if action:
-                return sum(1 for e in self._entries if e.action == action)
-            return len(self._entries)
+                return sum(1 for e in entries if e.action == action)
+            return len(entries)
 
-    def verify_integrity(self, limit: int = 1000) -> tuple[int, int]:
-        """Verify HMAC signatures. Returns (verified_count, tampered_count)."""
+    def verify_integrity(self, limit: int = 1000, tenant_id: str | None = None) -> tuple[int, int]:
+        """Verify chain-hashed HMAC signatures. Returns (verified_count, tampered_count)."""
         with self._lock:
-            entries = self._entries[-limit:]
-        verified = sum(1 for e in entries if e.verify())
-        tampered = len(entries) - verified
-        return verified, tampered
+            filtered = self._entries
+            if tenant_id is not None:
+                filtered = [e for e in filtered if str((e.details or {}).get("tenant_id", "")) == tenant_id]
+            entries = filtered
+            checkpoint = self._checkpoint_by_tenant.get(tenant_id or "default")
+        return _verify_audit_chain_with_checkpoint(entries, checkpoint)
 
 
 class SQLiteAuditLog:
@@ -160,16 +469,27 @@ class SQLiteAuditLog:
     def __init__(self, db_path: str = "agent_bom_audit.db") -> None:
         self._db_path = db_path
         self._local = threading.local()
+        self._last_sig_by_tenant: dict[str, str] = defaultdict(str)
+        self._append_lock = threading.Lock()
         self._init_db()
+        self._hydrate_last_signatures()
+        if os.path.exists(self._db_path):
+            os.chmod(self._db_path, 0o600)
 
     @property
     def _conn(self) -> sqlite3.Connection:
-        if not hasattr(self._local, "conn") or self._local.conn is None:
-            self._local.conn = sqlite3.connect(self._db_path, check_same_thread=False)
-            self._local.conn.execute("PRAGMA journal_mode=WAL")
-        return self._local.conn
+        conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Let a concurrent writer wait for the write lock instead of failing
+            # fast with "database is locked" under multi-thread contention.
+            conn.execute("PRAGMA busy_timeout=5000")
+            self._local.conn = conn
+        return conn
 
     def _init_db(self) -> None:
+        ensure_sqlite_schema_version(self._conn, "audit_log")
         self._conn.execute("""CREATE TABLE IF NOT EXISTS audit_log (
             entry_id TEXT PRIMARY KEY,
             timestamp TEXT NOT NULL,
@@ -177,20 +497,219 @@ class SQLiteAuditLog:
             actor TEXT NOT NULL DEFAULT '',
             resource TEXT NOT NULL DEFAULT '',
             details TEXT NOT NULL DEFAULT '{}',
-            hmac_signature TEXT NOT NULL
+            prev_signature TEXT NOT NULL DEFAULT '',
+            hmac_signature TEXT NOT NULL,
+            tenant_id TEXT NOT NULL DEFAULT 'default'
         )""")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_resource ON audit_log(resource)")
+        # Materialise the canonical tenant (COALESCE-default — the same value the
+        # hash chain keys on) into a real column so tenant-scoped reads ride an
+        # index instead of a per-row json_extract scan. Derived from the signed
+        # `details`; the column itself is not part of the HMAC.
+        _audit_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(audit_log)").fetchall()}
+        if "tenant_id" not in _audit_cols:
+            self._conn.execute("ALTER TABLE audit_log ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
+            self._conn.execute("UPDATE audit_log SET tenant_id = COALESCE(NULLIF(json_extract(details, '$.tenant_id'), ''), 'default')")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_tenant_ts ON audit_log(tenant_id, timestamp DESC)")
+        self._conn.execute("""CREATE TABLE IF NOT EXISTS audit_chain_checkpoint (
+            tenant_id TEXT PRIMARY KEY,
+            entry_count INTEGER NOT NULL,
+            head_signature TEXT NOT NULL
+        )""")
+        self._conn.commit()
+        self._ensure_fork_guard_index()
+        self._hydrate_checkpoints()
+
+    def _ensure_fork_guard_index(self) -> None:
+        """Serialize the hash chain at the DB with a per-tenant head uniqueness.
+
+        ``UNIQUE(tenant_id, prev_signature)`` lets at most one row link to any
+        given predecessor (and exactly one genesis, ``prev_signature = ''``, per
+        tenant), so a concurrent fork is rejected instead of persisted. Built
+        defensively: pre-existing forks in older data would make the unique index
+        creation fail, and we log rather than refuse to start — appends still
+        retry, but cross-writer forks cannot be rejected until the data is
+        reconciled.
+        """
+        try:
+            self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_tenant_prevsig ON audit_log(tenant_id, prev_signature)")
+            self._conn.commit()
+        except sqlite3.IntegrityError:
+            self._conn.rollback()
+            logger.warning(
+                "Could not create audit_log fork-guard unique index "
+                "(pre-existing chain forks?); appends will retry but forks cannot "
+                "be rejected at the DB until the existing rows are reconciled"
+            )
+
+    def _hydrate_checkpoints(self) -> None:
+        existing = self._conn.execute("SELECT COUNT(*) FROM audit_chain_checkpoint").fetchone()
+        if existing and int(existing[0]) > 0:
+            return
+        tenants = self._conn.execute(
+            """
+            SELECT DISTINCT tenant_id
+            FROM audit_log
+            """
+        ).fetchall()
+        for (tenant_id,) in tenants:
+            count_row = self._conn.execute(
+                """
+                SELECT COUNT(*) FROM audit_log
+                WHERE tenant_id = ?
+                """,
+                (str(tenant_id),),
+            ).fetchone()
+            head = self._latest_signature_for_tenant(str(tenant_id))
+            if not count_row or not head:
+                continue
+            self._conn.execute(
+                "INSERT OR REPLACE INTO audit_chain_checkpoint (tenant_id, entry_count, head_signature) VALUES (?, ?, ?)",
+                (str(tenant_id), int(count_row[0]), head),
+            )
         self._conn.commit()
 
-    def append(self, entry: AuditEntry) -> None:
-        entry.sign()
+    def _get_checkpoint(self, tenant_id: str) -> _AuditChainCheckpoint | None:
+        row = self._conn.execute(
+            "SELECT entry_count, head_signature FROM audit_chain_checkpoint WHERE tenant_id = ?",
+            (tenant_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return _AuditChainCheckpoint(entry_count=int(row[0]), head_signature=str(row[1]))
+
+    def _upsert_checkpoint(self, tenant_id: str, head_signature: str) -> None:
+        # First-seed entry_count is the tenant's TRUE audit_log row count, not a
+        # hardcoded 1: a legacy tenant whose rows predate its first checkpoint
+        # upsert would otherwise seed entry_count=1 while N historical rows exist,
+        # so verify_integrity's truncation check under-counts until N further
+        # appends accrue (#4294). The COUNT runs in the same transaction as the
+        # preceding audit_log INSERT (so it includes the just-inserted row) and
+        # only on the INSERT branch; the steady-state ON CONFLICT path stays an
+        # O(1) increment. A genuine genesis (0 prior rows) still seeds 1.
         self._conn.execute(
-            "INSERT INTO audit_log (entry_id, timestamp, action, actor, resource, details, hmac_signature) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (entry.entry_id, entry.timestamp, entry.action, entry.actor, entry.resource, json.dumps(entry.details), entry.hmac_signature),
+            """
+            INSERT INTO audit_chain_checkpoint (tenant_id, entry_count, head_signature)
+            VALUES (?, (SELECT COUNT(*) FROM audit_log WHERE tenant_id = ?), ?)
+            ON CONFLICT(tenant_id) DO UPDATE SET
+                entry_count = entry_count + 1,
+                head_signature = excluded.head_signature
+            """,
+            (tenant_id, tenant_id, head_signature),
         )
+
+    def backfill_checkpoints(self) -> int:
+        """Reconcile every tenant's checkpoint to its true chain state (#4294).
+
+        Recomputes ``entry_count`` (the tenant's audit_log row count) and
+        ``head_signature`` (the true chain tip in append/rowid order) directly
+        from ``audit_log``, healing legacy checkpoints seeded at ``entry_count=1``
+        and seeding tenants that have none. Idempotent: rerunning yields the same
+        rows. Returns the number of tenant checkpoints reconciled.
+        """
+        tenants = self._conn.execute("SELECT DISTINCT tenant_id FROM audit_log").fetchall()
+        reconciled = 0
+        for (tenant_id,) in tenants:
+            count_row = self._conn.execute(
+                "SELECT COUNT(*) FROM audit_log WHERE tenant_id = ?",
+                (str(tenant_id),),
+            ).fetchone()
+            head = self._latest_signature_for_tenant(str(tenant_id))
+            if not count_row or not head:
+                continue
+            self._conn.execute(
+                "INSERT OR REPLACE INTO audit_chain_checkpoint (tenant_id, entry_count, head_signature) VALUES (?, ?, ?)",
+                (str(tenant_id), int(count_row[0]), head),
+            )
+            reconciled += 1
         self._conn.commit()
+        return reconciled
+
+    def _latest_signature_for_tenant(self, tenant_id: str) -> str:
+        # The chain head is the LAST-APPENDED row (max rowid), not the row with
+        # the latest timestamp. Under concurrent appends a later-inserted entry
+        # can carry an earlier wall-clock timestamp, so ordering by rowid (true
+        # insertion/append order) keeps head selection aligned with the chain.
+        row = self._conn.execute(
+            """
+            SELECT hmac_signature
+            FROM audit_log
+            WHERE COALESCE(NULLIF(json_extract(details, '$.tenant_id'), ''), 'default') = ?
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (tenant_id,),
+        ).fetchone()
+        return row[0] if row else ""
+
+    def _hydrate_last_signatures(self) -> None:
+        rows = self._conn.execute(
+            """
+            SELECT tenant_id, hmac_signature
+            FROM (
+                SELECT
+                    tenant_id,
+                    hmac_signature,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY tenant_id
+                        ORDER BY rowid DESC
+                    ) AS rn
+                FROM audit_log
+            )
+            WHERE rn = 1
+            """
+        ).fetchall()
+        for tenant_id, signature in rows:
+            self._last_sig_by_tenant[str(tenant_id)] = str(signature or "")
+
+    def append(self, entry: AuditEntry) -> None:
+        tenant_id = _entry_tenant(entry)
+        # An in-process lock serializes seal+insert so threads sharing this store
+        # can't read the same head and fork the chain. The DB-level
+        # UNIQUE(tenant_id, prev_signature) plus this retry handle the
+        # cross-process case (separate connections/replicas): a writer that loses
+        # the race is rejected, then re-reads the advanced head and re-links.
+        with self._append_lock:
+            attempts = 0
+            while True:
+                attempts += 1
+                prev_sig = self._last_sig_by_tenant.get(tenant_id)
+                if prev_sig is None or prev_sig == "":
+                    prev_sig = self._latest_signature_for_tenant(tenant_id)
+                entry.prev_signature = prev_sig
+                entry.sign()
+                try:
+                    self._conn.execute(
+                        "INSERT INTO audit_log"
+                        " (entry_id, timestamp, action, actor, resource,"
+                        " details, prev_signature, hmac_signature, tenant_id)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            entry.entry_id,
+                            entry.timestamp,
+                            entry.action,
+                            entry.actor,
+                            entry.resource,
+                            json.dumps(entry.details),
+                            entry.prev_signature,
+                            entry.hmac_signature,
+                            tenant_id,
+                        ),
+                    )
+                    self._upsert_checkpoint(tenant_id, entry.hmac_signature)
+                    self._conn.commit()
+                except sqlite3.IntegrityError as exc:
+                    self._conn.rollback()
+                    if "prev_signature" not in str(exc) or attempts > _MAX_APPEND_RETRIES:
+                        raise
+                    # Another writer linked this head first — drop the stale cache
+                    # and re-read the advanced head before retrying.
+                    self._last_sig_by_tenant[tenant_id] = self._latest_signature_for_tenant(tenant_id)
+                    continue
+                self._last_sig_by_tenant[tenant_id] = entry.hmac_signature
+                return
 
     def list_entries(
         self,
@@ -199,9 +718,13 @@ class SQLiteAuditLog:
         since: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        tenant_id: str | None = None,
     ) -> list[AuditEntry]:
-        clauses = []
-        params: list = []
+        clauses: list[str] = []
+        params: list[Any] = []
+        if tenant_id is not None:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
         if action:
             clauses.append("action = ?")
             params.append(action)
@@ -214,7 +737,7 @@ class SQLiteAuditLog:
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""  # nosec B608 — clauses are static strings, values are parameterized
         sql = (
-            f"SELECT entry_id, timestamp, action, actor, resource, details, hmac_signature"  # nosec B608
+            f"SELECT entry_id, timestamp, action, actor, resource, details, prev_signature, hmac_signature"  # nosec B608
             f" FROM audit_log {where} ORDER BY timestamp DESC LIMIT ? OFFSET ?"
         )
         params.extend([limit, offset])
@@ -228,23 +751,68 @@ class SQLiteAuditLog:
                 actor=r[3],
                 resource=r[4],
                 details=json.loads(r[5]),
-                hmac_signature=r[6],
+                prev_signature=r[6],
+                hmac_signature=r[7],
             )
             for r in rows
         ]
 
-    def count(self, action: str | None = None) -> int:
+    def count(self, action: str | None = None, tenant_id: str | None = None) -> int:
+        clauses = []
+        params: list[object] = []
+        if tenant_id is not None:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
         if action:
-            row = self._conn.execute("SELECT COUNT(*) FROM audit_log WHERE action = ?", (action,)).fetchone()
-        else:
-            row = self._conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()
+            clauses.append("action = ?")
+            params.append(action)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self._conn.execute(f"SELECT COUNT(*) FROM audit_log{where}", params).fetchone()  # nosec B608
         return row[0] if row else 0
 
-    def verify_integrity(self, limit: int = 1000) -> tuple[int, int]:
-        entries = self.list_entries(limit=limit)
-        verified = sum(1 for e in entries if e.verify())
-        tampered = len(entries) - verified
-        return verified, tampered
+    def _list_entries_chronological(
+        self,
+        limit: int,
+        tenant_id: str | None = None,
+    ) -> list[AuditEntry]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if tenant_id is not None:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        # Walk the chain in true append order (rowid), which is how entries were
+        # linked. Ordering by timestamp would reorder concurrently-appended rows
+        # whose wall-clock times don't match insertion order and report a healthy
+        # chain as tampered.
+        sql = (
+            f"SELECT entry_id, timestamp, action, actor, resource, details, prev_signature, hmac_signature"  # nosec B608
+            f" FROM audit_log {where} ORDER BY rowid ASC LIMIT ?"
+        )
+        params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [
+            AuditEntry(
+                entry_id=r[0],
+                timestamp=r[1],
+                action=r[2],
+                actor=r[3],
+                resource=r[4],
+                details=json.loads(r[5]),
+                prev_signature=r[6],
+                hmac_signature=r[7],
+            )
+            for r in rows
+        ]
+
+    def verify_integrity(self, limit: int = 1000, tenant_id: str | None = None) -> tuple[int, int]:
+        """Verify chain-hashed HMAC signatures. Returns (verified_count, tampered_count)."""
+        tenant_key = tenant_id or "default"
+        total = self.count(tenant_id=tenant_id)
+        fetch_limit = total if total else limit
+        entries = self._list_entries_chronological(limit=fetch_limit, tenant_id=tenant_id)
+        checkpoint = self._get_checkpoint(tenant_key)
+        return _verify_audit_chain_with_checkpoint(entries, checkpoint)
 
 
 # ── Module-level singleton ──
@@ -258,12 +826,110 @@ def get_audit_log() -> AuditLogStore:
     if _audit_log is None:
         with _audit_lock:
             if _audit_log is None:
-                db = os.environ.get("AGENT_BOM_AUDIT_DB")
-                if db:
-                    _audit_log = SQLiteAuditLog(db)
+                if os.environ.get("AGENT_BOM_POSTGRES_URL"):
+                    from agent_bom.api.postgres_store import PostgresAuditLog
+
+                    _audit_log = PostgresAuditLog()
                 else:
-                    _audit_log = InMemoryAuditLog()
+                    db = os.environ.get("AGENT_BOM_AUDIT_DB") or os.environ.get("AGENT_BOM_DB")
+                    if db:
+                        _audit_log = SQLiteAuditLog(db)
+                    else:
+                        _audit_log = InMemoryAuditLog()
     return _audit_log
+
+
+def _default_tenant_id(details: dict[str, object]) -> str:
+    tenant = details.get("tenant_id")
+    if tenant not in (None, ""):
+        return str(tenant)
+    try:
+        from agent_bom.api.postgres_store import _current_tenant
+
+        current = _current_tenant.get()
+        if current:
+            return str(current)
+    except Exception:
+        logger.debug("Audit tenant fallback unavailable", exc_info=True)
+    return "default"
+
+
+def _sanitize_detail_key(key: object) -> str:
+    cleaned = _AUDIT_DETAIL_KEY_RE.sub("_", str(key).strip())[:_MAX_AUDIT_DETAIL_KEY_LENGTH].strip("._:-")
+    cleaned = cleaned.strip("_")
+    return cleaned or "detail"
+
+
+def _sanitize_detail_value(value: object, *, depth: int = 0) -> object:
+    if depth >= _MAX_AUDIT_DETAIL_DEPTH:
+        return "[truncated]"
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, str):
+        sanitized = sanitize_sensitive_payload(value, max_str_len=_MAX_AUDIT_DETAIL_STRING_LENGTH)
+        text = str(sanitized).replace("\r", " ").replace("\n", " ").replace("\t", " ")
+        return text[:_MAX_AUDIT_DETAIL_STRING_LENGTH]
+    if isinstance(value, dict):
+        out: dict[str, object] = {}
+        for index, (raw_key, raw_value) in enumerate(value.items()):
+            if index >= _MAX_AUDIT_DETAIL_COLLECTION_ITEMS:
+                out["_truncated"] = True
+                break
+            clean_key = _sanitize_detail_key(raw_key)
+            out[clean_key] = _sanitize_detail_value(
+                sanitize_sensitive_payload(raw_value, key=clean_key, max_str_len=_MAX_AUDIT_DETAIL_STRING_LENGTH),
+                depth=depth + 1,
+            )
+        return out
+    if isinstance(value, list | tuple | set):
+        items = list(value)
+        list_out = [
+            _sanitize_detail_value(sanitize_sensitive_payload(item, max_str_len=_MAX_AUDIT_DETAIL_STRING_LENGTH), depth=depth + 1)
+            for item in items[:_MAX_AUDIT_DETAIL_COLLECTION_ITEMS]
+        ]
+        if len(items) > _MAX_AUDIT_DETAIL_COLLECTION_ITEMS:
+            list_out.append("[truncated]")
+        return list_out
+    return str(sanitize_sensitive_payload(value, max_str_len=_MAX_AUDIT_DETAIL_STRING_LENGTH))[:_MAX_AUDIT_DETAIL_STRING_LENGTH]
+
+
+def sanitize_audit_details(details: dict[str, object]) -> dict[str, object]:
+    """Bound audit metadata shape and size before persistence/export."""
+    sanitized: dict[str, object] = {}
+    for index, (raw_key, raw_value) in enumerate(details.items()):
+        if index >= _MAX_AUDIT_DETAIL_KEYS:
+            sanitized["_truncated"] = True
+            break
+        clean_key = _sanitize_detail_key(raw_key)
+        sanitized[clean_key] = _sanitize_detail_value(
+            sanitize_sensitive_payload(raw_value, key=clean_key, max_str_len=_MAX_AUDIT_DETAIL_STRING_LENGTH)
+        )
+
+    encoded = json.dumps(sanitized, sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")
+    if len(encoded) <= _MAX_AUDIT_DETAILS_JSON_BYTES:
+        return sanitized
+
+    tenant_id = sanitized.get("tenant_id", "default")
+    return {
+        "tenant_id": str(tenant_id)[:_MAX_AUDIT_DETAIL_STRING_LENGTH],
+        "_truncated": True,
+        "_original_bytes": len(encoded),
+    }
+
+
+def _safe_audit_label(value: object, *, key: str, default: str = "") -> str:
+    """Return a durable tier-A label for top-level actor/resource fields."""
+    if value in (None, ""):
+        return default
+    text = str(sanitize_sensitive_payload(value, key=key, max_str_len=256) or "")
+    if not text:
+        return default
+    parsed = urlparse(text)
+    if parsed.scheme and parsed.netloc:
+        return f"<url:{parsed.hostname or 'host'}>"
+    if text.startswith(("/", "~/")) or re.match(r"^[A-Za-z]:[\\/]", text):
+        return sanitize_path_label(text)
+    return text[:256]
 
 
 def set_audit_log(store: AuditLogStore) -> None:
@@ -273,6 +939,43 @@ def set_audit_log(store: AuditLogStore) -> None:
 
 
 def log_action(action: str, actor: str = "system", resource: str = "", **details: object) -> None:
-    """Convenience: append an audit entry."""
-    entry = AuditEntry(action=action, actor=actor, resource=resource, details=dict(details))
+    """Convenience: append an audit entry.
+
+    The audit log is a tier-A (``SAFE_TO_STORE``) sink — see issue #2261.
+    Every payload is routed through the evidence redaction policy so any
+    tier-B field (raw prompts, tool inputs/outputs, full URLs, command
+    args, response bodies, workspace content) is dropped before HMAC
+    chaining and persistence.
+    """
+    from agent_bom.evidence import EvidenceTier, redact_for_persistence
+
+    raw_details = dict(details)
+    audit_details = redact_for_persistence(raw_details, EvidenceTier.SAFE_TO_STORE)
+    if not audit_details.get("tenant_id"):
+        audit_details["tenant_id"] = _default_tenant_id(raw_details)
+    audit_details = sanitize_audit_details(audit_details)
+    entry = AuditEntry(
+        action=action,
+        actor=_safe_audit_label(actor, key="actor_id", default="system"),
+        resource=_safe_audit_label(resource, key="resource_id"),
+        details=audit_details,
+    )
     get_audit_log().append(entry)
+    try:
+        from agent_bom.api.stores import _get_analytics_store
+
+        _get_analytics_store().record_audit_event(
+            {
+                "entry_id": entry.entry_id,
+                "timestamp": entry.timestamp,
+                "action": entry.action,
+                "actor": entry.actor,
+                "resource": entry.resource,
+                "tenant_id": str(entry.details.get("tenant_id", "default") or "default"),
+                "session_id": str(entry.details.get("session_id", "") or ""),
+                "trace_id": str(entry.details.get("trace_id", "") or ""),
+                "request_id": str(entry.details.get("request_id", "") or ""),
+            }
+        )
+    except Exception:
+        logger.debug("Audit analytics sync skipped", exc_info=True)

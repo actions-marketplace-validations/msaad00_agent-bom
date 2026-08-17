@@ -89,6 +89,29 @@ def test_vscode_env_vars_redacted():
     assert servers[0].env.get("GITHUB_TOKEN") == "***REDACTED***"
 
 
+def test_vscode_rejects_non_string_args_and_urls():
+    """Parser should not silently coerce dict/list labels into command args or URLs."""
+    from agent_bom.discovery import parse_mcp_config
+
+    config = {
+        "servers": {
+            "typed": {
+                "type": "http",
+                "uri": {"host": "internal"},
+                "command": {"cmd": "npx"},
+                "args": {"unexpected": "shape"},
+                "bearer_token_env_var": {"name": "TOKEN"},
+            }
+        }
+    }
+    servers = parse_mcp_config(config, "/fake/mcp.json")
+    assert len(servers) == 1
+    assert servers[0].command == ""
+    assert servers[0].args == []
+    assert servers[0].url is None
+    assert servers[0].env == {}
+
+
 def test_vscode_uri_fallback_to_url():
     """Parser handles both 'uri' (VS Code) and 'url' (standard) fields."""
     from agent_bom.discovery import parse_mcp_config
@@ -149,6 +172,8 @@ def test_compose_discovers_mcp_services(tmp_path):
     assert len(agent.mcp_servers) == 2  # playwright + fetch, NOT redis
     names = {s.name for s in agent.mcp_servers}
     assert names == {"playwright", "fetch"}
+    assert all(s.packages[0].floating_reference for s in agent.mcp_servers)
+    assert all(any("FLOATING_IMAGE_REFERENCE" in warning for warning in s.security_warnings) for s in agent.mcp_servers)
 
 
 def test_compose_extracts_env_vars(tmp_path):
@@ -195,6 +220,7 @@ def test_compose_creates_docker_packages(tmp_path):
     assert pkg.name == "mcp/filesystem"
     assert pkg.version == "1.2.3"
     assert pkg.ecosystem == "docker"
+    assert pkg.floating_reference is False
 
 
 def test_compose_handles_sha_digest(tmp_path):
@@ -215,6 +241,7 @@ def test_compose_handles_sha_digest(tmp_path):
     pkg = agent.mcp_servers[0].packages[0]
     assert pkg.name == "mcp/playwright"
     assert pkg.version == "4e403fabcdef"  # First 12 chars
+    assert pkg.floating_reference is False
 
 
 def test_compose_no_mcp_services(tmp_path):

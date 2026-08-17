@@ -12,11 +12,21 @@ venv/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
+.demo-bin/
 agent-bom-report.json
+gateway-baseline-policy.json
 agent-bom.cdx.json
+agent-bom-badge.json
+agent-bom-diagram.mmd
+agent-bom-graph.html
+agent-bom-graph.json
+agent-bom.sarif
+compliance-*.zip
 report.json
 report.html
+node_modules/
 .DS_Store
+.claude/launch.json
 .claude/settings.local.json
 .claude/settings.json
 src/agent_bom/ui_dist/
@@ -25,4 +35,47 @@ ui/out/
 ui/.next/
 .coverage
 .claude/worktrees/
+.claude/worktree-rescue/
+.codex/
+.cursor/
+.playwright-mcp/
+.venv-*/
 AUDIT_*.md
+ui/.claude/
+# macOS / iCloud duplicate conflict files — keep them out of git even if they
+# appear locally in a synced working tree.
+README [0-9].md
+docs/CAPTURE [0-9].md
+docs/images/* [0-9].png
+docs/images/* [0-9].gif
+docs/images/* [0-9].svg
+docs/**/* [0-9].png
+docs/**/* [0-9].gif
+docs/**/* [0-9].svg
+docs/**/* [0-9].md
+site-docs/**/* [0-9].md
+src/agent_bom/**/* [0-9].py
+tests/**/* [0-9].py
+ui/**/* [0-9].js
+ui/**/* [0-9].jsx
+ui/**/* [0-9].json
+ui/**/* [0-9].md
+ui/**/* [0-9].ts
+ui/**/* [0-9].tsx
+deploy/helm/agent-bom/**/* [0-9].yaml
+.github/workflows/* [0-9].yml
+# Catch-all for Finder copies anywhere (iCloud Desktop sync spawns these on
+# every edit). The pre-commit guard still fails the commit if one is staged;
+# this just keeps them out of `git add .` in the first place.
+* [0-9].*
+# Local working screenshots dropped at the repo root (graph/console captures);
+# real docs imagery lives under docs/images/.
+/*.png
+
+# Working-copy hygiene — Finder/iCloud duplicate copies, scan-output, macOS cruft
+* 2.*
+*-report.json
+agent-bom-report.json
+.DS_Store
+
+# Go runtime worker binaries (local builds; not release artifacts)

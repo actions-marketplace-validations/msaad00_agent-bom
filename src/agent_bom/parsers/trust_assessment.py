@@ -13,7 +13,7 @@ Categories:
 Usage:
     from agent_bom.parsers.trust_assessment import assess_trust
     result = assess_trust(scan_result, audit_result)
-    print(result.verdict, result.confidence)
+    verdict = (result.verdict, result.confidence)
 """
 
 from __future__ import annotations
@@ -48,6 +48,22 @@ class Verdict(str, Enum):
     MALICIOUS = "malicious"
 
 
+class ProvenanceVerdict(str, Enum):
+    """Provenance/signing verification verdict."""
+
+    VERIFIED = "verified"
+    UNVERIFIED = "unverified"
+
+
+class ReviewVerdict(str, Enum):
+    """Review-focused skill handling verdict."""
+
+    TRUSTED = "trusted"
+    REVIEW = "review"
+    HIGH_RISK = "high_risk"
+    BLOCKED = "blocked"
+
+
 class Confidence(str, Enum):
     """Confidence level in the verdict."""
 
@@ -73,12 +89,36 @@ class TrustCategoryResult:
 
 @dataclass
 class TrustAssessmentResult:
-    """Complete trust assessment across all 5 categories."""
+    """Complete trust assessment across all 5 categories.
+
+    The legacy single `verdict` conflated provenance signals (signed?
+    source URL?) with content risk signals (credential access? shell
+    exec? exfiltration?). Per #2197 audit, that misclassified legitimate
+    cybersecurity playbooks as `malicious` whenever they were unsigned
+    and lacked a frontmatter `source:` URL, even when the audit found
+    zero behavioural risk signals.
+
+    The result now carries TWO axes:
+
+    - `provenance_verdict` -- verified source/signing posture or unverified?
+    - `content_verdict`    -- behavioural risk signals from the audit?
+
+    `verdict` is preserved for pre-#2197 consumers as a derived content
+    verdict for one compatibility release. Use `review_verdict` or
+    `overall_recommendation` for handling decisions because provenance-only
+    gaps should send a skill to review without implying malicious content.
+    """
 
     categories: list[TrustCategoryResult] = field(default_factory=list)
     verdict: Verdict = Verdict.BENIGN
+    review_verdict: ReviewVerdict = ReviewVerdict.REVIEW
     confidence: Confidence = Confidence.LOW
+    provenance_verdict: ProvenanceVerdict = ProvenanceVerdict.VERIFIED
+    content_verdict: Verdict = Verdict.BENIGN
     recommendations: list[str] = field(default_factory=list)
+    review_reasons: list[str] = field(default_factory=list)
+    reviewer_guidance: list[str] = field(default_factory=list)
+    publisher_guidance: list[str] = field(default_factory=list)
     skill_name: str = ""
     source_file: str = ""
 
@@ -96,7 +136,13 @@ class TrustAssessmentResult:
             "skill_name": self.skill_name,
             "source_file": self.source_file,
             "verdict": self.verdict.value,
+            "review_verdict": self.review_verdict.value,
+            "overall_recommendation": self.review_verdict.value,
             "confidence": self.confidence.value,
+            # Two-axis split (#2197 audit). `verdict` above is kept for
+            # backward compat; new consumers should prefer these axes.
+            "provenance_verdict": self.provenance_verdict.value,
+            "content_verdict": self.content_verdict.value,
             "categories": [
                 {
                     "name": c.name,
@@ -109,6 +155,9 @@ class TrustAssessmentResult:
                 for c in self.categories
             ],
             "recommendations": self.recommendations,
+            "review_reasons": self.review_reasons,
+            "reviewer_guidance": self.reviewer_guidance,
+            "publisher_guidance": self.publisher_guidance,
         }
 
 
@@ -252,7 +301,7 @@ def _assess_instruction_scope(
             evidence.append(f"file_writes: {writes}")
 
     # Check for credential file access or data exfiltration
-    dangerous_scope = _audit_findings_for(audit, "credential_file_access", "data_exfiltration", "memory_poisoning")
+    dangerous_scope = _audit_findings_for(audit, "credential_file_access", "data_exfiltration", "memory_poisoning", "prompt_coercion")
     if dangerous_scope:
         for f in dangerous_scope[:3]:
             details.append(f"Behavioral finding: {f.title}")
@@ -263,7 +312,7 @@ def _assess_instruction_scope(
             name="Instruction Scope",
             key="instruction_scope",
             level=TrustLevel.FAIL,
-            summary="Credential file access or data exfiltration pattern detected",
+            summary="Prompt coercion, credential access, or data exfiltration pattern detected",
             details=details,
             evidence=evidence,
         )
@@ -579,6 +628,79 @@ def _compute_verdict(
     return Verdict.BENIGN, Confidence.LOW
 
 
+# Per #2197 audit: split verdict into provenance + content axes.
+# `install_mechanism` is the only category that scores on metadata
+# completeness (signed? source URL? install methods declared?). Every
+# other category scores on actual behavioural risk in the skill content.
+_PROVENANCE_CATEGORY_KEYS = frozenset({"install_mechanism"})
+
+
+def _split_categories(
+    categories: list[TrustCategoryResult],
+) -> tuple[list[TrustCategoryResult], list[TrustCategoryResult]]:
+    """Partition categories into (provenance, content) axes."""
+    provenance = [c for c in categories if c.key in _PROVENANCE_CATEGORY_KEYS]
+    content = [c for c in categories if c.key not in _PROVENANCE_CATEGORY_KEYS]
+    return provenance, content
+
+
+def _compute_axis_verdict(categories: list[TrustCategoryResult]) -> Verdict:
+    """Compute a single-axis verdict (BENIGN/SUSPICIOUS/MALICIOUS).
+
+    Used independently for provenance and content axes so the trust
+    contract surfaces honestly which dimension is suspect (#2197).
+    """
+    if not categories:
+        return Verdict.BENIGN
+    fail_count = sum(1 for c in categories if c.level == TrustLevel.FAIL)
+    warn_count = sum(1 for c in categories if c.level == TrustLevel.WARN)
+    if fail_count >= 2:
+        return Verdict.MALICIOUS
+    if fail_count >= 1:
+        # On a single-axis assessment a single FAIL no longer escalates to
+        # MALICIOUS unless paired with corroborating WARNs -- that's what
+        # the audit caught (one FAIL on `install_mechanism` was scoring
+        # the whole file MALICIOUS).
+        return Verdict.SUSPICIOUS if warn_count == 0 else Verdict.MALICIOUS
+    if warn_count >= 1:
+        return Verdict.SUSPICIOUS
+    return Verdict.BENIGN
+
+
+def _compute_content_verdict_from_audit(audit: SkillAuditResult) -> Verdict:
+    """Compute behavioral content risk without metadata/provenance signals.
+
+    Severity ladder:
+    - behavioral + critical -> malicious
+    - behavioral + high     -> suspicious
+    - behavioral + medium   -> benign content, review via review_verdict
+    - behavioral + low      -> benign content
+    - metadata/catalog only -> benign content; provenance/review axes handle it
+    """
+    findings = audit.findings
+    if _escalating_categories(findings, _BLOCKED_FINDING_CATEGORIES):
+        return Verdict.MALICIOUS
+    if any(f.severity == "critical" and _is_behavioral_content_finding(f.category) and not _is_low_confidence_keyword(f) for f in findings):
+        return Verdict.MALICIOUS
+    if _escalating_categories(findings, _HIGH_RISK_FINDING_CATEGORIES):
+        return Verdict.SUSPICIOUS
+    if any(f.severity == "high" and _is_behavioral_content_finding(f.category) and not _is_low_confidence_keyword(f) for f in findings):
+        return Verdict.SUSPICIOUS
+    return Verdict.BENIGN
+
+
+def _compute_provenance_verdict(provenance_categories: list[TrustCategoryResult]) -> ProvenanceVerdict:
+    """Compute whether provenance metadata is complete enough to be treated as verified."""
+    if _compute_axis_verdict(provenance_categories) == Verdict.BENIGN:
+        return ProvenanceVerdict.VERIFIED
+    return ProvenanceVerdict.UNVERIFIED
+
+
+def _combine_verdict(provenance_verdict: ProvenanceVerdict, content_verdict: Verdict) -> Verdict:
+    """Return legacy `verdict` as content verdict for one compatibility release."""
+    return content_verdict
+
+
 # ── Recommendations ──────────────────────────────────────────────────────────
 
 
@@ -633,6 +755,119 @@ def _generate_recommendations(categories: list[TrustCategoryResult]) -> list[str
     return recs
 
 
+_BLOCKED_FINDING_CATEGORIES = {
+    "credential_file_access",
+    "confirmation_bypass",
+    "privilege_escalation",
+}
+
+_HIGH_RISK_FINDING_CATEGORIES = {
+    "shell_access",
+    "destructive_action",
+    "financial_transaction",
+    "surveillance_access",
+    "agent_delegation",
+}
+
+_REVIEW_ONLY_FINDING_CATEGORIES = {
+    "missing_capability_declaration",
+    "undeclared_dependency",
+    "undocumented_network",
+    "unknown_package",
+    "unverified_server",
+}
+
+
+def _is_behavioral_content_finding(category: str) -> bool:
+    """Return whether an audit finding describes skill behavior."""
+    return category not in _REVIEW_ONLY_FINDING_CATEGORIES
+
+
+def _is_low_confidence_keyword(finding: object) -> bool:
+    """Return whether a finding is a lone low-confidence keyword/heuristic hit.
+
+    A single descriptive keyword in prose (e.g. "subagent" in a legitimate
+    CLAUDE.md/AGENTS.md) is emitted at low severity with ``confidence="low"``.
+    Such a hit must not, by itself, escalate ``content_verdict`` to malicious
+    or ``review_verdict`` to blocked/high_risk. Corroborated injection signals
+    keep high/critical severity (and high confidence) and still escalate.
+    """
+    return getattr(finding, "confidence", "medium") == "low" and getattr(finding, "severity", "low") in {"low", "medium"}
+
+
+def _escalating_categories(findings: list, categories: frozenset[str] | set[str]) -> bool:
+    """True when any finding in ``categories`` is strong enough to escalate.
+
+    Low-confidence keyword hits are kept visible but excluded here so a single
+    descriptive feature name cannot drive the verdict.
+    """
+    return any(f.category in categories and not _is_low_confidence_keyword(f) for f in findings)
+
+
+def _compute_review_verdict(
+    provenance_verdict: ProvenanceVerdict,
+    content_verdict: Verdict,
+    categories: list[TrustCategoryResult],
+    audit: SkillAuditResult,
+) -> ReviewVerdict:
+    """Map trust and audit signals to a handling-oriented review verdict."""
+    findings = audit.findings
+    if _escalating_categories(findings, _BLOCKED_FINDING_CATEGORIES) or any(
+        f.severity == "critical" and _is_behavioral_content_finding(f.category) and not _is_low_confidence_keyword(f) for f in findings
+    ):
+        return ReviewVerdict.BLOCKED
+    if content_verdict == Verdict.MALICIOUS or _escalating_categories(findings, _HIGH_RISK_FINDING_CATEGORIES):
+        return ReviewVerdict.HIGH_RISK
+    if any(f.severity == "medium" and _is_behavioral_content_finding(f.category) for f in findings):
+        return ReviewVerdict.REVIEW
+    if (
+        content_verdict == Verdict.SUSPICIOUS
+        or provenance_verdict == ProvenanceVerdict.UNVERIFIED
+        or any(c.level in {TrustLevel.WARN, TrustLevel.FAIL} for c in categories)
+    ):
+        return ReviewVerdict.REVIEW
+    return ReviewVerdict.TRUSTED
+
+
+def _build_review_reasons(categories: list[TrustCategoryResult], audit: SkillAuditResult) -> list[str]:
+    """Build short reasons explaining the current review verdict."""
+    reasons: list[str] = []
+    for category in categories:
+        if category.level in {TrustLevel.FAIL, TrustLevel.WARN}:
+            reasons.append(f"{category.name}: {category.summary}")
+    for finding in audit.findings:
+        if finding.severity in {"critical", "high"}:
+            reasons.append(f"{finding.title} ({finding.category})")
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for reason in reasons:
+        if reason not in seen:
+            seen.add(reason)
+            deduped.append(reason)
+    return deduped[:6]
+
+
+def _build_reviewer_guidance(audit: SkillAuditResult) -> list[str]:
+    """Build reviewer guidance from grouped behavioral findings."""
+    guidance: list[str] = []
+    families_obj = audit.behavioral_summary.get("families", {}) if audit.behavioral_summary else {}
+    families = families_obj if isinstance(families_obj, dict) else {}
+    if families.get("code_execution"):
+        guidance.append("Review shell, delegation, destructive, or code-execution paths before allowing this skill.")
+    if families.get("network_access"):
+        guidance.append("Review outbound endpoints, messaging, and remote server access before allowing network use.")
+    if families.get("prompt_coercion"):
+        guidance.append("Review instructions that override guardrails, memory, or system prompts before trusting the skill.")
+    if families.get("data_access"):
+        guidance.append("Review credential exposure and private-data access paths before exposing this skill to real data.")
+    if families.get("persistence"):
+        guidance.append("Review scheduled-task or persistence behavior before allowing unattended execution.")
+    if not guidance and any(f.severity in {"high", "critical"} for f in audit.findings):
+        guidance.append("Review the high-severity findings before using this skill in production.")
+    return guidance[:5]
+
+
 # ── Main entry point ─────────────────────────────────────────────────────────
 
 
@@ -657,14 +892,29 @@ def assess_trust(
         _assess_persistence_privilege(meta, scan, audit),
     ]
 
-    verdict, confidence = _compute_verdict(categories)
+    _legacy_verdict, confidence = _compute_verdict(categories)
+    # Per #2197 audit: split verdict into provenance + content so a clean
+    # skill that's just unsigned no longer reads as `malicious`.
+    provenance_categories, _content_categories = _split_categories(categories)
+    provenance_verdict = _compute_provenance_verdict(provenance_categories)
+    content_verdict = _compute_content_verdict_from_audit(audit)
+    verdict = _combine_verdict(provenance_verdict, content_verdict)
     recommendations = _generate_recommendations(categories)
+    review_verdict = _compute_review_verdict(provenance_verdict, content_verdict, categories, audit)
+    review_reasons = _build_review_reasons(categories, audit)
+    reviewer_guidance = _build_reviewer_guidance(audit)
 
     return TrustAssessmentResult(
         categories=categories,
         verdict=verdict,
+        review_verdict=review_verdict,
         confidence=confidence,
+        provenance_verdict=provenance_verdict,
+        content_verdict=content_verdict,
         recommendations=recommendations,
+        review_reasons=review_reasons,
+        reviewer_guidance=reviewer_guidance,
+        publisher_guidance=recommendations,
         skill_name=meta.name if meta else "",
         source_file=source_file,
     )

@@ -7,64 +7,263 @@ Provides pluggable job persistence:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from datetime import datetime, timezone
-from typing import Protocol
+from typing import Any, Protocol, cast
+
+from agent_bom.api.storage_schema import ensure_sqlite_schema_version
+from agent_bom.config import API_MAX_IN_MEMORY_JOBS
 
 from .server import JobStatus, ScanJob
 
 _JOB_TTL_SECONDS = 3600  # 1 hour
+
+# Curated public-demo scan jobs must outlive AGENT_BOM_API_JOB_TTL. Without this
+# exemption the cleanup loop deletes DONE demo jobs ~1h after bootstrap and the
+# hosted demo serves an empty findings spine until the next API restart.
+DEMO_ESTATE_TRIGGERED_BY = "demo-estate-bootstrap"
+
+
+def _literal_like_pattern(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _job_search_text(job: ScanJob) -> str:
+    request_source = getattr(job.request, "source_id", None)
+    values = (
+        job.job_id,
+        job.source_id,
+        request_source,
+        job.triggered_by,
+        job.schedule_id,
+        json.dumps(job.target, sort_keys=True) if job.target is not None else None,
+    )
+    return " ".join(str(value) for value in values if value).casefold()
+
+
+def _job_summary_search_text(row: dict) -> str:
+    values = (
+        row.get("job_id"),
+        row.get("source_id"),
+        row.get("triggered_by"),
+        row.get("schedule_id"),
+        json.dumps(row.get("target"), sort_keys=True) if row.get("target") is not None else None,
+    )
+    return " ".join(str(value) for value in values if value).casefold()
+
+
+def _sqlite_job_summary_filter(
+    tenant_id: str | None,
+    *,
+    query: str | None = None,
+    status: JobStatus | None = None,
+) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if tenant_id is not None:
+        clauses.append("tenant_id = ?")
+        params.append(tenant_id)
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status.value if isinstance(status, JobStatus) else str(status))
+    normalized_query = (query or "").strip().casefold()
+    if normalized_query:
+        clauses.append(
+            "LOWER(COALESCE(job_id, '') || ' ' || COALESCE(triggered_by, '') || ' ' || "
+            "COALESCE(schedule_id, '') || ' ' || COALESCE(target, '') || ' ' || "
+            "COALESCE(json_extract(data, '$.source_id'), '') || ' ' || "
+            "COALESCE(json_extract(data, '$.request.source_id'), '')) LIKE ? ESCAPE '\\'"
+        )
+        params.append(_literal_like_pattern(normalized_query))
+    return (f" WHERE {' AND '.join(clauses)}" if clauses else "", params)
+
+
+def _require_tenant_scope(tenant_id: str | None, all_tenants: bool, method: str) -> None:
+    """Fail closed when a request-path read/write omits a tenant scope.
+
+    A bare ``tenant_id=None`` used to mean "match every tenant" for the
+    SQLite/in-memory stores, which silently leaks cross-tenant rows on
+    request-serving paths. Cross-tenant access must now be explicit: legitimate
+    background reconciliation passes ``all_tenants=True``; anything else with a
+    missing tenant is rejected.
+    """
+    if tenant_id is None and not all_tenants:
+        raise ValueError(f"{method} requires a tenant_id; pass all_tenants=True for background reconciliation")
 
 
 class JobStore(Protocol):
     """Protocol for scan job persistence."""
 
     def put(self, job: ScanJob) -> None: ...
-    def get(self, job_id: str) -> ScanJob | None: ...
-    def delete(self, job_id: str) -> bool: ...
-    def list_all(self) -> list[ScanJob]: ...
-    def list_summary(self) -> list[dict]: ...
+    def get(self, job_id: str, tenant_id: str | None = None, *, all_tenants: bool = False) -> ScanJob | None: ...
+    def delete(self, job_id: str, tenant_id: str | None = None, *, all_tenants: bool = False) -> bool: ...
+    def list_all(self, tenant_id: str | None = None, *, all_tenants: bool = False) -> list[ScanJob]: ...
+    def list_summary(
+        self,
+        tenant_id: str | None = None,
+        *,
+        all_tenants: bool = False,
+        limit: int | None = None,
+        offset: int = 0,
+        query: str | None = None,
+        status: JobStatus | None = None,
+    ) -> list[dict]: ...
+    def count_summary(
+        self,
+        tenant_id: str | None = None,
+        *,
+        query: str | None = None,
+        status: JobStatus | None = None,
+    ) -> int: ...
+    def count_summary_by_status(
+        self,
+        tenant_id: str | None = None,
+        *,
+        query: str | None = None,
+    ) -> dict[str, int]: ...
     def cleanup_expired(self, ttl_seconds: int = _JOB_TTL_SECONDS) -> int: ...
 
 
 class InMemoryJobStore:
     """Dict-based in-memory store (original behavior). Thread-safe via lock."""
 
-    def __init__(self) -> None:
+    retains_job_objects_in_memory = True
+
+    def __init__(self, *, max_retained_jobs: int | None = API_MAX_IN_MEMORY_JOBS) -> None:
         self._jobs: dict[str, ScanJob] = {}
         self._lock = threading.Lock()
+        self._max_retained_jobs = max_retained_jobs
 
     def put(self, job: ScanJob) -> None:
         with self._lock:
             self._jobs[job.job_id] = job
+            self._evict_completed_locked()
 
-    def get(self, job_id: str) -> ScanJob | None:
-        with self._lock:
-            return self._jobs.get(job_id)
+    def _evict_completed_locked(self) -> None:
+        if self._max_retained_jobs is None or self._max_retained_jobs <= 0:
+            return
+        if len(self._jobs) <= self._max_retained_jobs:
+            return
 
-    def delete(self, job_id: str) -> bool:
-        with self._lock:
-            if job_id in self._jobs:
-                del self._jobs[job_id]
-                return True
-            return False
+        completed = [
+            (jid, job)
+            for jid, job in self._jobs.items()
+            if job.status in (JobStatus.DONE, JobStatus.FAILED, JobStatus.CANCELLED)
+            and getattr(job, "triggered_by", None) != DEMO_ESTATE_TRIGGERED_BY
+        ]
+        completed.sort(key=lambda item: (item[1].completed_at is None, item[1].completed_at or item[1].created_at))
+        for jid, _job in completed[: len(self._jobs) - self._max_retained_jobs]:
+            self._jobs.pop(jid, None)
 
-    def list_all(self) -> list[ScanJob]:
+    def get(self, job_id: str, tenant_id: str | None = None, *, all_tenants: bool = False) -> ScanJob | None:
+        _require_tenant_scope(tenant_id, all_tenants, "InMemoryJobStore.get()")
         with self._lock:
-            return list(self._jobs.values())
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            if tenant_id is not None and job.tenant_id != tenant_id:
+                return None
+            return job
 
-    def list_summary(self) -> list[dict]:
+    def delete(self, job_id: str, tenant_id: str | None = None, *, all_tenants: bool = False) -> bool:
+        _require_tenant_scope(tenant_id, all_tenants, "InMemoryJobStore.delete()")
         with self._lock:
-            return [
+            job = self._jobs.get(job_id)
+            if job is None:
+                return False
+            if tenant_id is not None and job.tenant_id != tenant_id:
+                return False
+            del self._jobs[job_id]
+            return True
+
+    def list_all(self, tenant_id: str | None = None, *, all_tenants: bool = False) -> list[ScanJob]:
+        _require_tenant_scope(tenant_id, all_tenants, "InMemoryJobStore.list_all()")
+        with self._lock:
+            jobs = list(self._jobs.values())
+            if tenant_id is None:
+                return jobs
+            return [job for job in jobs if job.tenant_id == tenant_id]
+
+    def list_summary(
+        self,
+        tenant_id: str | None = None,
+        *,
+        all_tenants: bool = False,
+        limit: int | None = None,
+        offset: int = 0,
+        query: str | None = None,
+        status: JobStatus | None = None,
+    ) -> list[dict]:
+        _require_tenant_scope(tenant_id, all_tenants, "InMemoryJobStore.list_summary()")
+        with self._lock:
+            rows = [
                 {
                     "job_id": j.job_id,
+                    "tenant_id": j.tenant_id,
+                    "batch_id": j.batch_id,
+                    "parent_job_id": j.parent_job_id,
+                    "child_job_ids": list(j.child_job_ids),
+                    "target": j.target,
+                    "target_index": j.target_index,
+                    "target_count": j.target_count,
+                    "schedule_id": j.schedule_id,
+                    "triggered_by": j.triggered_by,
                     "status": j.status,
                     "created_at": j.created_at,
                     "completed_at": j.completed_at,
                 }
                 for j in self._jobs.values()
             ]
+            if tenant_id is not None:
+                rows = [row for row in rows if row["tenant_id"] == tenant_id]
+            if status is not None:
+                rows = [row for row in rows if row["status"] == status]
+            normalized_query = (query or "").strip().casefold()
+            if normalized_query:
+                rows = [row for row in rows if normalized_query in _job_summary_search_text(row)]
+            rows.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
+            if offset:
+                rows = rows[offset:]
+            if limit is not None:
+                rows = rows[:limit]
+            return rows
+
+    def count_summary(
+        self,
+        tenant_id: str | None = None,
+        *,
+        query: str | None = None,
+        status: JobStatus | None = None,
+    ) -> int:
+        with self._lock:
+            rows = [job for job in self._jobs.values() if tenant_id is None or job.tenant_id == tenant_id]
+            if status is not None:
+                rows = [job for job in rows if job.status == status]
+            normalized_query = (query or "").strip().casefold()
+            if normalized_query:
+                rows = [job for job in rows if normalized_query in _job_search_text(job)]
+            return len(rows)
+
+    def count_summary_by_status(
+        self,
+        tenant_id: str | None = None,
+        *,
+        query: str | None = None,
+    ) -> dict[str, int]:
+        with self._lock:
+            normalized_query = (query or "").strip().casefold()
+            counts: dict[str, int] = {}
+            for job in self._jobs.values():
+                if tenant_id is not None and job.tenant_id != tenant_id:
+                    continue
+                if normalized_query and normalized_query not in _job_search_text(job):
+                    continue
+                key = job.status.value if isinstance(job.status, JobStatus) else str(job.status)
+                counts[key] = counts.get(key, 0) + 1
+            return counts
 
     def cleanup_expired(self, ttl_seconds: int = _JOB_TTL_SECONDS) -> int:
         with self._lock:
@@ -74,6 +273,7 @@ class InMemoryJobStore:
                 for jid, job in self._jobs.items()
                 if job.status in (JobStatus.DONE, JobStatus.FAILED, JobStatus.CANCELLED)
                 and job.completed_at
+                and getattr(job, "triggered_by", None) != DEMO_ESTATE_TRIGGERED_BY
                 and (now - datetime.fromisoformat(job.completed_at)).total_seconds() > ttl_seconds
             ]
             for jid in expired:
@@ -86,11 +286,13 @@ class SQLiteJobStore:
 
     Schema:
         jobs(job_id TEXT PK, status TEXT, created_at TEXT,
-             completed_at TEXT, data TEXT)
+             completed_at TEXT, tenant_id TEXT, data TEXT)
 
     The ``data`` column stores the full ScanJob as JSON. Status and timestamps
     are duplicated as columns for efficient queries.
     """
+
+    retains_job_objects_in_memory = False
 
     def __init__(self, db_path: str = "agent_bom_jobs.db") -> None:
         self._db_path = db_path
@@ -103,21 +305,77 @@ class SQLiteJobStore:
         if not hasattr(self._local, "conn") or self._local.conn is None:
             self._local.conn = sqlite3.connect(self._db_path, check_same_thread=False)
             self._local.conn.execute("PRAGMA journal_mode=WAL")
-        return self._local.conn
+            # API workers write and read large scan artifacts. Keep SQLite's
+            # per-connection cache bounded so each worker thread cannot retain
+            # an unbounded page cache in long-running serve mode.
+            self._local.conn.execute("PRAGMA cache_size=-2048")
+            self._local.conn.execute("PRAGMA temp_store=FILE")
+            self._local.conn.execute("PRAGMA mmap_size=0")
+        return cast(sqlite3.Connection, self._local.conn)
+
+    def _shrink_connection_memory(self) -> None:
+        try:
+            self._conn.execute("PRAGMA shrink_memory")
+        except sqlite3.Error:
+            pass
+
+    def _close_thread_connection(self) -> None:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
+        try:
+            conn.close()
+        finally:
+            self._local.conn = None
 
     def _init_db(self) -> None:
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS jobs (
-                job_id TEXT PRIMARY KEY,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                completed_at TEXT,
-                data TEXT NOT NULL
-            )
-        """)
-        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
-        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_completed ON jobs(completed_at)")
-        self._conn.commit()
+        try:
+            ensure_sqlite_schema_version(self._conn, "scan_jobs")
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS jobs (
+                    job_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    batch_id TEXT,
+                    parent_job_id TEXT,
+                    child_job_ids TEXT,
+                    target TEXT,
+                    target_index INTEGER,
+                    target_count INTEGER,
+                    schedule_id TEXT,
+                    triggered_by TEXT,
+                    data TEXT NOT NULL
+                )
+            """)
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)").fetchall()}
+            if "schedule_id" not in columns:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN schedule_id TEXT")
+            if "triggered_by" not in columns:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN triggered_by TEXT")
+            if "batch_id" not in columns:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN batch_id TEXT")
+            if "parent_job_id" not in columns:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN parent_job_id TEXT")
+            if "child_job_ids" not in columns:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN child_job_ids TEXT")
+            if "target" not in columns:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN target TEXT")
+            if "target_index" not in columns:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN target_index INTEGER")
+            if "target_count" not in columns:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN target_count INTEGER")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_completed ON jobs(completed_at)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_tenant ON jobs(tenant_id)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_batch ON jobs(tenant_id, batch_id, created_at DESC)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(tenant_id, parent_job_id, created_at DESC)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_schedule ON jobs(tenant_id, schedule_id, created_at DESC)")
+            self._conn.commit()
+        finally:
+            self._shrink_connection_memory()
+            self._close_thread_connection()
 
     @staticmethod
     def _serialize(job: ScanJob) -> str:
@@ -128,40 +386,174 @@ class SQLiteJobStore:
         return ScanJob.model_validate_json(data)
 
     def put(self, job: ScanJob) -> None:
-        self._conn.execute(
-            """INSERT OR REPLACE INTO jobs (job_id, status, created_at, completed_at, data)
-               VALUES (?, ?, ?, ?, ?)""",
-            (job.job_id, job.status.value, job.created_at, job.completed_at, self._serialize(job)),
-        )
-        self._conn.commit()
+        try:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO jobs (
+                       job_id, status, created_at, completed_at, tenant_id, batch_id, parent_job_id,
+                       child_job_ids, target, target_index, target_count, schedule_id, triggered_by, data
+                   )
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    job.job_id,
+                    job.status.value,
+                    job.created_at,
+                    job.completed_at,
+                    job.tenant_id,
+                    job.batch_id,
+                    job.parent_job_id,
+                    json.dumps(job.child_job_ids),
+                    json.dumps(job.target) if job.target is not None else None,
+                    job.target_index,
+                    job.target_count,
+                    job.schedule_id,
+                    job.triggered_by,
+                    self._serialize(job),
+                ),
+            )
+            self._conn.commit()
+        finally:
+            self._shrink_connection_memory()
+            self._close_thread_connection()
 
-    def get(self, job_id: str) -> ScanJob | None:
-        row = self._conn.execute("SELECT data FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
-        if row is None:
-            return None
-        return self._deserialize(row[0])
+    def get(self, job_id: str, tenant_id: str | None = None, *, all_tenants: bool = False) -> ScanJob | None:
+        _require_tenant_scope(tenant_id, all_tenants, "SQLiteJobStore.get()")
+        try:
+            if tenant_id is None:
+                row = self._conn.execute("SELECT data FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT data FROM jobs WHERE job_id = ? AND tenant_id = ?",
+                    (job_id, tenant_id),
+                ).fetchone()
+            if row is None:
+                return None
+            return self._deserialize(row[0])
+        finally:
+            self._shrink_connection_memory()
+            self._close_thread_connection()
 
-    def delete(self, job_id: str) -> bool:
-        cursor = self._conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
-        self._conn.commit()
-        return cursor.rowcount > 0
+    def delete(self, job_id: str, tenant_id: str | None = None, *, all_tenants: bool = False) -> bool:
+        _require_tenant_scope(tenant_id, all_tenants, "SQLiteJobStore.delete()")
+        try:
+            if tenant_id is None:
+                cursor = self._conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+            else:
+                cursor = self._conn.execute(
+                    "DELETE FROM jobs WHERE job_id = ? AND tenant_id = ?",
+                    (job_id, tenant_id),
+                )
+            self._conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            self._shrink_connection_memory()
+            self._close_thread_connection()
 
-    def list_all(self) -> list[ScanJob]:
-        rows = self._conn.execute("SELECT data FROM jobs ORDER BY created_at DESC").fetchall()
-        return [self._deserialize(r[0]) for r in rows]
+    def list_all(self, tenant_id: str | None = None, *, all_tenants: bool = False) -> list[ScanJob]:
+        _require_tenant_scope(tenant_id, all_tenants, "SQLiteJobStore.list_all()")
+        try:
+            if tenant_id is None:
+                rows = self._conn.execute("SELECT data FROM jobs ORDER BY created_at DESC").fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT data FROM jobs WHERE tenant_id = ? ORDER BY created_at DESC",
+                    (tenant_id,),
+                ).fetchall()
+            return [self._deserialize(r[0]) for r in rows]
+        finally:
+            self._shrink_connection_memory()
+            self._close_thread_connection()
 
-    def list_summary(self) -> list[dict]:
-        rows = self._conn.execute("SELECT job_id, status, created_at, completed_at FROM jobs ORDER BY created_at DESC").fetchall()
-        return [{"job_id": r[0], "status": r[1], "created_at": r[2], "completed_at": r[3]} for r in rows]
+    def list_summary(
+        self,
+        tenant_id: str | None = None,
+        *,
+        all_tenants: bool = False,
+        limit: int | None = None,
+        offset: int = 0,
+        query: str | None = None,
+        status: JobStatus | None = None,
+    ) -> list[dict]:
+        _require_tenant_scope(tenant_id, all_tenants, "SQLiteJobStore.list_summary()")
+        try:
+            base_sql = """SELECT job_id, tenant_id, status, created_at, completed_at, triggered_by, schedule_id,
+                                 batch_id, parent_job_id, child_job_ids, target, target_index, target_count
+                          FROM jobs"""
+            where, params = _sqlite_job_summary_filter(tenant_id, query=query, status=status)
+            sql = f"{base_sql}{where} ORDER BY created_at DESC"
+            if limit is not None:
+                sql = f"{sql} LIMIT ? OFFSET ?"
+                params.extend([int(limit), max(0, int(offset))])
+            rows = self._conn.execute(sql, params).fetchall()
+            summaries: list[dict] = []
+            for row in rows:
+                summaries.append(
+                    {
+                        "job_id": row[0],
+                        "tenant_id": row[1],
+                        "triggered_by": row[5],
+                        "schedule_id": row[6],
+                        "batch_id": row[7],
+                        "parent_job_id": row[8],
+                        "child_job_ids": json.loads(row[9] or "[]"),
+                        "target": json.loads(row[10]) if row[10] else None,
+                        "target_index": row[11],
+                        "target_count": row[12],
+                        "status": row[2],
+                        "created_at": row[3],
+                        "completed_at": row[4],
+                    }
+                )
+            return summaries
+        finally:
+            self._shrink_connection_memory()
+            self._close_thread_connection()
+
+    def count_summary(
+        self,
+        tenant_id: str | None = None,
+        *,
+        query: str | None = None,
+        status: JobStatus | None = None,
+    ) -> int:
+        try:
+            where, params = _sqlite_job_summary_filter(tenant_id, query=query, status=status)
+            row = self._conn.execute(f"SELECT COUNT(*) FROM jobs{where}", params).fetchone()  # nosec B608
+            return int(row[0]) if row else 0
+        finally:
+            self._shrink_connection_memory()
+            self._close_thread_connection()
+
+    def count_summary_by_status(
+        self,
+        tenant_id: str | None = None,
+        *,
+        query: str | None = None,
+    ) -> dict[str, int]:
+        try:
+            where, params = _sqlite_job_summary_filter(tenant_id, query=query)
+            rows = self._conn.execute(
+                # The WHERE fragments are fixed constants; all values are bound.
+                f"SELECT status, COUNT(*) FROM jobs{where} GROUP BY status",  # nosec B608
+                params,
+            ).fetchall()
+            return {str(status): int(count) for status, count in rows}
+        finally:
+            self._shrink_connection_memory()
+            self._close_thread_connection()
 
     def cleanup_expired(self, ttl_seconds: int = _JOB_TTL_SECONDS) -> int:
-        now = datetime.now(timezone.utc).isoformat()
-        cursor = self._conn.execute(
-            """DELETE FROM jobs
-               WHERE status IN ('done', 'failed', 'cancelled')
-                 AND completed_at IS NOT NULL
-                 AND julianday(?) - julianday(completed_at) > ?""",
-            (now, ttl_seconds / 86400.0),
-        )
-        self._conn.commit()
-        return cursor.rowcount
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            cursor = self._conn.execute(
+                """DELETE FROM jobs
+                   WHERE status IN ('done', 'failed', 'cancelled')
+                     AND completed_at IS NOT NULL
+                     AND IFNULL(triggered_by, '') != ?
+                     AND julianday(?) - julianday(completed_at) > ?""",
+                (DEMO_ESTATE_TRIGGERED_BY, now, ttl_seconds / 86400.0),
+            )
+            self._conn.commit()
+            return cursor.rowcount
+        finally:
+            self._shrink_connection_memory()
+            self._close_thread_connection()

@@ -20,6 +20,9 @@ from agent_bom.oci_parser import (
     _RPMTAG_RELEASE,
     _RPMTAG_VERSION,
     OCIParseError,
+    _decompression_ratio_exceeded,
+    _zip_compressed_size,
+    _zip_uncompressed_size,
     parse_oci_layout_dir,
     parse_oci_tarball,
     scan_oci,
@@ -39,10 +42,15 @@ def _make_layer_tar(files: dict[str, bytes]) -> bytes:
     return buf.getvalue()
 
 
-def _make_docker_save_tar(layers: list[dict[str, bytes]], repo_tags: list[str] | None = None) -> Path:
+def _make_docker_save_tar(
+    layers: list[dict[str, bytes]],
+    repo_tags: list[str] | None = None,
+    history: list[dict] | None = None,
+) -> Path:
     """Build a Docker save-style tarball with given filesystem layers."""
     tmp = tempfile.NamedTemporaryFile(suffix=".tar", delete=False)
     layer_paths: list[str] = []
+    config_path = "sha256:abc.json"
 
     with tarfile.open(fileobj=tmp, mode="w:") as outer:
         for i, layer_files in enumerate(layers):
@@ -56,7 +64,7 @@ def _make_docker_save_tar(layers: list[dict[str, bytes]], repo_tags: list[str] |
         # Write manifest.json
         manifest = [
             {
-                "Config": "sha256:abc.json",
+                "Config": config_path,
                 "RepoTags": repo_tags or ["myapp:latest"],
                 "Layers": layer_paths,
             }
@@ -66,11 +74,17 @@ def _make_docker_save_tar(layers: list[dict[str, bytes]], repo_tags: list[str] |
         info.size = len(manifest_bytes)
         outer.addfile(info, io.BytesIO(manifest_bytes))
 
+        if history is not None:
+            config_bytes = json.dumps({"history": history}).encode()
+            info = tarfile.TarInfo(name=config_path)
+            info.size = len(config_bytes)
+            outer.addfile(info, io.BytesIO(config_bytes))
+
     tmp.close()
     return Path(tmp.name)
 
 
-def _make_oci_layout_tar(layers: list[dict[str, bytes]]) -> Path:
+def _make_oci_layout_tar(layers: list[dict[str, bytes]], history: list[dict] | None = None) -> Path:
     """Build an OCI image layout tarball (index.json + blobs/sha256/)."""
     import hashlib
 
@@ -90,11 +104,22 @@ def _make_oci_layout_tar(layers: list[dict[str, bytes]]) -> Path:
                 {"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": f"sha256:{layer_hash}", "size": len(layer_data)}
             )
 
+        config_bytes = json.dumps({"history": history or []}).encode()
+        config_hash = hashlib.sha256(config_bytes).hexdigest()
+        config_blob_path = f"blobs/sha256/{config_hash}"
+        info = tarfile.TarInfo(name=config_blob_path)
+        info.size = len(config_bytes)
+        outer.addfile(info, io.BytesIO(config_bytes))
+
         # Write manifest blob
         manifest = {
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": "sha256:config", "size": 0},
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": f"sha256:{config_hash}",
+                "size": len(config_bytes),
+            },
             "layers": layer_descriptors,
         }
         manifest_bytes = json.dumps(manifest).encode()
@@ -124,7 +149,7 @@ def _make_oci_layout_tar(layers: list[dict[str, bytes]]) -> Path:
     return Path(tmp.name)
 
 
-def _make_oci_layout_dir(layers: list[dict[str, bytes]]) -> Path:
+def _make_oci_layout_dir(layers: list[dict[str, bytes]], history: list[dict] | None = None) -> Path:
     """Build an OCI image layout directory on disk."""
     import hashlib
 
@@ -141,9 +166,13 @@ def _make_oci_layout_dir(layers: list[dict[str, bytes]]) -> Path:
             {"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": f"sha256:{layer_hash}", "size": len(layer_data)}
         )
 
+    config_bytes = json.dumps({"history": history or []}).encode()
+    config_hash = hashlib.sha256(config_bytes).hexdigest()
+    (blobs_dir / config_hash).write_bytes(config_bytes)
+
     manifest = {
         "schemaVersion": 2,
-        "config": {"mediaType": "...", "digest": "sha256:config", "size": 0},
+        "config": {"mediaType": "...", "digest": f"sha256:{config_hash}", "size": len(config_bytes)},
         "layers": layer_descriptors,
     }
     manifest_bytes = json.dumps(manifest).encode()
@@ -175,11 +204,18 @@ Architecture: amd64
 
 _APK_INSTALLED = b"""P:busybox
 V:1.36.1-r0
+o:busybox
 T:Size optimized toolbox of many common UNIX utilities
 
 P:musl
 V:1.2.4-r2
+o:musl
 T:the musl c library (libc) implementation
+
+P:ssl_client
+V:1.36.1-r0
+o:busybox
+T:SSL client for busybox
 
 """
 
@@ -209,6 +245,76 @@ def test_docker_save_python_packages():
     assert "requests" in names
 
 
+_PKG_INFO_SETUPTOOLS = b"""Metadata-Version: 1.0
+Name: setuptools
+Version: 50.0.0
+Summary: Easily download, build, install, upgrade, and uninstall Python packages
+"""
+
+
+def test_docker_save_egg_info_python_packages():
+    """Legacy ``*.egg-info/PKG-INFO`` packages are extracted as pypi.
+
+    Older base images (e.g. Debian buster) ship setuptools/pip/wheel as
+    egg-info rather than dist-info; the parser must read both layouts.
+    """
+    tar = _make_docker_save_tar([{"usr/lib/python3.9/dist-packages/setuptools-50.0.egg-info/PKG-INFO": _PKG_INFO_SETUPTOOLS}])
+    result = parse_oci_tarball(tar)
+    pkg = next((p for p in result.packages if p.name == "setuptools"), None)
+    assert pkg is not None
+    assert pkg.version == "50.0.0"
+    assert pkg.ecosystem == "pypi"
+
+
+def test_docker_save_egg_info_and_dist_info_deduped():
+    """A package present as both egg-info and dist-info is recorded once."""
+    tar = _make_docker_save_tar(
+        [
+            {
+                "site-packages/requests-2.31.0.dist-info/METADATA": _METADATA_REQUESTS,
+                "site-packages/requests-2.31.0.egg-info/PKG-INFO": _METADATA_REQUESTS,
+            }
+        ]
+    )
+    result = parse_oci_tarball(tar)
+    requests_pkgs = [p for p in result.packages if p.name == "requests" and p.ecosystem == "pypi"]
+    assert len(requests_pkgs) == 1
+
+
+def test_lower_layer_whiteout_does_not_drop_readded_package():
+    """A file re-created in a higher layer survives a lower-layer whiteout.
+
+    This is the overlay-semantics bug that silently dropped pip/setuptools
+    dist-info on Debian-based images: a base layer whites out site-packages
+    and a later layer reinstalls the package at the same path.
+    """
+    base = {"site-packages/.wh.requests-2.31.0.dist-info": b""}
+    top = {"site-packages/requests-2.31.0.dist-info/METADATA": _METADATA_REQUESTS}
+    tar = _make_docker_save_tar([base, top])
+    result = parse_oci_tarball(tar)
+    assert any(p.name == "requests" for p in result.packages)
+
+
+def test_higher_layer_whiteout_drops_package():
+    """A package deleted by a strictly-higher layer whiteout is dropped."""
+    base = {"site-packages/flask-3.0.0.dist-info/METADATA": _METADATA_FLASK}
+    top = {"site-packages/.wh.flask-3.0.0.dist-info": b""}
+    tar = _make_docker_save_tar([base, top])
+    result = parse_oci_tarball(tar)
+    assert not any(p.name.lower() == "flask" for p in result.packages)
+
+
+def test_os_release_usr_lib_detects_distro():
+    """Distro is detected from usr/lib/os-release (the /etc symlink target)."""
+    os_release = b'ID=debian\nVERSION_ID="10"\n'
+    tar = _make_docker_save_tar([{"var/lib/dpkg/status": _DPKG_STATUS, "usr/lib/os-release": os_release}])
+    result = parse_oci_tarball(tar)
+    bash = next((p for p in result.packages if p.name == "bash"), None)
+    assert bash is not None
+    assert bash.distro_name == "debian"
+    assert bash.distro_version == "10"
+
+
 def test_docker_save_node_packages():
     tar = _make_docker_save_tar([{"usr/lib/node_modules/express/package.json": _PACKAGE_JSON_EXPRESS}])
     result = parse_oci_tarball(tar)
@@ -230,6 +336,8 @@ def test_docker_save_alpine_packages():
     names = {p.name for p in result.packages}
     assert "busybox" in names
     assert "musl" in names
+    ssl_client = next(p for p in result.packages if p.name == "ssl_client")
+    assert ssl_client.source_package == "busybox"
 
 
 def test_docker_save_multi_layer_dedup():
@@ -243,6 +351,40 @@ def test_docker_save_multi_layer_dedup():
     result = parse_oci_tarball(tar)
     names = [p.name for p in result.packages]
     assert names.count("requests") == 1
+
+
+def test_docker_save_tracks_layer_occurrences_and_instruction():
+    tar = _make_docker_save_tar(
+        [{"requests-2.31.0.dist-info/METADATA": _METADATA_REQUESTS}],
+        history=[{"created_by": "/bin/sh -c pip install requests==2.31.0"}],
+    )
+    result = parse_oci_tarball(tar)
+    pkg = next(p for p in result.packages if p.name == "requests")
+    assert len(pkg.occurrences) == 1
+    occ = pkg.occurrences[0]
+    assert occ.layer_index == 1
+    assert occ.package_path == "requests-2.31.0.dist-info/METADATA"
+    assert occ.created_by == "/bin/sh -c pip install requests==2.31.0"
+    assert occ.dockerfile_instruction == "RUN pip install requests==2.31.0"
+
+
+def test_docker_save_latest_layer_version_wins():
+    tar = _make_docker_save_tar(
+        [
+            {"requests-2.31.0.dist-info/METADATA": _METADATA_REQUESTS},
+            {"requests-2.32.0.dist-info/METADATA": b"Metadata-Version: 2.1\nName: requests\nVersion: 2.32.0\n"},
+        ],
+        history=[
+            {"created_by": "/bin/sh -c pip install requests==2.31.0"},
+            {"created_by": "/bin/sh -c pip install --upgrade requests==2.32.0"},
+        ],
+    )
+    result = parse_oci_tarball(tar)
+    pkg = next(p for p in result.packages if p.name == "requests")
+    assert pkg.version == "2.32.0"
+    assert len(pkg.occurrences) == 1
+    assert pkg.occurrences[0].layer_index == 2
+    assert pkg.occurrences[0].dockerfile_instruction == "RUN pip install --upgrade requests==2.32.0"
 
 
 def test_docker_save_multi_layer_multi_ecosystem():
@@ -266,6 +408,32 @@ def test_docker_save_repo_tags():
     tar = _make_docker_save_tar([{}], repo_tags=["myapp:v1.0"])
     result = parse_oci_tarball(tar)
     assert result.image_tags == ["myapp:v1.0"]
+
+
+def test_docker_save_skips_layer_over_uncompressed_limit(monkeypatch):
+    monkeypatch.setenv("AGENT_BOM_OCI_MAX_LAYER_UNCOMPRESSED_BYTES", "10")
+    tar = _make_docker_save_tar([{"huge.txt": b"x" * 11}])
+
+    result = parse_oci_tarball(tar)
+
+    assert result.packages == []
+    assert any("uncompressed extraction limit" in warning for warning in result.warnings)
+
+
+def test_decompression_ratio_guard_is_configurable(monkeypatch):
+    monkeypatch.setenv("AGENT_BOM_OCI_MAX_DECOMPRESSION_RATIO", "10")
+
+    assert _decompression_ratio_exceeded(101, 10) is True
+    assert _decompression_ratio_exceeded(100, 10) is False
+
+
+def test_zip_size_helpers_measure_compressed_and_uncompressed_bytes():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("payload.txt", b"x" * 4096)
+    with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zf:
+        assert _zip_uncompressed_size(zf) == 4096
+        assert _zip_compressed_size(zf) < 4096
 
 
 def test_docker_save_empty_layers():
@@ -342,6 +510,17 @@ def test_oci_layout_dir_multi_layer():
     names = {p.name for p in result.packages}
     assert "busybox" in names
     assert "requests" in names
+
+
+def test_oci_layout_dir_tracks_layer_instruction():
+    layout_dir = _make_oci_layout_dir(
+        [{"usr/lib/node_modules/express/package.json": _PACKAGE_JSON_EXPRESS}],
+        history=[{"created_by": "/bin/sh -c #(nop)  RUN npm install express"}],
+    )
+    result = parse_oci_layout_dir(layout_dir)
+    pkg = next(p for p in result.packages if p.name == "express")
+    assert pkg.occurrences[0].layer_index == 1
+    assert pkg.occurrences[0].dockerfile_instruction == "RUN npm install express"
 
 
 # ── Error cases ───────────────────────────────────────────────────────────────
@@ -709,6 +888,48 @@ def test_rpm_sqlite_gpg_pubkey_skipped():
     assert any(p.name == "bash" for p in result.packages)
 
 
+def test_legacy_bdb_rpmdb_extracts_embedded_package_headers():
+    """BerkeleyDB page bytes yield their canonical embedded RPM headers."""
+    database = (
+        b"\x00\x06\x15\x61berkeley-page-metadata\x00"
+        + _make_rpm_header_blob("bash", "4.4.20", "5.el8")
+        + b"\x00page-boundary\x00"
+        + _make_rpm_header_blob("curl", "7.61.1", "34.el8")
+    )
+    tar = _make_docker_save_tar([{"var/lib/rpm/Packages": database}])
+    result = parse_oci_tarball(tar)
+    versions = {p.name: p.version for p in result.packages if p.ecosystem == "rpm"}
+    assert versions == {"bash": "4.4.20-5.el8", "curl": "7.61.1-34.el8"}
+    assert result.warnings == []
+
+
+def test_legacy_ndb_rpmdb_extracts_package_headers_and_skips_pubkeys():
+    database = (
+        b"ndb-slot-table\x00"
+        + _make_rpm_header_blob("openssl-libs", "1.1.1k", "14.el8")
+        + _make_rpm_header_blob("gpg-pubkey", "deadbeef", "1")
+    )
+    tar = _make_docker_save_tar([{"var/lib/rpm/Packages.db": database}])
+    result = parse_oci_tarball(tar)
+    rpm_packages = [p for p in result.packages if p.ecosystem == "rpm"]
+    assert [(p.name, p.version) for p in rpm_packages] == [("openssl-libs", "1.1.1k-14.el8")]
+    assert result.warnings == []
+
+
+def test_malformed_legacy_rpmdb_fails_closed():
+    tar = _make_docker_save_tar([{"var/lib/rpm/Packages": b"not an rpm package database"}])
+    with pytest.raises(OCIParseError, match="no valid package header records"):
+        parse_oci_tarball(tar)
+
+
+def test_modern_sqlite_rpmdb_emits_no_legacy_warning():
+    """A modern rpmdb.sqlite must not trigger the legacy-coverage warning (no false positive)."""
+    db = _make_rpm_sqlite([("bash", "5.2.26", "1.el9")])
+    tar = _make_docker_save_tar([{"var/lib/rpm/rpmdb.sqlite": db}])
+    result = parse_oci_tarball(tar)
+    assert not any("not yet supported" in w for w in result.warnings)
+
+
 def test_rpm_sqlite_and_log_manifest_dedup():
     """Same package from sqlite and log manifest only counted once."""
     db = _make_rpm_sqlite([("nginx", "1.25.0", "1.el9")])
@@ -726,6 +947,130 @@ def test_rpm_sqlite_and_log_manifest_dedup():
 
 
 # ── Full mixed ecosystem layer ────────────────────────────────────────────────
+
+
+# ── Security hardening: tar-member safety ───────────────────────────────────
+
+
+def _make_layer_tar_with_members(members: list[tarfile.TarInfo], payloads: list[bytes | None]) -> bytes:
+    """Build an in-memory layer tar with explicit TarInfo objects (for symlink / traversal tests)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:") as tf:
+        for info, payload in zip(members, payloads):
+            if payload is None:
+                tf.addfile(info)  # link/symlink/dir — no payload
+            else:
+                info.size = len(payload)
+                tf.addfile(info, io.BytesIO(payload))
+    return buf.getvalue()
+
+
+def _wrap_layer_bytes_in_docker_save(layer_bytes: bytes) -> Path:
+    """Wrap a single raw layer tar into a Docker-save outer tar (manifest.json + layer.tar)."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".tar", delete=False)
+    layer_path = "0" * 40 + "/layer.tar"
+    with tarfile.open(fileobj=tmp, mode="w:") as outer:
+        info = tarfile.TarInfo(name=layer_path)
+        info.size = len(layer_bytes)
+        outer.addfile(info, io.BytesIO(layer_bytes))
+        manifest = [{"Config": "sha256:abc.json", "RepoTags": ["myapp:latest"], "Layers": [layer_path]}]
+        mb = json.dumps(manifest).encode()
+        mi = tarfile.TarInfo(name="manifest.json")
+        mi.size = len(mb)
+        outer.addfile(mi, io.BytesIO(mb))
+    tmp.close()
+    return Path(tmp.name)
+
+
+def test_is_safe_tar_member_name_accepts_normal_paths():
+    from agent_bom.oci_parser import _is_safe_tar_member_name
+
+    assert _is_safe_tar_member_name("var/lib/dpkg/status") is True
+    assert _is_safe_tar_member_name("./usr/lib/node_modules/foo/package.json") is True
+    assert _is_safe_tar_member_name("a/b/c") is True
+
+
+def test_is_safe_tar_member_name_rejects_traversal():
+    from agent_bom.oci_parser import _is_safe_tar_member_name
+
+    assert _is_safe_tar_member_name("../etc/passwd") is False
+    assert _is_safe_tar_member_name("../../etc/passwd") is False
+    assert _is_safe_tar_member_name("foo/../../etc/passwd") is False, "normalize must detect escapes that span segments"
+    assert _is_safe_tar_member_name("a/b/../../c/../../d") is False
+
+
+def test_is_safe_tar_member_name_rejects_absolute_and_nul():
+    from agent_bom.oci_parser import _is_safe_tar_member_name
+
+    assert _is_safe_tar_member_name("/etc/passwd") is False
+    assert _is_safe_tar_member_name("") is False
+    assert _is_safe_tar_member_name("a\x00b") is False
+
+
+def test_path_traversal_member_never_produces_a_package():
+    """A crafted tar whose member name escapes the root must not be parsed as a real file."""
+    traversal_info = tarfile.TarInfo(name="foo/../../../etc/passwd")
+    traversal_info.type = tarfile.REGTYPE
+    # Give it "METADATA-looking" content so a naive parser would treat it as a Python dist-info
+    payload = b"Name: evil\nVersion: 9.9.9\n"
+
+    benign_info = tarfile.TarInfo(name="requests-2.31.0.dist-info/METADATA")
+    benign_info.type = tarfile.REGTYPE
+
+    layer = _make_layer_tar_with_members(
+        [traversal_info, benign_info],
+        [payload, _METADATA_REQUESTS],
+    )
+    tar = _wrap_layer_bytes_in_docker_save(layer)
+    result = parse_oci_tarball(tar)
+    names = {p.name for p in result.packages}
+    assert "evil" not in names, "path-traversal member must not contribute a package"
+    assert "requests" in names, "legitimate sibling members must still parse"
+
+
+def test_symlink_metadata_member_is_refused_not_followed():
+    """A symlinked METADATA member must not be opened (would leak host FS if followed)."""
+    symlink = tarfile.TarInfo(name="requests-2.31.0.dist-info/METADATA")
+    symlink.type = tarfile.SYMTYPE
+    symlink.linkname = "/etc/passwd"
+
+    # Include a legitimate sibling package so we know the parser still runs.
+    other = tarfile.TarInfo(name="urllib3-2.0.0.dist-info/METADATA")
+    other.type = tarfile.REGTYPE
+    other_payload = b"Name: urllib3\nVersion: 2.0.0\n"
+
+    layer = _make_layer_tar_with_members([symlink, other], [None, other_payload])
+    tar = _wrap_layer_bytes_in_docker_save(layer)
+    result = parse_oci_tarball(tar)
+    names = {p.name for p in result.packages}
+    assert "requests" not in names, "symlinked METADATA must be skipped, not followed"
+    assert "urllib3" in names, "non-symlink siblings must still parse"
+
+
+def test_symlinked_dpkg_status_is_refused():
+    """A symlinked var/lib/dpkg/status must not be followed to leak host state."""
+    symlink = tarfile.TarInfo(name="var/lib/dpkg/status")
+    symlink.type = tarfile.SYMTYPE
+    symlink.linkname = "/etc/passwd"
+
+    layer = _make_layer_tar_with_members([symlink], [None])
+    tar = _wrap_layer_bytes_in_docker_save(layer)
+    result = parse_oci_tarball(tar)
+    assert all("passwd" not in (p.name or "") for p in result.packages)
+    # Zero dpkg packages because the symlink was refused.
+    assert len(result.packages) == 0
+
+
+def test_absolute_path_member_rejected():
+    """A member whose name starts with `/` must not be readable."""
+    info = tarfile.TarInfo(name="/etc/evil/METADATA")
+    info.type = tarfile.REGTYPE
+    payload = b"Name: escaped\nVersion: 0.0.1\n"
+
+    layer = _make_layer_tar_with_members([info], [payload])
+    tar = _wrap_layer_bytes_in_docker_save(layer)
+    result = parse_oci_tarball(tar)
+    assert not any(p.name == "escaped" for p in result.packages)
 
 
 def test_full_mixed_ecosystem_layer():

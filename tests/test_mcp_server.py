@@ -2,8 +2,10 @@
 
 import asyncio
 import json
+import re
 import sys
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from click.testing import CliRunner
@@ -16,6 +18,25 @@ pytest.importorskip("mcp", reason="mcp SDK not installed — pip install 'agent-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_registry_network():
+    """Keep this module hermetic — no test here may reach a package registry.
+
+    The ``check`` tool confirms a pinned version actually exists before calling
+    it clean, which is a live npm/PyPI lookup. Tests that only mocked the
+    scanner still made that request, so their result depended on CI egress:
+    a blocked or rate-limited runner turned "clean" into "unknown" and failed
+    the build on one Python version while the others passed.
+
+    The real published/unpublished semantics are covered deliberately in
+    ``tests/test_mcp_check_version_existence.py``, which mocks this same
+    function both ways. Here it is pinned to "published" so these tests
+    exercise the scanner path they are actually about.
+    """
+    with patch("agent_bom.mcp_tools.scanning._version_published", new=AsyncMock(return_value=True)):
+        yield
 
 
 def _run(coro):
@@ -57,6 +78,26 @@ def test_create_mcp_server_returns_object():
     assert server.name == "agent-bom"
 
 
+def test_create_mcp_server_rebuilds_sdk_settings_before_initialization(monkeypatch) -> None:
+    """Avoid pydantic-settings incomplete-forward-reference warnings at startup."""
+    from mcp.server.fastmcp.server import Settings
+
+    from agent_bom.mcp_server import create_mcp_server
+
+    calls = 0
+    original = Settings.model_rebuild
+
+    def _rebuild(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(Settings, "model_rebuild", _rebuild)
+    create_mcp_server()
+
+    assert calls == 1
+
+
 def test_mcp_server_has_correct_tool_count():
     """Server registers the same number of tools as _SERVER_CARD_TOOLS declares."""
     from agent_bom.mcp_server import _SERVER_CARD_TOOLS, create_mcp_server
@@ -76,6 +117,106 @@ def test_mcp_server_tool_names():
     assert names == {t["name"] for t in _SERVER_CARD_TOOLS}
 
 
+def test_create_mcp_server_enables_static_bearer_auth():
+    """create_mcp_server should wire FastMCP auth when a bearer token is configured."""
+    from agent_bom.mcp_server import _StaticBearerTokenVerifier, create_mcp_server
+
+    server = create_mcp_server(host="0.0.0.0", port=8423, bearer_token="test-token")
+    assert isinstance(server._token_verifier, _StaticBearerTokenVerifier)
+    assert server.settings.auth is not None
+    assert str(server.settings.auth.resource_server_url) == "http://0.0.0.0:8423/"
+    assert server.settings.auth.required_scopes == []
+
+
+def test_static_bearer_verifier_keeps_read_and_operator_tokens_separate():
+    """Read bearer tokens must not authorize MCP write tools."""
+    from agent_bom.mcp_server import _StaticBearerTokenVerifier
+
+    verifier = _StaticBearerTokenVerifier("read-token", operator_token="operator-token")
+    read_access = _run(verifier.verify_token("read-token"))
+    operator_access = _run(verifier.verify_token("operator-token"))
+
+    assert read_access is not None
+    assert read_access.client_id == "agent-bom-static-token"
+    assert read_access.scopes == ["read"]
+    assert operator_access is not None
+    assert operator_access.client_id == "agent-bom-operator-token"
+    assert set(operator_access.scopes) == {
+        "admin",
+        "cloud:write",
+        "findings:write",
+        "identity:write",
+        "shield:write",
+        "ticketing:write",
+    }
+
+
+def test_static_operator_token_authorizes_every_registered_write_family():
+    """The configured operator token must reach every registered write family."""
+    from agent_bom.mcp_server import _StaticBearerTokenVerifier
+    from agent_bom.mcp_server_runtime import authorize_destructive_tool
+
+    verifier = _StaticBearerTokenVerifier("read-token", operator_token="operator-token")
+    operator_access = _run(verifier.verify_token("operator-token"))
+
+    assert operator_access is not None
+    server_root = Path(__file__).resolve().parents[1] / "src" / "agent_bom"
+    required_scopes = {
+        match for path in server_root.glob("mcp_server_*.py") for match in re.findall(r'required_scope="([^"]+)"', path.read_text())
+    }
+    assert required_scopes == {"cloud:write", "findings:write", "identity:write", "shield:write", "ticketing:write"}
+    for required_scope in required_scopes:
+        denial = authorize_destructive_tool(
+            "write-tool",
+            operator_role="admin",
+            operator_scopes=required_scope,
+            auth_scopes=",".join(operator_access.scopes),
+            required_scope=required_scope,
+        )
+        assert denial is None
+
+
+def test_static_bearer_verifier_rejects_expired_read_token():
+    from agent_bom.mcp_server import _StaticBearerTokenVerifier
+
+    verifier = _StaticBearerTokenVerifier(
+        "read-token",
+        operator_token="operator-token",
+        token_expires_at="2020-01-01T00:00:00Z",
+        operator_token_expires_at="2099-01-01T00:00:00Z",
+    )
+
+    assert _run(verifier.verify_token("read-token")) is None
+    operator_access = _run(verifier.verify_token("operator-token"))
+    assert operator_access is not None
+    assert operator_access.client_id == "agent-bom-operator-token"
+    assert operator_access.expires_at is not None
+
+
+def test_static_bearer_verifier_rejects_expired_operator_token():
+    from agent_bom.mcp_server import _StaticBearerTokenVerifier
+
+    verifier = _StaticBearerTokenVerifier(
+        "read-token",
+        operator_token="operator-token",
+        token_expires_at="2099-01-01T00:00:00+00:00",
+        operator_token_expires_at="2020-01-01T00:00:00+00:00",
+    )
+
+    read_access = _run(verifier.verify_token("read-token"))
+    assert read_access is not None
+    assert read_access.client_id == "agent-bom-static-token"
+    assert read_access.expires_at is not None
+    assert _run(verifier.verify_token("operator-token")) is None
+
+
+def test_static_bearer_verifier_requires_timezone_for_expiry():
+    from agent_bom.mcp_server import _StaticBearerTokenVerifier
+
+    with pytest.raises(ValueError, match="AGENT_BOM_MCP_BEARER_TOKEN_EXPIRES_AT"):
+        _StaticBearerTokenVerifier("read-token", token_expires_at="2099-01-01T00:00:00")
+
+
 # ---------------------------------------------------------------------------
 # Tool: registry_lookup (no mocking needed — reads local JSON)
 # ---------------------------------------------------------------------------
@@ -93,12 +234,14 @@ def test_registry_lookup_known_server():
 
 
 def test_registry_lookup_unknown():
-    """Lookup of nonexistent server returns not-found."""
+    """Lookup of nonexistent server returns the stable not-found envelope (#1960)."""
     from agent_bom.mcp_server import create_mcp_server
 
     server = create_mcp_server()
     result = _call_tool(server, "registry_lookup", {"server_name": "nonexistent-server-xyz"})
-    assert result["found"] is False
+    assert result["error"]["code"] == "AGENTBOM_MCP_NOT_FOUND_RESOURCE"
+    assert result["error"]["category"] == "not_found"
+    assert result["error"]["details"]["query"] == "nonexistent-server-xyz"
 
 
 def test_registry_lookup_by_package():
@@ -125,8 +268,9 @@ def test_registry_lookup_empty_query():
 # ---------------------------------------------------------------------------
 
 
+@patch("agent_bom.scanners.ghsa_advisory.check_github_advisories")
 @patch("agent_bom.scanners.query_osv_batch")
-def test_check_clean_package(mock_osv):
+def test_check_clean_package(mock_osv, mock_ghsa):
     """Check tool returns clean status when no vulns."""
     from agent_bom.mcp_server import create_mcp_server
 
@@ -134,6 +278,7 @@ def test_check_clean_package(mock_osv):
         return {}
 
     mock_osv.side_effect = _fake_osv
+    mock_ghsa.return_value = 0
     server = create_mcp_server()
     result = _call_tool(server, "check", {"package": "safe-pkg@1.0.0", "ecosystem": "npm"})
     assert result["status"] == "clean"
@@ -142,8 +287,9 @@ def test_check_clean_package(mock_osv):
     assert result["version"] == "1.0.0"
 
 
+@patch("agent_bom.scanners.ghsa_advisory.check_github_advisories")
 @patch("agent_bom.scanners.query_osv_batch")
-def test_check_vulnerable_package(mock_osv):
+def test_check_vulnerable_package(mock_osv, mock_ghsa):
     """Check tool returns vulnerable status with details."""
     from agent_bom.mcp_server import create_mcp_server
 
@@ -160,6 +306,7 @@ def test_check_vulnerable_package(mock_osv):
         }
 
     mock_osv.side_effect = _fake_osv
+    mock_ghsa.return_value = 0
     server = create_mcp_server()
     result = _call_tool(server, "check", {"package": "bad-pkg@1.0.0", "ecosystem": "npm"})
     assert result["status"] == "vulnerable"
@@ -167,15 +314,15 @@ def test_check_vulnerable_package(mock_osv):
     assert result["details"][0]["id"] == "CVE-2025-9999"
 
 
-@patch("agent_bom.scanners.query_osv_batch")
-def test_check_scoped_npm_package(mock_osv):
+@patch("agent_bom.scanners.scan_packages")
+def test_check_scoped_npm_package(mock_scan):
     """Check parses scoped npm package correctly."""
     from agent_bom.mcp_server import create_mcp_server
 
-    async def _fake_osv(pkgs):
-        return {}
+    async def _fake_scan(pkgs, **_kwargs):
+        return None
 
-    mock_osv.side_effect = _fake_osv
+    mock_scan.side_effect = _fake_scan
     server = create_mcp_server()
     result = _call_tool(
         server,
@@ -190,8 +337,9 @@ def test_check_scoped_npm_package(mock_osv):
     assert result["version"] == "2025.1.14"
 
 
+@patch("agent_bom.scanners.ghsa_advisory.check_github_advisories")
 @patch("agent_bom.scanners.query_osv_batch")
-def test_check_default_ecosystem(mock_osv):
+def test_check_default_ecosystem(mock_osv, mock_ghsa):
     """Check defaults to npm ecosystem."""
     from agent_bom.mcp_server import create_mcp_server
 
@@ -199,6 +347,7 @@ def test_check_default_ecosystem(mock_osv):
         return {}
 
     mock_osv.side_effect = _fake_osv
+    mock_ghsa.return_value = 0
     server = create_mcp_server()
     result = _call_tool(server, "check", {"package": "express@4.18.2"})
     assert result["ecosystem"] == "npm"
@@ -225,7 +374,7 @@ def test_scan_returns_json(mock_pipeline):
     from agent_bom.mcp_server import create_mcp_server
 
     server = create_mcp_server()
-    result = _call_tool(server, "scan", {})
+    result = _call_tool(server, "scan", {"auto_update_db": False})
     assert "agents" in result
     assert result["summary"]["total_agents"] >= 1
 
@@ -237,8 +386,99 @@ def test_scan_no_agents(mock_pipeline):
     from agent_bom.mcp_server import create_mcp_server
 
     server = create_mcp_server()
-    result = _call_tool(server, "scan", {})
+    result = _call_tool(server, "scan", {"auto_update_db": False})
     assert result["status"] == "no_agents_found"
+
+
+@patch("agent_bom.mcp_server._run_scan_pipeline")
+def test_scan_accepts_direct_npx_package(mock_pipeline):
+    """Scan can target a direct npx package spec without local config discovery."""
+    mock_pipeline.return_value = ([], [], [], [])
+    from agent_bom.mcp_server import create_mcp_server
+
+    server = create_mcp_server()
+    result = _call_tool(
+        server,
+        "scan",
+        {"package": "npx -y @modelcontextprotocol/server-filesystem", "auto_update_db": False},
+    )
+
+    assert result["status"] == "no_agents_found"
+    args, kwargs = mock_pipeline.call_args
+    assert args[:4] == (None, None, None, "npx -y @modelcontextprotocol/server-filesystem")
+    assert kwargs["offline"] is True
+
+
+def test_scan_pipeline_builds_inventory_from_npx_package(monkeypatch):
+    """The scan pipeline converts npx specs into a synthetic MCP server inventory."""
+    from agent_bom.mcp_server_scan import run_scan_pipeline
+
+    captured_agents = []
+
+    async def _fake_scan_agents(agents, *, options):
+        captured_agents.extend(agents)
+        return []
+
+    monkeypatch.setattr("agent_bom.discovery.discover_all", lambda project_dir=None: [])
+    monkeypatch.setattr("agent_bom.scanners.scan_agents", _fake_scan_agents)
+
+    agents, _blast_radii, warnings, scan_sources = _run(
+        run_scan_pipeline(
+            safe_path=lambda value: Path(value),
+            package="npx -y @modelcontextprotocol/server-filesystem",
+            offline=True,
+        )
+    )
+
+    assert agents == captured_agents
+    assert scan_sources == ["mcp_package"]
+    server = agents[0].mcp_servers[0]
+    assert server.command == "npx"
+    assert server.args == ["-y", "@modelcontextprotocol/server-filesystem"]
+    assert server.packages[0].name == "@modelcontextprotocol/server-filesystem"
+    assert server.packages[0].declared_version == "latest"
+    assert server.packages[0].floating_reference is True
+    assert any("pass @modelcontextprotocol/server-filesystem@version" in warning for warning in warnings)
+
+
+@patch("agent_bom.mcp_server._run_scan_pipeline")
+def test_scan_default_read_only_contract_does_not_refresh_db_and_uses_offline_scan(mock_pipeline):
+    """Default read-only scan must avoid DB refresh and online vulnerability scans."""
+    mock_pipeline.return_value = ([], [], [], [])
+
+    from agent_bom.mcp_server import create_mcp_server
+
+    def _unexpected_sync(*_args, **_kwargs):
+        raise AssertionError("default MCP scan must not refresh the vulnerability DB")
+
+    server = create_mcp_server()
+    with patch("agent_bom.db.sync.sync_db", side_effect=_unexpected_sync):
+        result = _call_tool(server, "scan")
+
+    assert result["status"] == "no_agents_found"
+    _args, kwargs = mock_pipeline.call_args
+    assert kwargs["offline"] is True
+
+
+@patch("agent_bom.mcp_server._run_scan_pipeline")
+def test_scan_online_db_refresh_requires_explicit_opt_in(mock_pipeline):
+    """Callers can opt back into the historical DB refresh + online scan behavior."""
+    mock_pipeline.return_value = ([], [], [], [])
+    sync_calls: list[object] = []
+
+    from agent_bom.mcp_server import create_mcp_server
+
+    server = create_mcp_server()
+    with (
+        patch("agent_bom.db.schema.db_freshness_days", return_value=99),
+        patch("agent_bom.db.sync.sync_db", side_effect=lambda sources=None: sync_calls.append(sources)),
+    ):
+        result = _call_tool(server, "scan", {"offline": False, "auto_update_db": True, "db_sources": "osv,ghsa"})
+
+    assert result["status"] == "no_agents_found"
+    assert sync_calls == [["osv", "ghsa"]]
+    _args, kwargs = mock_pipeline.call_args
+    assert kwargs["offline"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -248,13 +488,247 @@ def test_scan_no_agents(mock_pipeline):
 
 @patch("agent_bom.mcp_server._run_scan_pipeline")
 def test_blast_radius_not_found(mock_pipeline):
-    """Unknown CVE should return found=False."""
+    """Unknown CVE returns the stable not-found envelope (#1960)."""
     mock_pipeline.return_value = ([], [], [], [])
     from agent_bom.mcp_server import create_mcp_server
 
     server = create_mcp_server()
     result = _call_tool(server, "blast_radius", {"cve_id": "CVE-9999-00000"})
-    assert result["found"] is False
+    assert result["error"]["code"] == "AGENTBOM_MCP_NOT_FOUND_RESOURCE"
+    assert result["error"]["category"] == "not_found"
+    assert result["error"]["details"]["cve_id"] == "CVE-9999-00000"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "impl_target"),
+    [
+        ("dataset_card_scan", "agent_bom.mcp_tools.specialized.dataset_card_scan_impl"),
+        ("training_pipeline_scan", "agent_bom.mcp_tools.specialized.training_pipeline_scan_impl"),
+        ("prompt_scan", "agent_bom.mcp_tools.specialized.prompt_scan_impl"),
+        ("model_file_scan", "agent_bom.mcp_tools.specialized.model_file_scan_impl"),
+        ("ai_inventory_scan", "agent_bom.mcp_tools.specialized.ai_inventory_scan_impl"),
+    ],
+)
+def test_directory_tools_use_safe_path_before_impl(tool_name, impl_target):
+    """Directory-taking tools should sanitize paths at the MCP boundary."""
+    from agent_bom.mcp_server import create_mcp_server
+
+    captured: dict[str, str] = {}
+    safe_path = Path("/tmp/safe-target")
+
+    async def _fake_impl(*, directory, _truncate_response, **_extra):
+        captured["directory"] = directory
+        return json.dumps({"directory": directory})
+
+    with patch("agent_bom.mcp_server._safe_path", return_value=safe_path), patch(impl_target, side_effect=_fake_impl):
+        server = create_mcp_server()
+        result = _call_tool(server, tool_name, {"directory": "/tmp/../unsafe"})
+
+    assert captured["directory"] == str(safe_path)
+    assert result["directory"] == str(safe_path)
+
+
+@patch("agent_bom.parsers.external_scanners.detect_and_parse")
+def test_ingest_external_scan_sanitizes_errors(mock_detect):
+    """External scan ingestion should not leak raw paths or URLs in errors."""
+    from agent_bom.mcp_server import create_mcp_server
+
+    mock_detect.side_effect = Exception("failed to parse https://example.com/report at /Users/mohamedsaad/secret.txt " + ("x" * 400))
+
+    server = create_mcp_server()
+    # parse_only stays an allowed read (the write path is destructive-gated, #3681);
+    # error sanitization runs in the parse path so this still exercises the envelope.
+    result = _call_tool(server, "ingest_external_scan", {"scan_json": "{}", "parse_only": True})
+
+    # Stable envelope from #1960 — error is now a dict, not a string. The
+    # message field still flows through sanitize_error so paths and URLs
+    # stay redacted before reaching the wire.
+    assert result["error"]["code"] == "AGENTBOM_MCP_INTERNAL_UNEXPECTED"
+    assert result["error"]["category"] == "internal"
+    message = result["error"]["message"]
+    assert "https://example.com" not in message
+    assert "/Users/mohamedsaad/secret.txt" not in message
+    assert "<url>" in message
+    assert "<path>" in message
+    assert len(message) <= 200
+
+
+# ---------------------------------------------------------------------------
+# Tool: ingest_external_scan — destructive-write authorization (#3681)
+#
+# When ``parse_only`` is false the tool bulk-ingests findings into the control
+# plane (and, with ``reconcile_absent``, mass-resolves open findings). That
+# write must be gated as a destructive action requiring ``findings:write``.
+# ``parse_only`` parses locally only and stays an allowed read.
+# ---------------------------------------------------------------------------
+
+
+def _fixed_request_meta(auth_scopes: str):
+    """Return a request-meta factory that reports a fixed authenticated scope set."""
+
+    def _factory():
+        return {
+            "caller": "test-caller",
+            "client_id": None,
+            "request_id": "req-test",
+            "auth_scopes": auth_scopes,
+        }
+
+    return _factory
+
+
+@patch("agent_bom.mcp_tools.sbom.diff_impl")
+def test_diff_write_requires_findings_scope(mock_diff):
+    """The history-mutating diff tool must fail closed for a read caller."""
+    from agent_bom import mcp_server
+    from agent_bom.mcp_server import create_mcp_server
+
+    server = create_mcp_server()
+    with patch.object(mcp_server, "_current_tool_request", _fixed_request_meta("read")):
+        result = _call_tool(server, "diff", {})
+
+    assert result.get("status") == "blocked", result
+    assert result.get("required_role") == "admin", result
+    mock_diff.assert_not_called()
+
+
+@patch("agent_bom.mcp_tools.sbom.diff_impl")
+def test_diff_write_accepts_operator_findings_scope(mock_diff):
+    """An authenticated findings operator can run the persisted diff."""
+    from agent_bom import mcp_server
+    from agent_bom.mcp_server import create_mcp_server
+
+    mock_diff.return_value = json.dumps({"status": "ok"})
+    server = create_mcp_server()
+    with patch.object(mcp_server, "_current_tool_request", _fixed_request_meta("admin,findings:write")):
+        result = _call_tool(server, "diff", {})
+
+    assert result == {"status": "ok"}
+    mock_diff.assert_called_once()
+
+
+@patch("agent_bom.mcp_tools.posture.access_review_impl")
+def test_access_review_write_requires_identity_scope(mock_access_review):
+    """Status-refresh persistence must not run for a read-only caller."""
+    from agent_bom import mcp_server
+    from agent_bom.mcp_server import create_mcp_server
+
+    server = create_mcp_server()
+    with patch.object(mcp_server, "_current_tool_request", _fixed_request_meta("read")):
+        result = _call_tool(server, "access_review", {})
+
+    assert result.get("status") == "blocked", result
+    assert result.get("required_role") == "admin", result
+    mock_access_review.assert_not_called()
+
+
+@patch("agent_bom.mcp_tools.posture.access_review_impl")
+def test_access_review_write_accepts_operator_identity_scope(mock_access_review):
+    """An authenticated identity operator can refresh access-review status."""
+    from agent_bom import mcp_server
+    from agent_bom.mcp_server import create_mcp_server
+
+    mock_access_review.return_value = json.dumps({"status": "ok"})
+    server = create_mcp_server()
+    with patch.object(mcp_server, "_current_tool_request", _fixed_request_meta("admin,identity:write")):
+        result = _call_tool(server, "access_review", {})
+
+    assert result == {"status": "ok"}
+    mock_access_review.assert_called_once()
+
+
+@patch("agent_bom.parsers.external_scanners.detect_and_parse")
+def test_ingest_external_scan_write_denied_for_read_scope(mock_detect):
+    """A read-scope/unauthenticated caller cannot write (parse_only=False)."""
+    from agent_bom import mcp_server
+    from agent_bom.mcp_server import create_mcp_server
+
+    server = create_mcp_server()
+    with patch.object(mcp_server, "_current_tool_request", _fixed_request_meta("read")):
+        result = _call_tool(
+            server,
+            "ingest_external_scan",
+            {"scan_json": "{}", "parse_only": False, "reconcile_absent": True},
+        )
+
+    assert result.get("status") == "blocked", result
+    assert result.get("required_role") == "admin", result
+    assert "write action" in result.get("error", "").lower(), result
+    # Dispatch fails closed before the handler runs — no parsing, no client call.
+    mock_detect.assert_not_called()
+
+
+@patch("agent_bom.parsers.external_scanners.detect_and_parse")
+def test_ingest_external_scan_write_denied_without_findings_write_scope(mock_detect):
+    """Admin baseline without findings:write is still blocked (defense in depth)."""
+    from agent_bom import mcp_server
+    from agent_bom.mcp_server import create_mcp_server
+
+    server = create_mcp_server()
+    with patch.object(mcp_server, "_current_tool_request", _fixed_request_meta("admin")):
+        result = _call_tool(
+            server,
+            "ingest_external_scan",
+            {"scan_json": "{}", "parse_only": False},
+        )
+
+    assert result.get("status") == "blocked", result
+    assert result.get("required_scope") == "findings:write", result
+    mock_detect.assert_not_called()
+
+
+@patch("agent_bom.parsers.external_scanners.detect_and_parse")
+def test_ingest_external_scan_write_allowed_with_findings_write_scope(mock_detect):
+    """A caller with findings:write is allowed through to the handler."""
+    from agent_bom import mcp_server
+    from agent_bom.mcp_server import create_mcp_server
+
+    mock_detect.return_value = []  # no packages -> no network, deterministic
+    server = create_mcp_server()
+    with patch.object(mcp_server, "_current_tool_request", _fixed_request_meta("admin,findings:write")):
+        result = _call_tool(
+            server,
+            "ingest_external_scan",
+            {"scan_json": "[]", "parse_only": False},
+        )
+
+    assert result.get("status") != "blocked", result
+    assert result.get("packages") == 0, result
+    mock_detect.assert_called_once()
+
+
+@patch("agent_bom.parsers.external_scanners.detect_and_parse")
+def test_ingest_external_scan_parse_only_allowed_without_scope(mock_detect):
+    """parse_only stays a read: no control-plane mutation, no scope required."""
+    from agent_bom import mcp_server
+    from agent_bom.mcp_server import create_mcp_server
+
+    mock_detect.return_value = []
+    server = create_mcp_server()
+    with patch.object(mcp_server, "_current_tool_request", _fixed_request_meta("")):
+        result = _call_tool(
+            server,
+            "ingest_external_scan",
+            {"scan_json": "[]", "parse_only": True},
+        )
+
+    assert result.get("status") != "blocked", result
+    assert result.get("packages") == 0, result
+    assert "control_plane" not in result, result
+    mock_detect.assert_called_once()
+
+
+def test_ingest_external_scan_annotation_is_write():
+    """The tool must advertise a mutating annotation, not readOnlyHint=true."""
+    from agent_bom.mcp_server import create_mcp_server
+
+    server = create_mcp_server()
+    tools = {t.name: t for t in _run(server.list_tools())}
+    tool = tools["ingest_external_scan"]
+    ann = tool.annotations
+    assert ann is not None
+    assert ann.readOnlyHint is False, ann
+    assert ann.destructiveHint is True, ann
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +802,7 @@ def test_generate_sbom_no_agents(mock_pipeline):
 def test_cli_mcp_server_help():
     """CLI should have mcp-server subcommand."""
     runner = CliRunner()
-    result = runner.invoke(main, ["mcp-server", "--help"])
+    result = runner.invoke(main, ["mcp", "server", "--help"])
     assert result.exit_code == 0
     assert "MCP server" in result.output or "mcp" in result.output.lower()
 
@@ -336,7 +810,7 @@ def test_cli_mcp_server_help():
 def test_cli_mcp_server_transport_options():
     """CLI should accept --transport, --port, --host options."""
     runner = CliRunner()
-    result = runner.invoke(main, ["mcp-server", "--help"])
+    result = runner.invoke(main, ["mcp", "server", "--help"])
     assert "--transport" in result.output
     assert "--port" in result.output
     assert "--host" in result.output
@@ -349,17 +823,20 @@ def test_cli_mcp_server_transport_options():
 
 @patch("agent_bom.mcp_server._run_scan_pipeline")
 def test_compliance_no_agents(mock_pipeline):
-    """Compliance with no agents should return 100% score."""
+    """Compliance with no evidence must be unevaluated, never a clean pass."""
     mock_pipeline.return_value = ([], [], [], [])
     from agent_bom.mcp_server import create_mcp_server
 
     server = create_mcp_server()
     result = _call_tool(server, "compliance", {})
-    assert result["overall_score"] == 100.0
-    assert result["overall_status"] == "pass"
+    assert result["overall_score"] == 0.0
+    assert result["overall_status"] == "no_data"
+    assert result["evaluated_controls"] == 0
+    assert result["not_evaluated_controls"] == result["total_controls"]
     assert len(result["owasp_llm_top10"]) == 10
     assert len(result["mitre_atlas"]) >= 50
     assert len(result["nist_ai_rmf"]) == 14
+    assert all(control["status"] == "not_evaluated" for control in result["owasp_llm_top10"])
 
 
 @patch("agent_bom.mcp_server._run_scan_pipeline")
@@ -519,7 +996,7 @@ def test_scan_with_transitive(mock_pipeline):
     from agent_bom.mcp_server import create_mcp_server
 
     server = create_mcp_server()
-    _call_tool(server, "scan", {"transitive": True})
+    _call_tool(server, "scan", {"transitive": True, "auto_update_db": False})
     _args, kwargs = mock_pipeline.call_args
     assert kwargs.get("transitive") is True or (len(_args) > 4 and _args[4] is True)
 
@@ -539,7 +1016,7 @@ def test_scan_with_fail_severity_pass(mock_pipeline):
     from agent_bom.mcp_server import create_mcp_server
 
     server = create_mcp_server()
-    result = _call_tool(server, "scan", {"fail_severity": "critical"})
+    result = _call_tool(server, "scan", {"fail_severity": "critical", "auto_update_db": False})
     assert result["gate_status"] == "pass"
     assert result["gate_severity"] == "critical"
 
@@ -576,7 +1053,7 @@ def test_scan_with_fail_severity_fail(mock_pipeline):
     from agent_bom.mcp_server import create_mcp_server
 
     server = create_mcp_server()
-    result = _call_tool(server, "scan", {"fail_severity": "high"})
+    result = _call_tool(server, "scan", {"fail_severity": "high", "auto_update_db": False})
     assert result["gate_status"] == "fail"
 
 
@@ -596,9 +1073,47 @@ def test_scan_with_policy(mock_pipeline):
 
     server = create_mcp_server()
     policy = {"rules": [{"id": "no-crit", "severity_gte": "critical", "action": "fail"}]}
-    result = _call_tool(server, "scan", {"policy": policy})
+    result = _call_tool(server, "scan", {"policy": policy, "auto_update_db": False})
     assert "policy_results" in result
     assert result["policy_results"]["passed"] is True
+
+
+@patch("agent_bom.mcp_server._run_scan_pipeline")
+def test_scan_with_policy_fail_action_surfaces_failure(mock_pipeline):
+    """Scan with inline policy should report fail-action matches to MCP callers."""
+    from agent_bom.models import (
+        Agent,
+        AgentType,
+        BlastRadius,
+        MCPServer,
+        Package,
+        Severity,
+        TransportType,
+        Vulnerability,
+    )
+
+    mock_agent = Agent(
+        name="test-agent",
+        agent_type=AgentType.CLAUDE_DESKTOP,
+        config_path="/tmp/test",
+        mcp_servers=[MCPServer(name="s", command="npx", args=[], env={}, transport=TransportType.STDIO, packages=[])],
+    )
+    br = BlastRadius(
+        vulnerability=Vulnerability(id="CVE-2026-0001", severity=Severity.HIGH, summary="bad"),
+        package=Package(name="axios", version="1.4.0", ecosystem="npm"),
+        affected_servers=[mock_agent.mcp_servers[0]],
+        affected_agents=[mock_agent],
+        exposed_credentials=[],
+        exposed_tools=[],
+    )
+    mock_pipeline.return_value = ([mock_agent], [br], [], ["agent_discovery"])
+    from agent_bom.mcp_server import create_mcp_server
+
+    server = create_mcp_server()
+    policy = {"rules": [{"id": "fail-high", "severity_gte": "high", "action": "fail"}]}
+    result = _call_tool(server, "scan", {"policy": policy, "auto_update_db": False})
+    assert result["policy_results"]["passed"] is False
+    assert result["policy_results"]["failures"][0]["rule_id"] == "fail-high"
 
 
 # ---------------------------------------------------------------------------
@@ -682,7 +1197,10 @@ def test_diff_no_baseline(mock_pipeline):
         from agent_bom.mcp_server import create_mcp_server
 
         server = create_mcp_server()
-        result = _call_tool(server, "diff", {})
+        from agent_bom import mcp_server
+
+        with patch.object(mcp_server, "_current_tool_request", _fixed_request_meta("admin,findings:write")):
+            result = _call_tool(server, "diff", {})
         assert "message" in result
         assert "baseline" in result["message"].lower()
 
@@ -694,7 +1212,10 @@ def test_diff_no_agents(mock_pipeline):
     from agent_bom.mcp_server import create_mcp_server
 
     server = create_mcp_server()
-    result = _call_tool(server, "diff", {})
+    from agent_bom import mcp_server
+
+    with patch.object(mcp_server, "_current_tool_request", _fixed_request_meta("admin,findings:write")):
+        result = _call_tool(server, "diff", {})
     assert "error" in result
 
 
@@ -745,6 +1266,62 @@ def test_resource_policy_template():
     assert "policy://template" in uris
 
 
+def test_resource_tool_metrics():
+    """metrics://tools resource should be discoverable."""
+    from agent_bom.mcp_server import create_mcp_server
+
+    server = create_mcp_server()
+    resources = _run(server.list_resources())
+    uris = [str(r.uri) for r in resources]
+    assert "metrics://tools" in uris
+
+
+def test_resources_include_trust_and_hardening_contracts():
+    """MCP resources should expose schema, hardening, and compliance guidance."""
+    from agent_bom.mcp_server import create_mcp_server
+
+    server = create_mcp_server()
+    resources = _run(server.list_resources())
+    uris = {str(r.uri) for r in resources}
+    assert "schema://inventory-v1" in uris
+    assert "bestpractices://mcp-hardening" in uris
+    assert "compliance://framework-controls" in uris
+
+
+def test_mcp_hardening_resource_includes_nsa_control_mapping():
+    """MCP hardening resource should expose the NSA-informed operator controls."""
+    from agent_bom.mcp_server import create_mcp_server
+
+    server = create_mcp_server()
+    content = _run(server.read_resource("bestpractices://mcp-hardening"))
+    payload = json.loads(content[0].content)
+
+    assert payload["schema_version"] == "mcp.hardening.v1"
+    assert "NSA CSI" in payload["source"]["name"]
+    assert payload["control_count"] >= 9
+
+    control_ids = {control["id"] for control in payload["controls"]}
+    assert "strict_parameter_validation" in control_ids
+    assert "message_integrity_and_replay" in control_ids
+    assert "audit_logging_and_detection" in control_ids
+    assert "not a certification" in payload["claim_boundary"]
+
+
+def test_prompts_include_agentic_workflow_recipes():
+    """MCP prompts should expose multi-step recipes, not only raw tools."""
+    from agent_bom.mcp_server import create_mcp_server
+
+    server = create_mcp_server()
+    prompts = _run(server.list_prompts())
+    names = {prompt.name for prompt in prompts}
+    assert "quick-audit" in names
+    assert "pre-install-check" in names
+    assert "compliance-report" in names
+    assert "fleet-audit" in names
+    assert "incident-triage" in names
+    assert "remediation-plan" in names
+
+
 # ── Robustness tests ────────────────────────────────────────────────────
 
 
@@ -756,6 +1333,69 @@ def test_where_tool_returns_json():
     result = _call_tool(server, "where", {})
     assert "clients" in result
     assert "platform" in result
+
+
+@patch("agent_bom.mcp_server._run_scan_pipeline")
+def test_graph_export_uses_scan_pipeline_tuple_contract(mock_pipeline):
+    """graph_export should serialize nodes from the tuple-style scan pipeline result."""
+    from agent_bom.mcp_server import create_mcp_server
+    from agent_bom.models import Agent, AgentType, MCPServer, Package, TransportType, Vulnerability
+
+    vuln = Vulnerability(id="CVE-2026-0001", severity="HIGH", summary="test")
+    pkg = Package(name="requests", version="2.0.0", ecosystem="pypi", vulnerabilities=[vuln])
+    server_obj = MCPServer(name="filesystem", command="npx", args=[], env={}, transport=TransportType.STDIO, packages=[pkg])
+    agent = Agent(name="claude", agent_type=AgentType.CLAUDE_DESKTOP, config_path="/tmp/test", mcp_servers=[server_obj])
+    mock_pipeline.return_value = ([agent], [], [], ["agent_discovery"])
+
+    server = create_mcp_server()
+    result = _call_tool(server, "graph_export", {"format": "json"})
+    assert result["nodes"]
+    assert any(node["kind"] == "agent" for node in result["nodes"])
+    assert any(edge["kind"] == "depends_on" for edge in result["edges"])
+
+
+@patch("agent_bom.mcp_server._run_scan_pipeline")
+def test_graph_export_mermaid_limit_zero_renders_full_graph(mock_pipeline):
+    """graph_export should pass the full-render sentinel through for Mermaid output."""
+    from agent_bom.mcp_server import create_mcp_server
+    from agent_bom.models import Agent, AgentType, MCPServer, Package, TransportType
+
+    pkg = Package(name="requests", version="2.0.0", ecosystem="pypi", vulnerabilities=[])
+    server_obj = MCPServer(
+        name="filesystem",
+        command="npx",
+        args=[],
+        env={},
+        transport=TransportType.STDIO,
+        packages=[pkg],
+    )
+    agent = Agent(
+        name="claude",
+        agent_type=AgentType.CLAUDE_DESKTOP,
+        config_path="/tmp/test",
+        mcp_servers=[server_obj],
+    )
+    mock_pipeline.return_value = ([agent], [], [], ["agent_discovery"])
+
+    server = create_mcp_server()
+    with patch("agent_bom.output.graph_export.to_mermaid", return_value="graph LR") as mermaid_mock:
+        content_blocks, _meta = _run(server.call_tool("graph_export", {"format": "mermaid", "mermaid_limit": 0}))
+
+    assert content_blocks[0].text == "graph LR"
+    mermaid_mock.assert_called_once()
+    assert mermaid_mock.call_args.kwargs == {"max_nodes": None, "max_edges": None}
+
+
+@patch("agent_bom.mcp_server._run_scan_pipeline")
+def test_graph_export_passes_through_pipeline_error_payload(mock_pipeline):
+    """graph_export should return a pipeline error payload instead of crashing on string results."""
+    from agent_bom.mcp_server import create_mcp_server
+
+    mock_pipeline.return_value = json.dumps({"error": "blocked path"})
+
+    server = create_mcp_server()
+    result = _call_tool(server, "graph_export", {"format": "json"})
+    assert result == {"error": "blocked path"}
 
 
 def test_registry_cache_returns_same_instance():
@@ -787,7 +1427,7 @@ def test_scan_with_invalid_severity_gate():
         mock_pipeline.return_value = ([mock_agent], [], [], ["agent_discovery"])
 
         with pytest.raises(ToolError, match="Invalid severity"):
-            _call_tool(server, "scan", {"fail_severity": "invalid_sev"})
+            _call_tool(server, "scan", {"fail_severity": "invalid_sev", "auto_update_db": False})
 
 
 def test_scan_surfaces_warnings():
@@ -805,7 +1445,7 @@ def test_scan_surfaces_warnings():
         )
         mock_pipeline.return_value = ([mock_agent], [], ["Image scan failed for bad:image: not found"], ["agent_discovery"])
 
-        result = _call_tool(server, "scan", {})
+        result = _call_tool(server, "scan", {"auto_update_db": False})
         assert "warnings" in result
         assert len(result["warnings"]) == 1
         assert "Image scan failed" in result["warnings"][0]
@@ -819,7 +1459,7 @@ def test_scan_no_agents_with_warnings():
     with patch("agent_bom.mcp_server._run_scan_pipeline") as mock_pipeline:
         mock_pipeline.return_value = ([], [], ["SBOM file too large"], [])
 
-        result = _call_tool(server, "scan", {})
+        result = _call_tool(server, "scan", {"auto_update_db": False})
         assert result["status"] == "no_agents_found"
         assert "warnings" in result
         assert "SBOM file too large" in result["warnings"][0]
@@ -855,7 +1495,7 @@ def test_validate_ecosystem_valid():
     """All supported ecosystems should pass validation."""
     from agent_bom.mcp_server import _validate_ecosystem
 
-    for eco in ("npm", "pypi", "go", "cargo", "maven", "nuget", "rubygems"):
+    for eco in ("npm", "pypi", "go", "cargo", "maven", "nuget", "rubygems", "composer", "swift", "deb", "apk", "rpm"):
         assert _validate_ecosystem(eco) == eco
     # Case insensitive + whitespace trimmed
     assert _validate_ecosystem("NPM") == "npm"
@@ -866,7 +1506,7 @@ def test_validate_ecosystem_invalid():
     """Invalid ecosystems should raise ValueError."""
     from agent_bom.mcp_server import _validate_ecosystem
 
-    for bad in ("pip", "", "python", "composer", "  "):
+    for bad in ("pip", "", "python", "gem", "  "):
         with pytest.raises(ValueError, match="Invalid ecosystem"):
             _validate_ecosystem(bad)
 
@@ -931,3 +1571,40 @@ def test_safe_path_traversal():
 
     with pytest.raises(ValueError, match="outside home directory"):
         _safe_path("/etc/passwd")
+
+
+def test_sdk_check_names_an_incompatible_major_distinctly():
+    """An installed-but-incompatible SDK must not read as "not installed".
+
+    ``check_mcp_sdk`` only did ``import mcp``, which succeeds on mcp 2.x — the
+    major that removed ``mcp.server.fastmcp``. Users got "install
+    agent-bom[mcp-server]", the exact command they had just run, for a problem
+    that installing more could never fix.
+    """
+    import builtins
+
+    from agent_bom.mcp_server_runtime import check_mcp_sdk
+
+    real_import = builtins.__import__
+
+    def _fastmcp_missing(name, *args, **kwargs):
+        if name == "mcp.server.fastmcp" or name.startswith("mcp.server.fastmcp."):
+            raise ModuleNotFoundError("No module named 'mcp.server.fastmcp'")
+        return real_import(name, *args, **kwargs)
+
+    with patch.object(builtins, "__import__", _fastmcp_missing):
+        with pytest.raises(ImportError) as excinfo:
+            check_mcp_sdk()
+
+    message = str(excinfo.value)
+    assert "incompatible" in message.lower(), message
+    assert "<2" in message or "2.x" in message, message
+
+
+def test_sdk_check_still_reports_a_genuinely_missing_sdk():
+    """The absent-SDK message must survive — it is the common case."""
+    from agent_bom.mcp_server_runtime import check_mcp_sdk
+
+    with patch.dict(sys.modules, {"mcp": None}):
+        with pytest.raises(ImportError, match="mcp SDK is required"):
+            check_mcp_sdk()

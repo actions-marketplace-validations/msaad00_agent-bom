@@ -1,9 +1,12 @@
 """Tests for the unified Finding model (issue #566, Phase 1)."""
 
+import json
+
 import pytest
 
 from agent_bom.finding import (
     Asset,
+    ControlTag,
     Finding,
     FindingSource,
     FindingType,
@@ -14,6 +17,8 @@ from agent_bom.models import (
     BlastRadius,
     MCPServer,
     Package,
+    PackageOccurrence,
+    ServerSurface,
     Severity,
     TransportType,
     Vulnerability,
@@ -94,6 +99,7 @@ def _make_blast_radius(
 def test_finding_type_values():
     assert FindingType.CVE == "CVE"
     assert FindingType.CIS_FAIL == "CIS_FAIL"
+    assert FindingType.CIS_ERROR == "CIS_ERROR"
     assert FindingType.TOOL_DRIFT == "TOOL_DRIFT"
 
 
@@ -176,6 +182,28 @@ def test_finding_different_assets_produce_different_ids():
     assert f1.id != f2.id
 
 
+def test_finding_distinct_packages_under_one_server_get_distinct_ids():
+    """Two CVEs on different packages under one mcp_server asset must not collide."""
+    server_asset = Asset(name="filesystem", asset_type="mcp_server")
+    f_torch = Finding(
+        finding_type=FindingType.CVE,
+        source=FindingSource.MCP_SCAN,
+        asset=server_asset,
+        severity="HIGH",
+        cve_id="CVE-2024-9999",
+        evidence={"package_name": "torch", "package_version": "2.3.0"},
+    )
+    f_numpy = Finding(
+        finding_type=FindingType.CVE,
+        source=FindingSource.MCP_SCAN,
+        asset=server_asset,
+        severity="HIGH",
+        cve_id="CVE-2024-9999",
+        evidence={"package_name": "numpy", "package_version": "1.26.0"},
+    )
+    assert f_torch.id != f_numpy.id
+
+
 def test_finding_effective_severity_vendor_wins():
     finding = Finding(
         finding_type=FindingType.CVE,
@@ -185,7 +213,7 @@ def test_finding_effective_severity_vendor_wins():
         vendor_severity="HIGH",
         cvss_severity="LOW",
     )
-    assert finding.effective_severity() == "HIGH"
+    assert finding.effective_severity() == "high"
 
 
 def test_finding_effective_severity_cvss_fallback():
@@ -197,7 +225,7 @@ def test_finding_effective_severity_cvss_fallback():
         vendor_severity=None,
         cvss_severity="LOW",
     )
-    assert finding.effective_severity() == "LOW"
+    assert finding.effective_severity() == "low"
 
 
 def test_finding_effective_severity_base_fallback():
@@ -207,7 +235,7 @@ def test_finding_effective_severity_base_fallback():
         asset=Asset(name="pkg", asset_type="package"),
         severity="HIGH",
     )
-    assert finding.effective_severity() == "HIGH"
+    assert finding.effective_severity() == "high"
 
 
 def test_finding_all_compliance_tags_deduplicates():
@@ -223,6 +251,81 @@ def test_finding_all_compliance_tags_deduplicates():
     tags = finding.all_compliance_tags()
     assert tags.count("LLM05") == 1
     assert "AML.T0010" in tags
+
+
+def test_finding_normalizes_legacy_control_tags():
+    finding = Finding(
+        finding_type=FindingType.CVE,
+        source=FindingSource.MCP_SCAN,
+        asset=Asset(name="pkg", asset_type="package"),
+        severity="HIGH",
+        owasp_tags=["LLM05"],
+        soc2_tags=["CC7.1"],
+    )
+
+    payload = finding.to_dict()
+
+    assert payload["controls"] == [
+        {
+            "framework": "owasp_llm",
+            "control": "LLM05",
+            "version": "2025",
+            "confidence": 0.75,
+            "source": "legacy:owasp_tags",
+            "via": "owasp_tags",
+        },
+        {
+            "framework": "soc2",
+            "control": "CC7.1",
+            "version": "2017",
+            "confidence": 0.75,
+            "source": "legacy:soc2_tags",
+            "via": "soc2_tags",
+        },
+    ]
+    assert payload["owasp_tags"] == ["LLM05"]
+    assert payload["soc2_tags"] == ["CC7.1"]
+
+
+def test_finding_deduplicates_explicit_and_legacy_controls():
+    finding = Finding(
+        finding_type=FindingType.CVE,
+        source=FindingSource.MCP_SCAN,
+        asset=Asset(name="pkg", asset_type="package"),
+        severity="HIGH",
+        controls=[ControlTag(framework="owasp_llm", control="LLM05", version="2025", confidence=0.9, source="hub")],
+        owasp_tags=["LLM05"],
+        atlas_tags=["AML.T0010"],
+    )
+
+    controls = finding.to_dict()["controls"]
+
+    assert controls == [
+        {
+            "framework": "owasp_llm",
+            "control": "LLM05",
+            "version": "2025",
+            "confidence": 0.9,
+            "source": "hub",
+            "via": None,
+        },
+        {
+            "framework": "mitre_atlas",
+            "control": "AML.T0010",
+            "version": "bundled",
+            "confidence": 0.75,
+            "source": "legacy:atlas_tags",
+            "via": "atlas_tags",
+        },
+    ]
+    assert "LLM05" in finding.all_compliance_tags()
+    assert "AML.T0010" in finding.all_compliance_tags()
+
+
+def test_control_tag_from_dict_accepts_via_alias():
+    tag = ControlTag.from_dict({"framework": "nist_csf", "control": "ID.RA-01", "via": "legacy"})
+
+    assert tag == ControlTag(framework="nist_csf", control="ID.RA-01", source="legacy", via="legacy")
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +345,23 @@ def test_blast_radius_to_finding_cve_type():
     assert finding.source == FindingSource.MCP_SCAN
 
 
+def test_blast_radius_to_finding_uses_sbom_source_for_non_mcp_surfaces():
+    server = _make_server("sbom-package")
+    server.surface = ServerSurface.SBOM
+    br = _make_blast_radius(servers=[server])
+    finding = blast_radius_to_finding(br)
+    assert finding.source == FindingSource.SBOM
+    assert "owasp_mcp" not in finding.applicable_frameworks
+
+
+def test_blast_radius_to_finding_uses_container_source_for_image_surfaces():
+    server = _make_server("container-image")
+    server.surface = ServerSurface.CONTAINER_IMAGE
+    br = _make_blast_radius(servers=[server])
+    finding = blast_radius_to_finding(br)
+    assert finding.source == FindingSource.CONTAINER
+
+
 def test_blast_radius_to_finding_severity_mapped():
     br = _make_blast_radius(severity=Severity.CRITICAL)
     finding = blast_radius_to_finding(br)
@@ -252,6 +372,25 @@ def test_blast_radius_to_finding_cve_id():
     br = _make_blast_radius(vuln_id="CVE-2024-1234")
     finding = blast_radius_to_finding(br)
     assert finding.cve_id == "CVE-2024-1234"
+
+
+def test_blast_radius_to_finding_derives_remediation_from_fixed_version():
+    br = _make_blast_radius()
+    br.vulnerability.fixed_version = "2.32.4"
+
+    finding = blast_radius_to_finding(br)
+
+    assert finding.remediation_guidance == "Upgrade requests to 2.32.4."
+    assert finding.to_dict()["remediation_guidance"] == "Upgrade requests to 2.32.4."
+
+
+def test_blast_radius_to_finding_preserves_explicit_remediation_text():
+    br = _make_blast_radius()
+    br.vulnerability.remediation = "Apply the vendor patch and restart affected workloads."
+
+    finding = blast_radius_to_finding(br)
+
+    assert finding.remediation_guidance == "Apply the vendor patch and restart affected workloads."
 
 
 def test_blast_radius_to_finding_asset_uses_server():
@@ -277,6 +416,54 @@ def test_blast_radius_to_finding_compliance_tags_carried():
     assert finding.soc2_tags == ["CC7.1"]
 
 
+def test_cloud_cis_check_without_a_severity_is_unrated_not_medium():
+    """A control that reports no severity must not be handed one.
+
+    The converter defaulted a missing/blank severity to ``medium``, which is a
+    rating the evidence does not support: a check that could not be evaluated
+    was published at the same band as a real medium failure and counted toward
+    the medium tile. ``unknown`` routes it to the explicit ``unrated`` bucket
+    instead, where it is still counted and still visible (#4631).
+    """
+    from agent_bom.finding import cloud_cis_check_to_finding
+    from agent_bom.graph.severity import severity_display_bucket
+
+    for blank in ("", "   ", None):
+        check = {
+            "check_id": "1.1",
+            "title": "Evidence source unreadable",
+            "status": "ERROR",
+            "severity": blank,
+        }
+        finding = cloud_cis_check_to_finding(check, "aws")
+        assert finding.severity == "unknown", f"severity={blank!r} was rated {finding.severity}"
+        assert severity_display_bucket(finding.severity) == "unrated"
+
+    # A check that DOES report a severity keeps it, error or not.
+    rated = cloud_cis_check_to_finding({"check_id": "1.1", "title": "MFA coverage", "status": "ERROR", "severity": "high"}, "aws")
+    assert rated.severity == "high"
+
+
+def test_cloud_cis_check_to_finding_sets_applicable_frameworks():
+    """cloud_cis_check_to_finding must populate applicable_frameworks (via
+    apply_hub_classification) like every other generator — previously it set only
+    compliance_tags, leaving applicable_frameworks empty so the finding was
+    invisible in the hub posture aggregation."""
+    from agent_bom.finding import cloud_cis_check_to_finding
+
+    check = {"check_id": "2.1.2", "title": "S3 public", "status": "FAIL", "severity": "high"}
+    finding = cloud_cis_check_to_finding(check, "aws")
+
+    assert finding.applicable_frameworks, "applicable_frameworks must be populated"
+    # A CIS Foundations benchmark failure authoritatively asserts the CIS control.
+    assert "cis" in finding.applicable_frameworks
+    # But it must NOT fabricate a specific SOC2/ISO/NIST crosswalk — there is no
+    # authoritative CIS-Foundations → SOC2/ISO/NIST-800-53 mapping in the repo.
+    assert "soc2" not in finding.applicable_frameworks
+    assert "iso-27001" not in finding.applicable_frameworks
+    assert "nist-800-53" not in finding.applicable_frameworks
+
+
 def test_blast_radius_to_finding_risk_score():
     br = _make_blast_radius()
     finding = blast_radius_to_finding(br)
@@ -290,12 +477,152 @@ def test_blast_radius_to_finding_kev():
     assert finding.is_kev is True
 
 
+def test_blast_radius_to_finding_preserves_suppression_ai_context_and_reach():
+    """The shim must not drop suppression, AI-context, or reach lists.
+
+    Regression guard: a suppressed BlastRadius previously surfaced as an
+    unsuppressed Finding, and multi-server / credential reach collapsed to
+    bare counts in evidence. These are now first-class on Finding.
+    """
+    br = _make_blast_radius(
+        servers=[_make_server("server-a"), _make_server("server-b")],
+        credentials=["OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY"],
+    )
+    br.suppressed = True
+    br.suppression_id = "sup-123"
+    br.suppression_state = "acknowledged"
+    br.suppression_reason = "risk accepted by owner"
+    br.unsuppressed_risk_score = 9.1
+    br.ai_risk_context = "Reachable from an internet-exposed agent"
+    br.ai_summary = "LLM-generated narrative"
+    br.attack_vector_summary = "agent -> server -> vulnerable package"
+
+    finding = blast_radius_to_finding(br)
+
+    assert finding.suppressed is True
+    assert finding.suppression_id == "sup-123"
+    assert finding.suppression_state == "acknowledged"
+    assert finding.suppression_reason == "risk accepted by owner"
+    assert finding.unsuppressed_risk_score == 9.1
+    assert finding.ai_risk_context == "Reachable from an internet-exposed agent"
+    assert finding.ai_summary == "LLM-generated narrative"
+    assert finding.attack_vector_summary == "agent -> server -> vulnerable package"
+    # Reach preserved structurally, not collapsed to counts.
+    assert finding.affected_servers == ["server-a", "server-b"]
+    assert finding.exposed_credentials == ["OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY"]
+
+
 def test_blast_radius_to_finding_evidence_has_package_info():
     br = _make_blast_radius()
     finding = blast_radius_to_finding(br)
     assert finding.evidence["package_name"] == "requests"
     assert finding.evidence["package_version"] == "2.0.0"
     assert finding.evidence["exposed_credential_count"] == 1
+
+
+def test_blast_radius_to_finding_preserves_sanitized_reachability_evidence():
+    raw_github_token = "ghp_" + "abcdefghijklmnopqrstuvwxyz" + "1234567890"
+    raw_slack_token = "xoxb-" + "1234567890-" + "1234567890-" + "abcdefghijklmnopqrstuv"
+    br = _make_blast_radius()
+    br.hop_depth = 3
+    br.delegation_chain = [f"test-server -> {raw_slack_token} -> delegated-agent"]
+    br.transitive_agents = [
+        {
+            "name": "delegated-agent",
+            "hop": 2,
+            "token": raw_github_token,
+            "config_path": "/Users/alice/.config/agent-bom/private-agent.json",
+        }
+    ]
+    br.transitive_servers = [
+        {
+            "name": "delegated-server",
+            "url": "https://user:" + "password@example.com/mcp?token=raw",
+        }
+    ]
+    br.transitive_packages = [
+        {
+            "name": "transitive-lib",
+            "version": "1.0.0",
+            "download_url": "https://user:" + "password@registry.example.com/transitive-lib.tgz?token=raw",
+        }
+    ]
+    br.transitive_credentials = ["AWS_SECRET_ACCESS_KEY"]
+    br.transitive_risk_score = 4.2
+    br.graph_reachable = True
+    br.graph_min_hop_distance = 2
+    br.graph_reachable_from_agents = ["delegated-agent"]
+
+    finding = blast_radius_to_finding(br)
+
+    assert finding.evidence["hop_depth"] == 3
+    assert finding.evidence["delegation_chain"] == ["test-server -> <redacted> -> delegated-agent"]
+    assert finding.evidence["transitive_agents"][0]["name"] == "delegated-agent"
+    assert finding.evidence["transitive_agents"][0]["hop"] == 2
+    assert finding.evidence["transitive_agents"][0]["token"] == "***REDACTED***"
+    assert finding.evidence["transitive_agents"][0]["config_path"] == "<path:private-agent.json>"
+    assert finding.evidence["transitive_servers"][0]["name"] == "delegated-server"
+    assert finding.evidence["transitive_servers"][0]["url"] == "https://example.com/mcp"
+    assert finding.evidence["transitive_packages"][0]["name"] == "transitive-lib"
+    assert finding.evidence["transitive_packages"][0]["download_url"] == "https://registry.example.com/transitive-lib.tgz"
+    assert finding.evidence["transitive_credential_count"] == 1
+    assert finding.evidence["transitive_risk_score"] == 4.2
+    assert finding.evidence["graph_reachable"] is True
+    assert finding.evidence["graph_min_hop_distance"] == 2
+    assert finding.evidence["graph_reachable_from_agents"] == ["delegated-agent"]
+
+    serialized = json.dumps(finding.evidence, sort_keys=True)
+    assert raw_github_token not in serialized
+    assert raw_slack_token not in serialized
+    assert "user:password" not in serialized
+    assert "/Users/alice/.config/agent-bom/private-agent.json" not in serialized
+
+
+def test_report_to_findings_preserves_sanitized_layer_attribution_evidence():
+    raw_token = "ghp_" + "abcdefghijklmnopqrstuvwxyz" + "1234567890"
+    pkg = _make_package()
+    pkg.is_direct = False
+    pkg.parent_package = "top-level"
+    pkg.dependency_depth = 2
+    pkg.dependency_scope = "runtime"
+    pkg.reachability_evidence = "lockfile"
+    pkg.occurrences = [
+        PackageOccurrence(
+            layer_index=7,
+            layer_id="sha256:layer7",
+            layer_path="/var/lib/docker/overlay2/sensitive-layer",
+            package_path="/Users/alice/work/private/package-lock.json",
+            created_by=f"RUN npm config set //registry.npmjs.org/:_authToken={raw_token}",
+            dockerfile_instruction=f"RUN npm install --token={raw_token}",
+        )
+    ]
+    br = _make_blast_radius()
+    br.package = pkg
+    br.graph_reachable = False
+    report = AIBOMReport(agents=[], blast_radii=[br])
+
+    finding = report.to_findings()[0]
+
+    assert finding.evidence["package_is_direct"] is False
+    assert finding.evidence["package_parent"] == "top-level"
+    assert finding.evidence["package_dependency_depth"] == 2
+    assert finding.evidence["package_dependency_scope"] == "runtime"
+    assert finding.evidence["package_reachability_evidence"] == "lockfile"
+    assert finding.evidence["graph_reachable"] is False
+    assert finding.evidence["layer_attribution"] == [
+        {
+            "layer_index": 7,
+            "layer_id": "sha256:layer7",
+            "layer_path": "<path:sensitive-layer>",
+            "package_path": "<path:package-lock.json>",
+            "created_by": "RUN npm config set //registry.npmjs.org/:_authToken=<redacted>",
+            "dockerfile_instruction": "RUN npm install --token=<redacted>",
+        }
+    ]
+
+    serialized = json.dumps(finding.evidence, sort_keys=True)
+    assert raw_token not in serialized
+    assert "/Users/alice/work/private/package-lock.json" not in serialized
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +642,29 @@ def test_report_to_findings_converts_blast_radii():
     assert all(f.finding_type == FindingType.CVE for f in findings)
 
 
+def test_blast_radius_to_finding_preserves_reachability_and_vulnerability_metadata():
+    br = _make_blast_radius()
+    br.impact_category = "availability"
+    br.vulnerability.published_at = "2026-01-02T00:00:00Z"
+    br.vulnerability.modified_at = "2026-01-03T00:00:00Z"
+    br.vulnerability.severity_source = "nvd:cvss_v3"
+    br.vulnerability.epss_percentile = 97.5
+    br.vulnerability.kev_date_added = "2026-01-04"
+    br.vulnerability.kev_due_date = "2026-02-04"
+    br.vulnerability.compliance_tags = {"nist_csf": ["ID.RA-01"]}
+
+    finding = AIBOMReport(agents=[], blast_radii=[br]).to_findings()[0]
+
+    assert finding.reachability == br.reachability
+    assert finding.is_actionable == br.is_actionable
+    assert finding.impact_category == "availability"
+    assert finding.evidence["published_at"] == "2026-01-02T00:00:00Z"
+    assert finding.evidence["severity_source"] == "nvd:cvss_v3"
+    assert finding.evidence["epss_percentile"] == 97.5
+    assert finding.evidence["kev_date_added"] == "2026-01-04"
+    assert finding.evidence["vulnerability_compliance_tags"] == {"nist_csf": ["ID.RA-01"]}
+
+
 def test_report_to_findings_returns_existing_when_populated():
     """If findings already populated (dual-write path), return as-is."""
     pre_existing = [
@@ -329,6 +679,38 @@ def test_report_to_findings_returns_existing_when_populated():
     result = report.to_findings()
     assert len(result) == 1
     assert result[0].finding_type == FindingType.CIS_FAIL
+
+
+def test_cve_findings_reuses_dual_write_projection():
+    """Output views must not reconvert the same BlastRadius stream repeatedly."""
+    from agent_bom.output.finding_views import cve_findings
+
+    report = _make_report_with_blast_radii(2)
+    report.findings = report.to_findings()
+
+    projected = cve_findings(report, report.blast_radii)
+
+    assert projected is not report.findings
+    assert projected == report.findings
+    assert all(item.finding_type == FindingType.CVE for item in projected)
+
+
+def test_report_to_findings_merges_explicit_and_blast_radius_findings():
+    """A report must expose CVEs and explicit policy findings together."""
+    report = _make_report_with_blast_radii(1)
+    report.findings = [
+        Finding(
+            finding_type=FindingType.CREDENTIAL_EXPOSURE,
+            source=FindingSource.SECRET_SCAN,
+            asset=Asset(name="OPENAI_API_KEY", asset_type="credential"),
+            severity="HIGH",
+        )
+    ]
+
+    findings = report.to_findings()
+
+    assert {finding.finding_type for finding in findings} == {FindingType.CVE, FindingType.CREDENTIAL_EXPOSURE}
+    assert len(findings) == 2
 
 
 def test_report_cve_findings_filters_by_type():
@@ -372,3 +754,66 @@ def test_report_dual_write_findings_field():
     # to_findings() returns the already-populated list
     assert len(report.to_findings()) == 1
     assert report.to_findings()[0].cve_id == "CVE-2024-9999"  # vuln_id maps to cve_id
+
+
+# ---------------------------------------------------------------------------
+# Owner + SLA (P0: finding-level owner + SLA populated on the spine)
+# ---------------------------------------------------------------------------
+
+
+def test_finding_to_dict_populates_owner_and_sla_from_first_seen():
+    from datetime import datetime
+
+    from agent_bom.graph.sla import SEVERITY_SLA_DAYS
+
+    finding = Finding(
+        finding_type=FindingType.CVE,
+        source=FindingSource.MCP_SCAN,
+        asset=Asset(name="pkg", asset_type="package", identifier="pkg:pypi/torch@2.3.0"),
+        severity="critical",
+        first_seen="2026-08-01T00:00:00+00:00",
+    )
+    payload = finding.to_dict()
+    assert payload["owner"] is None
+    assert payload["first_seen"] == "2026-08-01T00:00:00+00:00"
+    due = datetime.fromisoformat(payload["sla_due_at"])
+    anchor = datetime.fromisoformat("2026-08-01T00:00:00+00:00")
+    assert (due - anchor).days == SEVERITY_SLA_DAYS["critical"]
+
+
+def test_finding_to_dict_owner_surfaces_assignee():
+    finding = Finding(
+        finding_type=FindingType.CVE,
+        source=FindingSource.MCP_SCAN,
+        asset=Asset(name="pkg", asset_type="package", identifier="pkg:pypi/torch@2.3.0"),
+        severity="high",
+        owner="alice@example.com",
+    )
+    assert finding.to_dict()["owner"] == "alice@example.com"
+
+
+def test_finding_to_dict_sla_none_without_anchor():
+    finding = Finding(
+        finding_type=FindingType.CVE,
+        source=FindingSource.MCP_SCAN,
+        asset=Asset(name="pkg", asset_type="package", identifier="pkg:pypi/torch@2.3.0"),
+        severity="critical",
+    )
+    # Honest unknown: no first_seen anchor and no KEV date -> no fabricated date.
+    assert finding.to_dict()["sla_due_at"] is None
+
+
+def test_finding_to_dict_kev_due_date_overrides_sla():
+    from datetime import datetime
+
+    finding = Finding(
+        finding_type=FindingType.CVE,
+        source=FindingSource.MCP_SCAN,
+        asset=Asset(name="pkg", asset_type="package", identifier="pkg:pypi/torch@2.3.0"),
+        severity="high",
+        first_seen="2026-08-01T00:00:00+00:00",
+        is_kev=True,
+        evidence={"kev_due_date": "2026-08-10"},
+    )
+    due = datetime.fromisoformat(finding.to_dict()["sla_due_at"])
+    assert due == datetime.fromisoformat("2026-08-10T00:00:00+00:00")

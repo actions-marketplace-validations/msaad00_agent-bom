@@ -10,6 +10,7 @@ Tables:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -35,8 +36,13 @@ def _validated_db_path(raw: str) -> Path:
 
     p = Path(raw).expanduser()
     home = Path.home().resolve()
-    # Use the real system temp dir (macOS: /private/tmp or /private/var/folders/…)
-    tmp = Path(tempfile.gettempdir()).resolve()
+    # Accept both the real temp root and the common /tmp alias on macOS/Linux.
+    temp_roots = {Path(tempfile.gettempdir()).resolve()}
+    for candidate in (Path("/tmp"), Path("/private/tmp")):  # nosec B108
+        try:
+            temp_roots.add(candidate.resolve())
+        except OSError:
+            continue
 
     # Allow home subtree or system temp subtree (test fixtures land in temp)
     try:
@@ -44,7 +50,7 @@ def _validated_db_path(raw: str) -> Path:
     except (OSError, RuntimeError) as exc:
         raise ValueError(f"AGENT_BOM_DB_PATH is not a valid path: {raw!r}") from exc
 
-    if not (resolved.is_relative_to(home) or resolved.is_relative_to(tmp)):
+    if not (resolved.is_relative_to(home) or any(resolved.is_relative_to(root) for root in temp_roots)):
         raise ValueError(f"AGENT_BOM_DB_PATH must be inside the home directory or /tmp, got: {raw!r}")
 
     try:
@@ -58,7 +64,7 @@ def _validated_db_path(raw: str) -> Path:
 DB_PATH: Path = _validated_db_path(_RAW_DB_PATH)
 
 # Schema version — bump when DDL changes incompatibly
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 5
 
 # Migration scripts: list of (from_version, to_version, sql) tuples.
 # Add a new entry here whenever _SCHEMA_VERSION is bumped.
@@ -66,12 +72,42 @@ _SCHEMA_VERSION = 3
 _MIGRATIONS: list[tuple[int, int, str]] = [
     (1, 2, "ALTER TABLE vulns ADD COLUMN cwe_ids TEXT DEFAULT '';"),
     (2, 3, "ALTER TABLE vulns ADD COLUMN aliases TEXT DEFAULT '';"),
+    (3, 4, "ALTER TABLE sync_meta ADD COLUMN metadata_json TEXT DEFAULT '';"),
+    # v5 widens the affected primary key so multi-branch advisories keep every
+    # vulnerable window. Rows written under v4 collapsed to a single window per
+    # range, so clearing sync_meta forces the next `agent-bom db update` to
+    # re-ingest in full and restore the windows that were dropped. Existing
+    # rows are preserved: each is a genuine window, merely an incomplete set.
+    (
+        4,
+        5,
+        """
+        ALTER TABLE affected RENAME TO affected_v4;
+        CREATE TABLE affected (
+            vuln_id         TEXT NOT NULL REFERENCES vulns(id) ON DELETE CASCADE,
+            ecosystem       TEXT NOT NULL,
+            package_name    TEXT NOT NULL,
+            introduced      TEXT,
+            fixed           TEXT,
+            last_affected   TEXT,
+            PRIMARY KEY (vuln_id, ecosystem, package_name, introduced, fixed, last_affected)
+        );
+        INSERT OR IGNORE INTO affected
+            (vuln_id, ecosystem, package_name, introduced, fixed, last_affected)
+        SELECT vuln_id, ecosystem, package_name, introduced, fixed, last_affected
+        FROM affected_v4;
+        DROP TABLE affected_v4;
+        CREATE INDEX IF NOT EXISTS idx_affected_pkg ON affected(ecosystem, package_name);
+        DELETE FROM sync_meta;
+        """,
+    ),
 ]
 
 _DDL = """
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
+PRAGMA busy_timeout = 30000;
 
 CREATE TABLE IF NOT EXISTS schema_version (
     version     INTEGER NOT NULL
@@ -98,9 +134,32 @@ CREATE TABLE IF NOT EXISTS affected (
     introduced      TEXT,               -- semver or "" (means all)
     fixed           TEXT,               -- semver or "" (means no fix)
     last_affected   TEXT,
-    PRIMARY KEY (vuln_id, ecosystem, package_name, introduced)
+    -- One row per vulnerable window. Advisories that fix several release
+    -- branches emit multiple windows for the same package, and those windows
+    -- routinely share an ``introduced`` bound (commonly "0"), so the bound
+    -- alone cannot identify a row without silently overwriting siblings.
+    PRIMARY KEY (vuln_id, ecosystem, package_name, introduced, fixed, last_affected)
 );
 CREATE INDEX IF NOT EXISTS idx_affected_pkg ON affected(ecosystem, package_name);
+
+CREATE TABLE IF NOT EXISTS cpe_matches (
+    cve_id           TEXT NOT NULL,      -- CVE the applicability statement belongs to
+    criteria         TEXT NOT NULL,      -- full cpe:2.3:part:vendor:product:... string
+    vendor           TEXT NOT NULL,      -- CPE vendor field
+    product          TEXT NOT NULL,      -- CPE product field
+    version          TEXT,               -- exact version, or NULL when a range is used
+    version_start    TEXT,               -- range lower bound (NULL = unbounded)
+    version_start_op TEXT,               -- including | excluding
+    version_end      TEXT,               -- range upper bound (NULL = unbounded)
+    version_end_op   TEXT,               -- including | excluding
+    PRIMARY KEY (cve_id, criteria, version_start, version_end)
+);
+CREATE INDEX IF NOT EXISTS idx_cpe_product ON cpe_matches(vendor, product);
+-- match_component_cpe filters `WHERE product IN (...)` often without a vendor,
+-- so the (vendor, product) index above is unusable for those lookups. This
+-- product-only index covers the vendor-less path. Migration note: existing
+-- databases gain this index automatically on the next init_db() run.
+CREATE INDEX IF NOT EXISTS idx_cpe_product_only ON cpe_matches(product);
 
 CREATE TABLE IF NOT EXISTS epss_scores (
     cve_id          TEXT PRIMARY KEY,
@@ -120,7 +179,8 @@ CREATE TABLE IF NOT EXISTS kev_entries (
 CREATE TABLE IF NOT EXISTS sync_meta (
     source          TEXT PRIMARY KEY,   -- osv | epss | kev
     last_synced     TEXT,               -- ISO-8601 UTC
-    record_count    INTEGER DEFAULT 0
+    record_count    INTEGER DEFAULT 0,
+    metadata_json   TEXT DEFAULT ''     -- source-specific coverage/freshness details
 );
 """
 
@@ -137,11 +197,16 @@ def _set_db_permissions(db_path: Path) -> None:
 
 
 def _check_integrity(conn: sqlite3.Connection, db_path: Path) -> None:
-    """Run SQLite quick_check (fast header-only validation).
+    """Run SQLite ``quick_check`` over the database.
 
-    Full ``integrity_check`` scans every page (~4s on 700K records) —
-    too expensive for every scan.  Use ``quick_check`` which validates
-    the B-tree structure without reading every row.
+    **This is not cheap.** The previous docstring claimed ``quick_check``
+    "validates the B-tree structure without reading every row"; that is wrong.
+    ``quick_check`` walks every page of every btree — what it omits, relative to
+    ``integrity_check``, is the index-vs-table cross-check. Measured on a fully
+    synced 1.95 GB ``vulns.db``: **191 s cold, 10-21 s warm.**
+
+    So it belongs on maintenance paths that already touch the whole file (a DB
+    update), never on an open. See :func:`init_db`.
     """
     result = conn.execute("PRAGMA quick_check").fetchone()
     if result and result[0] != "ok":
@@ -152,12 +217,22 @@ def _check_integrity(conn: sqlite3.Connection, db_path: Path) -> None:
         )
 
 
-def init_db(path: Path | None = None) -> sqlite3.Connection:
+def init_db(path: Path | None = None, *, verify_integrity: bool = False) -> sqlite3.Connection:
     """Open (and initialise if needed) the local vuln DB.
 
-    Creates the DB file and parent directories if they don't exist.
-    Applies 0600 file permissions and runs an integrity check on open.
-    Returns an open connection with WAL mode and foreign keys enabled.
+    Creates the DB file and parent directories if they don't exist, applies 0600
+    permissions, and returns an open connection with WAL mode and foreign keys
+    enabled.
+
+    ``verify_integrity`` runs :func:`_check_integrity`, which reads the entire
+    file. It used to run on **every** open, and ``intel_lookup`` opens the DB
+    once per request in four places — so on a fully synced 1.95 GB database
+    every ``/v1/intel/*`` call re-validated the whole thing (measured: 22-58 s
+    per request, on a UI panel whose client cache is explicitly disabled).
+
+    Invisible in dev and CI because the cost scales with the size of
+    ``vulns.db``, not with the estate. Callers that already rewrite the database
+    — the sync/update path and the ``db`` CLI — opt in; readers do not.
     """
     db_path = path or DB_PATH
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -169,8 +244,10 @@ def init_db(path: Path | None = None) -> sqlite3.Connection:
     # Lock down file permissions after first creation
     _set_db_permissions(db_path)
 
-    # Integrity check — warn on corrupt DB, don't crash (read-only callers are safe)
-    _check_integrity(conn, db_path)
+    # Integrity check — warn on corrupt DB, don't crash (read-only callers are safe).
+    # Opt-in: it reads the whole file, so it must never sit on an open.
+    if verify_integrity:
+        _check_integrity(conn, db_path)
 
     # Seed schema_version on first creation
     row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
@@ -189,6 +266,21 @@ def init_db(path: Path | None = None) -> sqlite3.Connection:
                 _SCHEMA_VERSION,
             )
 
+    return conn
+
+
+def open_existing_db_readonly(path: Path | None = None) -> sqlite3.Connection:
+    """Open an existing vulnerability DB in read-only mode.
+
+    This is used for scan/read paths when the DB exists but the containing
+    directory is not writable (for example, sandboxed or read-only mounts).
+    """
+    db_path = path or DB_PATH
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    # WAL is set at write time; readers still need a busy_timeout so a scan does
+    # not raise SQLITE_BUSY the instant it races a concurrent sync/refresh.
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
@@ -232,7 +324,7 @@ def db_freshness_days(path: Path | None = None) -> int | None:
     if not db_path.exists():
         return None
     try:
-        conn = sqlite3.connect(str(db_path))
+        conn = open_existing_db_readonly(db_path)
         try:
             rows = conn.execute("SELECT last_synced FROM sync_meta").fetchall()
         finally:
@@ -269,6 +361,17 @@ def db_stats(conn: sqlite3.Connection) -> dict:
     stats["affected_count"] = conn.execute("SELECT COUNT(*) FROM affected").fetchone()[0]
     stats["epss_count"] = conn.execute("SELECT COUNT(*) FROM epss_scores").fetchone()[0]
     stats["kev_count"] = conn.execute("SELECT COUNT(*) FROM kev_entries").fetchone()[0]
-    rows = conn.execute("SELECT source, last_synced, record_count FROM sync_meta").fetchall()
-    stats["sync_meta"] = {r["source"]: {"last_synced": r["last_synced"], "count": r["record_count"]} for r in rows}
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(sync_meta)").fetchall()}
+    if "metadata_json" in columns:
+        rows = conn.execute("SELECT source, last_synced, record_count, metadata_json FROM sync_meta").fetchall()
+    else:
+        rows = conn.execute("SELECT source, last_synced, record_count, '' AS metadata_json FROM sync_meta").fetchall()
+    stats["sync_meta"] = {
+        r["source"]: {
+            "last_synced": r["last_synced"],
+            "count": r["record_count"],
+            "metadata": json.loads(r["metadata_json"] or "{}"),
+        }
+        for r in rows
+    }
     return stats

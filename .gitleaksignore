@@ -1,0 +1,56 @@
+# .gitleaksignore — fingerprint allowlist for verified false positives.
+#
+# FORMAT: one finding fingerprint per line.
+#   <commit-sha>:<file>:<rule-id>:<line>
+# See: https://github.com/gitleaks/gitleaks#gitleaksignore
+#
+# ─── HARD RULE — READ BEFORE ADDING AN ENTRY ─────────────────────────────────
+# DO NOT include the literal phrase that triggered the rule anywhere in your
+# comment or explanation. Gitleaks scans this file too; if your comment quotes
+# the offending English prose back, gitleaks will re-match on this file, you
+# will add a new fingerprint, you will quote the phrase again, and you will
+# spend an hour in an infinite loop before noticing. (Ask us how we know.)
+#
+# When describing a finding, reference it abstractly: "documentation prose in
+# section N of the enterprise playbook", not the specific words. If you need
+# the text for context, link to the commit on GitHub via the Fingerprint URL
+# that gitleaks prints in the job output.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Doc prose in an early draft of the enterprise security playbook. No secret;
+# reworded in a follow-up commit. History-only finding.
+a5c3a329da9d0f5deed6a6857bcbaeaf3a024f1e:docs/ENTERPRISE_SECURITY_PLAYBOOK.md:generic-api-key:258
+
+# Historical false positive in a previous version of this file itself, caused
+# by the trap documented above. Retained because gitleaks walks history.
+792b4ad4ff3f877992a678bd533f2dd2dd7854da:.gitleaksignore:generic-api-key:10
+
+# History-only false positives from test fixtures that temporarily used
+# unsigned token-shaped strings before being replaced with generated values.
+e67c1273881cb01cfbc64b1f6a1081613e5e8fe3:tests/test_api_hardening.py:jwt:286
+e67c1273881cb01cfbc64b1f6a1081613e5e8fe3:tests/test_api_oidc.py:jwt:334
+e67c1273881cb01cfbc64b1f6a1081613e5e8fe3:tests/test_api_oidc.py:jwt:360
+
+# History-only false positive from a synthetic token-shape redaction fixture.
+# The fixture verifies that prompt sanitization removes the value.
+8b56ca26dfb1f9a575f21678fa8f33be113fc231:tests/test_ai_enrich_providers.py:jwt:47
+
+# False positive: the compliance scorecard response declares its framework
+# registry identifier in a JSON field whose name ends in _key; the value is
+# the NIST catalog registry id, not a credential.
+0e43ed628801d7c2d4fbdd7e3a01b07fda2b113b:src/agent_bom/api/routes/compliance.py:generic-api-key:534
+# History-only: earlier revision of the note above quoted the flagged pair.
+523c32e9b3c52b355c33cc67bac34e670ff6167f:.gitleaksignore:generic-api-key:39
+
+# One-off prose false positive: a docstring sentence about credential wiring
+# in the side-scan runner matched generic-api-key.
+a9ab4c116af8bc5086aca63933d12a675573bb4b:src/agent_bom/cloud/side_scan_targets.py:generic-api-key:199
+
+# History-only false positives from runtime-evidence redaction fixtures. The
+# current test assembles each non-functional detector input at runtime.
+9ab04a6e7577f0117410e3baeeddc87ac7ac97a2:tests/cloud/test_runtime_workload_evidence.py:gitlab-pat:209
+9ab04a6e7577f0117410e3baeeddc87ac7ac97a2:tests/cloud/test_runtime_workload_evidence.py:curl-auth-header:331
+9ab04a6e7577f0117410e3baeeddc87ac7ac97a2:tests/cloud/test_runtime_workload_evidence.py:github-pat:374
+9ab04a6e7577f0117410e3baeeddc87ac7ac97a2:tests/cloud/test_runtime_workload_evidence.py:gitlab-pat:379
+9ab04a6e7577f0117410e3baeeddc87ac7ac97a2:tests/cloud/test_runtime_workload_evidence.py:gitlab-deploy-token:381
+9ab04a6e7577f0117410e3baeeddc87ac7ac97a2:tests/cloud/test_runtime_workload_evidence.py:gitlab-runner-authentication-token:382

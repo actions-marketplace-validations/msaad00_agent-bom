@@ -49,6 +49,34 @@ def test_convert_arg_pattern():
     assert fmt["rules"][0]["arg_pattern"] == {"cmd": "rm.*"}
 
 
+def test_convert_runtime_enforcement_fields():
+    p = _policy(
+        rules=[
+            GatewayRule(
+                id="r1",
+                action="block",
+                deny_tool_classes=["network"],
+                read_only=True,
+                block_secret_paths=True,
+                block_unknown_egress=True,
+                allowed_hosts=["api.openai.com"],
+            )
+        ]
+    )
+    fmt = gateway_policy_to_proxy_format(p)
+    assert fmt["rules"][0]["deny_tool_classes"] == ["network"]
+    assert fmt["rules"][0]["read_only"] is True
+    assert fmt["rules"][0]["block_secret_paths"] is True
+    assert fmt["rules"][0]["block_unknown_egress"] is True
+    assert fmt["rules"][0]["allowed_hosts"] == ["api.openai.com"]
+
+
+def test_convert_rate_limit():
+    p = _policy(rules=[GatewayRule(id="r1", action="block", rate_limit=25)])
+    fmt = gateway_policy_to_proxy_format(p)
+    assert fmt["rules"][0]["rate_limit"] == 25
+
+
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
 
@@ -112,6 +140,25 @@ def test_multiple_policies_first_blocks():
     assert pid == "p-2"
 
 
+def test_enforce_policy_takes_precedence_over_prior_audit_match():
+    audit = _policy(
+        policy_id="audit-rm",
+        mode=PolicyMode.AUDIT,
+        rules=[GatewayRule(id="audit", action="block", block_tools=["rm"])],
+    )
+    enforce = _policy(
+        policy_id="enforce-rm",
+        mode=PolicyMode.ENFORCE,
+        rules=[GatewayRule(id="enforce", action="block", block_tools=["rm"])],
+    )
+
+    allowed, reason, pid = evaluate_gateway_policies([audit, enforce], "rm", {})
+
+    assert allowed is False
+    assert "rm" in reason
+    assert pid == "enforce-rm"
+
+
 def test_tool_name_exact_match():
     p = _policy(rules=[GatewayRule(id="r1", action="block", tool_name="write_file")])
     allowed, _, _ = evaluate_gateway_policies([p], "write_file", {})
@@ -131,3 +178,26 @@ def test_arg_pattern_match():
     # Non-matching arg
     allowed2, _, _ = evaluate_gateway_policies([p], "read_file", {"path": "/tmp/safe"})
     assert allowed2 is True
+
+
+def test_gateway_read_only_blocks_write_tool():
+    p = _policy(rules=[GatewayRule(id="r1", action="block", read_only=True)])
+    allowed, reason, _ = evaluate_gateway_policies([p], "write_file", {"path": "/tmp/x"})
+    assert allowed is False
+    assert "read-only" in reason.lower()
+
+
+def test_gateway_unknown_egress_blocks_unapproved_host():
+    p = _policy(
+        rules=[
+            GatewayRule(
+                id="r1",
+                action="block",
+                block_unknown_egress=True,
+                allowed_hosts=["api.openai.com"],
+            )
+        ]
+    )
+    allowed, reason, _ = evaluate_gateway_policies([p], "web_fetch", {"url": "https://evil.example/"})
+    assert allowed is False
+    assert "allowlisted" in reason.lower()

@@ -1,0 +1,376 @@
+from __future__ import annotations
+
+import sqlite3
+
+from click.testing import CliRunner
+
+from agent_bom.canonical_ids import canonical_package_id
+from agent_bom.db.local_analytics import LocalAnalyticsStore
+
+
+def _report(scan_id: str = "scan-1") -> dict:
+    return {
+        "scan_id": scan_id,
+        "generated_at": "2026-05-10T16:00:00+00:00",
+        "summary": {
+            "total_agents": 1,
+            "total_packages": 2,
+            "total_vulnerabilities": 2,
+            "critical_findings": 1,
+        },
+        "agents": [
+            {
+                "name": "desktop-agent",
+                "mcp_servers": [
+                    {
+                        "name": "filesystem",
+                        "packages": [
+                            {
+                                "name": "fastapi",
+                                "version": "0.115.0",
+                                "ecosystem": "pypi",
+                                "purl": "pkg:pypi/fastapi@0.115.0",
+                            },
+                            {
+                                "name": "uvicorn",
+                                "version": "0.32.0",
+                                "ecosystem": "pypi",
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+        "blast_radius": [
+            {
+                "vulnerability_id": "CVE-2026-0001",
+                "canonical_id": "finding-canonical-1",
+                "package": "fastapi@0.115.0",
+                "package_name": "fastapi",
+                "package_version": "0.115.0",
+                "ecosystem": "pypi",
+                "asset": {"name": "fastapi", "canonical_id": "asset-canonical-1"},
+                "severity": "critical",
+                "risk_score": 9.4,
+                "affected_agents": ["desktop-agent"],
+                "affected_servers": ["filesystem"],
+            },
+            {
+                "vulnerability_id": "CVE-2026-0002",
+                "package": "uvicorn@0.32.0",
+                "ecosystem": "pypi",
+                "severity": "high",
+                "risk_score": 7.2,
+                "affected_agents": ["desktop-agent"],
+                "affected_servers": ["filesystem"],
+            },
+        ],
+    }
+
+
+def test_local_analytics_store_records_scan_summary_findings_and_packages(tmp_path):
+    store = LocalAnalyticsStore(tmp_path / "local.sqlite")
+
+    scan_id = store.record_scan_report(_report(), source="cli", artifact_path=tmp_path / "scan.json")
+
+    assert scan_id == "scan-1"
+    runs = store.list_scan_runs()
+    assert runs[0]["run_id"].startswith("local-run-")
+    assert runs[0]["scan_id"] == "scan-1"
+    assert runs[0]["total_packages"] == 2
+    assert runs[0]["critical_findings"] == 1
+    assert runs[0]["high_findings"] == 1
+
+    severity_rows = store.query("SELECT severity, COUNT(*) AS count FROM scan_findings GROUP BY severity ORDER BY severity")
+    assert severity_rows == [{"severity": "critical", "count": 1}, {"severity": "high", "count": 1}]
+
+    package_rows = store.query("SELECT package_name FROM scan_packages ORDER BY package_name")
+    assert package_rows == [{"package_name": "fastapi"}, {"package_name": "uvicorn"}]
+
+    canonical_finding_rows = store.query(
+        "SELECT canonical_id, asset_canonical_id FROM scan_findings WHERE vulnerability_id = ?",
+        ("CVE-2026-0001",),
+    )
+    assert canonical_finding_rows == [{"canonical_id": "finding-canonical-1", "asset_canonical_id": "asset-canonical-1"}]
+
+    canonical_package_rows = store.query("SELECT package_name, package_canonical_id FROM scan_packages ORDER BY package_name")
+    assert canonical_package_rows == [
+        {
+            "package_name": "fastapi",
+            "package_canonical_id": canonical_package_id("fastapi", "0.115.0", "pypi", "pkg:pypi/fastapi@0.115.0"),
+        },
+        {
+            "package_name": "uvicorn",
+            "package_canonical_id": canonical_package_id("uvicorn", "0.32.0", "pypi"),
+        },
+    ]
+
+
+def test_local_analytics_scan_runs_filter_by_tenant(tmp_path):
+    store = LocalAnalyticsStore(tmp_path / "local.sqlite")
+
+    store.record_scan_report(_report("scan-alpha"), source="cli", tenant_id="tenant-alpha")
+    store.record_scan_report(_report("scan-beta"), source="cli", tenant_id="tenant-beta")
+
+    alpha_runs = store.list_scan_runs(tenant_id="tenant-alpha")
+    beta_runs = store.list_scan_runs(tenant_id="tenant-beta")
+    all_runs = store.list_scan_runs()
+
+    assert [row["scan_id"] for row in alpha_runs] == ["scan-alpha"]
+    assert [row["tenant_id"] for row in alpha_runs] == ["tenant-alpha"]
+    assert [row["scan_id"] for row in beta_runs] == ["scan-beta"]
+    assert {row["tenant_id"] for row in all_runs} == {"tenant-alpha", "tenant-beta"}
+
+
+def test_local_analytics_store_records_repeated_artifact_as_distinct_runs(tmp_path):
+    report = _report()
+    store = LocalAnalyticsStore(tmp_path / "local.sqlite")
+
+    store.record_scan_report(report, source="cli")
+    report["summary"]["total_vulnerabilities"] = 3
+    report["blast_radius"].append(
+        {
+            "vulnerability_id": "CVE-2026-0003",
+            "package": "fastapi@0.115.0",
+            "ecosystem": "pypi",
+            "severity": "medium",
+        }
+    )
+    store.record_scan_report(report, source="cli")
+
+    runs = store.query("SELECT run_id, total_vulnerabilities FROM scan_runs WHERE scan_id = ? ORDER BY rowid", ("scan-1",))
+    assert [row["total_vulnerabilities"] for row in runs] == [2, 3]
+    assert len({row["run_id"] for row in runs}) == 2
+    assert store.query("SELECT COUNT(*) AS count FROM scan_findings WHERE scan_id = ?", ("scan-1",)) == [{"count": 5}]
+
+
+def test_local_analytics_store_records_unified_non_cve_findings(tmp_path):
+    store = LocalAnalyticsStore(tmp_path / "local.sqlite")
+    report = _report()
+    report.pop("blast_radius")
+    report["findings"] = [
+        {
+            "schema_version": "1",
+            "id": "prompt-risk-1",
+            "finding_type": "PROMPT_SECURITY",
+            "source": "PROMPT_SCAN",
+            "asset": {
+                "name": "system.prompt",
+                "asset_type": "prompt_template",
+                "identifier": "prompts/system.prompt",
+            },
+            "severity": "high",
+            "title": "Prompt injection pattern",
+            "description": "Prompt contains override language.",
+        }
+    ]
+
+    store.record_scan_report(report, source="cli")
+
+    rows = store.query(
+        """
+        SELECT finding_key, vulnerability_id, finding_type, source, schema_version, title, asset_json
+        FROM scan_findings
+        """
+    )
+    assert rows[0]["finding_key"] == "prompt-risk-1"
+    assert rows[0]["vulnerability_id"] == ""
+    assert rows[0]["finding_type"] == "PROMPT_SECURITY"
+    assert rows[0]["source"] == "PROMPT_SCAN"
+    assert rows[0]["schema_version"] == "1"
+    assert rows[0]["title"] == "Prompt injection pattern"
+    assert '"asset_type": "prompt_template"' in rows[0]["asset_json"]
+
+
+def test_history_save_dual_writes_local_analytics(monkeypatch, tmp_path):
+    import agent_bom.db.local_analytics as local_analytics
+    import agent_bom.history as history
+
+    analytics_path = tmp_path / "analytics.sqlite"
+    monkeypatch.setattr(history, "HISTORY_DIR", tmp_path / "history")
+    monkeypatch.setattr(local_analytics, "LOCAL_ANALYTICS_DB", str(analytics_path))
+
+    saved_path = history.save_report(_report("saved-scan"))
+
+    assert saved_path.exists()
+    with sqlite3.connect(analytics_path) as conn:
+        rows = conn.execute("SELECT scan_id, source, artifact_path FROM scan_runs").fetchall()
+    assert rows == [("saved-scan", "cli", str(saved_path))]
+
+
+def test_cli_agents_scan_mirrors_to_local_analytics(monkeypatch, tmp_path):
+    """CLI scan completions must mirror to local-analytics regardless of --save.
+
+    Before the v0.86.6 fix, `agent-bom report query "SELECT COUNT(*) FROM scan_runs"`
+    returned 0 after a CLI scan because the mirror was only wired into
+    `history.save_report` (gated on the `--save` flag).
+    """
+    import agent_bom.db.local_analytics as local_analytics
+    from agent_bom.cli import main
+
+    db_path = tmp_path / "analytics.sqlite"
+    monkeypatch.setattr(local_analytics, "LOCAL_ANALYTICS_DB", str(db_path))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["agents", "--agent-mode", "--demo", "--no-scan", "--offline", "--no-auto-update-db"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+
+    with sqlite3.connect(db_path) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM scan_runs").fetchone()[0]
+    assert count >= 1, "CLI scan must persist to local-analytics scan_runs"
+
+
+def test_cli_local_analytics_mirror_is_best_effort(monkeypatch, tmp_path):
+    """A mirror-write failure must never fail the scan."""
+    import agent_bom.cli.agents as agents_module
+    from agent_bom.cli import main
+
+    def _raise(*_args, **_kwargs):
+        raise RuntimeError("simulated analytics outage")
+
+    # Patch the function as imported inside the CLI scan-completion code path.
+    monkeypatch.setattr(
+        "agent_bom.db.local_analytics.record_scan_report_best_effort",
+        _raise,
+    )
+    # Sanity: make sure we patched the symbol the CLI imports.
+    assert agents_module is not None
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["agents", "--agent-mode", "--demo", "--no-scan", "--offline", "--no-auto-update-db"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_local_analytics_store_migrates_initial_scan_id_keyed_schema(tmp_path):
+    db_path = tmp_path / "local.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE scan_runs (
+                scan_id TEXT PRIMARY KEY,
+                generated_at TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                source TEXT NOT NULL,
+                artifact_path TEXT,
+                total_agents INTEGER NOT NULL DEFAULT 0,
+                total_packages INTEGER NOT NULL DEFAULT 0,
+                total_vulnerabilities INTEGER NOT NULL DEFAULT 0,
+                critical_findings INTEGER NOT NULL DEFAULT 0,
+                high_findings INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE scan_findings (
+                scan_id TEXT NOT NULL,
+                finding_key TEXT NOT NULL,
+                vulnerability_id TEXT NOT NULL,
+                package_name TEXT NOT NULL,
+                package_version TEXT NOT NULL,
+                package_ref TEXT NOT NULL,
+                ecosystem TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                risk_score REAL NOT NULL DEFAULT 0,
+                affected_agents_json TEXT NOT NULL DEFAULT '[]',
+                affected_servers_json TEXT NOT NULL DEFAULT '[]',
+                PRIMARY KEY (scan_id, finding_key)
+            );
+            CREATE TABLE scan_packages (
+                scan_id TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                server_name TEXT NOT NULL,
+                package_name TEXT NOT NULL,
+                package_version TEXT NOT NULL,
+                ecosystem TEXT NOT NULL,
+                purl TEXT,
+                PRIMARY KEY (scan_id, agent_name, server_name, package_name, package_version, ecosystem)
+            );
+            INSERT INTO scan_runs(scan_id, generated_at, recorded_at, source)
+            VALUES ('legacy-scan', '2026-05-10T16:00:00+00:00', '2026-05-10T16:01:00+00:00', 'cli');
+            INSERT INTO scan_findings(
+                scan_id, finding_key, vulnerability_id, package_name, package_version,
+                package_ref, ecosystem, severity, risk_score
+            )
+            VALUES ('legacy-scan', 'CVE-2026-0001|pkg|pypi', 'CVE-2026-0001', 'pkg', '1.0', 'pkg@1.0', 'pypi', 'high', 7.1);
+            INSERT INTO scan_packages(scan_id, agent_name, server_name, package_name, package_version, ecosystem)
+            VALUES ('legacy-scan', 'agent', 'server', 'pkg', '1.0', 'pypi');
+            """
+        )
+
+    store = LocalAnalyticsStore(db_path)
+
+    assert store.list_scan_runs()[0]["run_id"] == "legacy-scan"
+    assert store.query("SELECT run_id, scan_id, source FROM scan_findings") == [
+        {"run_id": "legacy-scan", "scan_id": "legacy-scan", "source": ""}
+    ]
+    assert store.query("SELECT run_id, scan_id, package_name FROM scan_packages") == [
+        {"run_id": "legacy-scan", "scan_id": "legacy-scan", "package_name": "pkg"}
+    ]
+
+
+def test_local_analytics_store_migrates_v2_canonical_columns(tmp_path):
+    db_path = tmp_path / "local.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE scan_runs (
+                run_id TEXT PRIMARY KEY,
+                scan_id TEXT NOT NULL,
+                generated_at TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                source TEXT NOT NULL,
+                artifact_path TEXT,
+                total_agents INTEGER NOT NULL DEFAULT 0,
+                total_packages INTEGER NOT NULL DEFAULT 0,
+                total_vulnerabilities INTEGER NOT NULL DEFAULT 0,
+                critical_findings INTEGER NOT NULL DEFAULT 0,
+                high_findings INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE scan_findings (
+                run_id TEXT NOT NULL,
+                scan_id TEXT NOT NULL,
+                finding_key TEXT NOT NULL,
+                vulnerability_id TEXT NOT NULL,
+                package_name TEXT NOT NULL,
+                package_version TEXT NOT NULL,
+                package_ref TEXT NOT NULL,
+                ecosystem TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                risk_score REAL NOT NULL DEFAULT 0,
+                schema_version TEXT NOT NULL DEFAULT '',
+                finding_type TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                asset_json TEXT NOT NULL DEFAULT '{}',
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                affected_agents_json TEXT NOT NULL DEFAULT '[]',
+                affected_servers_json TEXT NOT NULL DEFAULT '[]',
+                PRIMARY KEY (run_id, finding_key)
+            );
+            CREATE TABLE scan_packages (
+                run_id TEXT NOT NULL,
+                scan_id TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                server_name TEXT NOT NULL,
+                package_name TEXT NOT NULL,
+                package_version TEXT NOT NULL,
+                ecosystem TEXT NOT NULL,
+                purl TEXT,
+                PRIMARY KEY (run_id, agent_name, server_name, package_name, package_version, ecosystem)
+            );
+            """
+        )
+
+    store = LocalAnalyticsStore(db_path)
+
+    finding_columns = {row["name"] for row in store.query("SELECT name FROM pragma_table_info('scan_findings')")}
+    package_columns = {row["name"] for row in store.query("SELECT name FROM pragma_table_info('scan_packages')")}
+    assert {"canonical_id", "asset_canonical_id"} <= finding_columns
+    assert "package_canonical_id" in package_columns

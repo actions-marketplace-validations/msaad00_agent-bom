@@ -18,8 +18,6 @@ from pathlib import Path as _Path
 
 from fastapi import APIRouter, HTTPException
 
-from agent_bom.security import sanitize_error
-
 router = APIRouter()
 _logger = logging.getLogger(__name__)
 
@@ -93,7 +91,7 @@ def _load_registry() -> list[dict]:
 # ─── Connector endpoints ─────────────────────────────────────────────────────
 
 
-@router.get("/v1/connectors", tags=["connectors"])
+@router.get("/connectors", tags=["connectors"])
 async def list_available_connectors() -> dict:
     """List available SaaS connectors for AI agent discovery."""
     from agent_bom.connectors import list_connectors
@@ -101,7 +99,7 @@ async def list_available_connectors() -> dict:
     return {"connectors": list_connectors()}
 
 
-@router.get("/v1/connectors/{name}/health", tags=["connectors"])
+@router.get("/connectors/{name}/health", tags=["connectors"])
 async def connector_health(name: str) -> dict:
     """Check connectivity for a SaaS connector."""
     try:
@@ -110,20 +108,40 @@ async def connector_health(name: str) -> dict:
         status = check_connector_health(name)
         return {"connector": status.connector, "state": status.state.value, "message": status.message, "api_version": status.api_version}
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=sanitize_error(str(exc))) from exc
+        raise HTTPException(status_code=404, detail="Connector not found") from exc
 
 
 # ─── Registry endpoints ──────────────────────────────────────────────────────
 
 
-@router.get("/v1/registry", tags=["registry"])
+def _load_registry_meta() -> dict:
+    """Freshness/provenance metadata from the bundled registry (top-level keys)."""
+    import json as _json
+
+    registry_path = _Path(__file__).parent.parent.parent / "mcp_registry.json"
+    if not registry_path.exists():
+        return {}
+    try:
+        raw = _json.loads(registry_path.read_text())
+    except (_json.JSONDecodeError, OSError):
+        return {}
+    return {
+        "updated": raw.get("_updated"),
+        "total_servers": raw.get("_total_servers"),
+        "sources": raw.get("_sources", []),
+        "source_url": raw.get("_source"),
+        "schema_version": raw.get("_schema_version"),
+    }
+
+
+@router.get("/registry", tags=["registry"])
 async def list_registry() -> dict:
     """List all known MCP servers from the agent-bom registry."""
     servers = _load_registry()
-    return {"servers": servers, "count": len(servers)}
+    return {"servers": servers, "count": len(servers), "meta": _load_registry_meta()}
 
 
-@router.get("/v1/registry/{server_id:path}", tags=["registry"])
+@router.get("/registry/{server_id:path}", tags=["registry"])
 async def get_registry_server(server_id: str) -> dict:
     """Get a single MCP server entry by ID (e.g. 'modelcontextprotocol/filesystem')."""
     servers = _load_registry()
@@ -136,7 +154,7 @@ async def get_registry_server(server_id: str) -> dict:
 # ─── Security lookup endpoints ───────────────────────────────────────────────
 
 
-@router.get("/v1/malicious/check", tags=["security"])
+@router.get("/malicious/check", tags=["security"])
 async def check_malicious(name: str, ecosystem: str = "npm") -> dict:
     """Check if a package name is a known malicious package or typosquat.
 
@@ -155,7 +173,7 @@ async def check_malicious(name: str, ecosystem: str = "npm") -> dict:
     }
 
 
-@router.get("/v1/scorecard/{ecosystem}/{package:path}", tags=["security"])
+@router.get("/scorecard/{ecosystem}/{package:path}", tags=["security"])
 async def scorecard_lookup(ecosystem: str, package: str) -> dict:
     """Look up OpenSSF Scorecard for a package.
 

@@ -1,0 +1,28 @@
+# ── Profile: HOSTED POC OVERLAY ──────────────────────────────────────────────
+# Hosted POC hardening overlay for customer-facing / secure POC deployments.
+#
+# OVERLAY ONLY — this file must be layered on docker-compose.platform.yml; it
+# fails standalone `docker compose config` by design (no image/build keys).
+#
+# Use with docker-compose.platform.yml when a public Caddy/ALB front door is
+# the only internet-facing listener:
+#
+#   docker compose \
+#     -f deploy/docker-compose.platform.yml \
+#     -f deploy/docker-compose.hosted-poc.yml \
+#     up -d --build
+#
+# Auth stays required. Public anonymous demo flags live only in
+# deploy/docker-compose.demo-override.yml (layered by the demo redeploy path).
+# The hosted_poc_preflight.py security gate forbids
+# AGENT_BOM_ALLOW_UNAUTHENTICATED_API in this overlay.
+#
+# The base platform file binds API and UI to loopback by default. This overlay
+# keeps the customer-0 VM posture explicit and sets browser-session cookies to
+# Secure because Caddy terminates public TLS on 443 and proxies to local HTTP
+# ports.
+
+services:
+  api:
+    environment:
+      - AGENT_BOM_SESSION_COOKIE_SECURE=1

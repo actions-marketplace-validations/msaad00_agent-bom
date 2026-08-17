@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from agent_bom.evidence.scan_run import ScanOutcome, effective_scan_run
 from agent_bom.models import AIBOMReport, Severity
+from agent_bom.output.finding_views import cve_findings, nested_vulnerabilities, severity_value, unified_findings
 
 
 def to_badge(report: AIBOMReport) -> dict:
@@ -16,14 +18,33 @@ def to_badge(report: AIBOMReport) -> dict:
 
     Use with: https://img.shields.io/endpoint?url=<badge-json-url>
     """
-    all_vulns = []
-    for agent in report.agents:
-        for server in agent.mcp_servers:
-            for pkg in server.packages:
-                all_vulns.extend(pkg.vulnerabilities)
-    critical = len([v for v in all_vulns if v.severity == Severity.CRITICAL])
-    high = len([v for v in all_vulns if v.severity == Severity.HIGH])
-    total = len(all_vulns)
+    findings = unified_findings(report)
+    if findings:
+        severities = [severity_value(finding) for finding in findings]
+    else:
+        severities = [vuln.severity.value for vuln in nested_vulnerabilities(report)]
+
+    scan_run = effective_scan_run(report)
+    if scan_run.outcome is ScanOutcome.FAILED:
+        return {
+            "schemaVersion": 1,
+            "label": "agent-bom",
+            "message": "scan failed",
+            "color": "red",
+            "namedLogo": "shield",
+        }
+    if scan_run.outcome is ScanOutcome.PARTIAL:
+        return {
+            "schemaVersion": 1,
+            "label": "agent-bom",
+            "message": "partial scan",
+            "color": "yellow",
+            "namedLogo": "shield",
+        }
+
+    critical = len([severity for severity in severities if severity == Severity.CRITICAL.value])
+    high = len([severity for severity in severities if severity == Severity.HIGH.value])
+    total = len(severities)
 
     if critical > 0:
         color = "critical"
@@ -72,7 +93,8 @@ def to_rsp_badge(report: AIBOMReport) -> dict:
             "color": "lightgrey",
         }
 
-    has_vulns = any(br.vulnerability.severity in (Severity.CRITICAL, Severity.HIGH) for br in report.blast_radii)
+    findings = cve_findings(report)
+    has_vulns = any(severity_value(finding) in {Severity.CRITICAL.value, Severity.HIGH.value} for finding in findings)
 
     if has_vulns:
         return {

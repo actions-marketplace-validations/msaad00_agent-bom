@@ -180,6 +180,111 @@ async def test_scan_packages_maven_go_query_construction():
 
 
 @pytest.mark.asyncio
+async def test_query_osv_batch_uses_debian_distro_context():
+    """Debian OS packages should query distro-specific OSV ecosystems when known."""
+    from agent_bom.scanners import query_osv_batch
+
+    pkg = Package(
+        name="ncurses-bin",
+        version="6.5+20250216-2",
+        ecosystem="deb",
+        source_package="ncurses",
+        distro_name="debian",
+        distro_version="13",
+    )
+    captured_queries: list[dict] = []
+
+    async def mock_request_with_retry(client, method, url, json=None, **kwargs):
+        if json and "queries" in json:
+            captured_queries.extend(json["queries"])
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"results": [{"vulns": []} for _ in captured_queries]}
+        return resp
+
+    with (
+        patch("agent_bom.scanners._get_scan_cache", return_value=None),
+        patch("agent_bom.scanners.request_with_retry", side_effect=mock_request_with_retry),
+        patch("agent_bom.scanners.create_client") as mock_create_client,
+    ):
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_create_client.return_value = mock_client
+
+        await query_osv_batch([pkg])
+
+    ecosystems = {q["package"]["ecosystem"] for q in captured_queries}
+    names = {q["package"]["name"] for q in captured_queries}
+    assert ecosystems == {"Debian:13"}
+    assert names == {"ncurses-bin", "ncurses"}
+
+
+@pytest.mark.asyncio
+async def test_query_osv_batch_debian_fallbacks_when_distro_unknown():
+    """Direct deb checks without distro metadata should query supported Debian suites."""
+    from agent_bom.scanners import query_osv_batch
+
+    pkg = Package(name="ncurses-bin", version="6.5+20250216-2", ecosystem="deb", source_package="ncurses")
+    captured_queries: list[dict] = []
+
+    async def mock_request_with_retry(client, method, url, json=None, **kwargs):
+        if json and "queries" in json:
+            captured_queries.extend(json["queries"])
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"results": [{"vulns": []} for _ in captured_queries]}
+        return resp
+
+    with (
+        patch("agent_bom.scanners._get_scan_cache", return_value=None),
+        patch("agent_bom.scanners.request_with_retry", side_effect=mock_request_with_retry),
+        patch("agent_bom.scanners.create_client") as mock_create_client,
+    ):
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_create_client.return_value = mock_client
+
+        await query_osv_batch([pkg])
+
+    ecosystems = {q["package"]["ecosystem"] for q in captured_queries}
+    assert ecosystems == {"Debian:11", "Debian:12", "Debian:13", "Debian:14"}
+
+
+@pytest.mark.asyncio
+async def test_query_osv_batch_alpine_fallbacks_include_v323():
+    """Direct apk checks without distro metadata should include the current Alpine branch."""
+    from agent_bom.scanners import query_osv_batch
+
+    pkg = Package(name="util-linux", version="2.41.3-r0", ecosystem="apk")
+    captured_queries: list[dict] = []
+
+    async def mock_request_with_retry(client, method, url, json=None, **kwargs):
+        if json and "queries" in json:
+            captured_queries.extend(json["queries"])
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"results": [{"vulns": []} for _ in captured_queries]}
+        return resp
+
+    with (
+        patch("agent_bom.scanners._get_scan_cache", return_value=None),
+        patch("agent_bom.scanners.request_with_retry", side_effect=mock_request_with_retry),
+        patch("agent_bom.scanners.create_client") as mock_create_client,
+    ):
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_create_client.return_value = mock_client
+
+        await query_osv_batch([pkg])
+
+    ecosystems = {q["package"]["ecosystem"] for q in captured_queries}
+    assert "Alpine:v3.23" in ecosystems
+
+
+@pytest.mark.asyncio
 async def test_scan_packages_maven_vuln_attached():
     """Vulnerabilities from OSV are attached to Maven packages after scan."""
     from agent_bom.scanners import scan_packages
@@ -224,3 +329,36 @@ async def test_scan_packages_maven_vuln_attached():
     assert len(pkg.vulnerabilities) >= 1
     vuln_ids = [v.id for v in pkg.vulnerabilities]
     assert "CVE-2021-44228" in vuln_ids
+
+
+def test_non_osv_ecosystems_not_empty():
+    """_NON_OSV_ECOSYSTEMS must cover docker and other known non-queryable ecosystems."""
+    from agent_bom.scanners import _NON_OSV_ECOSYSTEMS
+
+    for eco in ("docker", "container", "container-image", "ollama", "smithery", "sast", "unknown"):
+        assert eco in _NON_OSV_ECOSYSTEMS, f"Expected {eco!r} in _NON_OSV_ECOSYSTEMS"
+
+
+@pytest.mark.asyncio
+async def test_docker_ecosystem_skipped_at_debug_not_warning(caplog):
+    """Packages with ecosystem='docker' should be skipped silently (DEBUG) not WARNING."""
+    import logging
+
+    from agent_bom.scanners import scan_packages
+
+    pkg = Package(name="mcp/playwright", version="1.0.0", ecosystem="docker")
+
+    with (
+        patch("agent_bom.scanners._get_scan_cache", return_value=None),
+        patch("agent_bom.scanners._scan_packages_local_db", return_value=(0, set())),
+        caplog.at_level(logging.DEBUG, logger="agent_bom.scanners"),
+    ):
+        await scan_packages([pkg])
+
+    # Must not emit a WARNING for docker ecosystem
+    warning_msgs = [r for r in caplog.records if r.levelno == logging.WARNING and "docker" in r.message]
+    assert not warning_msgs, f"Unexpected WARNING for docker ecosystem: {warning_msgs}"
+
+    # Should emit a DEBUG skip message
+    debug_msgs = [r for r in caplog.records if r.levelno == logging.DEBUG and "not OSV-queryable" in r.message]
+    assert debug_msgs, "Expected a DEBUG skip message for docker ecosystem"

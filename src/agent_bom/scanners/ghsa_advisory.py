@@ -9,15 +9,28 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
+import time
 
 import httpx
 
+from agent_bom.config import GHSA_UNAUTH_PACKAGE_BUDGET as _CONFIG_GHSA_UNAUTH_PACKAGE_BUDGET
+from agent_bom.enrichment_posture import record_enrichment_source
 from agent_bom.http_client import create_client, request_with_retry
-from agent_bom.models import Package, Severity, Vulnerability, normalize_package_name
+from agent_bom.models import Package, Severity, Vulnerability
+from agent_bom.package_utils import normalize_package_name
+from agent_bom.reachability_cve import (
+    advisory_affected_symbols_by_path,
+    advisory_affected_symbols_list,
+)
 
 logger = logging.getLogger(__name__)
 
 _GITHUB_ADVISORY_API = "https://api.github.com/advisories"
+_GHSA_PER_PAGE = 100
+_GHSA_RATE_LIMIT_BACKOFF = 60.0
+_GHSA_SINGLE_PACKAGE_RATE_LIMIT_BACKOFF = 0.0
 
 # Map internal ecosystem names to GitHub Advisory API ecosystem values
 _ECOSYSTEM_MAP: dict[str, str] = {
@@ -29,6 +42,50 @@ _ECOSYSTEM_MAP: dict[str, str] = {
     "nuget": "nuget",
     "rubygems": "rubygems",
 }
+
+
+class GHSARateLimitError(RuntimeError):
+    """Raised when GitHub advisory lookups remain rate-limited after retry."""
+
+    def __init__(self, retry_after: float) -> None:
+        super().__init__("GitHub Advisory API rate limited")
+        self.retry_after = retry_after
+
+
+def _github_token() -> str:
+    return os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
+
+
+def _unauthenticated_package_budget() -> int:
+    return max(0, int(_CONFIG_GHSA_UNAUTH_PACKAGE_BUDGET))
+
+
+def _ghsa_headers() -> dict[str, str]:
+    headers = {"Accept": "application/vnd.github+json"}
+    token = _github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _rate_limit_retry_after(resp: httpx.Response, default: float = _GHSA_RATE_LIMIT_BACKOFF) -> float:
+    retry_after = resp.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return min(float(retry_after), default)
+        except ValueError:
+            return default
+    reset_at = resp.headers.get("X-RateLimit-Reset")
+    if reset_at:
+        try:
+            return min(max(float(reset_at) - time.time(), 0.0), default)
+        except ValueError:
+            return default
+    return default
+
+
+def _is_rate_limited(resp: httpx.Response) -> bool:
+    return resp.status_code == 429 or (resp.status_code == 403 and resp.headers.get("X-RateLimit-Remaining") == "0")
 
 
 def _parse_ghsa_severity(advisory: dict) -> tuple[Severity, float | None]:
@@ -53,12 +110,16 @@ def _parse_ghsa_severity(advisory: dict) -> tuple[Severity, float | None]:
 def _extract_fixed_version(advisory: dict, package_name: str, ecosystem: str = "") -> str | None:
     """Extract the first patched version for a specific package.
 
-    Handles range strings like ``">= 4.18.0"``, ``">= 4.18.0, < 5.0.0"``,
-    and Ruby-style ``"~> 1.2.3"`` by extracting the lower bound.
+    Checks ``patched_versions`` first (older GHSA API format).  When that
+    field is null (current API behaviour), falls back to
+    ``vulnerable_version_range`` and extracts the exclusive upper bound for
+    ``< X`` constraints (the fix version is X in that case).
 
     Uses PEP 503 normalization for PyPI so that mixed-separator forms like
     ``Requests_OAuthlib`` match a normalized input of ``requests-oauthlib``.
     """
+    import re as _re
+
     norm_input = normalize_package_name(package_name, ecosystem)
     for vuln in advisory.get("vulnerabilities", []):
         pkg = vuln.get("package", {})
@@ -68,7 +129,104 @@ def _extract_fixed_version(advisory: dict, package_name: str, ecosystem: str = "
             patched = vuln.get("patched_versions")
             if patched:
                 return _parse_patched_range(patched)
+            # patched_versions is null in current GHSA API responses —
+            # attempt to derive the fix from an exclusive upper-bound range.
+            vuln_range = vuln.get("vulnerable_version_range") or ""
+            for part in vuln_range.split(","):
+                part = part.strip()
+                # "< X" → fix version is X (exclusive upper bound)
+                if part.startswith("<") and not part.startswith("<="):
+                    bound = part[1:].strip()
+                    if bound and _re.match(r"\d", bound):
+                        return bound
     return None
+
+
+def _get_vulnerable_ranges_for_package(advisory: dict, package_name: str, ecosystem: str = "") -> list[str]:
+    """Return all ``vulnerable_version_range`` strings for *package_name* in *advisory*.
+
+    An advisory may have multiple entries for the same package covering disjoint version
+    windows (e.g., "< 1.0" AND ">= 1.5, < 2.0").  All must be checked — affected if ANY
+    range matches (OR semantics across entries).
+    """
+    norm_input = normalize_package_name(package_name, ecosystem)
+    ranges: list[str] = []
+    for vuln in advisory.get("vulnerabilities", []):
+        pkg = vuln.get("package", {})
+        pkg_eco = pkg.get("ecosystem", ecosystem)
+        osv_norm = normalize_package_name(pkg.get("name", ""), pkg_eco)
+        if osv_norm == norm_input:
+            r = vuln.get("vulnerable_version_range")
+            if r:
+                ranges.append(r)
+    return ranges
+
+
+# Kept for backwards compatibility with any external callers.
+def _get_vulnerable_range_for_package(advisory: dict, package_name: str, ecosystem: str = "") -> str | None:
+    """Return the first ``vulnerable_version_range`` for *package_name*, or None."""
+    ranges = _get_vulnerable_ranges_for_package(advisory, package_name, ecosystem)
+    return ranges[0] if ranges else None
+
+
+_GHSA_RANGE_CLAUSE = re.compile(r"^\s*(>=|<=|==|=|>|<)?\s*(.+?)\s*$")
+
+
+def _installed_version_is_affected(installed: str, vuln_range: str, ecosystem: str = "") -> bool:
+    """Return True if *installed* falls within the GHSA vulnerable_version_range.
+
+    Range format examples::
+
+        '<= 1.6.8'             → affected if version <= 1.6.8
+        '< 4.5.2'              → affected if version < 4.5.2
+        '>= 22.0.0, < 26.0.0'  → affected if 22.0.0 <= version < 26.0.0
+
+    Every clause is evaluated with the ECOSYSTEM's own ordering via
+    ``compare_version_order``. The previous implementation parsed every
+    ecosystem through PEP 440 ``SpecifierSet``/``Version`` and returned ``True``
+    on any parse error, so npm/Maven/Go ranges — which PEP 440 rejects — failed
+    OPEN into false positives.
+
+    Fails CLOSED: a clause that cannot be compared cannot establish a match, and
+    the dropped bound is logged so the reason is recorded rather than silent.
+    """
+    from agent_bom.version_utils import compare_version_order
+
+    clauses = [clause for clause in (vuln_range or "").split(",") if clause.strip()]
+    if not clauses:
+        logger.warning(
+            "GHSA vulnerable_version_range %r (%s) is empty; failing closed — no match can be established",
+            vuln_range,
+            ecosystem or "unknown ecosystem",
+        )
+        return False
+
+    for clause in clauses:
+        match = _GHSA_RANGE_CLAUSE.match(clause)
+        if match is None:
+            logger.warning("GHSA range clause %r (%s) is unparseable; failing closed", clause, ecosystem or "unknown ecosystem")
+            return False
+        operator, bound = match.group(1) or "==", match.group(2)
+        order = compare_version_order(installed, bound, ecosystem)
+        if order is None:
+            logger.warning(
+                "GHSA range bound %r (%s) cannot be compared to %r; failing closed — affected-range accuracy may be reduced",
+                bound,
+                ecosystem or "unknown ecosystem",
+                installed,
+            )
+            return False
+        satisfied = {
+            ">=": order >= 0,
+            ">": order > 0,
+            "<=": order <= 0,
+            "<": order < 0,
+            "==": order == 0,
+            "=": order == 0,
+        }[operator]
+        if not satisfied:
+            return False
+    return True
 
 
 def _parse_patched_range(patched: str) -> str | None:
@@ -102,6 +260,9 @@ async def _fetch_advisories_for_package(
     pkg: Package,
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
+    *,
+    max_pages: int = 10,
+    rate_limit_backoff: float = _GHSA_RATE_LIMIT_BACKOFF,
 ) -> list[dict]:
     """Fetch GitHub advisories for a single package."""
     eco = _ECOSYSTEM_MAP.get(pkg.ecosystem.lower(), "")
@@ -109,29 +270,41 @@ async def _fetch_advisories_for_package(
         return []
 
     async with semaphore:
-        await asyncio.sleep(1.0)  # Rate limit: stay under 60 req/hr
-        resp = await request_with_retry(
-            client,
-            "GET",
-            _GITHUB_ADVISORY_API,
-            params={
-                "ecosystem": eco,
-                "package": pkg.name,
-                "per_page": "30",
-            },
-            headers={"Accept": "application/vnd.github+json"},
-        )
-        if resp and resp.status_code == 200:
-            try:
-                return resp.json()
-            except (ValueError, KeyError):
-                return []
-        return []
+        advisories: list[dict] = []
+        for page in range(1, max_pages + 1):
+            resp = await request_with_retry(
+                client,
+                "GET",
+                _GITHUB_ADVISORY_API,
+                params={
+                    "ecosystem": eco,
+                    "package": pkg.name,
+                    "per_page": str(_GHSA_PER_PAGE),
+                    "page": str(page),
+                },
+                headers=_ghsa_headers(),
+            )
+            if resp and resp.status_code == 200:
+                try:
+                    page_data = resp.json()
+                except (ValueError, KeyError):
+                    return advisories
+                if not isinstance(page_data, list):
+                    return advisories
+                advisories.extend(item for item in page_data if isinstance(item, dict))
+                if len(page_data) < _GHSA_PER_PAGE:
+                    return advisories
+                continue
+            if resp and _is_rate_limited(resp):
+                wait_seconds = min(_rate_limit_retry_after(resp, rate_limit_backoff), rate_limit_backoff)
+                raise GHSARateLimitError(wait_seconds)
+            return advisories
+        return advisories
 
 
 async def check_github_advisories(
     packages: list[Package],
-    max_packages: int = 50,
+    max_packages: int | None = None,
 ) -> int:
     """Check packages against GitHub Security Advisories (GHSA).
 
@@ -160,8 +333,37 @@ async def check_github_advisories(
     if not queryable:
         return 0
 
-    # Cap to avoid rate limit exhaustion
-    queryable = queryable[:max_packages]
+    if max_packages is not None:
+        queryable = queryable[:max_packages]
+
+    github_token_available = bool(_github_token())
+    if not github_token_available:
+        if max_packages is None:
+            unauth_budget = _unauthenticated_package_budget()
+            if len(queryable) > unauth_budget:
+                skipped = len(queryable) - unauth_budget
+                queryable = queryable[:unauth_budget]
+                # OSV mirrors GHSA within ~24h, so the skipped lookups are
+                # almost always already covered by the offline OSV bundle —
+                # this is an info-level note, not a scan-quality warning.
+                # Surface only at --verbose / --log-level info, and don't
+                # record it on the scan report's warnings_all badge.
+                logger.info(
+                    "GHSA advisory enrichment limited to %d unauthenticated package lookup(s); skipped %d. "
+                    "OSV bundle (refreshed via `agent-bom db update`) already covers GHSA — set GITHUB_TOKEN "
+                    "only if you need <24h advisory freshness.",
+                    unauth_budget,
+                    skipped,
+                )
+        # Same rationale as above: token absence is not a scan-quality
+        # warning when OSV already covers the same GHSA data offline.
+        logger.info(
+            "GITHUB_TOKEN/GH_TOKEN is not set; GHSA advisory live enrichment uses fail-fast budget. "
+            "OSV bundle covers GHSA already — set the token only for <24h advisory freshness."
+        )
+    if not queryable:
+        record_enrichment_source("ghsa", "failure", error="unauthenticated package budget disabled GHSA lookups")
+        return 0
 
     logger.info("GHSA advisory check for %d packages", len(queryable))
 
@@ -175,68 +377,114 @@ async def check_github_advisories(
 
     total_new = 0
     semaphore = asyncio.Semaphore(5)
+    fetch_errors: list[str] = []
+    rate_limited = False
 
-    async with create_client(timeout=15.0) as client:
-        tasks = [_fetch_advisories_for_package(p, client, semaphore) for p in queryable]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        async with create_client(timeout=15.0) as client:
+            rate_limit_backoff = _GHSA_RATE_LIMIT_BACKOFF
+            if not github_token_available:
+                rate_limit_backoff = _GHSA_SINGLE_PACKAGE_RATE_LIMIT_BACKOFF
+            tasks = [_fetch_advisories_for_package(p, client, semaphore, rate_limit_backoff=rate_limit_backoff) for p in queryable]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        for i, result in enumerate(results):
-            if isinstance(result, BaseException):
-                logger.debug("GHSA fetch failed for %s: %s", queryable[i].name, result)
-                continue
-            if not result:
-                continue
-
-            pkg = queryable[i]
-            eco = _ECOSYSTEM_MAP.get(pkg.ecosystem.lower(), "")
-            key = f"{eco}:{pkg.name.lower()}"
-            target_pkgs = pkg_groups.get(key, [pkg])
-
-            for advisory in result:
-                ghsa_id = advisory.get("ghsa_id", "")
-                cve_id = advisory.get("cve_id") or ""
-                vuln_id = cve_id or ghsa_id
-                if not vuln_id:
+            for i, result in enumerate(results):
+                if isinstance(result, BaseException):
+                    logger.debug("GHSA fetch failed for %s: %s", queryable[i].name, result)
+                    if isinstance(result, GHSARateLimitError):
+                        rate_limited = True
+                    fetch_errors.append(str(result))
+                    continue
+                if not result:
                     continue
 
-                severity, cvss_score = _parse_ghsa_severity(advisory)
-                summary = advisory.get("summary", "") or f"GitHub Advisory ({vuln_id})"
-                cwe_ids = _get_cwe_ids(advisory)
-                refs = [advisory.get("html_url", "")] if advisory.get("html_url") else []
+                pkg = queryable[i]
+                eco = _ECOSYSTEM_MAP.get(pkg.ecosystem.lower(), "")
+                key = f"{eco}:{pkg.name.lower()}"
+                target_pkgs = pkg_groups.get(key, [pkg])
 
-                for target_pkg in target_pkgs:
-                    # Verify this advisory actually affects the target package
-                    # (GitHub API does substring matching, so "express" returns
-                    # advisories for "express-session", "express-validator", etc.)
-                    # Use PEP 503 normalization so "Requests_OAuthlib" matches
-                    # the already-normalized target name "requests-oauthlib".
-                    target_eco = target_pkg.ecosystem
-                    advisory_pkg_names = {
-                        normalize_package_name(v.get("package", {}).get("name", ""), v.get("package", {}).get("ecosystem", target_eco))
-                        for v in advisory.get("vulnerabilities", [])
-                    }
-                    if normalize_package_name(target_pkg.name, target_eco) not in advisory_pkg_names:
+                for advisory in result:
+                    ghsa_id = advisory.get("ghsa_id", "")
+                    cve_id = advisory.get("cve_id") or ""
+                    vuln_id = cve_id or ghsa_id
+                    if not vuln_id:
                         continue
 
-                    existing_ids = {v.id for v in target_pkg.vulnerabilities}
-                    for v in target_pkg.vulnerabilities:
-                        existing_ids.update(v.aliases)
-                    # Skip if CVE or GHSA ID already present (including aliases)
-                    if vuln_id in existing_ids or (cve_id and cve_id in existing_ids) or (ghsa_id and ghsa_id in existing_ids):
-                        continue
+                    severity, cvss_score = _parse_ghsa_severity(advisory)
+                    summary = advisory.get("summary", "") or f"GitHub Advisory ({vuln_id})"
+                    cwe_ids = _get_cwe_ids(advisory)
+                    refs = [advisory.get("html_url", "")] if advisory.get("html_url") else []
 
-                    fixed = _extract_fixed_version(advisory, target_pkg.name, target_pkg.ecosystem)
-                    vuln = Vulnerability(
-                        id=vuln_id,
-                        summary=summary[:200],
-                        severity=severity,
-                        cvss_score=cvss_score,
-                        fixed_version=fixed,
-                        references=refs,
-                        cwe_ids=cwe_ids,
-                    )
-                    target_pkg.vulnerabilities.append(vuln)
-                    total_new += 1
+                    for target_pkg in target_pkgs:
+                        # Verify this advisory actually affects the target package
+                        # (GitHub API does substring matching, so "express" returns
+                        # advisories for "express-session", "express-validator", etc.)
+                        # Use PEP 503 normalization so "Requests_OAuthlib" matches
+                        # the already-normalized target name "requests-oauthlib".
+                        target_eco = target_pkg.ecosystem
+                        advisory_pkg_names = {
+                            normalize_package_name(v.get("package", {}).get("name", ""), v.get("package", {}).get("ecosystem", target_eco))
+                            for v in advisory.get("vulnerabilities", [])
+                        }
+                        if normalize_package_name(target_pkg.name, target_eco) not in advisory_pkg_names:
+                            continue
+
+                        existing_ids = {v.id for v in target_pkg.vulnerabilities}
+                        for v in target_pkg.vulnerabilities:
+                            existing_ids.update(v.aliases)
+                        # Skip if CVE or GHSA ID already present (including aliases)
+                        if vuln_id in existing_ids or (cve_id and cve_id in existing_ids) or (ghsa_id and ghsa_id in existing_ids):
+                            continue
+
+                        fixed = _extract_fixed_version(advisory, target_pkg.name, target_pkg.ecosystem)
+
+                        if target_pkg.version:
+                            # Skip if the installed version is already at or beyond
+                            # the fix. ``compare_versions`` returns True only when
+                            # fix > current (upgrade needed); False = already
+                            # patched. This is a short-circuit ONLY — it can never
+                            # stand in for the advisory's own range, because a fix
+                            # bound says nothing about the range's LOWER bound
+                            # (jackson-databind 2.9.10 is below the fix 2.18.8 but
+                            # also below the ">= 2.13.0" the advisory introduces).
+                            if fixed:
+                                from agent_bom.version_utils import compare_versions
+
+                                if not compare_versions(target_pkg.version, fixed, target_pkg.ecosystem):
+                                    continue
+                            # Always evaluate vulnerable_version_range when present.
+                            # An advisory may list MULTIPLE disjoint ranges for the
+                            # same package — affected if it matches ANY of them.
+                            vuln_ranges = _get_vulnerable_ranges_for_package(advisory, target_pkg.name, target_pkg.ecosystem)
+                            if vuln_ranges and not any(
+                                _installed_version_is_affected(target_pkg.version, r, target_pkg.ecosystem) for r in vuln_ranges
+                            ):
+                                continue
+
+                        vuln = Vulnerability(
+                            id=vuln_id,
+                            summary=summary[:200],
+                            severity=severity,
+                            cvss_score=cvss_score,
+                            fixed_version=fixed,
+                            references=refs,
+                            cwe_ids=cwe_ids,
+                            affected_symbols=advisory_affected_symbols_list(advisory),
+                            affected_symbols_by_path=advisory_affected_symbols_by_path(advisory),
+                            advisory_sources=["ghsa"],
+                        )
+                        target_pkg.vulnerabilities.append(vuln)
+                        total_new += 1
+    except Exception as exc:
+        record_enrichment_source("ghsa", "failure", error=str(exc))
+        raise
+
+    if rate_limited:
+        record_enrichment_source("ghsa", "failure", error="rate_limited")
+    elif fetch_errors:
+        record_enrichment_source("ghsa", "failure", error=fetch_errors[0])
+    else:
+        record_enrichment_source("ghsa", "success")
 
     if total_new:
         logger.info("GHSA advisories: found %d new CVE(s)", total_new)

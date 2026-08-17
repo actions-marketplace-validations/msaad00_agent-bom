@@ -1,0 +1,1051 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import {
+  api,
+  type ApiKeyRecord,
+  type AuthPolicyResponse,
+  type CreateApiKeyRequest,
+  type RotateApiKeyRequest,
+  type TenantQuotaUpdateRequest,
+  formatDate,
+} from "@/lib/api";
+import {
+  CheckCircle2,
+  Copy,
+  KeyRound,
+  Loader2,
+  Plus,
+  RefreshCw,
+  RotateCw,
+  ShieldAlert,
+  ShieldOff,
+} from "lucide-react";
+import { SsoSetupPresets } from "@/components/sso-setup-presets";
+
+function formatSeconds(value: number): string {
+  if (value < 60) return `${value}s`;
+  if (value < 3600) return `${Math.floor(value / 60)}m`;
+  if (value < 86400) return `${Math.floor(value / 3600)}h`;
+  return `${Math.floor(value / 86400)}d`;
+}
+
+function toIsoOrNull(value: string): string | null {
+  if (!value.trim()) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error("Expiration must be a valid date/time");
+  }
+  return parsed.toISOString();
+}
+
+function keyStateTone(state: ApiKeyRecord["state"]): string {
+  switch (state) {
+    case "active":
+      return "border-emerald-500/30 dark:border-emerald-900/60 bg-emerald-500/10 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-300";
+    case "rotation_overlap":
+      return "border-sky-500/30 dark:border-sky-900/60 bg-sky-500/10 dark:bg-sky-950/30 text-sky-700 dark:text-sky-300";
+    case "rotated":
+      return "border-amber-500/30 dark:border-amber-900/60 bg-amber-500/10 dark:bg-amber-950/30 text-amber-700 dark:text-amber-300";
+    case "revoked":
+      return "border-red-500/30 dark:border-red-900/60 bg-red-500/10 dark:bg-red-950/30 text-red-700 dark:text-red-300";
+    case "expired":
+    default:
+      return "border-[var(--border-subtle)] bg-[var(--surface)] text-[var(--text-secondary)]";
+  }
+}
+
+function stateLabel(state: ApiKeyRecord["state"]): string {
+  switch (state) {
+    case "rotation_overlap":
+      return "Rotation overlap";
+    default:
+      return state.charAt(0).toUpperCase() + state.slice(1);
+  }
+}
+
+type TenantQuotaUsageEntry =
+  AuthPolicyResponse["tenant_quota_runtime"]["usage"][keyof AuthPolicyResponse["tenant_quota_runtime"]["usage"]];
+type QuotaKey = keyof AuthPolicyResponse["tenant_quota_runtime"]["usage"];
+type QuotaCard = {
+  field: QuotaKey;
+  label: string;
+  value: TenantQuotaUsageEntry;
+};
+type QuotaForm = Record<QuotaKey, string>;
+
+function isSessionKey(key: ApiKeyRecord): boolean {
+  return key.name.startsWith("saml:") || key.scopes.includes("saml-session");
+}
+
+function formatModeLabel(value: string): string {
+  const acronyms: Record<string, string> = {
+    oidc: "OIDC",
+    api: "API",
+    ui: "UI",
+    saml: "SAML",
+    sso: "SSO",
+  };
+  return value
+    .split("_")
+    .filter(Boolean)
+    .map((segment) => acronyms[segment] ?? (segment.charAt(0).toUpperCase() + segment.slice(1)))
+    .join(" ");
+}
+
+function modeTone(value: string): string {
+  switch (value) {
+    case "reverse_proxy_oidc":
+    case "trusted_proxy":
+      return "border-emerald-500/30 dark:border-emerald-900/60 bg-emerald-500/10 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-300";
+    case "oidc_bearer":
+    case "saml_sso":
+      return "border-sky-500/30 dark:border-sky-900/60 bg-sky-500/10 dark:bg-sky-950/30 text-sky-700 dark:text-sky-300";
+    case "session_api_key":
+    case "api_key":
+      return "border-amber-500/30 dark:border-amber-900/60 bg-amber-500/10 dark:bg-amber-950/30 text-amber-700 dark:text-amber-300";
+    case "no_auth":
+    default:
+      return "border-[var(--border-subtle)] bg-[var(--surface)] text-[var(--text-secondary)]";
+  }
+}
+
+function quotaInputValue(value: number | null | undefined): string {
+  return value == null ? "" : String(value);
+}
+
+function quotaStatusTone(status: string): string {
+  switch (status) {
+    case "ok":
+      return "border-emerald-500/30 dark:border-emerald-900/60 bg-emerald-500/10 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-300";
+    case "near_limit":
+      return "border-amber-500/30 dark:border-amber-900/60 bg-amber-500/10 dark:bg-amber-950/30 text-amber-700 dark:text-amber-300";
+    case "at_limit":
+      return "border-red-500/30 dark:border-red-900/60 bg-red-500/10 dark:bg-red-950/30 text-red-700 dark:text-red-300";
+    case "unlimited":
+    default:
+      return "border-[var(--border-subtle)] bg-[var(--surface)] text-[var(--text-secondary)]";
+  }
+}
+
+function quotaStatusLabel(status: string): string {
+  return status.replaceAll("_", " ");
+}
+
+function formatStatusLabel(value: string): string {
+  return value.replaceAll("_", " ");
+}
+
+function formatBoundaryList(values: string[]): string {
+  return values.map(formatStatusLabel).join(" · ");
+}
+
+function formatCadence(rotationDays: number | null, maxAgeDays: number | null): string | null {
+  const parts = [];
+  if (rotationDays != null) parts.push(`rotate ${rotationDays}d`);
+  if (maxAgeDays != null) parts.push(`max ${maxAgeDays}d`);
+  return parts.length ? parts.join(" · ") : null;
+}
+
+function formatRotationDetail(posture: {
+  rotation_status: string;
+  rotation_method: string;
+  last_rotated: string | null;
+  age_days: number | null;
+  rotation_days: number | null;
+  max_age_days: number | null;
+}): string {
+  return [
+    formatStatusLabel(posture.rotation_status),
+    posture.last_rotated ? `rotated ${formatDate(posture.last_rotated)}` : "timestamp unset",
+    posture.age_days != null ? `${posture.age_days}d old` : null,
+    formatCadence(posture.rotation_days, posture.max_age_days),
+    posture.rotation_method.replaceAll("_", " "),
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function formatRateLimitRotationDetail(rateLimit: AuthPolicyResponse["rate_limit_key"]): string {
+  return [
+    formatStatusLabel(rateLimit.status),
+    rateLimit.last_rotated ? `rotated ${formatDate(rateLimit.last_rotated)}` : "timestamp unset",
+    rateLimit.age_days != null ? `${rateLimit.age_days}d old` : null,
+    formatCadence(rateLimit.rotation_days ?? null, rateLimit.max_age_days ?? null),
+    rateLimit.fallback_source ? `fallback ${rateLimit.fallback_source}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+export function KeyLifecyclePanel({
+  loading,
+  error,
+  policy,
+  keys,
+  onRefresh,
+  roleLabel,
+}: {
+  loading: boolean;
+  error: string | null;
+  policy: AuthPolicyResponse | null;
+  keys: ApiKeyRecord[];
+  onRefresh: () => Promise<void> | void;
+  roleLabel?: string | null | undefined;
+}) {
+  const [busyKeyId, setBusyKeyId] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<"create" | "rotate" | "revoke" | "quota" | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [issuedSecret, setIssuedSecret] = useState<{
+    title: string;
+    rawKey: string;
+    detail: string;
+  } | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [rotationTarget, setRotationTarget] = useState<ApiKeyRecord | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
+
+  const [createForm, setCreateForm] = useState({
+    name: "",
+    role: "viewer",
+    expiresAt: "",
+    owner: "",
+  });
+  const [rotateForm, setRotateForm] = useState({
+    name: "",
+    expiresAt: "",
+    overlapSeconds: "",
+  });
+  const [quotaForm, setQuotaForm] = useState<QuotaForm>({
+    active_scan_jobs: "",
+    retained_scan_jobs: "",
+    fleet_agents: "",
+    schedules: "",
+  });
+
+  const stateCounts = useMemo(() => {
+    return keys.reduce<Record<string, number>>((acc, key) => {
+      acc[key.state] = (acc[key.state] || 0) + 1;
+      return acc;
+    }, {});
+  }, [keys]);
+
+  const quotaCards = useMemo<QuotaCard[]>(() => {
+    if (!policy) return [];
+    return [
+      { field: "active_scan_jobs", label: "Active scan jobs", value: policy.tenant_quota_runtime.usage.active_scan_jobs },
+      { field: "retained_scan_jobs", label: "Retained scan jobs", value: policy.tenant_quota_runtime.usage.retained_scan_jobs },
+      { field: "fleet_agents", label: "Fleet agents", value: policy.tenant_quota_runtime.usage.fleet_agents },
+      { field: "schedules", label: "Schedules", value: policy.tenant_quota_runtime.usage.schedules },
+    ];
+  }, [policy]);
+
+  useEffect(() => {
+    if (!policy) return;
+    setQuotaForm({
+      active_scan_jobs: quotaInputValue(policy.tenant_quota_runtime.usage.active_scan_jobs.override_limit),
+      retained_scan_jobs: quotaInputValue(policy.tenant_quota_runtime.usage.retained_scan_jobs.override_limit),
+      fleet_agents: quotaInputValue(policy.tenant_quota_runtime.usage.fleet_agents.override_limit),
+      schedules: quotaInputValue(policy.tenant_quota_runtime.usage.schedules.override_limit),
+    });
+  }, [policy]);
+
+  async function copyIssuedSecret() {
+    if (!issuedSecret?.rawKey) return;
+    await navigator.clipboard.writeText(issuedSecret.rawKey);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1200);
+  }
+
+  async function handleCreateSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusyAction("create");
+    setFormError(null);
+    try {
+      const body: CreateApiKeyRequest = {
+        name: createForm.name.trim(),
+        role: createForm.role,
+        expires_at: toIsoOrNull(createForm.expiresAt),
+        owner: createForm.owner.trim() || undefined,
+      };
+      const created = await api.createKey(body);
+      setIssuedSecret({
+        title: `Created key ${created.name}`,
+        rawKey: created.raw_key,
+        detail: created.message,
+      });
+      setCreateOpen(false);
+      setCreateForm({ name: "", role: "viewer", expiresAt: "", owner: "" });
+      await onRefresh();
+    } catch (nextError) {
+      setFormError(nextError instanceof Error ? nextError.message : "Failed to create API key");
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleRotateSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!rotationTarget) return;
+    setBusyAction("rotate");
+    setBusyKeyId(rotationTarget.key_id);
+    setFormError(null);
+    try {
+      const overlap = rotateForm.overlapSeconds.trim();
+      const body: RotateApiKeyRequest = {
+        name: rotateForm.name.trim() || undefined,
+        expires_at: toIsoOrNull(rotateForm.expiresAt) ?? undefined,
+        overlap_seconds: overlap ? Number(overlap) : undefined,
+      };
+      const rotated = await api.rotateKey(rotationTarget.key_id, body);
+      setIssuedSecret({
+        title: `Rotated key ${rotationTarget.name}`,
+        rawKey: rotated.raw_key,
+        detail: `${rotated.message} Overlap ends ${formatDate(rotated.overlap_until)}.`,
+      });
+      setRotationTarget(null);
+      setRotateForm({ name: "", expiresAt: "", overlapSeconds: "" });
+      await onRefresh();
+    } catch (nextError) {
+      setFormError(nextError instanceof Error ? nextError.message : "Failed to rotate API key");
+    } finally {
+      setBusyKeyId(null);
+      setBusyAction(null);
+    }
+  }
+
+  async function handleRevoke(key: ApiKeyRecord) {
+    if (!window.confirm(`Revoke ${key.name}? Existing clients will stop authenticating immediately.`)) {
+      return;
+    }
+    setBusyAction("revoke");
+    setBusyKeyId(key.key_id);
+    setFormError(null);
+    try {
+      await api.deleteKey(key.key_id);
+      await onRefresh();
+    } catch (nextError) {
+      setFormError(nextError instanceof Error ? nextError.message : "Failed to revoke API key");
+    } finally {
+      setBusyKeyId(null);
+      setBusyAction(null);
+    }
+  }
+
+  async function handleQuotaSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusyAction("quota");
+    setFormError(null);
+    try {
+      const payload: TenantQuotaUpdateRequest = {};
+      for (const [name, raw] of Object.entries(quotaForm) as Array<[QuotaKey, string]>) {
+        const value = raw.trim();
+        if (!value) {
+          payload[name] = null;
+          continue;
+        }
+        const parsed = Number(value);
+        if (!Number.isInteger(parsed) || parsed < 0) {
+          throw new Error(`${name.replaceAll("_", " ")} must be a whole number greater than or equal to 0`);
+        }
+        payload[name] = parsed;
+      }
+      await api.updateTenantQuota(payload);
+      await onRefresh();
+    } catch (nextError) {
+      setFormError(nextError instanceof Error ? nextError.message : "Failed to update tenant quotas");
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleQuotaReset() {
+    setBusyAction("quota");
+    setFormError(null);
+    try {
+      await api.resetTenantQuota();
+      await onRefresh();
+    } catch (nextError) {
+      setFormError(nextError instanceof Error ? nextError.message : "Failed to reset tenant quotas");
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  return (
+    <section className="space-y-4 rounded-2xl border border-[var(--border-subtle)] bg-[var(--background)]/70 p-5">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <h2 className="flex items-center gap-2 text-lg font-semibold text-[var(--foreground)]">
+            <KeyRound className="h-5 w-5 text-emerald-400" />
+            Control-plane auth and API keys
+          </h2>
+          <p className="mt-1 text-sm text-[var(--text-secondary)]">
+            Rotate service keys with an overlap window, inspect auth policy, and revoke stale machine-to-machine access
+            without leaving the control plane.
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={() => {
+              setRotationTarget(null);
+              setCreateOpen((value) => !value);
+              setFormError(null);
+            }}
+            className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-500/30 dark:border-emerald-900/60 bg-emerald-500/10 dark:bg-emerald-950/30 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-300 transition hover:bg-emerald-500/10 dark:hover:bg-emerald-950/50"
+          >
+            <Plus className="h-4 w-4" />
+            New key
+          </button>
+          <button
+            onClick={() => void onRefresh()}
+            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--border-subtle)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text-secondary)] transition hover:bg-[var(--surface-elevated)]"
+          >
+            <RefreshCw className="h-4 w-4" />
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      {issuedSecret ? (
+        <div className="rounded-2xl border border-emerald-900/60 bg-emerald-950/20 p-4">
+          <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+            <div>
+              <p className="text-sm font-semibold text-emerald-300">{issuedSecret.title}</p>
+              <p className="mt-1 text-sm text-[var(--text-secondary)]">{issuedSecret.detail}</p>
+              <p className="mt-2 text-xs text-[var(--text-tertiary)]">This raw key is shown once. Store it securely before you close this panel.</p>
+            </div>
+            <button
+              onClick={() => void copyIssuedSecret()}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--border-subtle)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text-secondary)] transition hover:bg-[var(--surface-elevated)]"
+            >
+              {copied ? <CheckCircle2 className="h-4 w-4 text-emerald-400" /> : <Copy className="h-4 w-4" />}
+              {copied ? "Copied" : "Copy raw key"}
+            </button>
+          </div>
+          <pre className="mt-3 max-w-full overflow-x-auto whitespace-pre-wrap break-all rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] px-3 py-3 text-sm text-[var(--foreground)]">
+            {issuedSecret.rawKey}
+          </pre>
+        </div>
+      ) : null}
+
+      {formError ? (
+        <div className="rounded-xl border border-red-500/30 dark:border-red-900/50 bg-red-500/10 dark:bg-red-950/20 px-4 py-3 text-sm text-red-700 dark:text-red-300">{formError}</div>
+      ) : null}
+
+      {createOpen ? (
+        <form onSubmit={handleCreateSubmit} className="grid gap-4 rounded-2xl border border-[var(--border-subtle)] bg-[var(--surface)]/50 p-4 md:grid-cols-3">
+          <label className="space-y-2 text-sm text-[var(--text-secondary)]">
+            <span>Name</span>
+            <input
+              required
+              value={createForm.name}
+              onChange={(event) => setCreateForm((current) => ({ ...current, name: event.target.value }))}
+              className="w-full rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] px-3 py-2 text-sm text-[var(--foreground)] outline-none focus:border-emerald-500"
+              placeholder="ci-service"
+            />
+          </label>
+          <label className="space-y-2 text-sm text-[var(--text-secondary)]">
+            <span>Role</span>
+            <select
+              value={createForm.role}
+              onChange={(event) => setCreateForm((current) => ({ ...current, role: event.target.value }))}
+              className="w-full rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] px-3 py-2 text-sm text-[var(--foreground)] outline-none focus:border-emerald-500"
+            >
+              <option value="viewer">viewer</option>
+              <option value="analyst">analyst</option>
+              <option value="admin">admin</option>
+            </select>
+          </label>
+          <label className="space-y-2 text-sm text-[var(--text-secondary)]">
+            <span>Expires at (optional)</span>
+            <input
+              type="datetime-local"
+              value={createForm.expiresAt}
+              onChange={(event) => setCreateForm((current) => ({ ...current, expiresAt: event.target.value }))}
+              className="w-full rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] px-3 py-2 text-sm text-[var(--foreground)] outline-none focus:border-emerald-500"
+            />
+          </label>
+          <label className="space-y-2 text-sm text-[var(--text-secondary)] md:col-span-3">
+            <span>Owner (optional)</span>
+            <input
+              value={createForm.owner}
+              onChange={(event) => setCreateForm((current) => ({ ...current, owner: event.target.value }))}
+              className="w-full rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] px-3 py-2 text-sm text-[var(--foreground)] outline-none focus:border-emerald-500"
+              placeholder="user@example.com or SCIM user id"
+            />
+            <span className="block text-xs text-[var(--text-tertiary)]">
+              Bind this key to a user so it is revoked when that user is deprovisioned.
+            </span>
+          </label>
+          <div className="md:col-span-3 flex items-center justify-between gap-3">
+            <p className="text-xs text-[var(--text-tertiary)]">
+              Default TTL: {policy ? formatSeconds(policy.api_key.default_ttl_seconds) : "policy unavailable"}.
+            </p>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setCreateOpen(false)}
+                className="rounded-xl border border-[var(--border-subtle)] px-3 py-2 text-sm text-[var(--text-secondary)] transition hover:bg-[var(--surface-elevated)]"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={busyAction === "create"}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-500 px-4 py-2 text-sm font-medium text-[var(--on-accent)] transition hover:bg-emerald-400 disabled:opacity-60"
+              >
+                {busyAction === "create" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                Create key
+              </button>
+            </div>
+          </div>
+        </form>
+      ) : null}
+
+      {rotationTarget ? (
+        <form onSubmit={handleRotateSubmit} className="grid gap-4 rounded-2xl border border-sky-900/50 bg-sky-950/20 p-4 md:grid-cols-3">
+          <div className="md:col-span-3">
+            <p className="text-sm font-semibold text-sky-300">Rotate {rotationTarget.name}</p>
+            <p className="mt-1 text-sm text-[var(--text-secondary)]">
+              The current key stays valid during the overlap window so clients can roll without downtime.
+            </p>
+          </div>
+          <label className="space-y-2 text-sm text-[var(--text-secondary)]">
+            <span>Replacement name (optional)</span>
+            <input
+              value={rotateForm.name}
+              onChange={(event) => setRotateForm((current) => ({ ...current, name: event.target.value }))}
+              className="w-full rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] px-3 py-2 text-sm text-[var(--foreground)] outline-none focus:border-sky-500"
+              placeholder={rotationTarget.name}
+            />
+          </label>
+          <label className="space-y-2 text-sm text-[var(--text-secondary)]">
+            <span>Replacement expiry (optional)</span>
+            <input
+              type="datetime-local"
+              value={rotateForm.expiresAt}
+              onChange={(event) => setRotateForm((current) => ({ ...current, expiresAt: event.target.value }))}
+              className="w-full rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] px-3 py-2 text-sm text-[var(--foreground)] outline-none focus:border-sky-500"
+            />
+          </label>
+          <label className="space-y-2 text-sm text-[var(--text-secondary)]">
+            <span>Overlap seconds</span>
+            <input
+              type="number"
+              min={0}
+              max={policy?.api_key.max_overlap_seconds ?? 86400}
+              value={rotateForm.overlapSeconds}
+              onChange={(event) => setRotateForm((current) => ({ ...current, overlapSeconds: event.target.value }))}
+              className="w-full rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] px-3 py-2 text-sm text-[var(--foreground)] outline-none focus:border-sky-500"
+              placeholder={String(policy?.api_key.default_overlap_seconds ?? 900)}
+            />
+          </label>
+          <div className="md:col-span-3 flex items-center justify-between gap-3">
+            <p className="text-xs text-[var(--text-tertiary)]">
+              Allowed overlap: up to {policy ? formatSeconds(policy.api_key.max_overlap_seconds) : "policy unavailable"}.
+            </p>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setRotationTarget(null)}
+                className="rounded-xl border border-[var(--border-subtle)] px-3 py-2 text-sm text-[var(--text-secondary)] transition hover:bg-[var(--surface-elevated)]"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={busyAction === "rotate"}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-sky-500 px-4 py-2 text-sm font-medium text-[var(--on-accent)] transition hover:bg-sky-400 disabled:opacity-60"
+              >
+                {busyAction === "rotate" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCw className="h-4 w-4" />}
+                Rotate key
+              </button>
+            </div>
+          </div>
+        </form>
+      ) : null}
+
+      {loading ? (
+        <div className="flex items-center justify-center rounded-2xl border border-[var(--border-subtle)] bg-[var(--surface)]/40 px-4 py-10 text-[var(--text-secondary)]">
+          <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+          Loading auth policy and keys...
+        </div>
+      ) : error ? (
+        <div className="rounded-2xl border border-amber-900/50 bg-amber-950/20 p-4">
+          <div className="flex items-start gap-3">
+            <ShieldAlert className="mt-0.5 h-5 w-5 text-amber-300" />
+            <div>
+              <p className="text-sm font-semibold text-amber-200">Admin access is required for key lifecycle operations</p>
+              <p className="mt-1 text-sm text-amber-100/80">{error}</p>
+              {roleLabel ? (
+                <p className="mt-2 text-xs text-amber-100/70">
+                  Current role: {roleLabel}. Contributors and viewers can review audit state, but only admins can manage service keys.
+                </p>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      ) : policy ? (
+        <>
+          <div className="grid gap-3 md:grid-cols-4">
+            <MetricCard label="Default TTL" value={formatSeconds(policy.api_key.default_ttl_seconds)} hint="Issued key lifetime" />
+            <MetricCard label="Default overlap" value={formatSeconds(policy.api_key.default_overlap_seconds)} hint="Rotation grace window" />
+            <MetricCard label="Recommended UI mode" value={formatModeLabel(policy.ui.recommended_mode)} hint="Browser auth posture" />
+            <MetricCard label="Active keys" value={String(stateCounts.active ?? 0)} hint={`${keys.length} total in tenant`} />
+          </div>
+
+          <div className="grid gap-4 xl:grid-cols-[1.2fr_1fr]">
+            <section className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--surface)]/40 p-4">
+              <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-tertiary)]">Operator guidance</p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <span className={`inline-flex rounded-full border px-2.5 py-1 text-xs ${modeTone(policy.ui.recommended_mode)}`}>
+                  Recommended: {formatModeLabel(policy.ui.recommended_mode)}
+                </span>
+                {policy.ui.configured_modes.map((mode) => (
+                  <span key={mode} className={`inline-flex rounded-full border px-2.5 py-1 text-xs ${modeTone(mode)}`}>
+                    {formatModeLabel(mode)}
+                  </span>
+                ))}
+              </div>
+              <p className="mt-3 text-sm text-[var(--text-secondary)]">{policy.ui.message}</p>
+              <div className="mt-4 grid gap-3 md:grid-cols-2">
+                <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--background)]/70 p-3">
+                  <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-tertiary)]">Runtime rate-limit backend</p>
+                  <p className="mt-2 text-sm font-semibold text-[var(--foreground)]">
+                    {policy.rate_limit_runtime.backend}
+                    {policy.rate_limit_runtime.shared_across_replicas ? " · shared" : " · process-local"}
+                  </p>
+                  <p className="mt-1 text-xs text-[var(--text-secondary)]">{policy.rate_limit_runtime.message}</p>
+                </div>
+                <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--background)]/70 p-3">
+                  <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-tertiary)]">Trusted browser path</p>
+                  <p className="mt-2 text-sm font-semibold text-[var(--foreground)]">{policy.ui.credentials_mode === "include" ? "Cookie-backed browser session" : policy.ui.credentials_mode}</p>
+                  <p className="mt-1 text-xs text-[var(--text-secondary)]">
+                    Trusted headers: {policy.ui.trusted_proxy_headers.length ? policy.ui.trusted_proxy_headers.join(", ") : "none"}.
+                  </p>
+                </div>
+              </div>
+            </section>
+
+            <section className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--surface)]/40 p-4">
+              <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-tertiary)]">Tenant guardrails</p>
+              <p className="mt-3 text-sm text-[var(--text-secondary)]">{policy.tenant_quota_runtime.message}</p>
+              <div className="mt-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--background)]/70 p-3">
+                <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-tertiary)]">Quota source</p>
+                <p className="mt-2 text-sm font-semibold text-[var(--foreground)]">
+                  {policy.tenant_quota_runtime.source}
+                  {policy.tenant_quota_runtime.active_override ? " · tenant override active" : " · global defaults active"}
+                </p>
+                <p className="mt-1 break-words text-xs text-[var(--text-secondary)] [overflow-wrap:anywhere]">Manage overrides at {policy.tenant_quota_runtime.override_endpoint}.</p>
+              </div>
+              <div className="mt-3 grid grid-cols-2 gap-3">
+                {quotaCards.map(({ field, label, value }) => (
+                  <div key={field} className="rounded-xl border border-[var(--border-subtle)] bg-[var(--background)]/70 p-3">
+                    <div className="flex items-start justify-between gap-2">
+                      <p className="text-[11px] uppercase tracking-[0.16em] text-[var(--text-tertiary)]">{label}</p>
+                      <span className={`rounded-md border px-1.5 py-0.5 text-[10px] uppercase tracking-[0.12em] ${quotaStatusTone(value.status)}`}>
+                        {quotaStatusLabel(value.status)}
+                      </span>
+                    </div>
+                    <p className="mt-2 text-lg font-semibold text-[var(--foreground)]">{value.enforced ? value.limit : "Unlimited"}</p>
+                    <p className="mt-1 text-xs text-[var(--text-secondary)]">
+                      Current {value.current}
+                      {value.remaining != null ? ` · Remaining ${value.remaining}` : " · Unlimited"}
+                    </p>
+                    <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-[var(--surface-elevated)]" aria-hidden="true">
+                      <div
+                        className={`h-full rounded-full ${
+                          value.status === "at_limit" ? "bg-red-500" : value.status === "near_limit" ? "bg-amber-400" : "bg-emerald-400"
+                        }`}
+                        style={{ width: `${value.utilization_pct ?? 0}%` }}
+                      />
+                    </div>
+                    <p className="mt-2 text-xs text-[var(--text-tertiary)]">{value.recommended_action}</p>
+                    <p className="mt-1 text-[11px] uppercase tracking-[0.14em] text-[var(--text-tertiary)]">
+                      {value.source === "tenant_override" ? "Tenant override" : "Global default"}
+                    </p>
+                  </div>
+                ))}
+              </div>
+              <form onSubmit={handleQuotaSubmit} className="mt-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--background)]/70 p-3">
+                <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-tertiary)]">Override management</p>
+                <p className="mt-2 text-xs text-[var(--text-secondary)]">
+                  Leave a field blank to inherit the global default. Set `0` only when you intentionally want an unlimited or disabled guardrail.
+                </p>
+                <div className="mt-3 grid grid-cols-2 gap-3">
+                  {quotaCards.map(({ field, label, value }) => (
+                    <label key={field} className="space-y-2 text-sm text-[var(--text-secondary)]">
+                      <span>{label}</span>
+                      <input
+                        type="number"
+                        min={0}
+                        value={quotaForm[field]}
+                        onChange={(event) => setQuotaForm((current) => ({ ...current, [field]: event.target.value }))}
+                        className="w-full rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] px-3 py-2 text-sm text-[var(--foreground)] outline-none focus:border-emerald-500"
+                        placeholder={`Default ${value.default_limit}`}
+                      />
+                    </label>
+                  ))}
+                </div>
+                <div className="mt-3 flex items-center justify-between gap-3">
+                  <p className="text-xs text-[var(--text-tertiary)]">
+                    {policy.tenant_quota_runtime.active_override ? "Tenant-specific overrides are active." : "No tenant-specific overrides are active."}
+                  </p>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void handleQuotaReset()}
+                      disabled={busyAction === "quota"}
+                      className="rounded-xl border border-[var(--border-subtle)] px-3 py-2 text-sm text-[var(--text-secondary)] transition hover:bg-[var(--surface-elevated)] disabled:opacity-60"
+                    >
+                      Reset overrides
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={busyAction === "quota"}
+                      className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-500 px-4 py-2 text-sm font-medium text-[var(--on-accent)] transition hover:bg-emerald-400 disabled:opacity-60"
+                    >
+                      {busyAction === "quota" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                      Save overrides
+                    </button>
+                  </div>
+                </div>
+              </form>
+            </section>
+          </div>
+
+          <section className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--surface)]/40 p-4">
+            <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-tertiary)]">Data access boundaries</p>
+            <div className="mt-3 grid gap-3 lg:grid-cols-3">
+              <BoundaryCard
+                title="Default posture"
+                body={`Hidden telemetry ${String(policy.data_access_boundaries.default_posture.hidden_telemetry)}; hosted control plane required ${String(
+                  policy.data_access_boundaries.default_posture.mandatory_hosted_control_plane
+                )}.`}
+                detail={`${policy.data_access_boundaries.default_posture.default_network_mode.replaceAll("_", " ")} · support ${policy.data_access_boundaries.default_posture.support_access_default.replaceAll("_", " ")}`}
+                accent="teal"
+              />
+              <BoundaryCard
+                title="Credential evidence"
+                body={`Secret scan evidence is ${policy.data_access_boundaries.credential_evidence.project_secret_scan.replaceAll("_", " ")}; config environment variables are ${policy.data_access_boundaries.credential_evidence.config_env_vars.replaceAll("_", " ")}.`}
+                detail={`value stored ${String(policy.data_access_boundaries.credential_evidence.stores_matched_value)} · prefix stored ${String(
+                  policy.data_access_boundaries.credential_evidence.stores_matched_prefix
+                )} · live validation ${String(policy.data_access_boundaries.credential_evidence.validates_live_secret)}`}
+                accent="teal"
+              />
+              <BoundaryCard
+                title="Evidence context"
+                body={`Allowed context: ${formatBoundaryList(policy.data_access_boundaries.redacted_evidence_context.allowed_context)}.`}
+                detail={`Never show: ${formatBoundaryList(policy.data_access_boundaries.redacted_evidence_context.never_show)}`}
+                accent="teal"
+              />
+              <BoundaryCard
+                title="Network and exports"
+                body={`Telemetry is ${policy.data_access_boundaries.network_boundaries.telemetry}; outbound exports are ${policy.data_access_boundaries.network_boundaries.outbound_exports.replaceAll("_", " ")}.`}
+                detail={`controls ${policy.data_access_boundaries.network_boundaries.disable_controls.join(", ")}`}
+                accent="teal"
+              />
+              <BoundaryCard
+                title="Storage"
+                body={`Control-plane records are ${policy.data_access_boundaries.storage_boundaries.control_plane_default.replaceAll("_", " ")}; raw artifact exports are ${policy.data_access_boundaries.storage_boundaries.raw_artifact_exports.replaceAll("_", " ")}.`}
+                detail={`secrets ${policy.data_access_boundaries.storage_boundaries.secret_values.replaceAll("_", " ")} · previews ${policy.data_access_boundaries.storage_boundaries.secret_previews.replaceAll("_", " ")}`}
+                accent="teal"
+              />
+              <BoundaryCard
+                title="Auth and tenancy"
+                body={`Authorization is bound by ${formatBoundaryList(policy.data_access_boundaries.auth_boundaries.authorization)}.`}
+                detail={`SCIM tenant ${policy.data_access_boundaries.auth_boundaries.scim.tenant_source} · payload tenant ignored ${String(
+                  policy.data_access_boundaries.auth_boundaries.scim.payload_tenant_attributes_ignored
+                )}`}
+                accent="teal"
+              />
+              <BoundaryCard
+                title="Operator controls"
+                body={`${policy.data_access_boundaries.operator_controls.scope_preview}; scope with ${policy.data_access_boundaries.operator_controls.project_scope} or ${policy.data_access_boundaries.operator_controls.config_scope}.`}
+                detail={`${policy.data_access_boundaries.operator_controls.disable_vulnerability_network} · ${policy.data_access_boundaries.operator_controls.disable_scan_network_and_vuln_lookup}`}
+                accent="teal"
+              />
+              <BoundaryCard
+                title="Connectors and plugins"
+                body={`Connectors default to ${policy.data_access_boundaries.extension_boundaries.connectors.default_posture.replaceAll("_", " ")}; plugins and skills are ${policy.data_access_boundaries.extension_boundaries.plugins_and_skills.default_posture.replaceAll("_", " ")}.`}
+                detail={`connector scope ${policy.data_access_boundaries.extension_boundaries.connectors.credential_scope.replaceAll("_", " ")} · ${policy.data_access_boundaries.extension_boundaries.roles.principle.replaceAll("_", " ")}`}
+                accent="teal"
+              />
+            </div>
+            <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+              {policy.data_access_boundaries.modes.map((mode) => (
+                <div key={mode.mode} className="rounded-xl border border-[var(--border-subtle)] bg-[var(--background)]/70 p-3">
+                  <p className="text-sm font-semibold text-[var(--foreground)]">{formatStatusLabel(mode.mode)}</p>
+                  <p className="mt-1 text-xs leading-5 text-[var(--text-secondary)]">Reads: {formatBoundaryList(mode.reads)}</p>
+                  {mode.does_not_read?.length ? (
+                    <p className="mt-1 text-xs leading-5 text-[var(--text-tertiary)]">Does not read: {formatBoundaryList(mode.does_not_read)}</p>
+                  ) : null}
+                  {mode.does_not_do?.length ? (
+                    <p className="mt-1 text-xs leading-5 text-[var(--text-tertiary)]">Does not do: {formatBoundaryList(mode.does_not_do)}</p>
+                  ) : null}
+                  {mode.does_not_store?.length ? (
+                    <p className="mt-1 text-xs leading-5 text-[var(--text-tertiary)]">Does not store: {formatBoundaryList(mode.does_not_store)}</p>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--surface)]/40 p-4">
+            <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-tertiary)]">Secret and integrity posture</p>
+            <div className="mt-3 grid gap-3 lg:grid-cols-2">
+              <BoundaryCard
+                title="Audit HMAC"
+                body={policy.secret_integrity.audit_hmac.message}
+                accent="teal"
+                detail={`${policy.secret_integrity.audit_hmac.status.replaceAll("_", " ")} · ${policy.secret_integrity.audit_hmac.source}${
+                  policy.secret_integrity.audit_hmac.persists_across_restart ? " · survives restart" : " · resets on restart"
+                }`}
+              />
+              <BoundaryCard
+                title="Compliance evidence signing"
+                body={policy.secret_integrity.compliance_signing.message}
+                accent="teal"
+                detail={`${policy.secret_integrity.compliance_signing.algorithm} · ${policy.secret_integrity.compliance_signing.mode.replaceAll("_", " ")}${
+                  policy.secret_integrity.compliance_signing.key_id ? ` · key ${policy.secret_integrity.compliance_signing.key_id}` : ""
+                }${policy.secret_integrity.compliance_signing.public_key_endpoint ? ` · ${policy.secret_integrity.compliance_signing.public_key_endpoint}` : ""}`}
+              />
+            </div>
+          </section>
+
+          <section className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--surface)]/40 p-4">
+            <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-tertiary)]">Rotation posture</p>
+            <div className="mt-3 grid gap-3 lg:grid-cols-2 xl:grid-cols-4">
+              <BoundaryCard
+                title="Service API keys"
+                body="Service keys rotate through an overlap-aware replacement flow so callers can roll without downtime."
+                detail={`enforced · ${formatSeconds(policy.api_key.default_overlap_seconds)} default overlap · ${policy.api_key.rotation_endpoint}`}
+              />
+              <BoundaryCard
+                title="Rate-limit key"
+                body={policy.rate_limit_key.message ?? "Rate-limit fingerprint rotation posture is not available."}
+                detail={formatRateLimitRotationDetail(policy.rate_limit_key)}
+              />
+              <BoundaryCard
+                title="Audit HMAC rotation"
+                body={policy.secret_integrity.audit_hmac.rotation_message}
+                detail={formatRotationDetail(policy.secret_integrity.audit_hmac)}
+              />
+              <BoundaryCard
+                title="Compliance signing rotation"
+                body={policy.secret_integrity.compliance_signing.rotation_message}
+                detail={formatRotationDetail(policy.secret_integrity.compliance_signing)}
+              />
+            </div>
+          </section>
+
+          <section className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--surface)]/40 p-4">
+            <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-tertiary)]">Identity lifecycle</p>
+            <div className="mt-3 grid gap-3 lg:grid-cols-3">
+              <BoundaryCard
+                title="OIDC browser / bearer"
+                body={policy.identity_provisioning.oidc.message}
+                detail={`${formatModeLabel(policy.identity_provisioning.oidc.mode)} · ${policy.identity_provisioning.oidc.provider_count} issuer${
+                  policy.identity_provisioning.oidc.provider_count === 1 ? "" : "s"
+                } · ${policy.identity_provisioning.oidc.require_tenant_claim ? "tenant claim required" : "default tenant allowed"}`}
+              />
+              <BoundaryCard
+                title="SAML assertion exchange"
+                body={policy.identity_provisioning.saml.message}
+                detail={`${policy.identity_provisioning.saml.metadata_endpoint}${
+                  policy.identity_provisioning.saml.acs_path ? ` · ${policy.identity_provisioning.saml.acs_path}` : ""
+                } · ${formatSeconds(policy.identity_provisioning.saml.session_ttl_seconds)} session`}
+              />
+              <BoundaryCard
+                title="SCIM provisioning"
+                body={policy.identity_provisioning.scim.message}
+                detail={`${policy.identity_provisioning.scim.status.replaceAll("_", " ")} · ${policy.identity_provisioning.scim.base_path} · ${
+                  policy.identity_provisioning.scim.token_configured ? "token configured" : "token missing"
+                }`}
+              />
+              <BoundaryCard
+                title="Provisioning posture"
+                body={`Roles from ${policy.identity_provisioning.scim.role_attribute} default to ${policy.identity_provisioning.scim.default_role}; tenant assignment is bound to ${policy.identity_provisioning.scim.tenant_assignment.source}. Payload tenant fields are ignored.`}
+                detail={`Roles: ${policy.identity_provisioning.scim.role_values.join(", ")} · external ID ${policy.identity_provisioning.scim.external_id_attribute}${
+                  policy.identity_provisioning.scim.groups_required ? " · groups required" : ""
+                }`}
+              />
+              <BoundaryCard
+                title="SCIM auth boundary"
+                body={policy.identity_provisioning.scim.deprovisioning_boundary}
+                detail={`${policy.identity_provisioning.scim.provisioning_authority} · auth: ${policy.identity_provisioning.scim.auth_authority} · ${
+                  policy.identity_provisioning.scim.runtime_auth_enforced ? "runtime enforced" : "upstream enforced"
+                }`}
+              />
+            </div>
+          </section>
+
+          <SsoSetupPresets />
+
+          <section className="rounded-2xl border border-amber-900/40 bg-amber-950/10 p-4">
+            <p className="text-xs uppercase tracking-[0.18em] text-amber-200/70">Revocation boundaries</p>
+            <div className="mt-3 grid gap-3 lg:grid-cols-3">
+              <BoundaryCard
+                title="Service keys"
+                body={policy.identity_provisioning.session_revocation.service_keys}
+              />
+              <BoundaryCard
+                title="Session API key fallback"
+                body={policy.identity_provisioning.session_revocation.session_api_key}
+              />
+              <BoundaryCard
+                title="Reverse-proxy or OIDC sessions"
+                body={policy.identity_provisioning.session_revocation.browser_sessions}
+              />
+            </div>
+          </section>
+
+          <div className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--surface)]/40 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-semibold text-[var(--foreground)]">Key inventory</h3>
+                <p className="mt-1 text-xs text-[var(--text-tertiary)]">
+                  Rotation overlap lets old and new keys coexist briefly while clients roll.
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-2 text-xs text-[var(--text-tertiary)]">
+                <span>{stateCounts.rotation_overlap ?? 0} rotating</span>
+                <span>{stateCounts.rotated ?? 0} rotated</span>
+                <span>{stateCounts.revoked ?? 0} revoked</span>
+              </div>
+            </div>
+
+            <div className="mt-4 overflow-x-auto">
+              <table className="w-full text-left text-sm">
+                <thead className="text-xs uppercase tracking-[0.18em] text-[var(--text-tertiary)]">
+                  <tr>
+                    <th className="pb-2">Name</th>
+                    <th className="pb-2">Role</th>
+                    <th className="pb-2">State</th>
+                    <th className="pb-2">Expires</th>
+                    <th className="pb-2">Overlap</th>
+                    <th className="pb-2 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[var(--border-subtle)]">
+                  {keys.map((key) => {
+                    const sessionKey = isSessionKey(key);
+                    const canRotate = key.state === "active" && !sessionKey;
+                    const canRevoke = key.state !== "revoked";
+                    return (
+                      <tr key={key.key_id}>
+                        <td className="py-3">
+                          <div className="font-medium text-[var(--foreground)]">{key.name}</div>
+                          <div className="text-xs text-[var(--text-tertiary)]">
+                            {key.key_prefix} · {sessionKey ? "session key" : "service key"}
+                          </div>
+                          {key.owner ? <div className="text-xs text-[var(--text-tertiary)]">owner: {key.owner}</div> : null}
+                        </td>
+                        <td className="py-3 text-[var(--text-secondary)]">{key.role}</td>
+                        <td className="py-3">
+                          <span className={`inline-flex rounded-full border px-2 py-1 text-xs ${keyStateTone(key.state)}`}>
+                            {stateLabel(key.state)}
+                          </span>
+                        </td>
+                        <td className="py-3 text-[var(--text-secondary)]">{key.expires_at ? formatDate(key.expires_at) : "Never"}</td>
+                        <td className="py-3 text-[var(--text-secondary)]">
+                          {key.rotation_overlap_until
+                            ? `${formatDate(key.rotation_overlap_until)}${
+                                key.overlap_seconds_remaining != null ? ` · ${formatSeconds(key.overlap_seconds_remaining)} left` : ""
+                              }`
+                            : "—"}
+                        </td>
+                        <td className="py-3">
+                          <div className="flex justify-end gap-2">
+                            <button
+                              onClick={() => {
+                                setCreateOpen(false);
+                                setFormError(null);
+                                setRotateForm({
+                                  name: "",
+                                  expiresAt: "",
+                                  overlapSeconds: String(policy.api_key.default_overlap_seconds),
+                                });
+                                setRotationTarget(key);
+                              }}
+                              disabled={!canRotate || busyKeyId === key.key_id}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-sky-500/30 dark:border-sky-900/60 bg-sky-500/10 dark:bg-sky-950/20 px-3 py-1.5 text-xs text-sky-700 dark:text-sky-300 transition hover:bg-sky-500/10 dark:hover:bg-sky-950/40 disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                              {busyAction === "rotate" && busyKeyId === key.key_id ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <RotateCw className="h-3.5 w-3.5" />
+                              )}
+                              Rotate
+                            </button>
+                            <button
+                              onClick={() => void handleRevoke(key)}
+                              disabled={!canRevoke || busyKeyId === key.key_id}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/30 dark:border-red-900/60 bg-red-500/10 dark:bg-red-950/20 px-3 py-1.5 text-xs text-red-700 dark:text-red-300 transition hover:bg-red-500/10 dark:hover:bg-red-950/40 disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                              {busyAction === "revoke" && busyKeyId === key.key_id ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <ShieldOff className="h-3.5 w-3.5" />
+                              )}
+                              Revoke
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      ) : null}
+    </section>
+  );
+}
+
+function MetricCard({ label, value, hint }: { label: string; value: string; hint: string }) {
+  return (
+    <div className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--surface)]/40 p-4">
+      <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-tertiary)]">{label}</p>
+      <p className="mt-2 text-lg font-semibold text-[var(--foreground)]">{value}</p>
+      <p className="mt-1 text-xs text-[var(--text-tertiary)]">{hint}</p>
+    </div>
+  );
+}
+
+function BoundaryCard({
+  title,
+  body,
+  detail,
+  accent = "amber",
+}: {
+  title: string;
+  body: string;
+  detail?: string | undefined;
+  accent?: "amber" | "teal" | undefined;
+}) {
+  const tone =
+    accent === "teal"
+      ? {
+          border: "border-teal-900/30",
+          title: "text-teal-100",
+          detail: "text-teal-200/70",
+        }
+      : {
+          border: "border-amber-900/30",
+          title: "text-amber-100",
+          detail: "text-amber-200/70",
+        };
+  return (
+    <div className={`min-w-0 rounded-xl border bg-[var(--background)]/50 p-3 ${tone.border}`}>
+      <p className={`text-sm font-semibold ${tone.title}`}>{title}</p>
+      <p className="mt-1 break-words text-xs leading-5 text-[var(--text-secondary)] [overflow-wrap:anywhere]">{body}</p>
+      {detail ? (
+        <p className={`mt-2 break-words text-[11px] uppercase tracking-[0.14em] [overflow-wrap:anywhere] ${tone.detail}`}>{detail}</p>
+      ) : null}
+    </div>
+  );
+}

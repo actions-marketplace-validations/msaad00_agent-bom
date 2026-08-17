@@ -452,7 +452,14 @@ def _check_ai_7_1() -> CISCheckResult:
             }
         )
 
-        installed = {dist.metadata["Name"].lower() for dist in importlib.metadata.distributions()}
+        installed = set()
+        for dist in importlib.metadata.distributions():
+            try:
+                package_name = dist.metadata["Name"]
+            except KeyError:
+                continue
+            if package_name:
+                installed.add(package_name.lower())
         found_malicious = installed & {p.lower() for p in malicious_ml_packages}
 
         if found_malicious:
@@ -598,6 +605,8 @@ _AVAILABLE_CHECKS: dict[str, tuple[str, Any]] = {
     "AI-7.2": ("_check_ai_7_2", _check_ai_7_2),
     "AI-8.1": ("_check_ai_8_1", _check_ai_8_1),
 }
+
+AISVS_CHECK_IDS: tuple[str, ...] = tuple(_AVAILABLE_CHECKS)
 
 
 def run_benchmark(
