@@ -280,12 +280,25 @@ def _apply_worker_thread_limit() -> None:
     anyio.to_thread.current_default_thread_limiter().total_tokens = WORKER_THREAD_LIMIT
 
 
+def _preflight_postgres_tenant_isolation() -> None:
+    """Fail bare ASGI startup before traffic when the DB role can bypass RLS."""
+    # Store selection is Snowflake > Postgres > SQLite. A dormant Postgres URL
+    # must not load an optional driver or contact an unused backend when the
+    # selected Snowflake control plane starts.
+    if os.environ.get("SNOWFLAKE_ACCOUNT") or not os.environ.get("AGENT_BOM_POSTGRES_URL"):
+        return
+    from agent_bom.api.postgres_common import preflight_rls_capable_role
+
+    preflight_rls_capable_role()
+
+
 @asynccontextmanager
 async def _lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
     """Start background cleanup task on startup, cancel on shutdown."""
     _log_control_plane_auth_posture()
     _apply_worker_thread_limit()
     configure_otel_tracing()
+    _preflight_postgres_tenant_isolation()
     # Priority: Snowflake > Postgres > SQLite > InMemory (lazy default)
     snowflake_configured = bool(os.environ.get("SNOWFLAKE_ACCOUNT"))
     if snowflake_configured:
