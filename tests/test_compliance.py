@@ -92,7 +92,7 @@ def test_compliance_tag_registry_covers_every_blast_radius_tag_field() -> None:
     assert set(COMPLIANCE_TAG_FIELDS).issubset(row)
 
 
-def test_narrative_and_evidence_index_preserve_all_framework_tags(monkeypatch) -> None:
+def test_evidence_index_preserves_all_framework_tags() -> None:
     from agent_bom.api.routes import compliance as route
     from agent_bom.compliance_coverage import COMPLIANCE_TAG_FIELDS
 
@@ -110,14 +110,6 @@ def test_narrative_and_evidence_index_preserve_all_framework_tags(monkeypatch) -
         created_at="2026-07-29T00:00:00Z",
         completed_at="2026-07-29T00:01:00Z",
     )
-    monkeypatch.setattr(route, "_tenant_jobs", lambda _request: [job])
-
-    report = route._latest_report(object())
-    assert report is not None
-    rebuilt = report.blast_radii[0]
-    for field in COMPLIANCE_TAG_FIELDS:
-        assert getattr(rebuilt, field) == [f"tag:{field}"]
-
     index = route._index_blast_radii_by_tag([job])
     for field in COMPLIANCE_TAG_FIELDS:
         assert f"tag:{field}" in index
@@ -146,9 +138,10 @@ def test_compliance_no_scans():
     assert data["aisvs_benchmark"]["benchmark"]["checks"] == []
     assert data["summary"]["aisvs_pass"] == 0
     assert data["summary"]["aisvs_fail"] == 0
-    # With no evidence, every control is not_assessed — not a trivial "pass".
+    # OWASP Top 10 rows are applicability overlays, so no evidence means the
+    # risks are not applicable — never a passing control claim.
     for c in data["owasp_llm_top10"]:
-        assert c["status"] == "not_assessed"
+        assert c["status"] == "not_applicable"
         assert c["findings"] == 0
     for metadata in TAG_MAPPED_FRAMEWORKS:
         assert len(data[metadata.output_key]) == metadata.control_count
@@ -355,18 +348,17 @@ def test_compliance_with_findings():
     assert data["scan_count"] == 1
     assert data["overall_status"] == "fail"  # HIGH severity → fail
 
-    # LLM05 should be fail (has HIGH severity finding)
+    # OWASP Top 10 identifies applicable risks; it does not assert a failed
+    # control. Severity remains available as evidence metadata.
     lmm05 = next(c for c in data["owasp_llm_top10"] if c["code"] == "LLM05")
-    assert lmm05["status"] == "fail"
+    assert lmm05["status"] == "applicable"
     assert lmm05["findings"] == 1
     assert "express" in lmm05["affected_packages"]
     assert "claude-desktop" in lmm05["affected_agents"]
 
-    # LLM01 should be pass (no findings)
+    # No observed finding means the risk is not applicable, not "passed".
     lmm01 = next(c for c in data["owasp_llm_top10"] if c["code"] == "LLM01")
-    # No findings map to this control — it is not_evaluated (no evidence), never a
-    # silent pass. Matches the narrative + CLI export.
-    assert lmm01["status"] == "not_evaluated"
+    assert lmm01["status"] == "not_applicable"
     assert lmm01["findings"] == 0
 
     _clear_jobs()
@@ -392,15 +384,15 @@ def test_compliance_severity_breakdown():
     data = client.get("/v1/compliance", headers=_AUTH_HEADERS).json()
 
     lmm04 = next(c for c in data["owasp_llm_top10"] if c["code"] == "LLM04")
-    assert lmm04["status"] == "fail"
+    assert lmm04["status"] == "applicable"
     assert lmm04["severity_breakdown"]["critical"] == 1
     assert lmm04["severity_breakdown"]["high"] == 0
 
     _clear_jobs()
 
 
-def test_compliance_warning_status():
-    """MEDIUM-only findings produce warning (not fail) status."""
+def test_compliance_overlay_preserves_medium_severity_breakdown():
+    """An applicable risk keeps severity evidence without becoming a score."""
     _clear_jobs()
     _add_done_job(
         [
@@ -419,7 +411,7 @@ def test_compliance_warning_status():
     data = client.get("/v1/compliance", headers=_AUTH_HEADERS).json()
 
     lmm05 = next(c for c in data["owasp_llm_top10"] if c["code"] == "LLM05")
-    assert lmm05["status"] == "warning"
+    assert lmm05["status"] == "applicable"
     assert lmm05["severity_breakdown"]["medium"] == 1
 
     _clear_jobs()
@@ -473,14 +465,9 @@ def test_compliance_summary_counts():
     data = client.get("/v1/compliance", headers=_AUTH_HEADERS).json()
 
     s = data["summary"]
-    # Verify OWASP: 1 fail (LLM05), 9 pass
-    assert s["owasp_fail"] == 1
-    # The other 9 controls have no mapped findings → not_evaluated, not a silent
-    # pass (would otherwise inflate the score toward 100).
-    assert s["owasp_pass"] == 0
-    assert s["owasp_warn"] == 0
-    assert s["owasp_not_evaluated"] == 9
-    assert s["owasp_pass"] + s["owasp_warn"] + s["owasp_fail"] + s["owasp_not_evaluated"] == 10
+    assert s["owasp_applicable"] == 1
+    assert s["owasp_not_applicable"] == 9
+    assert s["owasp_applicable"] + s["owasp_not_applicable"] == 10
 
     _clear_jobs()
 
@@ -536,11 +523,8 @@ def test_compliance_summary_with_scan_counts_evaluated_controls():
     client = TestClient(app)
     data = client.get("/v1/compliance/summary", headers=_AUTH_HEADERS).json()
     assert data["scan_count"] == 1
-    assert data["summary"]["owasp_fail"] == 1
-    # Never-triggered controls are not_evaluated, not pass — so the evaluated
-    # split is surfaced even on a non-empty scan.
-    assert data["summary"]["owasp_pass"] == 0
-    assert data["summary"]["owasp_not_evaluated"] == 9
+    assert data["summary"]["owasp_applicable"] == 1
+    assert data["summary"]["owasp_not_applicable"] == 9
     _clear_jobs()
 
 
