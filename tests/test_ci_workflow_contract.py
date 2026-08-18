@@ -120,6 +120,14 @@ def test_path_gated_jobs_remain_cancellable() -> None:
         assert "always()" not in condition
 
 
+def test_postgres_integration_uses_a_persistent_audit_signing_key() -> None:
+    """A durable shared audit ledger must never use a process-local key."""
+    postgres_env = _ci()["jobs"]["postgres-integration"]["env"]
+
+    assert postgres_env["AGENT_BOM_POSTGRES_URL"]
+    assert postgres_env["AGENT_BOM_AUDIT_HMAC_KEY"] == "ci-postgres-audit-signing-key"
+
+
 def test_test_job_timeout_leaves_margin_over_observed_worst_case() -> None:
     """Keep bounded headroom over the Python 3.11 coverage lane on main.
 
@@ -128,6 +136,18 @@ def test_test_job_timeout_leaves_margin_over_observed_worst_case() -> None:
     35-minute ceiling preserves a hard bound while allowing normal suite growth.
     """
     assert _ci()["jobs"]["test"]["timeout-minutes"] == 35
+
+
+def test_version_alignment_fails_fast_when_uv_lock_is_stale() -> None:
+    """Reject dependency drift before Docker and full-suite jobs consume runners."""
+    steps = _ci()["jobs"]["version-check"]["steps"]
+    lock_check_index = next(index for index, step in enumerate(steps) if step.get("name") == "Verify uv lockfile freshness")
+    dependency_install_index = next(
+        index for index, step in enumerate(steps) if step.get("name") == "Install dependencies for CLI smoke checks"
+    )
+
+    assert steps[lock_check_index]["run"] == "uv lock --check"
+    assert lock_check_index < dependency_install_index
 
 
 def test_alpine_full_suite_timeout_leaves_musl_headroom() -> None:

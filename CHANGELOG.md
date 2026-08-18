@@ -9,6 +9,25 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The consumer pre-commit dependency hook now scopes scans to the downstream
+  repository instead of including unrelated workstation MCP configuration.
+- Baseline and history diffs keep a CVE attached to the same normalized package
+  across version upgrades, while inventory diffs continue to report the package
+  version change separately.
+- RPM scans preserve nonzero epochs, cloud benchmark PASS results require a
+  verified account boundary, and structural dependency closure no longer
+  masquerades as an evidence-backed reachable attack path.
+- Security-relevant native AST flows now surface through unified findings,
+  SARIF, policy gates, and source-to-tool graph provenance; inventory-only LLM
+  client calls remain inventory rather than vulnerabilities.
+- PostgreSQL audit and governance chains serialize tenant appends with
+  transaction-scoped advisory locks, reconcile migration-owned guards, and
+  require persistent HMAC signing for shared durable ledgers.
+- Bare ASGI startup enforces the database RLS-role preflight, while public-demo
+  operator pages withhold deployment posture and integration diagnostics.
+
 ## [0.101.0] - 2026-08-16
 
 A workflow-completion and deployment-portability release. The same finding can
