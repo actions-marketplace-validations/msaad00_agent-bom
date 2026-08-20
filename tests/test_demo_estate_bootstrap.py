@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
@@ -17,6 +18,16 @@ VIEWER: dict[str, str] = {}
 
 @pytest.fixture()
 def demo_estate_client(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    from agent_bom.backpressure import _controller_for, reset_backpressure_for_tests
+
+    # Model the stale process state that caused main CI's 429 regression. Keep
+    # this proof inside the exported fixture so modules that import only
+    # ``demo_estate_client`` do not lose one of its private dependencies.
+    reset_backpressure_for_tests()
+    controller = _controller_for("findings")
+    controller.open_until_monotonic = time.monotonic() + 60
+    controller.last_trigger_reason = "p99_latency_threshold"
+
     monkeypatch.setenv("AGENT_BOM_DEMO_ESTATE", "1")
     monkeypatch.setenv("AGENT_BOM_DB", str(tmp_path / "demo-estate.db"))
     monkeypatch.setenv("AGENT_BOM_GRAPH_DB", str(tmp_path / "demo-graph.db"))
@@ -36,6 +47,10 @@ def demo_estate_client(monkeypatch: pytest.MonkeyPatch, tmp_path):
     api_stores._graph_store = None
     set_compliance_hub_store(None)
     reset_findings_count_cache()
+    # Each TestClient instance represents a fresh API process.  The adaptive
+    # controllers are process-global, so reset them at that lifecycle boundary
+    # instead of carrying latency/cooldown state across randomized test apps.
+    reset_backpressure_for_tests()
 
     try:
         with TestClient(api_server.app) as client:
@@ -45,6 +60,7 @@ def demo_estate_client(monkeypatch: pytest.MonkeyPatch, tmp_path):
         api_stores._graph_store = original_graph_store
         set_compliance_hub_store(original_hub_store)
         reset_findings_count_cache()
+        reset_backpressure_for_tests()
         # The proxy alert/metric ring buffers and the firewall decision store are
         # process-global; the demo bootstrap seeds them, so clear them here to
         # keep the seeded gateway feed from leaking into later tests.
