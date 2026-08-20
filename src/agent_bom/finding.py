@@ -204,20 +204,42 @@ def _control_tag_from_compliance_tag(value: str) -> ControlTag:
     namespace only; it does not claim equivalence between frameworks.
     """
     source = "legacy:compliance_tags"
-    if value.startswith("NIST-CSF-"):
+    upper = value.upper()
+    if upper.startswith("NIST-CSF-"):
         return ControlTag(
             framework="nist_csf",
-            control=value.removeprefix("NIST-CSF-"),
+            control=value[len("NIST-CSF-") :],
             version="2.0",
             confidence=1.0,
             source=source,
             via="compliance_tags",
         )
-    if value.startswith("NIST-"):
+    if upper.startswith("NIST-AI-RMF-"):
+        return ControlTag(
+            framework="nist_ai_rmf",
+            control=value[len("NIST-AI-RMF-") :],
+            version="1.0",
+            confidence=1.0,
+            source=source,
+            via="compliance_tags",
+        )
+    # Only the two-letter 800-53 family shape claims 800-53. A looser ``NIST-``
+    # prefix match would file NIST-AI-RMF and other NIST publications under a
+    # catalog that never contained them.
+    if nist_match := re.fullmatch(r"NIST-([A-Z]{2})-(.+)", upper):
         return ControlTag(
             framework="nist_800_53",
-            control=value.removeprefix("NIST-"),
+            control=f"{nist_match.group(1)}-{nist_match.group(2)}",
             version="rev5",
+            confidence=1.0,
+            source=source,
+            via="compliance_tags",
+        )
+    if upper.startswith("SOC2-"):
+        return ControlTag(
+            framework="soc2",
+            control=value[len("SOC2-") :],
+            version="2017",
             confidence=1.0,
             source=source,
             via="compliance_tags",
@@ -370,6 +392,9 @@ class Finding:
     # Risk
     risk_score: float = 0.0  # 0-10 unified risk score
     reachability: Optional[str] = None
+    graph_reachable: Optional[bool] = None
+    graph_min_hop_distance: Optional[int] = None
+    graph_reachable_from_agents: list[str] = field(default_factory=list)
     is_actionable: Optional[bool] = None
     impact_category: Optional[str] = None
 
@@ -678,6 +703,9 @@ class Finding:
             "entity_type": self.entity_type,
             "risk_score": self.risk_score,
             "reachability": self.reachability,
+            "graph_reachable": self.graph_reachable,
+            "graph_min_hop_distance": self.graph_min_hop_distance,
+            "graph_reachable_from_agents": list(self.graph_reachable_from_agents),
             "is_actionable": self.is_actionable,
             "impact_category": self.impact_category,
             # Ownership + remediation SLA (derived, single source of truth in
@@ -953,7 +981,7 @@ def ast_flow_dict_to_finding(raw: dict) -> "Finding":
         asset=Asset(
             name=f"{entrypoint or sink or category} in {file_path}" if file_path else entrypoint or sink or category,
             asset_type="source_file",
-            identifier=f"{file_path}:{line}:{entrypoint}:{sink}",
+            identifier=file_path or None,
             location=file_path or None,
         ),
         severity=severity,
@@ -975,6 +1003,7 @@ def ast_flow_dict_to_finding(raw: dict) -> "Finding":
         },
         risk_score=9.5 if severity == "critical" else 8.0 if severity == "high" else 6.0,
         exposed_tools=[entrypoint] if entrypoint else [],
+        id=stable_id("ast-flow", file_path, str(line), entrypoint, sink, category),
     )
     from agent_bom.compliance_hub import apply_hub_classification
 
@@ -1040,7 +1069,7 @@ def secret_dict_to_finding(secret: dict) -> "Finding":
         asset=Asset(
             name=f"{secret_type} in {file_path}" if file_path else secret_type,
             asset_type="file",
-            identifier=loc or None,
+            identifier=file_path or None,
             location=file_path or None,
         ),
         severity=severity,
@@ -1058,6 +1087,7 @@ def secret_dict_to_finding(secret: dict) -> "Finding":
             "category": category,
             "redacted_preview": _safe_secret_preview(secret.get("preview")),
         },
+        id=stable_id("secret", file_path, str(line or ""), secret_type, category),
     )
     from agent_bom.compliance_hub import apply_hub_classification
 
@@ -1159,6 +1189,20 @@ def cloud_cis_check_to_finding(check: dict, provider: str) -> "Finding":
         ),
         remediation_guidance=recommendation or None,
         compliance_tags=sorted(set(compliance)),
+        controls=(
+            [
+                ControlTag(
+                    framework=f"cis_{provider.lower()}_benchmark",
+                    control=check_id,
+                    version=benchmark_version or "bundled",
+                    confidence=1.0,
+                    source="cloud_cis_check",
+                    via="check_id",
+                )
+            ]
+            if not is_vendor_best_practice
+            else []
+        ),
         attack_tags=sorted(set(attack)),
         evidence={
             "provider": provider,
@@ -1228,7 +1272,7 @@ def iac_finding_to_finding(iac: dict) -> "Finding":
         asset=Asset(
             name=file_path,
             asset_type="iac_resource",
-            identifier=f"iac:{category}:{file_path}:{line_number}",
+            identifier=file_path,
             location=file_path,
         ),
         severity=severity,
@@ -1538,6 +1582,9 @@ def blast_radius_to_finding(br: object) -> "Finding":
         evidence=evidence,
         risk_score=br.risk_score,
         reachability=getattr(br, "reachability", None),
+        graph_reachable=getattr(br, "graph_reachable", None),
+        graph_min_hop_distance=getattr(br, "graph_min_hop_distance", None),
+        graph_reachable_from_agents=list(getattr(br, "graph_reachable_from_agents", []) or []),
         is_actionable=getattr(br, "is_actionable", None),
         impact_category=getattr(br, "impact_category", None),
         suppressed=bool(getattr(br, "suppressed", False)) or is_vex_suppressed(vuln),

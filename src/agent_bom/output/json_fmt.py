@@ -1040,7 +1040,7 @@ def to_json(report: AIBOMReport) -> dict:
         },
         "warnings": scan_run.warnings,
         "scan_sources": report.scan_sources,
-        "codeowners": dict(report.codeowners),
+        "codeowners": dict(report.codeowners) if isinstance(report.codeowners, dict) else list(report.codeowners),
         "has_mcp_context": report.has_mcp_context,
         "has_agent_context": report.has_agent_context,
         "framework_catalogs": {
@@ -1295,7 +1295,6 @@ def to_json(report: AIBOMReport) -> dict:
         "scorecard_summary": summarize_scorecard_coverage(all_packages).to_dict(),
         "remediation_plan": _build_remediation_json(report),
     }
-
     # AI enrichment fields (only when present)
     if report.executive_summary:
         result["executive_summary"] = report.executive_summary

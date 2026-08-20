@@ -266,6 +266,8 @@ function FindingsPage() {
   const paramProvider = searchParams.get("provider");
   const paramAccount = searchParams.get("account");
   const paramEnvironment = searchParams.get("environment");
+  const paramOwner = searchParams.get("owner");
+  const paramSla = searchParams.get("sla");
   // Compliance drill-through (epic #4790): a framework section id + optional
   // control code linked from the Compliance view's per-control finding count.
   const paramFramework = searchParams.get("framework");
@@ -296,6 +298,10 @@ function FindingsPage() {
   const [providerFilter, setProviderFilter] = useState<string>(paramProvider ?? "");
   const [accountFilter, setAccountFilter] = useState<string>(paramAccount ?? "");
   const [environmentFilter, setEnvironmentFilter] = useState<string>(paramEnvironment ?? "");
+  const [ownerFilter, setOwnerFilter] = useState<string>(paramOwner ?? "");
+  const [slaFilter, setSlaFilter] = useState<"" | "overdue" | "due" | "unassigned">(
+    paramSla === "overdue" || paramSla === "due" || paramSla === "unassigned" ? paramSla : "",
+  );
   const [frameworkFilter, setFrameworkFilter] = useState<string>(paramFramework ?? "");
   // A control code is only meaningful alongside a framework; it is cleared with it.
   const [controlFilter, setControlFilter] = useState<string>(paramFramework ? (paramControl ?? "") : "");
@@ -404,6 +410,11 @@ function FindingsPage() {
   }, [paramEnvironment]);
 
   useEffect(() => {
+    setOwnerFilter(paramOwner ?? "");
+    setSlaFilter(paramSla === "overdue" || paramSla === "due" || paramSla === "unassigned" ? paramSla : "");
+  }, [paramOwner, paramSla]);
+
+  useEffect(() => {
     setFrameworkFilter(paramFramework ?? "");
     setControlFilter(paramFramework ? (paramControl ?? "") : "");
   }, [paramFramework, paramControl]);
@@ -432,6 +443,8 @@ function FindingsPage() {
     if (providerFilter.trim()) params.set("provider", providerFilter.trim());
     if (accountFilter.trim()) params.set("account", accountFilter.trim());
     if (environmentFilter.trim()) params.set("environment", environmentFilter.trim());
+    if (ownerFilter.trim()) params.set("owner", ownerFilter.trim());
+    if (slaFilter) params.set("sla", slaFilter);
     if (frameworkFilter.trim()) params.set("framework", frameworkFilter.trim());
     // A control code without a framework is meaningless — only sync it alongside.
     if (frameworkFilter.trim() && controlFilter.trim()) params.set("control", controlFilter.trim());
@@ -449,6 +462,8 @@ function FindingsPage() {
     providerFilter,
     accountFilter,
     environmentFilter,
+    ownerFilter,
+    slaFilter,
     frameworkFilter,
     controlFilter,
     windowDays,
@@ -569,6 +584,8 @@ function FindingsPage() {
           ...(providerFilter.trim() ? { provider: providerFilter.trim() } : {}),
           ...(accountFilter.trim() ? { account: accountFilter.trim() } : {}),
           ...(environmentFilter.trim() ? { environment: environmentFilter.trim() } : {}),
+          ...(ownerFilter.trim() ? { owner: ownerFilter.trim() } : {}),
+          ...(slaFilter ? { sla: slaFilter } : {}),
           ...(frameworkFilter.trim() ? { framework: frameworkFilter.trim() } : {}),
           ...(frameworkFilter.trim() && controlFilter.trim() ? { control: controlFilter.trim() } : {}),
           ...(issueTypeFilter !== "all" ? { findingClass: issueTypeFilter } : {}),
@@ -609,6 +626,8 @@ function FindingsPage() {
     providerFilter,
     accountFilter,
     environmentFilter,
+    ownerFilter,
+    slaFilter,
     frameworkFilter,
     controlFilter,
     issueTypeFilter,
@@ -699,6 +718,12 @@ function FindingsPage() {
     environmentFilter.trim()
       ? { key: "environment", label: `Env: ${environmentFilter.trim()}`, onClear: () => setEnvironmentFilter("") }
       : null,
+    ownerFilter.trim()
+      ? { key: "owner", label: `Owner: ${ownerFilter.trim()}`, onClear: () => setOwnerFilter("") }
+      : null,
+    slaFilter
+      ? { key: "sla", label: `SLA: ${slaFilter}`, onClear: () => setSlaFilter("") }
+      : null,
     // Compliance drill-through chips. Clearing the framework also clears the
     // control, since a control code without its framework is meaningless.
     frameworkFilter.trim()
@@ -721,6 +746,8 @@ function FindingsPage() {
     setProviderFilter("");
     setAccountFilter("");
     setEnvironmentFilter("");
+    setOwnerFilter("");
+    setSlaFilter("");
     setFrameworkFilter("");
     setControlFilter("");
   };
@@ -1037,6 +1064,29 @@ function FindingsPage() {
                           onChange={(e) => setEnvironmentFilter(e.target.value)}
                           className="rounded-lg border border-[color:var(--border-subtle)] bg-[color:var(--surface)] px-3 py-1.5 text-sm text-[color:var(--foreground)] placeholder-[color:var(--text-tertiary)] focus:border-[color:var(--border-strong)] focus:outline-none"
                         />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-[10px] font-medium uppercase tracking-[0.14em] text-[color:var(--text-tertiary)]">Owner</span>
+                        <input
+                          type="text"
+                          placeholder="e.g. payments-security"
+                          value={ownerFilter}
+                          onChange={(e) => setOwnerFilter(e.target.value)}
+                          className="rounded-lg border border-[color:var(--border-subtle)] bg-[color:var(--surface)] px-3 py-1.5 text-sm text-[color:var(--foreground)] placeholder-[color:var(--text-tertiary)] focus:border-[color:var(--border-strong)] focus:outline-none"
+                        />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-[10px] font-medium uppercase tracking-[0.14em] text-[color:var(--text-tertiary)]">SLA</span>
+                        <select
+                          value={slaFilter}
+                          onChange={(e) => setSlaFilter(e.target.value as "" | "overdue" | "due" | "unassigned")}
+                          className="rounded-lg border border-[color:var(--border-subtle)] bg-[color:var(--surface)] px-3 py-1.5 text-sm text-[color:var(--foreground)] focus:border-[color:var(--border-strong)] focus:outline-none"
+                        >
+                          <option value="">Any SLA</option>
+                          <option value="overdue">Overdue</option>
+                          <option value="due">Due later</option>
+                          <option value="unassigned">No SLA</option>
+                        </select>
                       </div>
                       <div className="flex items-center justify-between gap-2 border-t border-[color:var(--border-subtle)] pt-2">
                         <button
