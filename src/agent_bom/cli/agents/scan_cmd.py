@@ -18,7 +18,6 @@ import click
 from rich.console import Console
 
 from agent_bom.cli._common import (
-    _make_console,
     _sync_runtime_consoles,
     logger,
 )
@@ -691,12 +690,19 @@ def scan(
         # the scan; disable with AGENT_BOM_REPO_TRUST=0.
         repo_trust_data = fetch_repo_trust(repo_url, token_env="AGENT_BOM_REPO_SCAN_TOKEN")
 
-    # Route console output based on flags
+    # Keep phase/progress diagnostics redirectable separately from the final
+    # human report. Both still render to a TTY during an interactive run, while
+    # ``agent-bom scan > report.txt`` captures only the report and leaves
+    # discovery/scanner progress visible on stderr.
     is_stdout = output == "-"
     is_null_sink = _is_null_device(output)
-    con = _make_console(quiet=quiet or is_stdout, output_format=output_format, no_color=no_color)
-    runtime_console = Console(stderr=True, quiet=quiet or is_stdout, no_color=no_color)
-    _sync_runtime_consoles(runtime_console)
+    con = Console(stderr=True, quiet=quiet or is_stdout, no_color=no_color)
+    report_con = Console(
+        file=click.get_text_stream("stdout"),
+        quiet=quiet or is_stdout,
+        no_color=no_color,
+    )
+    _sync_runtime_consoles(con)
 
     # `-o /dev/null` is a discard sink: run the scan, write nothing, and let the
     # policy exit code stand. Without this the console-to-file guard below tripped
@@ -714,8 +720,10 @@ def scan(
 
     # Also set the output module's console so print_summary etc. route correctly
     import agent_bom.output as _out
+    import agent_bom.output.console_render as _console_render
 
     _out.console = con
+    _console_render.console = con
 
     _validated_ignore_entries: list[dict[str, Any]] | None = None
     if policy:
@@ -1417,7 +1425,18 @@ def scan(
             except _HCError as exc:
                 con.print(f"  [yellow]⚠[/yellow] {exc}")
 
-        # Step 2c: Tool poisoning detection + enforcement (--enforce)
+        # Step 2c: Passive tool/resource description poisoning detection.
+        # These surfaces are already in the discovered config and require no
+        # active connection or policy action, so their findings must not depend
+        # on the broader --enforce mode.
+        from agent_bom.enforcement import scan_description_surfaces
+
+        _description_report = scan_description_surfaces([s for a in agents for s in a.mcp_servers])
+        if _description_report.findings:
+            _enforcement_data = _description_report.to_dict()
+            ctx.enforcement_data = _enforcement_data
+
+        # Step 2d: Full tool poisoning detection + enforcement (--enforce)
         if enforce:
             from agent_bom.enforcement import run_enforcement
 
@@ -1538,6 +1557,7 @@ def scan(
             if not quiet:
                 con.print("  [dim]No packages to scan[/dim]")
         else:
+            input_vulnerability_count = sum(len(package.vulnerabilities) for package in all_packages)
             _unique_pkgs = len({(p.name, p.version, p.ecosystem) for a in agents for s in a.mcp_servers for p in s.packages})
             if not quiet:
                 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
@@ -1679,6 +1699,11 @@ def scan(
                 # only. Graph-derived findings surface after graph analysis
                 # below, and the all-categories totals line reconciles both.
                 con.print(f"  [red]⚠[/red] Scan complete — package CVEs: {_sev_str}")
+            elif input_vulnerability_count:
+                con.print(
+                    "  [yellow]⚠[/yellow] Scan complete — retained "
+                    f"{input_vulnerability_count} vulnerability record(s) supplied by the input inventory"
+                )
             elif offline:
                 if unresolved:
                     con.print(
@@ -1987,6 +2012,15 @@ def scan(
     _scan_outcome = (
         ScanOutcome.FAILED if ctx.cloud_provider_failures and not ctx.cloud_provider_successes and not agents else ScanOutcome.COMPLETE
     )
+    _codeowners: list[dict[str, object]] = []
+    try:
+        _project_root = Path(project or ".").resolve()
+        if _project_root.is_dir():
+            from agent_bom.graph.codeowners import load_codeowners
+
+            _codeowners = [rule.to_dict() for rule in load_codeowners(_project_root)]
+    except OSError:
+        _codeowners = []
     report = AIBOMReport(
         agents=agents,
         blast_radii=blast_radii,
@@ -1995,6 +2029,7 @@ def scan(
         scan_run=ScanRun(outcome=_scan_outcome, issues=_scan_issues),
         scan_id=_scan_id,
         endpoint_inventory_data=_endpoint_inventory_data,
+        codeowners=_codeowners,
         **_report_kwargs,
     )
     from agent_bom.advisory_sources import summarize_advisory_coverage
@@ -2319,21 +2354,6 @@ def scan(
         if not quiet:
             con.print(f"  [green]✓[/green] VEX applied: {_vex_count} vulnerabilities updated from {vex_path}")
 
-    if generate_vex_flag and report.blast_radii:
-        from agent_bom.vex import export_openvex, generate_vex
-        from agent_bom.vex import to_serializable as _vex_to_ser
-
-        _vex_doc = generate_vex(report, auto_triage=True)
-        report.vex_data = _vex_to_ser(_vex_doc)
-        _vex_out = vex_output_path or "agent-bom.vex.json"
-        import json as _vex_json
-
-        with open(_vex_out, "w") as _vf:
-            _vex_json.dump(export_openvex(_vex_doc), _vf, indent=2)
-        if not quiet:
-            _n_stmts = len(_vex_doc.statements)
-            con.print(f"  [green]✓[/green] VEX generated: {_n_stmts} statements → {_vex_out}")
-
     # ── Toxic combination detection ──────────────────────────────────
     if report.blast_radii and (enrich or preset == "enterprise"):
         from agent_bom.toxic_combos import detect_toxic_combinations as _detect_toxic
@@ -2398,6 +2418,38 @@ def scan(
                 con.print(f"  [yellow]⚠[/yellow] {w}")
             for w in manifest_warnings:
                 con.print(f"  [yellow]⚠[/yellow] {w}")
+            # Refused/missing scan roots and bounded pickle analysis are
+            # coverage facts, not merely console warnings.  Preserve them on
+            # scan_run so JSON/SARIF and the process exit fail closed together.
+            for _model_warning in [*mf_warnings, *manifest_warnings]:
+                if _model_warning.startswith(("Model scan:", "Model manifest scan:")):
+                    report.scan_run.add_issue(
+                        ScanIssue(
+                            code="scanner_coverage_gap",
+                            stage="scanning",
+                            source="model-scan",
+                            message=_model_warning,
+                            affects_coverage=True,
+                        )
+                    )
+            _incomplete_model_flags = {
+                "TRUNCATED_PICKLE_UNSCANNED",
+                "OVERSIZE_PICKLE_UNSCANNED",
+                "PICKLE_SCAN_ERROR",
+            }
+            for _model_result in mf_results:
+                for _model_flag in _model_result.get("security_flags", []) or []:
+                    _flag_type = str(_model_flag.get("type") or "")
+                    if _flag_type in _incomplete_model_flags:
+                        report.scan_run.add_issue(
+                            ScanIssue(
+                                code="scanner_coverage_gap",
+                                stage="scanning",
+                                source="model-scan",
+                                message=f"Model artifact analysis incomplete: {_flag_type}",
+                                affects_coverage=True,
+                            )
+                        )
             if mf_results:
                 security_count = sum(1 for m in mf_results if m["security_flags"])
                 con.print(
@@ -2858,6 +2910,24 @@ def scan(
         # Reachability is best-effort enrichment — don't let it fail the scan.
         pass
 
+    # Generate VEX only after dependency/function reachability has been
+    # stamped and CVE findings have been resynchronized. Otherwise automatic
+    # ``not_affected`` decisions can never use symbol execution evidence.
+    if generate_vex_flag and report.blast_radii:
+        from agent_bom.vex import export_openvex, generate_vex
+        from agent_bom.vex import to_serializable as _vex_to_ser
+
+        _vex_doc = generate_vex(report, auto_triage=True)
+        report.vex_data = _vex_to_ser(_vex_doc)
+        _vex_out = vex_output_path or "agent-bom.vex.json"
+        import json as _vex_json
+
+        with open(_vex_out, "w") as _vf:
+            _vex_json.dump(export_openvex(_vex_doc), _vf, indent=2)
+        if not quiet:
+            _n_stmts = len(_vex_doc.statements)
+            con.print(f"  [green]✓[/green] VEX generated: {_n_stmts} statements → {_vex_out}")
+
     # Attach blast_radii and report to context for downstream phases
     ctx.blast_radii = blast_radii
     ctx.report = report
@@ -2930,29 +3000,38 @@ def scan(
     _step_t0 = _time.monotonic()
     _posture_console_only = posture and output_format == "console" and not output
     if not _posture_console_only and not agent_mode:
-        render_output(
-            ctx,
-            output=output,
-            output_format=output_format,
-            no_tree=no_tree,
-            quiet=quiet,
-            no_color=no_color,
-            open_report=open_report,
-            offline_html=offline_html,
-            compliance_export=compliance_export,
-            mermaid_mode=mermaid_mode,
-            push_gateway=push_gateway,
-            otel_endpoint=otel_endpoint,
-            baseline=baseline,
-            delta_mode=delta_mode,
-            verbose=verbose,
-            exclude_unfixable=exclude_unfixable,
-            fixable_only=fixable_only,
-            agent_mode=agent_mode,
-            agent_token_budget=agent_token_budget,
-            agent_mode_full=agent_mode_full,
-            page=page,
-        )
+        _render_con = report_con if output_format == "console" and not output else con
+        ctx.con = _render_con
+        _out.console = _render_con
+        _console_render.console = _render_con
+        try:
+            render_output(
+                ctx,
+                output=output,
+                output_format=output_format,
+                no_tree=no_tree,
+                quiet=quiet,
+                no_color=no_color,
+                open_report=open_report,
+                offline_html=offline_html,
+                compliance_export=compliance_export,
+                mermaid_mode=mermaid_mode,
+                push_gateway=push_gateway,
+                otel_endpoint=otel_endpoint,
+                baseline=baseline,
+                delta_mode=delta_mode,
+                verbose=verbose,
+                exclude_unfixable=exclude_unfixable,
+                fixable_only=fixable_only,
+                agent_mode=agent_mode,
+                agent_token_budget=agent_token_budget,
+                agent_mode_full=agent_mode_full,
+                page=page,
+            )
+        finally:
+            ctx.con = con
+            _out.console = con
+            _console_render.console = con
 
     from agent_bom.db.adoption_events import record_scan_completion_best_effort
 
@@ -3077,6 +3156,7 @@ def scan(
             _execution_outcome is ScanOutcome.COMPLETE
             and not no_scan
             and total_packages > 0
+            and report.total_vulnerabilities == 0
             and not [f for f in report.to_findings() if f.finding_type.value != "CVE"]
         ):
             con.print("\n  [green]→[/green] no vulnerabilities found — supply chain looks clean")

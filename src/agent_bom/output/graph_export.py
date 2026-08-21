@@ -20,6 +20,7 @@ Usage::
 from __future__ import annotations
 
 import json
+from collections import deque
 from pathlib import Path
 from typing import Any, Union
 
@@ -251,7 +252,7 @@ def build_graph_from_scan_data(data: dict[str, Any]) -> DepGraph:
                     graph.add_node(cve_id, vuln_id_str, "cve", severity)
                     graph.add_edge(pkg_id, cve_id, "affects")
 
-    _merge_cloud_graph(graph, data)
+    _merge_unified_graph_evidence(graph, data)
     return graph
 
 
@@ -284,8 +285,8 @@ _CLOUD_ENTITY_TYPES = frozenset(
 )
 
 
-def _merge_cloud_graph(graph: DepGraph, data: dict[str, Any]) -> None:
-    """Merge the cloud-aware unified graph's cloud/identity nodes into the DepGraph.
+def _merge_unified_graph_evidence(graph: DepGraph, data: dict[str, Any]) -> None:
+    """Merge unified-only cloud, identity, and source evidence into the DepGraph.
 
     The CLI graph export historically walked only agents→servers→tools→creds→
     packages→CVEs, so cloud-inventory, CIEM (HAS_PERMISSION), CIS misconfigs, and
@@ -293,6 +294,8 @@ def _merge_cloud_graph(graph: DepGraph, data: dict[str, Any]) -> None:
     ``build_unified_graph_from_report`` (the single source of cloud graph truth)
     and grafts its cloud/identity/posture nodes + edges onto the DepGraph so every
     existing serializer (json/dot/mermaid/graphml/cypher) shows the full estate.
+    Source-discovered MCP tools also originate only in the unified graph; graft
+    those tool/file nodes so graph export does not discard their provenance.
     Best-effort: never raises into the export path.
     """
     try:
@@ -305,7 +308,9 @@ def _merge_cloud_graph(graph: DepGraph, data: dict[str, Any]) -> None:
     added: set[str] = set()
     for node in unified.nodes.values():
         etype = node.entity_type.value if hasattr(node.entity_type, "value") else str(node.entity_type)
-        if etype not in _CLOUD_ENTITY_TYPES or node.id in graph._nodes:
+        is_ast_tool = etype == "tool" and node.attributes.get("discovery_source") == "ast_analysis"
+        is_ast_source = etype == "source_file" and "ast_analysis" in node.data_sources
+        if (etype not in _CLOUD_ENTITY_TYPES and not is_ast_tool and not is_ast_source) or node.id in graph._nodes:
             continue
         graph.add_node(
             node.id,
@@ -426,6 +431,57 @@ def to_dot(graph: DepGraph, title: str = "agent-bom dependency graph") -> str:
 
 _MERMAID_DEFAULT_MAX_NODES = 80
 _MERMAID_DEFAULT_MAX_EDGES = 240
+_MERMAID_SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+_MERMAID_KIND_PRIORITY = {
+    "cve": 0,
+    "pkg_vuln": 1,
+    "misconfiguration": 1,
+    "credential": 2,
+    "tool": 2,
+    "server_blocked": 2,
+    "server_cred": 2,
+    "server_intel": 2,
+    "server": 3,
+    "agent": 4,
+    "provider": 5,
+}
+
+
+def _mermaid_priority_nodes(graph: DepGraph) -> list[_Node]:
+    """Order nodes by propagated finding severity before applying a limit.
+
+    A severe CVE raises the priority of its upstream package and estate path,
+    keeping the useful risk relationship visible without allowing early
+    alphabetic development dependencies to consume the Mermaid budget.
+    """
+    nodes = graph.nodes
+    insertion_order = {node.id: index for index, node in enumerate(nodes)}
+    priority = {node.id: _MERMAID_SEVERITY_RANK.get(node.severity.lower(), 0) for node in nodes}
+
+    # Edges point from estate roots toward findings. Propagate the highest
+    # downstream severity back through predecessors. Each node can advance at
+    # most four ranks, so this stays linear even for large imported graphs and
+    # remains safe when those graphs contain cycles.
+    predecessors: dict[str, list[str]] = {}
+    for edge in graph.edges:
+        predecessors.setdefault(edge.target, []).append(edge.source)
+    queue = deque(node_id for node_id, rank in priority.items() if rank)
+    while queue:
+        target = queue.popleft()
+        downstream = priority[target]
+        for source in predecessors.get(target, []):
+            if downstream > priority.get(source, 0):
+                priority[source] = downstream
+                queue.append(source)
+
+    return sorted(
+        nodes,
+        key=lambda node: (
+            -priority.get(node.id, 0),
+            _MERMAID_KIND_PRIORITY.get(node.kind, 6),
+            insertion_order[node.id],
+        ),
+    )
 
 
 def to_mermaid(
@@ -476,7 +532,7 @@ def to_mermaid(
             "cve": "cve",
         }.get(kind, "pkg")
 
-    nodes = graph.nodes
+    nodes = _mermaid_priority_nodes(graph)
     visible_nodes = nodes if max_nodes is None else nodes[:max_nodes]
     visible_node_ids = {node.id for node in visible_nodes}
     visible_edges = [edge for edge in graph.edges if edge.source in visible_node_ids and edge.target in visible_node_ids]

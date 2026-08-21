@@ -1,10 +1,10 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import FindingsPage from "@/app/findings/page";
 
-const { apiMock, navigationState, authState } = vi.hoisted(() => ({
+const { apiMock, navigationState, authState, routerReplace } = vi.hoisted(() => ({
   apiMock: {
     listFindings: vi.fn(),
     listFindingTriage: vi.fn(),
@@ -14,11 +14,12 @@ const { apiMock, navigationState, authState } = vi.hoisted(() => ({
   },
   navigationState: { query: "" },
   authState: { canManageExceptions: true },
+  routerReplace: vi.fn(),
 }));
 
 vi.mock("next/navigation", () => ({
   useSearchParams: () => new URLSearchParams(navigationState.query),
-  useRouter: () => ({ replace: vi.fn() }),
+  useRouter: () => ({ replace: routerReplace }),
   usePathname: () => "/findings",
 }));
 
@@ -72,6 +73,7 @@ describe("FindingsPage", () => {
     apiMock.createException.mockReset();
     apiMock.exportFindingTriageVex.mockReset();
     apiMock.getPostureCounts.mockReset();
+    routerReplace.mockReset();
 
     apiMock.listFindings.mockResolvedValue({
       schema_version: "v1",
@@ -90,6 +92,83 @@ describe("FindingsPage", () => {
       kev: 0,
       compound_issues: 0,
     });
+  });
+
+  it("does not assert zero findings while the authoritative total is loading", async () => {
+    let resolveFindings!: (value: {
+      schema_version: string;
+      findings: typeof canonicalFinding[];
+      total: number;
+      has_more: boolean;
+      next_cursor: string;
+    }) => void;
+    apiMock.listFindings.mockReturnValue(
+      new Promise((resolve) => {
+        resolveFindings = resolve;
+      }),
+    );
+
+    render(<FindingsPage />);
+
+    expect(screen.getByTestId("findings-loading-state")).toBeInTheDocument();
+    expect(screen.getByText(/Total unavailable/i)).toBeInTheDocument();
+    expect(screen.queryByText(/0 findings/i)).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolveFindings({
+        schema_version: "v1",
+        findings: [canonicalFinding],
+        total: 1,
+        has_more: false,
+        next_cursor: "",
+      });
+    });
+    expect(await screen.findByText("CVE-2026-1234")).toBeInTheDocument();
+  });
+
+  it("uses the server-backed issue view and expands preserved asset occurrences", async () => {
+    apiMock.listFindings.mockResolvedValue({
+      schema_version: "v1",
+      findings: [
+        {
+          ...canonicalFinding,
+          finding_group_id: "group-1",
+          occurrence_count: 2,
+          occurrences_truncated: false,
+          occurrences: [
+            {
+              finding_id: "finding-api",
+              asset: { name: "api-image", asset_type: "package", stable_id: "asset-api" },
+              severity: "critical",
+            },
+            {
+              finding_id: "finding-worker",
+              asset: { name: "worker-image", asset_type: "package", stable_id: "asset-worker" },
+              severity: "high",
+            },
+          ],
+        },
+      ],
+      total: 1,
+      has_more: false,
+      next_cursor: "",
+    });
+
+    render(<FindingsPage />);
+
+    await waitFor(() =>
+      expect(apiMock.listFindings).toHaveBeenCalledWith(
+        expect.objectContaining({ groupOccurrences: true }),
+      ),
+    );
+    expect(await screen.findByText(/1 issues · current state/)).toBeInTheDocument();
+    const expander = await screen.findByRole("button", { name: "Show 2 affected asset occurrences" });
+    expect(screen.queryByText("api-image")).not.toBeInTheDocument();
+
+    fireEvent.click(expander);
+
+    expect(await screen.findByText("api-image")).toBeInTheDocument();
+    expect(screen.getByText("worker-image")).toBeInTheDocument();
   });
 
   it("keeps findings as a compact queue and opens evidence in a drawer", async () => {
@@ -120,6 +199,59 @@ describe("FindingsPage", () => {
     await waitFor(() => {
       expect(screen.queryByRole("dialog", { name: "Finding details for CVE-2026-1234" })).not.toBeInTheDocument();
     });
+  });
+
+  it("deep-links the exact finding row when a CVE affects more than one asset", async () => {
+    navigationState.query = "finding=finding-2";
+    apiMock.listFindings.mockResolvedValue({
+      schema_version: "v1",
+      findings: [
+        canonicalFinding,
+        {
+          ...canonicalFinding,
+          id: "finding-2",
+          asset: { name: "second-package", asset_type: "package" },
+          scan_id: "scan-2",
+        },
+      ],
+      total: 2,
+      has_more: false,
+      next_cursor: "",
+    });
+
+    render(<FindingsPage />);
+
+    const drawer = await screen.findByRole("dialog", {
+      name: "Finding details for CVE-2026-1234",
+    });
+    expect(within(drawer).getByText("second-package")).toBeInTheDocument();
+
+    const closeButtons = within(drawer).getAllByRole("button", { name: "Close" });
+    fireEvent.click(closeButtons.at(-1)!);
+    await waitFor(() => {
+      expect(routerReplace).toHaveBeenLastCalledWith("/findings", { scroll: false });
+    });
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Open details for CVE-2026-1234" })[0]!);
+    await waitFor(() => {
+      expect(routerReplace).toHaveBeenLastCalledWith(
+        "/findings?finding=finding-1",
+        { scroll: false },
+      );
+    });
+  });
+
+  it("links package and agent identities back into the findings investigation", async () => {
+    render(<FindingsPage />);
+
+    expect(await screen.findByRole("link", { name: "better-sqlite3" })).toHaveAttribute(
+      "href",
+      "/findings?q=better-sqlite3",
+    );
+    expect(screen.getByRole("link", { name: "developer-copilot" })).toHaveAttribute(
+      "href",
+      "/findings?q=developer-copilot",
+    );
   });
 
   it("renders exception and triage writes disabled for a viewer", async () => {
@@ -347,6 +479,20 @@ describe("FindingsPage", () => {
     });
   });
 
+  it("owns owner and SLA workflow filters in the URL and canonical API", async () => {
+    navigationState.query = "owner=payments-security&sla=overdue";
+    render(<FindingsPage />);
+    expect(await screen.findByText("Findings queue")).toBeInTheDocument();
+
+    await waitFor(() =>
+      expect(apiMock.listFindings).toHaveBeenLastCalledWith(
+        expect.objectContaining({ owner: "payments-security", sla: "overdue" }),
+      ),
+    );
+    expect(screen.getByTestId("findings-chip-owner")).toHaveTextContent("Owner: payments-security");
+    expect(screen.getByTestId("findings-chip-sla")).toHaveTextContent("SLA: overdue");
+  });
+
   it("sends the selected issue class to the paginated findings API", async () => {
     render(<FindingsPage />);
     expect(await screen.findByText("Findings queue")).toBeInTheDocument();
@@ -417,6 +563,44 @@ describe("FindingsPage", () => {
     expect(screen.getByRole("columnheader", { name: "Reach / exploit" })).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: "Owner / SLA" })).toBeInTheDocument();
     expect(screen.queryByRole("columnheader", { name: "Control mapping" })).not.toBeInTheDocument();
+  });
+
+  it("keeps unrated findings reachable from the severity controls", async () => {
+    apiMock.listFindings.mockResolvedValue({
+      schema_version: "v1",
+      findings: [
+        {
+          ...canonicalFinding,
+          id: "finding-unrated-1",
+          cve_id: undefined,
+          severity: "none",
+          title: "Finding without a severity rating",
+        },
+      ],
+      total: 3,
+      facets: {
+        finding_class: { vulnerability: 0, misconfiguration: 0, secret: 0, identity: 0, unclassified: 3 },
+        severity: { critical: 0, high: 0, medium: 0, low: 0, info: 0, unknown: 3 },
+        status: { open: 3, resolved: 0 },
+        domain: { cspm: 0, vuln: 0, aspm: 0, dspm: 0, aispm: 3 },
+        freshness: { last_24_hours: 0, last_7_days: 0, last_30_days: 0, older: 0, unavailable: 3 },
+      },
+    });
+
+    render(<FindingsPage />);
+
+    const unrated = await screen.findByRole("button", { name: "Unrated (3)" });
+    fireEvent.click(unrated);
+
+    await waitFor(() =>
+      expect(apiMock.listFindings).toHaveBeenLastCalledWith(
+        expect.objectContaining({ severity: "unknown" }),
+      ),
+    );
+    expect(routerReplace).toHaveBeenLastCalledWith(
+      expect.stringContaining("severity=unrated"),
+      { scroll: false },
+    );
   });
 
   it("labels a budget-bounded scope walk partial instead of showing a silent empty page", async () => {

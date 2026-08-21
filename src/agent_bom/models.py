@@ -642,6 +642,38 @@ class PermissionProfile:
         return "low"
 
 
+@dataclass(frozen=True)
+class CredentialIdentityBinding:
+    """Explicit, non-secret evidence joining a credential slot to an identity.
+
+    Environment-variable names alone are not identity evidence.  Producers may
+    populate this contract only when a configuration or provider observation
+    names both sides of the relationship.
+    """
+
+    credential_ref: str
+    identity_canonical_id: str
+    evidence_source: str
+    provider: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        for field_name in ("credential_ref", "identity_canonical_id", "evidence_source"):
+            normalized = str(getattr(self, field_name) or "").strip()
+            if not normalized:
+                raise ValueError(f"{field_name} is required")
+            object.__setattr__(self, field_name, normalized)
+        if self.provider is not None:
+            object.__setattr__(self, "provider", str(self.provider).strip().lower() or None)
+
+    def to_dict(self) -> dict[str, str | None]:
+        return {
+            "credential_ref": self.credential_ref,
+            "identity_canonical_id": self.identity_canonical_id,
+            "evidence_source": self.evidence_source,
+            "provider": self.provider,
+        }
+
+
 @dataclass
 class MCPServer:
     """An MCP server with its tools, resources, and dependencies."""
@@ -668,6 +700,7 @@ class MCPServer:
     surface: ServerSurface = ServerSurface.MCP
     discovery_sources: list[str] = field(default_factory=list)
     discovery_provenance: Optional[dict[str, Any]] = None  # Sanitized discovery provenance contract for this server asset
+    identity_bindings: list[CredentialIdentityBinding] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Scope child tool/resource/prompt identities to this server."""
@@ -1220,6 +1253,12 @@ class AIBOMReport:
     # license, pushed_at, …). Best-effort read-only API metadata — never required
     # for the security scan itself.
     repo_trust_data: Optional[dict[str, Any]] = None
+    # Ownership parsed from the repository's CODEOWNERS file, carried as
+    # provenance so graph overlays never need filesystem access. Two shapes are
+    # accepted and round-trip unchanged: ordered ``{"pattern", "owners"}`` rules
+    # (full CODEOWNERS precedence, used to assign source-finding owners) and the
+    # flattened ``{path_prefix: owner}`` map the repo-tree scan produces.
+    codeowners: Union[list[dict[str, Any]], dict[str, str]] = field(default_factory=list)
     introspection_data: Optional[dict[str, Any]] = None  # Runtime MCP introspection results (tools, resources, drift)
     health_check_data: Optional[dict[str, Any]] = None  # MCP server reachability/health results
     runtime_session_graph: Optional[dict[str, Any]] = None  # Structured runtime session graph/timeline evidence
@@ -1306,7 +1345,10 @@ class AIBOMReport:
 
     @property
     def total_servers(self) -> int:
-        return sum(len(a.mcp_servers) for a in self.agents)
+        # Package manifests, SBOMs, and container layers reuse MCPServer as a
+        # dependency-bearing surface model. They are not MCP servers and must
+        # not inflate the public MCP inventory count.
+        return sum(1 for agent in self.agents for server in agent.mcp_servers if server.is_mcp_surface)
 
     @property
     def total_packages(self) -> int:
@@ -1438,6 +1480,14 @@ class AIBOMReport:
 
         return ciem_over_privilege_findings_from_data(self.ciem_over_privilege_findings_data)
 
+    def _enforcement_findings(self) -> "list[Finding]":
+        """MCP description/enforcement findings promoted from the side block."""
+        if not isinstance(self.enforcement_data, dict):
+            return []
+        from agent_bom.finding import enforcement_dict_to_finding
+
+        return [enforcement_dict_to_finding(raw) for raw in self.enforcement_data.get("findings", []) or [] if isinstance(raw, dict)]
+
     def to_findings(self) -> "list[Finding]":
         """Return the unified findings list, auto-populating from blast_radii if empty.
 
@@ -1474,6 +1524,8 @@ class AIBOMReport:
         base.extend(finding for finding in self._nhi_governance_findings() if finding.id not in nhi_existing)
         ciem_existing = {getattr(f, "id", None) for f in base}
         base.extend(finding for finding in self._ciem_over_privilege_findings() if finding.id not in ciem_existing)
+        enforcement_existing = {getattr(f, "id", None) for f in base}
+        base.extend(finding for finding in self._enforcement_findings() if finding.id not in enforcement_existing)
         mcp_existing = {getattr(f, "id", None) for f in base}
         base.extend(finding for finding in self._mcp_tool_rule_findings() if finding.id not in mcp_existing)
         iac_existing = {getattr(f, "id", None) for f in base}
@@ -1484,6 +1536,10 @@ class AIBOMReport:
         base.extend(finding for finding in self._cloud_org_architecture_findings() if finding.id not in org_existing)
         malicious_existing = {getattr(f, "id", None) for f in base}
         base.extend(finding for finding in self._malicious_package_findings() if finding.id not in malicious_existing)
+        if self.codeowners:
+            from agent_bom.graph.codeowners import apply_codeowners
+
+            apply_codeowners(base, self.codeowners)
         return base
 
     def _malicious_package_findings(self) -> "list[Finding]":

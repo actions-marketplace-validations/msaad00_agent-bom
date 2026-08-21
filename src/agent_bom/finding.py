@@ -184,6 +184,89 @@ def _dedupe_control_tags(tags: list[ControlTag]) -> list[ControlTag]:
     return out
 
 
+_CIS_BENCHMARK_FRAMEWORKS: dict[str, str] = {
+    "AWS": "cis_aws_foundations",
+    "AZURE": "cis_azure_foundations",
+    "GCP": "cis_gcp_foundations",
+    "DOCKER": "cis_docker_benchmark",
+    "K8S": "cis_kubernetes_benchmark",
+    "KUBERNETES": "cis_kubernetes_benchmark",
+}
+
+
+def _control_tag_from_compliance_tag(value: str) -> ControlTag:
+    """Type one legacy compliance identifier without inventing a crosswalk.
+
+    IaC scanners historically placed every identifier in ``compliance_tags``.
+    Treating that mixed array as one ``generic`` framework made real NIST
+    controls unjoinable and, worse, could make a cloud Foundations benchmark
+    look like CIS Controls v8.  Prefix parsing preserves the identifier's own
+    namespace only; it does not claim equivalence between frameworks.
+    """
+    source = "legacy:compliance_tags"
+    upper = value.upper()
+    if upper.startswith("NIST-CSF-"):
+        return ControlTag(
+            framework="nist_csf",
+            control=value[len("NIST-CSF-") :],
+            version="2.0",
+            confidence=1.0,
+            source=source,
+            via="compliance_tags",
+        )
+    if upper.startswith("NIST-AI-RMF-"):
+        return ControlTag(
+            framework="nist_ai_rmf",
+            control=value[len("NIST-AI-RMF-") :],
+            version="1.0",
+            confidence=1.0,
+            source=source,
+            via="compliance_tags",
+        )
+    # Only the two-letter 800-53 family shape claims 800-53. A looser ``NIST-``
+    # prefix match would file NIST-AI-RMF and other NIST publications under a
+    # catalog that never contained them.
+    if nist_match := re.fullmatch(r"NIST-([A-Z]{2})-(.+)", upper):
+        return ControlTag(
+            framework="nist_800_53",
+            control=f"{nist_match.group(1)}-{nist_match.group(2)}",
+            version="rev5",
+            confidence=1.0,
+            source=source,
+            via="compliance_tags",
+        )
+    if upper.startswith("SOC2-"):
+        return ControlTag(
+            framework="soc2",
+            control=value[len("SOC2-") :],
+            version="2017",
+            confidence=1.0,
+            source=source,
+            via="compliance_tags",
+        )
+    cis_match = re.fullmatch(r"CIS-([A-Za-z0-9]+)-(.+)", value)
+    if cis_match:
+        provider, control = cis_match.groups()
+        framework = _CIS_BENCHMARK_FRAMEWORKS.get(provider.upper())
+        if framework:
+            return ControlTag(
+                framework=framework,
+                control=control,
+                version="benchmark",
+                confidence=1.0,
+                source=source,
+                via="compliance_tags",
+            )
+    return ControlTag(
+        framework="generic",
+        control=value,
+        version="legacy",
+        confidence=0.75,
+        source=source,
+        via="compliance_tags",
+    )
+
+
 @dataclass
 class Asset:
     """What is affected by this finding."""
@@ -309,6 +392,9 @@ class Finding:
     # Risk
     risk_score: float = 0.0  # 0-10 unified risk score
     reachability: Optional[str] = None
+    graph_reachable: Optional[bool] = None
+    graph_min_hop_distance: Optional[int] = None
+    graph_reachable_from_agents: list[str] = field(default_factory=list)
     is_actionable: Optional[bool] = None
     impact_category: Optional[str] = None
 
@@ -419,6 +505,34 @@ class Finding:
         return self.id
 
     @property
+    def occurrence_id(self) -> str:
+        """Workflow identity for this finding on this exact asset occurrence."""
+        return self.id
+
+    @property
+    def finding_group_key(self) -> str:
+        """Asset-independent issue identity used only for aggregate/expand views.
+
+        The occurrence id remains authoritative for triage, lifecycle, evidence,
+        and persistence.  Vulnerability groups intentionally omit the asset and
+        installed version so repeated occurrences can be presented together
+        without destroying their distinct workflow records.
+        """
+        vulnerability_id = str(self.vulnerability_id or "").strip().lower()
+        if self.finding_type is not FindingType.CVE or not vulnerability_id:
+            return f"occurrence:{self.occurrence_id}"
+        package_name = self.asset.name if self.asset.asset_type == "package" else ""
+        if not package_name and isinstance(self.evidence, dict):
+            package_name = str(self.evidence.get("package_name") or "")
+        package_name = package_name.strip().lower()
+        return f"vulnerability:{vulnerability_id}:{package_name}"
+
+    @property
+    def finding_group_id(self) -> str:
+        """Deterministic identifier for a grouped issue queue row."""
+        return stable_id("finding-group", self.finding_group_key)
+
+    @property
     def vulnerability_id(self) -> Optional[str]:
         """Canonical advisory identity, regardless of CVE/GHSA/OSV namespace.
 
@@ -464,6 +578,9 @@ class Finding:
             values = getattr(self, field_name)
             for value in values:
                 if value:
+                    if field_name == "compliance_tags":
+                        tags.append(_control_tag_from_compliance_tag(str(value)))
+                        continue
                     tags.append(
                         ControlTag(
                             framework=framework,
@@ -538,6 +655,10 @@ class Finding:
             "schema_version": FINDING_SCHEMA_VERSION,
             "id": self.id,
             "canonical_id": self.canonical_id,
+            "finding_id": self.occurrence_id,
+            "occurrence_id": self.occurrence_id,
+            "finding_group_id": self.finding_group_id,
+            "finding_group_key": self.finding_group_key,
             "finding_type": self.finding_type.value,
             "finding_category": self.finding_category,
             "source": self.source.value,
@@ -614,6 +735,9 @@ class Finding:
             "entity_type": self.entity_type,
             "risk_score": self.risk_score,
             "reachability": self.reachability,
+            "graph_reachable": self.graph_reachable,
+            "graph_min_hop_distance": self.graph_min_hop_distance,
+            "graph_reachable_from_agents": list(self.graph_reachable_from_agents),
             "is_actionable": self.is_actionable,
             "impact_category": self.impact_category,
             # Ownership + remediation SLA (derived, single source of truth in
@@ -831,14 +955,16 @@ def _safe_secret_preview(value: object) -> str:
     return "***REDACTED***"
 
 
-_AST_FLOW_CRITICAL_MARKERS = ("command_execution", "unsafe_deserialization")
+_AST_FLOW_CRITICAL_MARKERS = ("command_execution", "unsafe_deserialization", "dynamic_code_execution")
 _AST_FLOW_HIGH_MARKERS = (
+    "credential_file_access",
     "dangerous",
     "unguarded_tool_sink",
     "command_string",
     "dynamic_require",
     "path_access",
     "path_traversal",
+    "privilege_escalation",
     "sql",
     "ssrf",
     "xss",
@@ -881,13 +1007,13 @@ def ast_flow_dict_to_finding(raw: dict) -> "Finding":
     detail = sanitize_text(raw.get("detail", "") or title, max_len=2_000)
     call_path = [sanitize_text(item, max_len=200) for item in raw.get("call_path", []) if isinstance(item, str)][:20]
 
-    return Finding(
+    finding = Finding(
         finding_type=FindingType.SAST,
         source=FindingSource.SAST,
         asset=Asset(
             name=f"{entrypoint or sink or category} in {file_path}" if file_path else entrypoint or sink or category,
             asset_type="source_file",
-            identifier=f"{file_path}:{line}:{entrypoint}:{sink}",
+            identifier=file_path or None,
             location=file_path or None,
         ),
         severity=severity,
@@ -909,6 +1035,47 @@ def ast_flow_dict_to_finding(raw: dict) -> "Finding":
         },
         risk_score=9.5 if severity == "critical" else 8.0 if severity == "high" else 6.0,
         exposed_tools=[entrypoint] if entrypoint else [],
+        id=stable_id("ast-flow", file_path, str(line), entrypoint, sink, category),
+    )
+    from agent_bom.compliance_hub import apply_hub_classification
+
+    return apply_hub_classification(finding)
+
+
+def enforcement_dict_to_finding(raw: dict) -> "Finding":
+    """Promote a passive/full MCP enforcement row to the unified stream."""
+    from agent_bom.security import sanitize_text
+
+    category = sanitize_text(raw.get("category", "injection") or "injection", max_len=80).lower()
+    server_name = sanitize_text(raw.get("server_name", "unknown-server") or "unknown-server", max_len=200)
+    tool_name = sanitize_text(raw.get("tool_name", "") or "", max_len=200)
+    reason = sanitize_text(raw.get("reason", "MCP description security finding") or "", max_len=2_000)
+    recommendation = sanitize_text(raw.get("recommendation", "") or "", max_len=1_000)
+    severity = sanitize_text(raw.get("severity", "high") or "high", max_len=40)
+    finding_type = FindingType.TOOL_DRIFT if "drift" in category else FindingType.INJECTION
+    surface_name = tool_name or server_name
+
+    return Finding(
+        finding_type=finding_type,
+        source=FindingSource.MCP_SCAN,
+        asset=Asset(
+            name=f"{surface_name} on {server_name}" if tool_name else server_name,
+            asset_type="mcp_tool" if tool_name else "mcp_server",
+            identifier=f"{server_name}:{tool_name or category}",
+        ),
+        severity=severity,
+        title=f"MCP {category.replace('_', ' ')} on {surface_name}",
+        description=reason,
+        remediation_guidance=recommendation or None,
+        evidence={
+            "category": category,
+            "server_name": server_name,
+            "tool_name": tool_name or None,
+            "detector": "mcp_enforcement",
+        },
+        risk_score=9.0 if severity.lower() == "critical" else 8.0 if severity.lower() == "high" else 6.0,
+        affected_servers=[server_name],
+        exposed_tools=[tool_name] if tool_name else [],
     )
 
 
@@ -928,13 +1095,13 @@ def secret_dict_to_finding(secret: dict) -> "Finding":
     category = sanitize_text(secret.get("category", "secret") or "secret", max_len=120)
     severity = sanitize_text(secret.get("severity", "medium") or "medium", max_len=40)
     loc = f"{file_path}:{line}" if line else file_path
-    return Finding(
+    finding = Finding(
         finding_type=FindingType.CREDENTIAL_EXPOSURE,
         source=FindingSource.SECRET_SCAN,
         asset=Asset(
             name=f"{secret_type} in {file_path}" if file_path else secret_type,
             asset_type="file",
-            identifier=loc or None,
+            identifier=file_path or None,
             location=file_path or None,
         ),
         severity=severity,
@@ -952,7 +1119,11 @@ def secret_dict_to_finding(secret: dict) -> "Finding":
             "category": category,
             "redacted_preview": _safe_secret_preview(secret.get("preview")),
         },
+        id=stable_id("secret", file_path, str(line or ""), secret_type, category),
     )
+    from agent_bom.compliance_hub import apply_hub_classification
+
+    return apply_hub_classification(finding)
 
 
 def cloud_cis_check_to_finding(check: dict, provider: str) -> "Finding":
@@ -1050,6 +1221,20 @@ def cloud_cis_check_to_finding(check: dict, provider: str) -> "Finding":
         ),
         remediation_guidance=recommendation or None,
         compliance_tags=sorted(set(compliance)),
+        controls=(
+            [
+                ControlTag(
+                    framework=f"cis_{provider.lower()}_benchmark",
+                    control=check_id,
+                    version=benchmark_version or "bundled",
+                    confidence=1.0,
+                    source="cloud_cis_check",
+                    via="check_id",
+                )
+            ]
+            if not is_vendor_best_practice
+            else []
+        ),
         attack_tags=sorted(set(attack)),
         evidence={
             "provider": provider,
@@ -1113,13 +1298,13 @@ def iac_finding_to_finding(iac: dict) -> "Finding":
     compliance = [str(t) for t in (iac.get("compliance") or []) if str(t).strip()]
     attack = [str(t) for t in (iac.get("attack_techniques") or []) if str(t).strip()]
 
-    return Finding(
+    finding = Finding(
         finding_type=FindingType.CIS_FAIL,
         source=FindingSource.CLOUD_SECURITY,
         asset=Asset(
             name=file_path,
             asset_type="iac_resource",
-            identifier=f"iac:{category}:{file_path}:{line_number}",
+            identifier=file_path,
             location=file_path,
         ),
         severity=severity,
@@ -1141,6 +1326,9 @@ def iac_finding_to_finding(iac: dict) -> "Finding":
         impact_category="iac_misconfiguration",
         id=stable_id("iac", rule_id, file_path, str(line_number)),
     )
+    from agent_bom.compliance_hub import apply_hub_classification
+
+    return apply_hub_classification(finding)
 
 
 def snowflake_governance_finding_to_finding(finding: dict, account: str) -> "Finding":
@@ -1426,6 +1614,9 @@ def blast_radius_to_finding(br: object) -> "Finding":
         evidence=evidence,
         risk_score=br.risk_score,
         reachability=getattr(br, "reachability", None),
+        graph_reachable=getattr(br, "graph_reachable", None),
+        graph_min_hop_distance=getattr(br, "graph_min_hop_distance", None),
+        graph_reachable_from_agents=list(getattr(br, "graph_reachable_from_agents", []) or []),
         is_actionable=getattr(br, "is_actionable", None),
         impact_category=getattr(br, "impact_category", None),
         suppressed=bool(getattr(br, "suppressed", False)) or is_vex_suppressed(vuln),

@@ -71,12 +71,27 @@ from agent_bom.cloud.aws_cis_benchmark import (
     _check_5_4,
     _check_5_5,
     _check_5_6,
+    finalize_read_coverage,
     run_benchmark,
 )
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _targeting_alarm_for(logs_client: MagicMock) -> MagicMock:
+    """Attach one usable metric transformation and return its targeting alarm client."""
+    pages = logs_client.get_paginator.return_value.paginate.return_value
+    for page in pages:
+        for metric_filter in page.get("metricFilters", []):
+            metric_filter.setdefault(
+                "metricTransformations",
+                [{"metricName": "SecurityEvents", "metricNamespace": "Security"}],
+            )
+    cloudwatch = MagicMock()
+    cloudwatch.describe_alarms_for_metric.return_value = {"MetricAlarms": [{"AlarmName": "SecurityEventsAlarm"}]}
+    return cloudwatch
 
 
 def _iam_client(**overrides) -> MagicMock:
@@ -742,13 +757,13 @@ class TestCheck114:
 
 
 class TestCheck116:
-    def test_pass_no_admin_policies(self):
+    def test_no_data_without_admin_policies(self):
         client = _iam_client()
         paginator = MagicMock()
         paginator.paginate.return_value = [{"Policies": []}]
         client.get_paginator.return_value = paginator
         result = _check_1_16(client)
-        assert result.status == CheckStatus.PASS
+        assert result.status == CheckStatus.NO_DATA
         assert result.check_id == "1.16"
 
     def test_fail_admin_policy(self):
@@ -930,13 +945,13 @@ class TestCheck241:
         result = _check_2_4_1(client)
         assert result.status == CheckStatus.PASS
 
-    def test_pass_no_keys(self):
+    def test_no_data_without_keys(self):
         client = MagicMock()
         paginator = MagicMock()
         paginator.paginate.return_value = [{"Keys": []}]
         client.get_paginator.return_value = paginator
         result = _check_2_4_1(client)
-        assert result.status == CheckStatus.PASS
+        assert result.status == CheckStatus.NO_DATA
 
 
 # ---------------------------------------------------------------------------
@@ -1035,32 +1050,80 @@ class TestCheck37:
 
 class TestCheck43:
     def test_pass_root_filter_exists(self):
-        client = MagicMock()
+        logs = MagicMock()
+        cloudwatch = MagicMock()
         paginator = MagicMock()
         paginator.paginate.return_value = [
-            {"metricFilters": [{"filterPattern": '{ $.userIdentity.type = "Root" && $.userIdentity.invokedBy NOT EXISTS }'}]}
+            {
+                "metricFilters": [
+                    {
+                        "filterPattern": '{ $.userIdentity.type = "Root" && $.userIdentity.invokedBy NOT EXISTS }',
+                        "metricTransformations": [{"metricName": "RootUsage", "metricNamespace": "Security"}],
+                    }
+                ]
+            }
         ]
-        client.get_paginator.return_value = paginator
-        result = _check_4_3(client)
+        logs.get_paginator.return_value = paginator
+        cloudwatch.describe_alarms_for_metric.return_value = {"MetricAlarms": [{"AlarmName": "RootUsageAlarm"}]}
+        result = _check_4_3(logs, cloudwatch)
         assert result.status == CheckStatus.PASS
         assert result.check_id == "4.3"
+        cloudwatch.describe_alarms_for_metric.assert_called_once_with(MetricName="RootUsage", Namespace="Security")
 
     def test_fail_no_root_filter(self):
-        client = MagicMock()
+        logs = MagicMock()
         paginator = MagicMock()
         paginator.paginate.return_value = [{"metricFilters": []}]
-        client.get_paginator.return_value = paginator
-        result = _check_4_3(client)
+        logs.get_paginator.return_value = paginator
+        result = _check_4_3(logs, MagicMock())
         assert result.status == CheckStatus.FAIL
         assert "No metric filter" in result.evidence
 
     def test_fail_unrelated_filter(self):
-        client = MagicMock()
+        logs = MagicMock()
         paginator = MagicMock()
         paginator.paginate.return_value = [{"metricFilters": [{"filterPattern": "{ $.errorCode = AccessDenied }"}]}]
-        client.get_paginator.return_value = paginator
-        result = _check_4_3(client)
+        logs.get_paginator.return_value = paginator
+        result = _check_4_3(logs, MagicMock())
         assert result.status == CheckStatus.FAIL
+
+    def test_fail_root_filter_without_alarm(self):
+        logs = MagicMock()
+        cloudwatch = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {
+                "metricFilters": [
+                    {
+                        "filterPattern": '{ $.userIdentity.type = "Root" }',
+                        "metricTransformations": [{"metricName": "RootUsage", "metricNamespace": "Security"}],
+                    }
+                ]
+            }
+        ]
+        logs.get_paginator.return_value = paginator
+        cloudwatch.describe_alarms_for_metric.return_value = {"MetricAlarms": []}
+
+        result = _check_4_3(logs, cloudwatch)
+
+        assert result.status == CheckStatus.FAIL
+        assert "alarm" in result.evidence.lower()
+
+
+def test_zero_inspected_resources_are_no_data_not_pass() -> None:
+    result = CISCheckResult(check_id="2.1.2", title="S3 public access", status=CheckStatus.PASS, severity="high")
+
+    finalized = finalize_read_coverage(
+        result,
+        inspected=0,
+        denied=[],
+        permission="s3:GetBucketPublicAccessBlock",
+        resource_kind="bucket",
+        pass_evidence="All 0 bucket(s) comply.",
+    )
+
+    assert finalized.status is CheckStatus.NO_DATA
+    assert "no bucket" in finalized.evidence.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -1086,7 +1149,7 @@ class TestCheck44:
             }
         ]
         client.get_paginator.return_value = paginator
-        result = _check_4_4(client)
+        result = _check_4_4(client, _targeting_alarm_for(client))
         assert result.status == CheckStatus.PASS
         assert result.check_id == "4.4"
 
@@ -1136,7 +1199,7 @@ class TestCheck45:
             }
         ]
         logs.get_paginator.return_value = paginator
-        result = _check_4_5(logs, ct)
+        result = _check_4_5(logs, ct, _targeting_alarm_for(logs))
         assert result.status == CheckStatus.PASS
         assert result.check_id == "4.5"
 
@@ -1755,11 +1818,11 @@ class TestCheck213:
         assert result.status == CheckStatus.FAIL
         assert "no-mfa" in result.evidence
 
-    def test_pass_no_buckets(self):
+    def test_no_data_without_buckets(self):
         client = MagicMock()
         client.list_buckets.return_value = {"Buckets": []}
         result = _check_2_1_3(client)
-        assert result.status == CheckStatus.PASS
+        assert result.status == CheckStatus.NO_DATA
 
 
 # ---------------------------------------------------------------------------
@@ -1880,7 +1943,7 @@ class TestCheck41:
         paginator = MagicMock()
         paginator.paginate.return_value = [{"metricFilters": [{"filterPattern": "{ $.errorCode = AccessDenied }"}]}]
         client.get_paginator.return_value = paginator
-        result = _check_4_1(client)
+        result = _check_4_1(client, _targeting_alarm_for(client))
         assert result.status == CheckStatus.PASS
         assert result.check_id == "4.1"
 
@@ -1907,7 +1970,7 @@ class TestCheck42:
             {"metricFilters": [{"filterPattern": '{ $.eventName = ConsoleLogin && $.additionalEventData.MFAUsed != "Yes" }'}]}
         ]
         client.get_paginator.return_value = paginator
-        result = _check_4_2(client)
+        result = _check_4_2(client, _targeting_alarm_for(client))
         assert result.status == CheckStatus.PASS
         assert result.check_id == "4.2"
 
@@ -1942,7 +2005,7 @@ class TestCheck46:
             {"metricFilters": [{"filterPattern": '{ $.eventName = ConsoleLogin && $.errorMessage = "Failed authentication" }'}]}
         ]
         client.get_paginator.return_value = paginator
-        result = _check_4_6(client)
+        result = _check_4_6(client, _targeting_alarm_for(client))
         assert result.status == CheckStatus.PASS
         assert result.check_id == "4.6"
 
@@ -1968,7 +2031,7 @@ class TestCheck47:
             {"metricFilters": [{"filterPattern": "{ $.eventName = DisableKey || $.eventName = ScheduleKeyDeletion }"}]}
         ]
         client.get_paginator.return_value = paginator
-        result = _check_4_7(client)
+        result = _check_4_7(client, _targeting_alarm_for(client))
         assert result.status == CheckStatus.PASS
         assert result.check_id == "4.7"
 
@@ -2002,7 +2065,7 @@ class TestCheck48:
             }
         ]
         client.get_paginator.return_value = paginator
-        result = _check_4_8(client)
+        result = _check_4_8(client, _targeting_alarm_for(client))
         assert result.status == CheckStatus.PASS
         assert result.check_id == "4.8"
 
@@ -2037,7 +2100,7 @@ class TestCheck49:
             }
         ]
         client.get_paginator.return_value = paginator
-        result = _check_4_9(client)
+        result = _check_4_9(client, _targeting_alarm_for(client))
         assert result.status == CheckStatus.PASS
         assert result.check_id == "4.9"
 
@@ -2073,7 +2136,7 @@ class TestCheck410:
             }
         ]
         client.get_paginator.return_value = paginator
-        result = _check_4_10(client)
+        result = _check_4_10(client, _targeting_alarm_for(client))
         assert result.status == CheckStatus.PASS
         assert result.check_id == "4.10"
 
@@ -2109,7 +2172,7 @@ class TestCheck411:
             }
         ]
         client.get_paginator.return_value = paginator
-        result = _check_4_11(client)
+        result = _check_4_11(client, _targeting_alarm_for(client))
         assert result.status == CheckStatus.PASS
         assert result.check_id == "4.11"
 
@@ -2145,7 +2208,7 @@ class TestCheck412:
             }
         ]
         client.get_paginator.return_value = paginator
-        result = _check_4_12(client)
+        result = _check_4_12(client, _targeting_alarm_for(client))
         assert result.status == CheckStatus.PASS
         assert result.check_id == "4.12"
 
@@ -2179,7 +2242,7 @@ class TestCheck413:
             }
         ]
         client.get_paginator.return_value = paginator
-        result = _check_4_13(client)
+        result = _check_4_13(client, _targeting_alarm_for(client))
         assert result.status == CheckStatus.PASS
         assert result.check_id == "4.13"
 
@@ -2209,7 +2272,7 @@ class TestCheck414:
             }
         ]
         client.get_paginator.return_value = paginator
-        result = _check_4_14(client)
+        result = _check_4_14(client, _targeting_alarm_for(client))
         assert result.status == CheckStatus.PASS
         assert result.check_id == "4.14"
 
@@ -2245,7 +2308,7 @@ class TestCheck415:
             }
         ]
         client.get_paginator.return_value = paginator
-        result = _check_4_15(client)
+        result = _check_4_15(client, _targeting_alarm_for(client))
         assert result.status == CheckStatus.PASS
         assert result.check_id == "4.15"
 
@@ -2411,11 +2474,13 @@ class TestCISBenchmarkReport:
                 CISCheckResult(check_id="1.4", title="test", status=CheckStatus.PASS, severity="critical"),
                 CISCheckResult(check_id="1.5", title="test", status=CheckStatus.FAIL, severity="critical"),
                 CISCheckResult(check_id="1.6", title="test", status=CheckStatus.ERROR, severity="critical"),
+                CISCheckResult(check_id="1.7", title="test", status=CheckStatus.NO_DATA, severity="critical"),
             ]
         )
         assert report.passed == 1
         assert report.failed == 1
-        assert report.total == 3
+        assert report.no_data == 1
+        assert report.total == 4
         assert report.pass_rate == 50.0
 
     def test_to_dict(self):
@@ -2432,6 +2497,7 @@ class TestCISBenchmarkReport:
         assert d["account_id"] == "123456789012"
         assert len(d["checks"]) == 1
         assert d["checks"][0]["status"] == "pass"
+        assert d["no_data"] == 0
 
 
 # ---------------------------------------------------------------------------

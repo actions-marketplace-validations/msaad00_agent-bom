@@ -10,6 +10,7 @@ from io import StringIO
 
 import click
 from rich.console import Console
+from rich.markup import escape
 
 
 @click.command("doctor")
@@ -72,9 +73,16 @@ def doctor_cmd() -> None:
 
     # Network — OSV API
     try:
+        import json
         import urllib.request
 
-        urllib.request.urlopen("https://api.osv.dev/v1", timeout=5)  # nosec B310 — hardcoded HTTPS URL
+        request = urllib.request.Request(  # nosec B310 — hardcoded HTTPS URL
+            "https://api.osv.dev/v1/query",
+            data=json.dumps({"package": {"name": "jinja2", "ecosystem": "PyPI"}, "version": "3.1.4"}).encode(),
+            headers={"Content-Type": "application/json", "User-Agent": "agent-bom-doctor"},
+            method="POST",
+        )
+        urllib.request.urlopen(request, timeout=5)  # nosec B310 — hardcoded HTTPS URL
         core_checks.append(("Network", "api.osv.dev reachable", "ok"))
     except Exception:
         core_checks.append(("Network", "api.osv.dev unreachable", "warn"))
@@ -140,7 +148,8 @@ def doctor_cmd() -> None:
             elif sdk["status"] == "outdated":
                 value = f"{sdk['installed_version']} < recommended floor {sdk['recommended_floor']} — upgrade agent-bom[{sdk['provider']}]"
             elif sdk["status"] == "not_installed":
-                value = f"not installed (install agent-bom[{sdk['provider']}] to scan {sdk['provider']})"
+                provider = sdk["provider"]
+                value = f"not installed (install with: pip install 'agent-bom[{provider}]' to scan {provider.upper()})"
             else:
                 value = f"version unknown (floor {sdk['recommended_floor']})"
             cloud_sdk_checks.append((sdk["distribution"], value, _sdk_status_map.get(sdk["status"], "info")))
@@ -317,5 +326,5 @@ def _print_section(console: Console, title: str, checks: list[tuple[str, str, st
             icon = "[yellow]⚠[/yellow]"
         else:
             icon = "[dim]○[/dim]"
-        console.print(f"    {icon}  {label + ':':<20s} {value}")
+        console.print(f"    {icon}  {escape(label + ':'):<20s} {escape(value)}")
     console.print()

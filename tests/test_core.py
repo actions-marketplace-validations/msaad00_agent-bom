@@ -19,6 +19,7 @@ from agent_bom.models import (
     BlastRadius,
     MCPServer,
     Package,
+    ServerSurface,
     Severity,
     TransportType,
     Vulnerability,
@@ -73,6 +74,26 @@ def test_mcp_server_no_credentials():
         env={"PORT": "3000", "HOST": "localhost"},
     )
     assert not server.has_credentials
+
+
+def test_report_total_servers_excludes_dependency_only_surfaces():
+    report = AIBOMReport(
+        agents=[
+            Agent(
+                name="repo",
+                agent_type=AgentType.CUSTOM,
+                config_path="/repo/.mcp.json",
+                mcp_servers=[
+                    MCPServer(name="real-mcp"),
+                    MCPServer(name="package-json", surface=ServerSurface.FILESYSTEM),
+                    MCPServer(name="uploaded-sbom", surface=ServerSurface.SBOM),
+                ],
+            )
+        ]
+    )
+
+    assert report.total_servers == 1
+    assert report.total_packages == 0
 
 
 def test_blast_radius_scoring():
@@ -136,6 +157,61 @@ def test_parse_empty_config():
     config = {}
     servers = parse_mcp_config(config, "/test/config.json")
     assert len(servers) == 0
+
+
+def test_parse_mcp_config_preserves_only_explicit_credential_identity_bindings():
+    """Credential names alone never imply a cloud identity relationship."""
+    config = {
+        "mcpServers": {
+            "deploy": {
+                "command": "node",
+                "args": ["deploy-agent.js"],
+                "env": {"AWS_ROLE_ARN": "arn:aws:iam::123456789012:role/deploy"},
+                "identityBindings": [
+                    {
+                        "credentialRef": "AWS_ROLE_ARN",
+                        "identityCanonicalId": "managed_identity:aws:123456789012:role/deploy",
+                        "evidenceSource": "mcp-config:identityBindings",
+                        "provider": "AWS",
+                    },
+                    {
+                        "credentialRef": "MISSING",
+                        "identityCanonicalId": "managed_identity:aws:123456789012:role/missing",
+                        "evidenceSource": "mcp-config:identityBindings",
+                    },
+                    {"credentialRef": "AWS_ROLE_ARN"},
+                ],
+            }
+        }
+    }
+
+    [server] = parse_mcp_config(config, "/tmp/mcp.json")
+
+    assert [binding.to_dict() for binding in server.identity_bindings] == [
+        {
+            "credential_ref": "AWS_ROLE_ARN",
+            "identity_canonical_id": "managed_identity:aws:123456789012:role/deploy",
+            "evidence_source": "mcp-config:identityBindings",
+            "provider": "aws",
+        }
+    ]
+
+
+def test_parse_mcp_config_does_not_infer_identity_from_environment_names():
+    [server] = parse_mcp_config(
+        {
+            "mcpServers": {
+                "deploy": {
+                    "command": "node",
+                    "args": ["deploy-agent.js"],
+                    "env": {"AWS_ROLE_ARN": "arn:aws:iam::123456789012:role/deploy"},
+                }
+            }
+        },
+        "/tmp/mcp.json",
+    )
+
+    assert server.identity_bindings == []
 
 
 # ─── Parser Tests ───────────────────────────────────────────────────────────

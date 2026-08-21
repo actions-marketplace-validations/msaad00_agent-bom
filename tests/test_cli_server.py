@@ -453,6 +453,18 @@ def test_serve_cmd_requires_clickhouse_url_for_backend():
 # ---------------------------------------------------------------------------
 
 
+def test_mcp_server_help_does_not_require_an_optional_extra():
+    runner = CliRunner()
+
+    result = runner.invoke(mcp_server_cmd, ["--help"])
+
+    assert result.exit_code == 0
+    assert "pip install 'agent-bom[mcp-server]'" not in result.output
+    assert "included in the standard agent-bom install" in result.output
+    assert "--profile [guided|full]" in result.output
+    assert "guided" in result.output
+
+
 def test_mcp_server_cmd_invalid_port_is_usage_error():
     runner = CliRunner()
     result = runner.invoke(mcp_server_cmd, ["--port", "99999"])
@@ -520,7 +532,7 @@ def test_mcp_server_cmd_allows_remote_bind_with_bearer_token():
         )
 
     assert result.exit_code == 0
-    mock_create.assert_called_once_with(host="0.0.0.0", port=8423, bearer_token="test-token")
+    mock_create.assert_called_once_with(host="0.0.0.0", port=8423, bearer_token="test-token", profile="guided")
     mock_server.run.assert_called_once_with(transport="sse")
     assert "Bearer token required" in result.output
     assert "Transport" in result.output

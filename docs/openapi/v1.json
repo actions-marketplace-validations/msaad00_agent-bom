@@ -3034,6 +3034,11 @@
             "title": "Findings",
             "type": "array"
           },
+          "graph_snapshot_id": {
+            "default": "showcase",
+            "title": "Graph Snapshot Id",
+            "type": "string"
+          },
           "primary_correlation": {
             "$ref": "#/components/schemas/EnterpriseCorrelation"
           },
@@ -6118,6 +6123,18 @@
             "$ref": "#/components/schemas/ReportFormat",
             "default": "ndjson"
           },
+          "owner": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner"
+          },
           "provider": {
             "anyOf": [
               {
@@ -6174,6 +6191,22 @@
               }
             ],
             "title": "Severity"
+          },
+          "sla": {
+            "anyOf": [
+              {
+                "enum": [
+                  "overdue",
+                  "due",
+                  "unassigned"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sla"
           },
           "sort": {
             "default": "effective_reach",
@@ -18023,6 +18056,18 @@
             }
           },
           {
+            "description": "Group vulnerability occurrences by advisory and package while preserving asset-scoped rows",
+            "in": "query",
+            "name": "group_occurrences",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Group vulnerability occurrences by advisory and package while preserving asset-scoped rows",
+              "title": "Group Occurrences",
+              "type": "boolean"
+            }
+          },
+          {
             "description": "Compliance framework drill-through, e.g. soc2 / nist-csf (compliance section id)",
             "in": "query",
             "name": "framework",
@@ -18058,6 +18103,44 @@
               ],
               "description": "Framework control code, narrows within framework (e.g. CC6.1)",
               "title": "Control"
+            }
+          },
+          {
+            "in": "query",
+            "name": "owner",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Owner"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sla",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "overdue",
+                    "due",
+                    "unassigned"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Sla"
             }
           },
           {
@@ -18516,6 +18599,76 @@
       "get": {
         "description": "Export signed OpenVEX for eligible tenant-scoped not_affected triage decisions.",
         "operationId": "export_finding_triage_vex_v1_findings_triage_vex_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "assignee",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Assignee"
+            }
+          },
+          {
+            "in": "query",
+            "name": "package",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Package"
+            }
+          },
+          {
+            "in": "query",
+            "name": "vulnerability_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Vulnerability Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "server_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Server Name"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -18528,6 +18681,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "Export Finding Triage Vex",

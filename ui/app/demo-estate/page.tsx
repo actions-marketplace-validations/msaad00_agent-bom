@@ -17,9 +17,11 @@ import {
 } from "lucide-react";
 
 import { StatStrip } from "@/components/stat-strip";
+import { PaginationBar } from "@/components/pagination-bar";
 import { PersonaStartRoutes } from "@/components/persona-start-routes";
 import { PageErrorState, PageLoadingState } from "@/components/states/page-state";
 import { api, type EnterpriseDemoStory } from "@/lib/api";
+import { securityGraphHref } from "@/lib/page-links";
 
 const FIRST_COMMAND = "agent-bom serve --demo-estate --allow-insecure-no-auth";
 const DISPLAY_LABELS: Record<string, string> = {
@@ -46,6 +48,8 @@ const SEVERITY_CHIP: Record<string, string> = {
   unrated: "border-[color:var(--border-subtle)] bg-[color:var(--surface-muted)] text-[color:var(--text-secondary)]",
 };
 const MAX_CONTROL_CHIPS = 3;
+const CORRELATIONS_PER_PAGE = 6;
+type StoryView = "posture" | "evidence" | "correlations";
 
 function words(value: string): string {
   return DISPLAY_LABELS[value] ?? value.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
@@ -69,6 +73,8 @@ function displayTime(value: string): string {
 export default function DemoEstatePage() {
   const [story, setStory] = useState<EnterpriseDemoStory | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [storyView, setStoryView] = useState<StoryView>("posture");
+  const [correlationPage, setCorrelationPage] = useState(1);
 
   useEffect(() => {
     let active = true;
@@ -115,6 +121,14 @@ export default function DemoEstatePage() {
 
   const primary = story.primary_correlation;
   const posture = story.finding_summary;
+  const correlationPages = Math.max(
+    1,
+    Math.ceil(story.correlations.length / CORRELATIONS_PER_PAGE),
+  );
+  const displayedCorrelations = story.correlations.slice(
+    (correlationPage - 1) * CORRELATIONS_PER_PAGE,
+    correlationPage * CORRELATIONS_PER_PAGE,
+  );
 
   return (
     <div className="space-y-6" data-testid="demo-estate-page">
@@ -136,7 +150,7 @@ export default function DemoEstatePage() {
               {story.scenario}
             </p>
             <div className="mt-5 flex flex-wrap gap-2">
-              <Link className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-500" href="/security-graph">
+              <Link className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-500" href={securityGraphHref({ scan: story.graph_snapshot_id })}>
                 Open security graph <ExternalLink className="h-3.5 w-3.5" />
               </Link>
               <Link className="inline-flex items-center gap-2 rounded-lg border border-[color:var(--border-subtle)] bg-[color:var(--surface-elevated)] px-3 py-2 text-sm font-medium text-[color:var(--foreground)] hover:border-[color:var(--border-strong)]" href="/traces">
@@ -204,10 +218,47 @@ export default function DemoEstatePage() {
 
       <PersonaStartRoutes />
 
-      <section
-        className="rounded-2xl border border-[color:var(--border-subtle)] bg-[color:var(--surface)] p-5 elev-1"
-        data-testid="demo-estate-posture"
+      <nav
+        aria-label="Enterprise story views"
+        className="flex flex-wrap gap-2 rounded-2xl border border-[color:var(--border-subtle)] bg-[color:var(--surface)] p-2 elev-1"
+        role="tablist"
       >
+        {([
+          ["posture", "Risk posture"],
+          ["evidence", "Evidence timeline"],
+          ["correlations", "Correlations"],
+        ] as const).map(([view, label]) => {
+          const selected = storyView === view;
+          return (
+            <button
+              key={view}
+              type="button"
+              role="tab"
+              aria-controls={`demo-estate-${view}-panel`}
+              aria-selected={selected}
+              onClick={() => setStoryView(view)}
+              className={`rounded-xl px-4 py-2 text-sm font-medium transition ${
+                selected
+                  ? "bg-emerald-600 text-white"
+                  : "text-[color:var(--text-secondary)] hover:bg-[color:var(--surface-elevated)] hover:text-[color:var(--foreground)]"
+              }`}
+            >
+              {label}
+            </button>
+          );
+        })}
+      </nav>
+
+      <div
+        id="demo-estate-posture-panel"
+        role="tabpanel"
+        aria-label="Risk posture"
+        hidden={storyView !== "posture"}
+      >
+      <section
+          className="rounded-2xl border border-[color:var(--border-subtle)] bg-[color:var(--surface)] p-5 elev-1"
+          data-testid="demo-estate-posture"
+        >
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div>
             <div className="flex items-center gap-2">
@@ -302,8 +353,16 @@ export default function DemoEstatePage() {
             </tbody>
           </table>
         </div>
-      </section>
+        </section>
+      </div>
 
+      <div
+        id="demo-estate-evidence-panel"
+        role="tabpanel"
+        aria-label="Evidence timeline"
+        hidden={storyView !== "evidence"}
+        data-testid="demo-estate-evidence-panel"
+      >
       <div className="grid gap-6 xl:grid-cols-[1.4fr_0.6fr]">
         <section className="rounded-2xl border border-[color:var(--border-subtle)] bg-[color:var(--surface)] p-5 elev-1">
           <div className="flex items-center gap-2">
@@ -366,8 +425,16 @@ export default function DemoEstatePage() {
             </dl>
           </section>
         </div>
+        </div>
       </div>
 
+      <div
+        id="demo-estate-correlations-panel"
+        role="tabpanel"
+        aria-label="Correlations"
+        hidden={storyView !== "correlations"}
+        data-testid="demo-estate-correlations-panel"
+      >
       <section className="rounded-2xl border border-[color:var(--border-subtle)] bg-[color:var(--surface)] p-5 elev-1">
         <h2 className="text-base font-semibold text-[color:var(--foreground)]">Cross-vendor correlations</h2>
         {/* The list is bounded so the incident stays findable at estate scale.
@@ -377,7 +444,7 @@ export default function DemoEstatePage() {
           Showing {story.correlations.length} of {story.summary.correlations} — the incident first. {story.summary.cross_source_correlations} span more than one evidence source.
         </p>
         <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-          {story.correlations.map((correlation) => (
+          {displayedCorrelations.map((correlation) => (
             <article key={correlation.correlation_id} className="rounded-xl border border-[color:var(--border-subtle)] bg-[color:var(--surface-muted)] p-4">
               <div className="flex items-start justify-between gap-3">
                 <div><div className="text-sm font-semibold text-[color:var(--foreground)]">{words(correlation.kind)}</div><div className="mt-1 font-mono text-[10px] text-[color:var(--text-tertiary)]">{shortId(correlation.trace_id)}</div></div>
@@ -388,7 +455,19 @@ export default function DemoEstatePage() {
             </article>
           ))}
         </div>
+        {correlationPages > 1 ? (
+          <PaginationBar
+            page={correlationPage}
+            totalPages={correlationPages}
+            totalItems={story.correlations.length}
+            itemLabel="correlations"
+            onPrevious={() => setCorrelationPage((page) => Math.max(1, page - 1))}
+            onNext={() => setCorrelationPage((page) => Math.min(correlationPages, page + 1))}
+            className="mt-4 border-t border-[color:var(--border-subtle)] pt-4"
+          />
+        ) : null}
       </section>
+      </div>
     </div>
   );
 }

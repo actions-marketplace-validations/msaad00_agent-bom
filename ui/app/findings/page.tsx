@@ -122,7 +122,9 @@ function collectUnifiedFindings(findings: UnifiedFinding[]): EnrichedVuln[] {
     ]);
     return {
       id: findingLabel,
-      finding_id: finding.id,
+      finding_id: finding.finding_id ?? finding.id,
+      finding_group_id: finding.finding_group_id,
+      finding_group_key: finding.finding_group_key,
       node_id: finding.node_id ?? undefined,
       finding_node_id: finding.finding_node_id ?? undefined,
       entity_type: finding.entity_type ?? undefined,
@@ -200,6 +202,8 @@ function collectUnifiedFindings(findings: UnifiedFinding[]): EnrichedVuln[] {
       scan_count: finding.scan_count,
       last_observed: finding.last_observed ?? finding.last_seen ?? undefined,
       occurrence_count: finding.occurrence_count ?? finding.scan_count,
+      occurrences: finding.occurrences,
+      occurrences_truncated: finding.occurrences_truncated,
       remediation_versions: finding.remediation_versions ?? undefined,
       provenance: finding.provenance ?? undefined,
       owner: finding.owner ?? undefined,
@@ -251,6 +255,7 @@ function FindingsPage() {
   const router = useRouter();
   const pathname = usePathname();
   const paramSeverity = searchParams.get("severity");
+  const paramFinding = searchParams.get("finding");
   const paramCve = searchParams.get("cve");
   const paramAgent = searchParams.get("agent");
   const paramQuery = searchParams.get("q");
@@ -265,6 +270,8 @@ function FindingsPage() {
   const paramProvider = searchParams.get("provider");
   const paramAccount = searchParams.get("account");
   const paramEnvironment = searchParams.get("environment");
+  const paramOwner = searchParams.get("owner");
+  const paramSla = searchParams.get("sla");
   // Compliance drill-through (epic #4790): a framework section id + optional
   // control code linked from the Compliance view's per-control finding count.
   const paramFramework = searchParams.get("framework");
@@ -279,7 +286,7 @@ function FindingsPage() {
   // matches the actual cause instead of always reading as a connect failure.
   const [errorKind, setErrorKind] = useState<"network" | "auth" | "forbidden">("network");
   const [filter, setFilter] = useState<SeverityFilter>(
-    paramSeverity && ["critical", "high", "medium", "low"].includes(paramSeverity)
+    paramSeverity && ["critical", "high", "medium", "low", "unrated"].includes(paramSeverity)
       ? (paramSeverity as SeverityFilter)
       : "all"
   );
@@ -295,6 +302,10 @@ function FindingsPage() {
   const [providerFilter, setProviderFilter] = useState<string>(paramProvider ?? "");
   const [accountFilter, setAccountFilter] = useState<string>(paramAccount ?? "");
   const [environmentFilter, setEnvironmentFilter] = useState<string>(paramEnvironment ?? "");
+  const [ownerFilter, setOwnerFilter] = useState<string>(paramOwner ?? "");
+  const [slaFilter, setSlaFilter] = useState<"" | "overdue" | "due" | "unassigned">(
+    paramSla === "overdue" || paramSla === "due" || paramSla === "unassigned" ? paramSla : "",
+  );
   const [frameworkFilter, setFrameworkFilter] = useState<string>(paramFramework ?? "");
   // A control code is only meaningful alongside a framework; it is cleared with it.
   const [controlFilter, setControlFilter] = useState<string>(paramFramework ? (paramControl ?? "") : "");
@@ -315,12 +326,14 @@ function FindingsPage() {
   const [triageError, setTriageError] = useState("");
   const [triageBusyKey, setTriageBusyKey] = useState<string | null>(null);
   const [vexExporting, setVexExporting] = useState(false);
-  const [selectedId, setSelectedId] = useState<string | null>(paramCve ?? null);
+  const [selectedId, setSelectedId] = useState<string | null>(paramFinding ?? paramCve ?? null);
   const [page, setPage] = useState(() => {
     const parsed = Number(paramPage ?? "1");
     return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 1;
   });
-  const [findingsTotal, setFindingsTotal] = useState<number | null>(0);
+  // The API owns the canonical total. ``null`` means it has not answered yet;
+  // initializing this to zero makes the loading state assert an all-clear count.
+  const [findingsTotal, setFindingsTotal] = useState<number | null>(null);
   const [findingsTotalApproximate, setFindingsTotalApproximate] = useState(false);
   const [findingFacets, setFindingFacets] = useState<FindingFacets | null>(null);
   const [findingFacetsApproximate, setFindingFacetsApproximate] = useState(false);
@@ -357,7 +370,7 @@ function FindingsPage() {
   // changes don't write to the URL, so these effects only fire on navigation.
   useEffect(() => {
     setFilter(
-      paramSeverity && ["critical", "high", "medium", "low"].includes(paramSeverity)
+      paramSeverity && ["critical", "high", "medium", "low", "unrated"].includes(paramSeverity)
         ? (paramSeverity as SeverityFilter)
         : "all",
     );
@@ -373,8 +386,8 @@ function FindingsPage() {
   }, [paramPage]);
 
   useEffect(() => {
-    if (paramCve) setSelectedId(paramCve);
-  }, [paramCve]);
+    setSelectedId(paramFinding ?? paramCve ?? null);
+  }, [paramFinding, paramCve]);
 
   useEffect(() => {
     if (paramIssueType && ISSUE_TYPE_FILTERS.some((entry) => entry.key === paramIssueType)) {
@@ -401,6 +414,11 @@ function FindingsPage() {
   }, [paramEnvironment]);
 
   useEffect(() => {
+    setOwnerFilter(paramOwner ?? "");
+    setSlaFilter(paramSla === "overdue" || paramSla === "due" || paramSla === "unassigned" ? paramSla : "");
+  }, [paramOwner, paramSla]);
+
+  useEffect(() => {
     setFrameworkFilter(paramFramework ?? "");
     setControlFilter(paramFramework ? (paramControl ?? "") : "");
   }, [paramFramework, paramControl]);
@@ -420,6 +438,7 @@ function FindingsPage() {
     // other posture deep links. Preserve it while synchronizing page-local
     // controls so navigation does not silently narrow or rewrite that scope.
     if (paramScope === "all") params.set("scope", "all");
+    if (selectedId) params.set("finding", selectedId);
     if (filter !== "all") params.set("severity", filter);
     if (issueTypeFilter !== "all") params.set("issue", issueTypeFilter);
     if (lens !== "ops") params.set("lens", lens);
@@ -428,6 +447,8 @@ function FindingsPage() {
     if (providerFilter.trim()) params.set("provider", providerFilter.trim());
     if (accountFilter.trim()) params.set("account", accountFilter.trim());
     if (environmentFilter.trim()) params.set("environment", environmentFilter.trim());
+    if (ownerFilter.trim()) params.set("owner", ownerFilter.trim());
+    if (slaFilter) params.set("sla", slaFilter);
     if (frameworkFilter.trim()) params.set("framework", frameworkFilter.trim());
     // A control code without a framework is meaningless — only sync it alongside.
     if (frameworkFilter.trim() && controlFilter.trim()) params.set("control", controlFilter.trim());
@@ -445,10 +466,13 @@ function FindingsPage() {
     providerFilter,
     accountFilter,
     environmentFilter,
+    ownerFilter,
+    slaFilter,
     frameworkFilter,
     controlFilter,
     windowDays,
     page,
+    selectedId,
     paramScope,
     paramScan,
     pathname,
@@ -555,14 +579,17 @@ function FindingsPage() {
       setError("");
       try {
         const currentCursor = pageCursors[page - 1] || undefined;
+        const findingQuery = search.trim() || paramFinding;
         const response = await api.listFindings({
           ...(paramScan ? { scanId: paramScan } : {}),
-          ...(search.trim() ? { query: search.trim() } : {}),
-          ...(filter !== "all" ? { severity: filter } : {}),
+          ...(findingQuery ? { query: findingQuery } : {}),
+          ...(filter !== "all" ? { severity: filter === "unrated" ? "unknown" : filter } : {}),
           ...(domainFilter !== "all" ? { domain: domainFilter } : {}),
           ...(providerFilter.trim() ? { provider: providerFilter.trim() } : {}),
           ...(accountFilter.trim() ? { account: accountFilter.trim() } : {}),
           ...(environmentFilter.trim() ? { environment: environmentFilter.trim() } : {}),
+          ...(ownerFilter.trim() ? { owner: ownerFilter.trim() } : {}),
+          ...(slaFilter ? { sla: slaFilter } : {}),
           ...(frameworkFilter.trim() ? { framework: frameworkFilter.trim() } : {}),
           ...(frameworkFilter.trim() && controlFilter.trim() ? { control: controlFilter.trim() } : {}),
           ...(issueTypeFilter !== "all" ? { findingClass: issueTypeFilter } : {}),
@@ -571,6 +598,7 @@ function FindingsPage() {
           ...(!currentCursor ? { offset: (page - 1) * PAGE_SIZE } : {}),
           ...(currentCursor ? { cursor: currentCursor } : {}),
           approximateTotal: true,
+          groupOccurrences: true,
           includeFacets: true,
           windowDays,
         });
@@ -595,6 +623,7 @@ function FindingsPage() {
     void loadFindings();
   }, [
     paramScan,
+    paramFinding,
     search,
     page,
     filter,
@@ -602,6 +631,8 @@ function FindingsPage() {
     providerFilter,
     accountFilter,
     environmentFilter,
+    ownerFilter,
+    slaFilter,
     frameworkFilter,
     controlFilter,
     issueTypeFilter,
@@ -692,6 +723,12 @@ function FindingsPage() {
     environmentFilter.trim()
       ? { key: "environment", label: `Env: ${environmentFilter.trim()}`, onClear: () => setEnvironmentFilter("") }
       : null,
+    ownerFilter.trim()
+      ? { key: "owner", label: `Owner: ${ownerFilter.trim()}`, onClear: () => setOwnerFilter("") }
+      : null,
+    slaFilter
+      ? { key: "sla", label: `SLA: ${slaFilter}`, onClear: () => setSlaFilter("") }
+      : null,
     // Compliance drill-through chips. Clearing the framework also clears the
     // control, since a control code without its framework is meaningless.
     frameworkFilter.trim()
@@ -714,6 +751,8 @@ function FindingsPage() {
     setProviderFilter("");
     setAccountFilter("");
     setEnvironmentFilter("");
+    setOwnerFilter("");
+    setSlaFilter("");
     setFrameworkFilter("");
     setControlFilter("");
   };
@@ -728,6 +767,11 @@ function FindingsPage() {
     { key: "high", label: `High${findingFacets ? ` (${findingFacets.severity.high})` : ""}`, color: "text-orange-400" },
     { key: "medium", label: `Medium${findingFacets ? ` (${findingFacets.severity.medium})` : ""}`, color: "text-yellow-400" },
     { key: "low", label: `Low${findingFacets ? ` (${findingFacets.severity.low})` : ""}`, color: "text-blue-400" },
+    {
+      key: "unrated",
+      label: `Unrated${findingFacets ? ` (${findingFacets.severity.unknown})` : ""}`,
+      color: "text-[var(--text-muted)]",
+    },
   ];
 
   return (
@@ -737,7 +781,7 @@ function FindingsPage() {
         title="Findings"
         subtitle={findingsPageSubtitle(
           lens,
-          `${findingsTotalLabel}${findingsTotal == null ? "" : " findings"}`,
+          `${findingsTotalLabel}${findingsTotal == null ? "" : " issues"}`,
           paramScan
             ? `from scan ${paramScan.slice(0, 8)}.`
             : `current state across completed scans · ${findingsWindowLabel}.`,
@@ -885,7 +929,7 @@ function FindingsPage() {
                   {findingsQueueTitle(lens)}
                 </span>
                 <span aria-hidden="true">·</span>
-                <span>{displayed.length} on this page</span>
+                <span>{displayed.length} issues on this page</span>
                 <span aria-hidden="true">·</span>
                 <span>{PAGE_SIZE} per page</span>
               </p>
@@ -1026,6 +1070,29 @@ function FindingsPage() {
                           className="rounded-lg border border-[color:var(--border-subtle)] bg-[color:var(--surface)] px-3 py-1.5 text-sm text-[color:var(--foreground)] placeholder-[color:var(--text-tertiary)] focus:border-[color:var(--border-strong)] focus:outline-none"
                         />
                       </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-[10px] font-medium uppercase tracking-[0.14em] text-[color:var(--text-tertiary)]">Owner</span>
+                        <input
+                          type="text"
+                          placeholder="e.g. payments-security"
+                          value={ownerFilter}
+                          onChange={(e) => setOwnerFilter(e.target.value)}
+                          className="rounded-lg border border-[color:var(--border-subtle)] bg-[color:var(--surface)] px-3 py-1.5 text-sm text-[color:var(--foreground)] placeholder-[color:var(--text-tertiary)] focus:border-[color:var(--border-strong)] focus:outline-none"
+                        />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-[10px] font-medium uppercase tracking-[0.14em] text-[color:var(--text-tertiary)]">SLA</span>
+                        <select
+                          value={slaFilter}
+                          onChange={(e) => setSlaFilter(e.target.value as "" | "overdue" | "due" | "unassigned")}
+                          className="rounded-lg border border-[color:var(--border-subtle)] bg-[color:var(--surface)] px-3 py-1.5 text-sm text-[color:var(--foreground)] focus:border-[color:var(--border-strong)] focus:outline-none"
+                        >
+                          <option value="">Any SLA</option>
+                          <option value="overdue">Overdue</option>
+                          <option value="due">Due later</option>
+                          <option value="unassigned">No SLA</option>
+                        </select>
+                      </div>
                       <div className="flex items-center justify-between gap-2 border-t border-[color:var(--border-subtle)] pt-2">
                         <button
                           type="button"
@@ -1141,7 +1208,7 @@ function FindingsPage() {
             totalPages={totalPages}
             totalItems={findingsTotal}
             hasMore={hasMoreFindings}
-            itemLabel={findingsTotalApproximate ? "findings (approx.)" : "findings"}
+            itemLabel={findingsTotalApproximate ? "issues (approx.)" : "issues"}
             onPrevious={() => setPage((p) => Math.max(1, p - 1))}
             onNext={() => {
               if (nextFindingsCursor) {

@@ -19,6 +19,20 @@ from agent_bom.cli._agent_mode import dumps_envelope, success_envelope, summariz
 from agent_bom.models import Agent, AgentType, BlastRadius, MCPServer, Package, Severity, Vulnerability
 from agent_bom.scanners import IncompleteScanError
 
+
+def test_cli_generates_vex_after_reachability_stamping():
+    """The CLI must not auto-triage before symbol evidence reaches findings."""
+    from inspect import getsource
+
+    from agent_bom.cli.agents.scan_cmd import scan
+
+    source = getsource(scan.callback)
+    stamp_index = source.index("apply_symbol_reachability_to_blast_radii")
+    vex_index = source.index("_vex_doc = generate_vex(report, auto_triage=True)")
+
+    assert stamp_index < vex_index
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -712,6 +726,98 @@ def test_scan_sbom_does_not_merge_ambient_skill_packages(tmp_path, monkeypatch):
     assert packages == {("axios", "1.6.0", "npm")}
     assert [agent["name"] for agent in report["agents"]] == ["sbom:bom.cdx"]
     assert "Scanning 1 skill file" not in result.output
+
+
+def test_scan_sbom_with_embedded_vulnerability_never_prints_clean_stage_message(tmp_path, monkeypatch):
+    sbom = tmp_path / "vulnerable.cdx.json"
+    sbom.write_text(
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "specVersion": "1.5",
+                "components": [
+                    {
+                        "type": "library",
+                        "bom-ref": "pkg:pypi/flask@2.0.0",
+                        "name": "flask",
+                        "version": "2.0.0",
+                        "purl": "pkg:pypi/flask@2.0.0",
+                    }
+                ],
+                "vulnerabilities": [
+                    {
+                        "id": "CVE-2026-0001",
+                        "ratings": [{"severity": "high"}],
+                        "affects": [{"ref": "pkg:pypi/flask@2.0.0"}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("agent_bom.cli.agents.scan_agents_sync", lambda *args, **kwargs: [])
+
+    result = _run(
+        [
+            "scan",
+            "--sbom",
+            str(sbom),
+            "--no-discover",
+            "--offline",
+            "--no-auto-update-db",
+            "--format",
+            "console",
+            "--no-color",
+        ]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Offline scan complete: no known vulnerabilities found in local data" not in result.output
+    assert "retained 1 vulnerability" in result.output.lower()
+    assert "no vulnerabilities found" not in result.output.lower()
+    assert "supply chain looks clean" not in result.output.lower()
+
+
+def test_scan_console_report_stdout_keeps_phase_diagnostics_on_stderr(tmp_path, monkeypatch):
+    sbom = tmp_path / "bom.cdx.json"
+    sbom.write_text(
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "specVersion": "1.5",
+                "components": [
+                    {
+                        "type": "library",
+                        "name": "flask",
+                        "version": "2.0.0",
+                        "purl": "pkg:pypi/flask@2.0.0",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("agent_bom.cli.agents.scan_agents_sync", lambda *args, **kwargs: [])
+
+    result = _run(
+        [
+            "scan",
+            "--sbom",
+            str(sbom),
+            "--offline",
+            "--no-auto-update-db",
+            "--format",
+            "console",
+            "--no-color",
+        ]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Summary" in result.stdout
+    assert "Discovery" not in result.stdout
+    assert "Vulnerability Scan" not in result.stdout
+    assert "Discovery" in result.stderr
+    assert "Vulnerability Scan" in result.stderr
 
 
 def test_scan_inventory_only_round_trips_scan_report_snapshot_without_accretion(tmp_path):
@@ -1473,6 +1579,37 @@ def test_zero_finding_partial_secret_scan_is_preserved_and_fails_closed(monkeypa
     ]
 
 
+def test_model_scan_refusal_is_preserved_and_fails_closed(tmp_path):
+    output = tmp_path / "model-refusal.json"
+
+    result = _run(
+        [
+            "scan",
+            "--no-scan",
+            "--offline",
+            "--no-auto-update-db",
+            "--model-files",
+            "/etc",
+            "--format",
+            "json",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result.exit_code != 0, result.output
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["scan_run"]["outcome"] == "partial"
+    issues = payload["scan_run"]["issues"]
+    assert len(issues) == 2
+    assert {issue["source"] for issue in issues} == {"model-scan"}
+    assert {issue["code"] for issue in issues} == {"scanner_coverage_gap"}
+    assert all(issue["affects_coverage"] is True for issue in issues)
+    assert any(issue["message"].startswith("Model scan:") for issue in issues)
+    assert any(issue["message"].startswith("Model manifest scan:") for issue in issues)
+    assert "escapes safe scan roots" in payload["scan_run"]["issues"][0]["message"]
+
+
 @pytest.mark.parametrize(
     ("patch_target", "source"),
     [
@@ -1939,6 +2076,31 @@ def test_scan_format_graph_html_writes_file(tmp_path):
     assert result.exit_code == 0
     assert out.exists(), "graph-html output file was not created"
     assert "<html" in out.read_text().lower()
+
+
+def test_scan_format_graph_html_writes_nested_graph_html_extension(tmp_path):
+    """The format-specific suffix should work and create missing parents."""
+    out = tmp_path / "nested" / "mcp.graph-html"
+    with (
+        patch("agent_bom.cli.agents.scan_agents_sync", return_value=([], [])),
+        patch("agent_bom.cli.agents.resolve_all_versions_sync", return_value=[]),
+    ):
+        result = _run(["scan", "--demo", "--format", "graph-html", "--output", str(out), "--no-scan"])
+    assert result.exit_code == 0, result.output
+    assert out.exists(), "nested graph-html output file was not created"
+    assert "<html" in out.read_text(encoding="utf-8").lower()
+
+
+def test_scan_infers_graph_html_from_graph_html_extension(tmp_path):
+    out = tmp_path / "nested" / "mcp.graph-html"
+    with (
+        patch("agent_bom.cli.agents.scan_agents_sync", return_value=([], [])),
+        patch("agent_bom.cli.agents.resolve_all_versions_sync", return_value=[]),
+    ):
+        result = _run(["scan", "--demo", "--output", str(out), "--no-scan"])
+    assert result.exit_code == 0, result.output
+    assert out.exists()
+    assert "<html" in out.read_text(encoding="utf-8").lower()
 
 
 def test_scan_format_graph_html_offline_omits_cdn_scripts(tmp_path):

@@ -117,6 +117,61 @@ def test_mcp_server_tool_names():
     assert names == {t["name"] for t in _SERVER_CARD_TOOLS}
 
 
+def test_guided_mcp_profile_exposes_only_workflow_tools():
+    """The guided profile keeps the first agent turn focused and bounded."""
+    import json
+
+    from agent_bom.mcp_server import _GUIDED_TOOL_NAMES, create_mcp_server
+
+    full_tools = _run(create_mcp_server(profile="full").list_tools())
+    guided_tools = _run(create_mcp_server(profile="guided").list_tools())
+    guided_names = {tool.name for tool in guided_tools}
+
+    assert guided_names == _GUIDED_TOOL_NAMES
+    assert len(guided_tools) < len(full_tools) / 2
+    full_payload = json.dumps([tool.model_dump(by_alias=True) for tool in full_tools], separators=(",", ":"))
+    guided_payload = json.dumps([tool.model_dump(by_alias=True) for tool in guided_tools], separators=(",", ":"))
+    assert len(guided_payload) < len(full_payload) / 2
+
+
+def test_guided_mcp_profile_covers_every_documented_workflow_dependency():
+    from agent_bom.mcp_server import _GUIDED_TOOL_NAMES
+
+    workflow_dependencies = {
+        "scan",
+        "exposure_paths",
+        "compliance",
+        "check",
+        "registry_lookup",
+        "should_i_deploy",
+        "audit_integrity",
+        "fleet_scan",
+        "context_graph",
+        "policy_check",
+        "intel_lookup",
+        "runtime_correlate",
+        "remediate",
+        "generate_sbom",
+        "cloud_inventory",
+        "cis_benchmark",
+        "graph_export",
+        "gateway_status",
+        "proxy_alerts",
+        "firewall_check",
+    }
+
+    assert workflow_dependencies <= _GUIDED_TOOL_NAMES
+
+
+def test_unknown_mcp_profile_is_rejected():
+    import pytest
+
+    from agent_bom.mcp_server import create_mcp_server
+
+    with pytest.raises(ValueError, match="Unknown MCP tool profile"):
+        create_mcp_server(profile="everything")
+
+
 def test_create_mcp_server_enables_static_bearer_auth():
     """create_mcp_server should wire FastMCP auth when a bearer token is configured."""
     from agent_bom.mcp_server import _StaticBearerTokenVerifier, create_mcp_server
@@ -439,6 +494,42 @@ def test_scan_pipeline_builds_inventory_from_npx_package(monkeypatch):
     assert server.packages[0].declared_version == "latest"
     assert server.packages[0].floating_reference is True
     assert any("pass @modelcontextprotocol/server-filesystem@version" in warning for warning in warnings)
+
+
+def test_scan_pipeline_no_discover_excludes_ambient_agents(monkeypatch, tmp_path):
+    from agent_bom.mcp_server_scan import run_scan_pipeline
+
+    def _unexpected_discovery(*_args, **_kwargs):
+        raise AssertionError("ambient discovery must be disabled")
+
+    async def _fake_scan_agents(agents, *, options):
+        return []
+
+    monkeypatch.setattr("agent_bom.discovery.discover_all", _unexpected_discovery)
+    monkeypatch.setattr("agent_bom.scanners.scan_agents", _fake_scan_agents)
+
+    agents, _blast_radii, _warnings, scan_sources = _run(
+        run_scan_pipeline(
+            safe_path=lambda value: Path(value),
+            config_path=str(tmp_path),
+            no_discover=True,
+            offline=True,
+        )
+    )
+
+    assert agents == []
+    assert "agent_discovery" not in scan_sources
+
+
+@patch("agent_bom.mcp_server._run_scan_pipeline")
+def test_scan_tool_forwards_no_discover_for_deterministic_scope(mock_pipeline):
+    mock_pipeline.return_value = ([], [], [], [])
+    from agent_bom.mcp_server import create_mcp_server
+
+    result = _call_tool(create_mcp_server(), "scan", {"config_path": ".", "no_discover": True})
+
+    assert result["status"] == "no_agents_found"
+    assert mock_pipeline.call_args.kwargs["no_discover"] is True
 
 
 @patch("agent_bom.mcp_server._run_scan_pipeline")
@@ -1551,8 +1642,33 @@ def test_truncate_response_over_limit():
 
     long_str = "x" * (_MAX_RESPONSE_CHARS + 1000)
     result = _truncate_response(long_str)
-    assert len(result) < len(long_str)
-    assert "_truncated" in result
+    payload = json.loads(result)
+
+    assert len(result) <= _MAX_RESPONSE_CHARS
+    assert payload["_truncated"] is True
+    assert payload["original_length"] == len(long_str)
+    assert f"{_MAX_RESPONSE_CHARS:,}" in payload["message"]
+    assert payload["preview"]
+
+
+def test_truncate_response_accounts_for_json_escaping():
+    from agent_bom.mcp_server_runtime import truncate_response
+
+    result = truncate_response('"\\\n' * 500, 256)
+
+    assert len(result) <= 256
+    assert json.loads(result)["_truncated"] is True
+
+
+@pytest.mark.parametrize("limit", [0, 1, 2, 8])
+def test_truncate_response_keeps_tiny_custom_limits_parseable(limit):
+    from agent_bom.mcp_server_runtime import truncate_response
+
+    result = truncate_response("x" * 100, limit)
+
+    assert len(result) <= limit
+    if result:
+        json.loads(result)
 
 
 def test_safe_path_valid(tmp_path):

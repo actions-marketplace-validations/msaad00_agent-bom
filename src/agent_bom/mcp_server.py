@@ -160,6 +160,55 @@ _ToolReturn = TypeVar("_ToolReturn")
 # read metadata directly from `agent_bom.mcp_server`.
 _SERVER_CARD_PROMPTS = _METADATA_SERVER_CARD_PROMPTS
 _SERVER_CARD_TOOLS = _METADATA_SERVER_CARD_TOOLS
+
+# The guided profile is the default human/agent front door.  It contains every
+# tool referenced by the eight shipped workflow prompts plus the three asset
+# inventory drill-downs.  Programmatic callers keep the historical full
+# catalog unless they explicitly request this profile.
+_GUIDED_TOOL_NAMES = frozenset(
+    {
+        "audit_integrity",
+        "check",
+        "cis_benchmark",
+        "cloud_inventory",
+        "compliance",
+        "context_graph",
+        "exposure_paths",
+        "firewall_check",
+        "fleet_scan",
+        "gateway_status",
+        "generate_sbom",
+        "graph_export",
+        "intel_lookup",
+        "inventory_asset",
+        "inventory_list",
+        "inventory_summary",
+        "policy_check",
+        "proxy_alerts",
+        "registry_lookup",
+        "remediate",
+        "runtime_correlate",
+        "scan",
+        "should_i_deploy",
+    }
+)
+_MCP_TOOL_PROFILES = {"guided": _GUIDED_TOOL_NAMES, "full": frozenset(str(tool["name"]) for tool in _SERVER_CARD_TOOLS)}
+
+
+def _apply_mcp_tool_profile(mcp: Any, profile: str) -> None:
+    """Limit the live FastMCP registry to one documented tool profile."""
+    selected = _MCP_TOOL_PROFILES.get(profile)
+    if selected is None:
+        choices = ", ".join(sorted(_MCP_TOOL_PROFILES))
+        raise ValueError(f"Unknown MCP tool profile {profile!r}; expected one of: {choices}")
+    if profile == "full":
+        return
+    registered = mcp._tool_manager._tools
+    for name in tuple(registered):
+        if name not in selected:
+            del registered[name]
+
+
 build_server_card = _metadata_build_server_card
 
 # ---------------------------------------------------------------------------
@@ -505,6 +554,7 @@ async def _run_scan_pipeline(
     transitive: bool = False,
     offline: bool = False,
     ecosystem: Optional[str] = None,
+    no_discover: bool = False,
 ):
     """Run discovery -> extraction -> scanning and return (agents, blast_radii, warnings)."""
     return await _mcp_scan.run_scan_pipeline(
@@ -517,6 +567,7 @@ async def _run_scan_pipeline(
         transitive=transitive,
         offline=offline,
         ecosystem=ecosystem,
+        no_discover=no_discover,
     )
 
 
@@ -532,7 +583,13 @@ def _persisted_finding_evidence(*, tenant_id: str, cve_id: str, scan_id: str | N
 # ---------------------------------------------------------------------------
 
 
-def create_mcp_server(*, host: str = "127.0.0.1", port: int = 8000, bearer_token: str | None = None):
+def create_mcp_server(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    bearer_token: str | None = None,
+    profile: str = "full",
+):
     """Create and configure the agent-bom MCP server with all tools.
 
     When the smithery SDK is installed, the server is automatically enhanced
@@ -601,11 +658,21 @@ def create_mcp_server(*, host: str = "127.0.0.1", port: int = 8000, bearer_token
             Field(
                 description=(
                     "Local directory to scan — a project root or an MCP client config "
-                    "directory. Auto-discovers all installed MCP clients if omitted. "
+                    "directory. Auto-discovers installed MCP clients if omitted unless "
+                    "no_discover=true. "
                     "Mutually exclusive with repo_url."
                 )
             ),
         ] = None,
+        no_discover: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Disable ambient host MCP-client discovery. Explicit repo/config, image, "
+                    "SBOM, and package targets are still scanned; use this for deterministic CI."
+                )
+            ),
+        ] = False,
         image: Annotated[str | None, Field(description="Docker image to scan (e.g. 'nginx:1.25', 'ghcr.io/org/app:v1').")] = None,
         sbom_path: Annotated[str | None, Field(description="Path to existing CycloneDX or SPDX JSON SBOM file to ingest.")] = None,
         package: Annotated[
@@ -701,6 +768,7 @@ def create_mcp_server(*, host: str = "127.0.0.1", port: int = 8000, bearer_token
             "scan",
             scan_impl,
             config_path=config_path,
+            no_discover=no_discover,
             repo_url=repo_url,
             image=image,
             sbom_path=sbom_path,
@@ -1386,6 +1454,8 @@ def create_mcp_server(*, host: str = "127.0.0.1", port: int = 8000, bearer_token
     if activated:
         logger.info("Activated %d third-party MCP tool plugin(s): %s", len(activated), ", ".join(sorted(activated)))
         harden_tool_arguments(mcp)
+
+    _apply_mcp_tool_profile(mcp, profile)
 
     return mcp
 
