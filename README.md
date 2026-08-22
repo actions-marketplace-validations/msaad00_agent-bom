@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/msaad00/agent-bom/main/docs/images/logo-dark.svg">
-    <img src="https://raw.githubusercontent.com/msaad00/agent-bom/main/docs/images/logo-light.svg" alt="agent-bom" width="320" />
-  </picture>
+  <img src="https://raw.githubusercontent.com/msaad00/agent-bom/main/docs/images/social-preview.svg" alt="agent-bom — Discover. Scan. Correlate. Graph. Security evidence across code, AI agents, MCP, cloud, and containers." width="960" />
 </p>
 
 <p align="center">
@@ -102,6 +99,22 @@ agent-bom scan .
 The repository scan shows inventory, findings, and reachable impact.
 `agent-bom scan .` and `agent-bom scan -p .` are the same command; `PATH` is an
 alias for `--project`.
+
+Need a disconnected scan? Seed the smallest package-advisory database first:
+
+```bash
+agent-bom db update --osv-ecosystem PyPI
+agent-bom scan . --offline
+```
+
+On a fresh database, that command covers only the selected ecosystem; packages
+from other ecosystems remain explicit offline coverage gaps. Repeat
+`--osv-ecosystem` for a polyglot repository, or use
+`agent-bom db update --source osv` for OSV's all-ecosystems archive. The full
+archive can exceed 1 GB, may take several minutes, and shows live progress with
+the exact total when the server supplies it. Run the broader
+`agent-bom db update` when you also need distro, exploit-probability, and
+known-exploited-vulnerability feeds.
 
 **A non-zero exit is a verdict, not a crash.** `scan` exits `0` when nothing
 matched a gate, and `1` when one did — a `--fail-on-*` threshold you set, a

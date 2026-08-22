@@ -85,6 +85,16 @@ def test_readme_keeps_one_readable_product_proof_and_links_the_gallery() -> None
         assert diagram not in readme
 
 
+def test_readme_leads_with_discover_scan_correlate_graph_brand_header() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    header = readme.split("<!-- mcp-name:", 1)[0]
+
+    assert "docs/images/social-preview.svg" in header
+    assert "Discover. Scan. Correlate. Graph." in header
+    assert "logo-dark.svg" not in header
+    assert header.index("social-preview.svg") < header.index("img.shields.io")
+
+
 def test_gallery_retains_full_size_product_screens() -> None:
     gallery = (ROOT / "docs" / "GALLERY.md").read_text(encoding="utf-8")
 
@@ -107,6 +117,16 @@ def test_persona_routes_start_with_their_actual_work() -> None:
     assert "| Security engineer | `agent-bom scan . -f sarif -o findings.sarif`" in personas
     assert "| Platform / DevOps | `pip install 'agent-bom[ui]' && agent-bom serve`" in personas
     assert "owner and sla" in personas.lower()
+
+
+def test_readme_offline_bootstrap_leads_with_truthful_ecosystem_scope() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    offline = readme.split("Need a disconnected scan?", 1)[1].split("**A non-zero exit", 1)[0]
+
+    assert "agent-bom db update --osv-ecosystem PyPI" in offline
+    assert "covers only" in offline.lower()
+    assert "selected ecosystem" in offline.lower()
+    assert offline.index("--osv-ecosystem PyPI") < offline.index("--source osv")
 
 
 def test_docs_home_leads_with_product_value_and_attack_path_proof() -> None:
