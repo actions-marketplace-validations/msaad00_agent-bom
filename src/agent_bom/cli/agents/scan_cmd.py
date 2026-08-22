@@ -299,6 +299,7 @@ def scan(
     scorecard_flag: bool,
     quiet: bool,
     fail_on_severity: Optional[str],
+    exit_zero: bool,
     warn_on_severity: Optional[str],
     fail_on_kev: bool,
     fail_on_malicious: bool,
@@ -639,7 +640,17 @@ def scan(
     elif preset == "quick":
         transitive = False
         enrich = False
-    elif preset == "workstation":
+
+    # A critical vulnerability is a failed security verdict by default. The
+    # explicit escape hatch is deliberately limited to vulnerability severity:
+    # malicious packages, policy failures, and incomplete evidence remain
+    # fail-closed in ``compute_exit_code``.
+    if exit_zero:
+        fail_on_severity = None
+    elif fail_on_severity is None:
+        fail_on_severity = "critical"
+
+    if preset == "workstation":
         browser_extensions = True
         os_packages = True
         include_processes = True
@@ -3206,7 +3217,11 @@ def scan(
         fail_if_ai_risk=fail_if_ai_risk,
         push_url=push_url,
         push_api_key=push_api_key,
-        quiet=quiet,
+        # Structured renderers own stdout only when no output file is selected.
+        # Their non-zero verdict is carried by the process status and report
+        # fields; human gate explanations after the document would make the
+        # JSON/SARIF stream invalid. File output keeps the console explanation.
+        quiet=quiet or (output_format != "console" and output in {None, "-"}),
     )
 
     if agent_mode:
