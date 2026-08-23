@@ -29,7 +29,8 @@
 data platforms, MCP servers, and runtime activity, then normalizes the evidence
 into one Finding + UnifiedGraph model for prioritized investigation and action.
 
-Blast radius connects a package finding to the AI surfaces that can reach it:
+Blast radius starts at an agent or MCP tool entrypoint and connects a package
+finding to the AI surfaces that can reach it:
 
 ```text
 package
@@ -43,6 +44,12 @@ package
 The terminal report shows this attack path for human review. MCP clients can
 query the same evidence through `exposure_paths` and use `should_i_deploy` for
 a bounded pre-deployment verdict.
+
+**Measured matcher proof:** the committed, mutation-tested range benchmark
+currently covers 207 comparable OSV advisories, 19,161 affected-version checks,
+and 576 fixed-version checks with zero false negatives and zero false positives.
+[Method and machine-readable result](docs/CVE_MATCHING_ACCURACY.json). This is a
+reproducible range-matcher baseline, not a universal scanner-accuracy claim.
 
 - **Run where you deploy:** the same deterministic scanner produces findings, SARIF, SBOMs, HTML reports, and graph exports on a workstation, in CI, in Docker/Kubernetes, or in your control plane.
 - **Centralize when ready:** self-host fleet, browser, compliance, and audit evidence inside your cloud and identity boundary.
@@ -109,6 +116,10 @@ agent-bom db update --osv-ecosystem PyPI
 agent-bom scan . --offline
 ```
 
+If that database is missing or unreadable, the scan writes a partial artifact
+when `-o` is set and exits `1`; CI therefore cannot mistake unavailable
+advisory coverage for a clean scan.
+
 On a fresh database, that command covers only the selected ecosystem; packages
 from other ecosystems remain explicit offline coverage gaps. Repeat
 `--osv-ecosystem` for a polyglot repository, or use
@@ -126,6 +137,32 @@ in full either way, and the last line names the gate that matched. Full
 
 Save an artifact with `agent-bom scan . -f sarif -o findings.sarif`, or follow
 the [first-run guide](docs/FIRST_RUN.md) for formats and CI use.
+
+### Daily developer loop
+
+Try the scanner without installing it, then check a package before adding it:
+
+```bash
+uvx agent-bom scan .
+uvx agent-bom check requests@2.33.0 --ecosystem pypi
+```
+
+`check` returns an allow/unsafe/incomplete pre-install verdict; `scan` covers the
+repository plus discovered AI/MCP configuration. To make both dependency and
+secret gates automatic for a team, pin the shipped consumer hooks:
+
+```yaml
+repos:
+  - repo: https://github.com/msaad00/agent-bom
+    rev: v0.102.0
+    hooks:
+      - id: agent-bom-secrets
+      - id: agent-bom-scan
+```
+
+Run `pre-commit install` once. The hooks install agent-bom into their own
+isolated environment, so contributors do not need a separate global install.
+[Hook behavior and CI examples](docs/DEPLOYMENT.md#pre-commit-hook).
 
 <details>
 <summary><b>Expansion paths — pick one only after the front door works</b></summary>
