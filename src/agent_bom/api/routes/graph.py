@@ -57,6 +57,7 @@ from agent_bom.graph import (
     UnifiedNode,
 )
 from agent_bom.graph.completeness import bounded_walk_reason, graph_completeness
+from agent_bom.graph.reachability_truth import node_reachability
 from agent_bom.graph.rollup import ROLLUP_CONTAINMENT_RELATIONSHIPS, ROLLUP_RELATIONSHIPS
 from agent_bom.graph.scope import GraphScopeKind, select_observed_scope
 from agent_bom.graph.semantic_clusters import SEMANTIC_CLUSTER_KINDS, build_semantic_clusters, semantic_cluster_stats
@@ -85,6 +86,8 @@ _GRAPH_QUERY_DEFAULT_BUDGET = {
 _FILTERED_GRAPH_ATTACK_PATH_LIMIT = 100
 _GOVERNANCE_EDGE_LIMIT = 5_000
 _GOVERNANCE_ATTACK_PATH_LIMIT = 100
+
+_EdgeLookup = dict[tuple[str, str], UnifiedEdge]
 
 
 class GraphScopeDescriptor(BaseModel):
@@ -163,6 +166,16 @@ _ATTACK_PATH_ITEM_OPENAPI_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "exposure_path": None,  # filled after _EXPOSURE_PATH_OPENAPI_SCHEMA is defined
+        "reachability": {
+            "type": "string",
+            "enum": ["confirmed", "likely", "unlikely", "unknown"],
+            "description": "Evidence strength for whether the path is executable; structural topology alone is unknown.",
+        },
+        "reachability_basis": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Machine-readable evidence that produced the reachability verdict.",
+        },
         "technique_mappings": {"type": "array", "items": _TECHNIQUE_MAPPING_OPENAPI_SCHEMA},
         "mitre_technique_ids": {
             "type": "array",
@@ -198,6 +211,8 @@ _EXPOSURE_PATH_OPENAPI_SCHEMA: dict[str, Any] = {
         "dependencyContext": {"type": "object", "additionalProperties": True},
         "evidence": {"type": "object", "additionalProperties": True},
         "provenance": {"type": "object", "additionalProperties": True},
+        "reachability": {"type": "string", "enum": ["confirmed", "likely", "unlikely", "unknown"]},
+        "reachabilityBasis": {"type": "array", "items": {"type": "string"}},
     },
 }
 
@@ -682,7 +697,13 @@ def _next_actions_for_path(graph: UnifiedGraph, path: AttackPath) -> list[dict[s
     return actions[:4]
 
 
-def _fix_first_card_for_path(graph: UnifiedGraph, path: AttackPath, rank: int) -> dict:
+def _fix_first_card_for_path(
+    graph: UnifiedGraph,
+    path: AttackPath,
+    rank: int,
+    *,
+    edge_lookup: _EdgeLookup | None = None,
+) -> dict:
     findings = _finding_ids_for_path(graph, path.hops, path.vuln_ids)
     agents = _node_labels_for_types(
         graph,
@@ -703,7 +724,14 @@ def _fix_first_card_for_path(graph: UnifiedGraph, path: AttackPath, rank: int) -
         "title": " ".join(title_parts),
         "summary": path.summary or "Review this path before opening the full topology graph.",
         "attack_path": path.to_dict(),
-        "exposure_path": _exposure_path_for_attack_path(path, nodes_by_id=graph.nodes, edges=graph.edges, rank=rank, scan_id=graph.scan_id),
+        "exposure_path": _exposure_path_for_attack_path(
+            path,
+            nodes_by_id=graph.nodes,
+            edges=graph.edges,
+            rank=rank,
+            scan_id=graph.scan_id,
+            edge_lookup=edge_lookup,
+        ),
         "nodes": [graph.nodes[hop].to_dict() for hop in path.hops if hop in graph.nodes],
         "sequence_labels": sequence,
         "risk_reasons": _risk_reasons_for_path(graph, path),
@@ -863,21 +891,31 @@ def _boundary_edge_count(edges: list[UnifiedEdge], node_ids: set[str]) -> int:
     return sum(1 for edge in edges if edge.source not in node_ids or edge.target not in node_ids)
 
 
-def _edge_relationships_for_hops(hops: list[str], edges: list[UnifiedEdge]) -> list[str]:
+def _build_edge_lookup(edges: list[UnifiedEdge] | None) -> _EdgeLookup:
+    """Index directed hop pairs once for a response serialization batch."""
+    by_pair: _EdgeLookup = {}
+    for edge in edges or []:
+        by_pair.setdefault((edge.source, edge.target), edge)
+        if edge.is_bidirectional:
+            by_pair.setdefault((edge.target, edge.source), edge)
+    return by_pair
+
+
+def _edge_relationships_for_hops(
+    hops: list[str],
+    edges: list[UnifiedEdge] | None = None,
+    *,
+    edge_lookup: _EdgeLookup | None = None,
+) -> list[str]:
     """Return relationship names for consecutive hop pairs when topology is available."""
     if len(hops) < 2:
         return []
-    by_pair: dict[tuple[str, str], str] = {}
-    for edge in edges:
-        rel = _rel_value(edge)
-        by_pair.setdefault((edge.source, edge.target), rel)
-        if edge.is_bidirectional:
-            by_pair.setdefault((edge.target, edge.source), rel)
+    by_pair = edge_lookup if edge_lookup is not None else _build_edge_lookup(edges)
     relationships: list[str] = []
     for source, target in zip(hops, hops[1:], strict=False):
-        relationship = by_pair.get((source, target))
-        if relationship:
-            relationships.append(relationship)
+        edge = by_pair.get((source, target))
+        if edge is not None:
+            relationships.append(_rel_value(edge))
     return relationships
 
 
@@ -918,17 +956,17 @@ def _exposure_ref_for_node(node_id: str, nodes_by_id: dict[str, Any]) -> dict[st
     return ref
 
 
-def _exposure_relationships_for_path(path: AttackPath, edges: list[UnifiedEdge] | None) -> list[dict[str, Any]]:
-    by_pair: dict[tuple[str, str], UnifiedEdge] = {}
-    edge: UnifiedEdge | None
-    for edge in edges or []:
-        by_pair.setdefault((edge.source, edge.target), edge)
-        if edge.is_bidirectional:
-            by_pair.setdefault((edge.target, edge.source), edge)
+def _exposure_relationships_for_path(
+    path: AttackPath,
+    edges: list[UnifiedEdge] | None,
+    *,
+    edge_lookup: _EdgeLookup | None = None,
+) -> list[dict[str, Any]]:
+    by_pair = edge_lookup if edge_lookup is not None else _build_edge_lookup(edges)
 
     relationships: list[dict[str, Any]] = []
     for index, (source, target) in enumerate(zip(path.hops, path.hops[1:], strict=False)):
-        edge = by_pair.get((source, target))
+        edge: UnifiedEdge | None = by_pair.get((source, target))
         relationship = ""
         if edge is not None:
             relationship = _rel_value(edge)
@@ -980,12 +1018,13 @@ def _exposure_path_for_attack_path(
     edges: list[UnifiedEdge] | None = None,
     rank: int | None = None,
     scan_id: str = "",
+    edge_lookup: _EdgeLookup | None = None,
 ) -> dict[str, Any]:
     hops = [_exposure_ref_for_node(hop, nodes_by_id) for hop in path.hops]
     empty_ref = {"id": "", "label": "", "role": "unknown"}
     source = _exposure_ref_for_node(path.source, nodes_by_id) if path.source else (hops[0] if hops else empty_ref)
     target = _exposure_ref_for_node(path.target, nodes_by_id) if path.target else (hops[-1] if hops else empty_ref)
-    relationships = _exposure_relationships_for_path(path, edges)
+    relationships = _exposure_relationships_for_path(path, edges, edge_lookup=edge_lookup)
     packages = [hop for hop in hops if hop["role"] == "package"]
     servers = [hop for hop in hops if hop["role"] == "server"]
     agents = [hop for hop in hops if hop["role"] == "agent"]
@@ -1008,6 +1047,8 @@ def _exposure_path_for_attack_path(
         "affectedServers": [hop["label"] for hop in servers],
         "reachableTools": list(path.tool_exposure),
         "exposedCredentials": list(path.credential_exposure),
+        "reachability": path.reachability,
+        "reachabilityBasis": list(path.reachability_basis),
         "provenance": {"source": "graph_attack_path", "scanId": scan_id} if scan_id else {"source": "graph_attack_path"},
     }
     if rank is not None:
@@ -1046,17 +1087,48 @@ def _serialize_attack_path(
     nodes_by_id: dict[str, Any] | None = None,
     rank: int | None = None,
     scan_id: str = "",
+    edge_lookup: _EdgeLookup | None = None,
 ) -> dict:
     data = path.to_dict()
     if not data.get("edges") and edges is not None:
-        data["edges"] = _edge_relationships_for_hops(path.hops, edges)
+        data["edges"] = _edge_relationships_for_hops(path.hops, edges, edge_lookup=edge_lookup)
     if nodes_by_id is not None:
         # Prefer stamped Finding.id values over CVE labels when available.
         resolved = _finding_ids_for_nodes(nodes_by_id, path.hops, path.vuln_ids)
         if resolved:
             data["finding_ids"] = resolved
-        data["exposure_path"] = _exposure_path_for_attack_path(path, nodes_by_id=nodes_by_id, edges=edges, rank=rank, scan_id=scan_id)
+        data["exposure_path"] = _exposure_path_for_attack_path(
+            path,
+            nodes_by_id=nodes_by_id,
+            edges=edges,
+            rank=rank,
+            scan_id=scan_id,
+            edge_lookup=edge_lookup,
+        )
     return data
+
+
+def _serialize_attack_path_batch(
+    paths: list[AttackPath],
+    edges: list[UnifiedEdge] | None = None,
+    *,
+    nodes_by_id: dict[str, Any] | None = None,
+    scan_id: str = "",
+    rank_offset: int | None = None,
+) -> list[dict[str, Any]]:
+    """Serialize a page of paths with one topology index shared by every row."""
+    edge_lookup = _build_edge_lookup(edges)
+    return [
+        _serialize_attack_path(
+            path,
+            edges,
+            nodes_by_id=nodes_by_id,
+            rank=(rank_offset + index + 1) if rank_offset is not None else None,
+            scan_id=scan_id,
+            edge_lookup=edge_lookup,
+        )
+        for index, path in enumerate(paths)
+    ]
 
 
 def _node_type_value(node: UnifiedNode) -> str:
@@ -1279,7 +1351,9 @@ def _derived_toxic_combination_paths(graph: UnifiedGraph) -> list[AttackPath]:
     for edge in graph.edges:
         rel = _rel_value(edge)
         if rel == RelationshipType.VULNERABLE_TO.value:
-            vulnerable.add(edge.source)
+            vulnerability_node = graph.nodes.get(edge.target)
+            if vulnerability_node is not None and node_reachability(getattr(vulnerability_node, "attributes", None)).permits_exploit_chain:
+                vulnerable.add(edge.source)
         elif rel == RelationshipType.HAS_PERMISSION.value:
             principal = graph.nodes.get(edge.source)
             # A resource is admin-privilege-reachable when a principal that can
@@ -1378,10 +1452,37 @@ def _derived_attack_paths(graph: UnifiedGraph) -> list[AttackPath]:
     both branches so they surface even when materialised vuln paths exist.
     """
     governance_paths = _derived_governance_attack_paths(graph) + _derived_toxic_combination_paths(graph)
+    for path in governance_paths:
+        if path.reachability == "unknown":
+            path.reachability = "likely"
+            path.reachability_basis = ["observed_graph_edges"]
     if graph.attack_paths:
+        materialized: list[AttackPath] = []
+        for path in graph.attack_paths:
+            vulnerability_nodes = [
+                graph.nodes[hop]
+                for hop in path.hops
+                if hop in graph.nodes and _node_type_value(graph.nodes[hop]) == EntityType.VULNERABILITY.value
+            ]
+            assessments = [node_reachability(getattr(node, "attributes", None)) for node in vulnerability_nodes]
+            if any(item.verdict == "unlikely" for item in assessments):
+                continue
+            if path.reachability == "unknown":
+                strongest = next((item for item in assessments if item.verdict == "confirmed"), None)
+                if strongest is None:
+                    strongest = next((item for item in assessments if item.verdict == "likely"), None)
+                if strongest is not None:
+                    path.reachability = strongest.verdict
+                    path.reachability_basis = list(strongest.basis)
+                elif vulnerability_nodes:
+                    path.composite_risk = min(path.composite_risk, 39.0)
+                    path.reachability_basis = ["structural_topology_only"]
+                    if "unverified" not in path.summary.lower():
+                        path.summary = f"Unverified structural candidate. {path.summary}".strip()
+            materialized.append(path)
         return _with_technique_mappings(
             sorted(
-                list(graph.attack_paths) + governance_paths,
+                materialized + governance_paths,
                 key=lambda path: (path.composite_risk, len(path.hops), len(path.credential_exposure), len(path.tool_exposure)),
                 reverse=True,
             ),
@@ -1390,6 +1491,7 @@ def _derived_attack_paths(graph: UnifiedGraph) -> list[AttackPath]:
 
     incoming: dict[str, list] = {}
     outgoing: dict[str, list] = {}
+    edge_lookup = _build_edge_lookup(graph.edges)
     for edge in graph.edges:
         incoming.setdefault(edge.target, []).append(edge)
         outgoing.setdefault(edge.source, []).append(edge)
@@ -1400,6 +1502,9 @@ def _derived_attack_paths(graph: UnifiedGraph) -> list[AttackPath]:
 
     for finding in graph.nodes.values():
         if _node_type_value(finding) not in finding_types:
+            continue
+        reach = node_reachability(getattr(finding, "attributes", None))
+        if reach.verdict == "unlikely":
             continue
         for finding_edge in incoming.get(finding.id, []):
             if _rel_value(finding_edge) != RelationshipType.VULNERABLE_TO.value:
@@ -1446,7 +1551,11 @@ def _derived_attack_paths(graph: UnifiedGraph) -> list[AttackPath]:
                     if vulnerable_source.id != server_id:
                         hop_ids.append(vulnerable_source.id)
                     hop_ids.append(finding.id)
-                    path_edges = _edge_relationships_for_hops(hop_ids, graph.edges)
+                    path_edges = _edge_relationships_for_hops(
+                        hop_ids,
+                        graph.edges,
+                        edge_lookup=edge_lookup,
+                    )
                     key = (agent_id, server_id, vulnerable_source.id, finding.id)
                     if key in seen:
                         continue
@@ -1461,6 +1570,19 @@ def _derived_attack_paths(graph: UnifiedGraph) -> list[AttackPath]:
                     from agent_bom.graph.asset_entity import finding_id_from_node_attributes
 
                     stamped_finding_id = finding_id_from_node_attributes(getattr(finding, "attributes", None))
+                    if reach.verdict == "unknown":
+                        # Preserve relative investigation priority while keeping
+                        # unverified topology below evidence-backed paths.
+                        risk = min(39.0, risk * 0.35)
+                        summary = (
+                            "Unverified structural candidate: graph topology connects the agent and vulnerable "
+                            "package/server, but no executable graph or symbol path has been proven."
+                        )
+                    else:
+                        summary = (
+                            "Evidence-backed graph path: vulnerable package/server is reachable from an agent "
+                            "and inherits the server's credential/tool exposure."
+                        )
                     paths.append(
                         AttackPath(
                             source=agent_id,
@@ -1468,14 +1590,13 @@ def _derived_attack_paths(graph: UnifiedGraph) -> list[AttackPath]:
                             hops=hop_ids,
                             edges=path_edges,
                             composite_risk=round(min(100.0, risk), 2),
-                            summary=(
-                                "Derived from graph topology: vulnerable package/server is reachable from an agent "
-                                "and inherits the server's credential/tool exposure."
-                            ),
+                            summary=summary,
                             credential_exposure=sorted(set(credentials)),
                             tool_exposure=sorted(set(tools)),
                             vuln_ids=[finding.label or finding.id],
                             finding_ids=[stamped_finding_id] if stamped_finding_id else [],
+                            reachability=reach.verdict,
+                            reachability_basis=list(reach.basis),
                         )
                     )
 
@@ -1659,7 +1780,12 @@ def _filtered_graph_response(graph: UnifiedGraph, *, offset: int, limit: int) ->
     off_page_hops = {hop for p in kept_paths for hop in p.hops} - paged_ids
     nodes_by_id = {n.id: n for n in paged_nodes}
     nodes_by_id.update({hop: graph.nodes[hop] for hop in off_page_hops if hop in graph.nodes})
-    attack_paths = [_serialize_attack_path(p, graph.edges, nodes_by_id=nodes_by_id, scan_id=graph.scan_id) for p in kept_paths]
+    attack_paths = _serialize_attack_path_batch(
+        kept_paths,
+        graph.edges,
+        nodes_by_id=nodes_by_id,
+        scan_id=graph.scan_id,
+    )
     interaction_risks = [
         r.to_dict() for r in graph.interaction_risks if r.agents and all(f"agent:{agent_name}" in paged_ids for agent_name in r.agents)
     ]
@@ -1734,8 +1860,9 @@ def _fix_first_graph_view_payload(graph: UnifiedGraph, *, cve: str, package: str
         reverse=True,
     )
     cards = []
+    edge_lookup = _build_edge_lookup(graph.edges)
     for index, path in enumerate(ranked_paths[:limit]):
-        card = _fix_first_card_for_path(graph, path, index + 1)
+        card = _fix_first_card_for_path(graph, path, index + 1, edge_lookup=edge_lookup)
         card["rank_meta"] = criticality_rank_meta(graph, path)
         cards.append(card)
     covered_findings = {finding for card in cards for finding in card["affected"]["findings"]}
@@ -1812,10 +1939,13 @@ def _serialize_attack_path_queue(
         "created_at": created_at,
         "nodes": [node.to_dict() for node in nodes],
         "edges": [edge.to_dict() for edge in path_edges],
-        "attack_paths": [
-            _serialize_attack_path(path, path_edges, nodes_by_id=nodes_by_id, rank=offset + index + 1, scan_id=scan_id)
-            for index, path in enumerate(paths)
-        ],
+        "attack_paths": _serialize_attack_path_batch(
+            paths,
+            path_edges,
+            nodes_by_id=nodes_by_id,
+            scan_id=scan_id,
+            rank_offset=offset,
+        ),
         "interaction_risks": [],
         "stats": stats,
         "pagination": _page_meta(total, offset, limit),
@@ -1860,9 +1990,12 @@ def _governance_graph_payload(
     edges = candidate_edges[:edge_limit]
 
     matching_paths = [p for p in _derived_attack_paths(graph) if p.hops and any(hop in governance_ids for hop in p.hops)]
-    attack_paths = [
-        _serialize_attack_path(p, keep_edges, nodes_by_id=graph.nodes, scan_id=graph.scan_id) for p in matching_paths[:attack_path_limit]
-    ]
+    attack_paths = _serialize_attack_path_batch(
+        matching_paths[:attack_path_limit],
+        keep_edges,
+        nodes_by_id=graph.nodes,
+        scan_id=graph.scan_id,
+    )
     counts: dict[str, int] = {}
     for node in graph.nodes.values():
         if node.entity_type in governance_types:
@@ -2327,9 +2460,12 @@ async def get_graph(
         "created_at": created_at,
         "nodes": [n.to_dict() for n in response_nodes],
         "edges": [e.to_dict() for e in response_edges],
-        "attack_paths": [
-            _serialize_attack_path(path, paged_edges, nodes_by_id=nodes_by_id, scan_id=effective_scan_id) for path in source_attack_paths
-        ],
+        "attack_paths": _serialize_attack_path_batch(
+            source_attack_paths,
+            paged_edges,
+            nodes_by_id=nodes_by_id,
+            scan_id=effective_scan_id,
+        ),
         "interaction_risks": [],
         "stats": snapshot_stats,
         "pagination": _page_meta(total, offset, limit, cursor=cursor, next_cursor=next_cursor),
@@ -2770,11 +2906,12 @@ async def get_graph_paths(
         "reachable_count": len(reachable),
         "reachable_nodes": sorted(reachable),
         "paths": [{"target": p[-1], "hops": p, "depth": len(p) - 1} for p in paged_paths],
-        "attack_paths": [
-            _serialize_attack_path(ap, path_edges, nodes_by_id=nodes_by_id, scan_id=requested_scan_id)
-            for ap in attack_paths
-            if ap.source == source_node_id
-        ],
+        "attack_paths": _serialize_attack_path_batch(
+            [ap for ap in attack_paths if ap.source == source_node_id],
+            path_edges,
+            nodes_by_id=nodes_by_id,
+            scan_id=requested_scan_id,
+        ),
         "pagination": pagination,
         "truncated": traversal_truncated,
         "depth_limited": depth_limited,
@@ -3048,9 +3185,12 @@ async def query_graph(request: Request, body: GraphQueryRequest) -> dict:
             node_ids=missing_hop_ids,
         )
         nodes_by_id = {**filtered_graph.nodes, **{node.id: node for node in backfilled_nodes}}
-        attack_paths = [
-            _serialize_attack_path(ap, filtered_graph.edges, nodes_by_id=nodes_by_id, scan_id=filtered_graph.scan_id) for ap in root_paths
-        ]
+        attack_paths = _serialize_attack_path_batch(
+            root_paths,
+            filtered_graph.edges,
+            nodes_by_id=nodes_by_id,
+            scan_id=filtered_graph.scan_id,
+        )
 
     return {
         "scan_id": filtered_graph.scan_id,
