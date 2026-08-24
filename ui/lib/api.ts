@@ -837,6 +837,7 @@ export const api = {
   updateTenantQuota: (body: TenantQuotaUpdateRequest) =>
     put<AuthPolicyResponse["tenant_quota_runtime"]>("/v1/auth/quota", body),
   resetTenantQuota: () => del("/v1/auth/quota"),
+  createDevAuthSession: () => postVoid("/v1/auth/dev-session", {}),
   createAuthSession: (apiKey: string) => postVoid("/v1/auth/session", { api_key: apiKey }),
   deleteAuthSession: () => del("/v1/auth/session"),
   reportClientError: (body: { message: string; digest?: string | undefined; path?: string | undefined; component?: string | undefined }) =>
@@ -1470,7 +1471,11 @@ export const api = {
     post<EvaluateResult>("/v1/gateway/evaluate", body),
   listGatewayAudit: () => get<GatewayAuditResponse>("/v1/gateway/audit"),
   getGatewayStats: () => get<GatewayStatsResponse>("/v1/gateway/stats"),
-  getGatewayFeed: (limit = 100) => get<GatewayFeedResponse>(`/v1/gateway/feed?limit=${limit}`),
+  getGatewayFeed: (limit = 100, cursor?: string) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (cursor) params.set("cursor", cursor);
+    return get<GatewayFeedResponse>(`/v1/gateway/feed?${params}`, { ttlMs: 0 });
+  },
   getGatewayFeedKpis: () => get<GatewayFeedKpis>("/v1/gateway/feed/kpis"),
   getFirewallStats: () => get<FirewallRuntimeStats>("/v1/firewall/stats"),
 
