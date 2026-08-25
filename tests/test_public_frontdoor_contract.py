@@ -37,8 +37,7 @@ def test_social_preview_is_portable_and_evidence_focused() -> None:
         assert claim in svg
     for integration in (
         "Claude",
-        "Codex CLI",
-        "OpenAI · GPT",
+        "OpenAI / Codex",
         "Cursor",
         "GitHub Copilot",
         "VS Code",
@@ -63,12 +62,15 @@ def test_social_preview_is_portable_and_evidence_focused() -> None:
     assert "/Users/" not in svg
     assert "<image" not in svg
     assert "tint-" not in svg
-    assert svg.count("<symbol ") == 10
-    assert svg.count('href="#embedded-') == 11
+    assert "Codex CLI" not in svg
+    assert "OpenAI · GPT" not in svg
+    assert svg.count("<symbol ") == 12
+    assert svg.count('href="#embedded-') == 13
     assert render_social_preview(template) == svg
     for relative_asset in (
         "brand/mark-dark.svg",
-        "vendor/simple-icons/claude.svg",
+        "vendor/claude-icon-rounded.svg",
+        "vendor/openai-blossom-white.svg",
         "vendor/simple-icons/cursor.svg",
         "vendor/simple-icons/githubcopilot.svg",
         "vendor/simple-icons/amazonwebservices.svg",
@@ -123,7 +125,8 @@ def test_readme_frontdoor_is_short_and_integration_roles_are_explicit() -> None:
     assert "[Integration capability matrix](docs/INTEGRATIONS.md)" in frontdoor
 
     header_note = readme.split('<p align="center">', 2)[2].split("</p>", 1)[0]
-    assert "not identical connector depth" in header_note
+    assert "Supported backends vary by capability" in header_note
+    assert "Capability matrix" in header_note
 
     matrix = (ROOT / "docs" / "INTEGRATIONS.md").read_text(encoding="utf-8")
     for role in ("Client discovery", "Read-only cloud connection", "Scan and deploy", "Identity", "Data platform", "Analytics backend"):
@@ -153,9 +156,27 @@ def test_persona_routes_start_with_their_actual_work() -> None:
 
     assert "| AppSec / product security | `agent-bom scan . -f sarif -o findings.sarif`" in personas
     assert "| AI / ML engineer | `agent-bom scan .`" in personas
-    assert "| Cloud security | `agent-bom connect aws`" in personas
+    assert "| Cloud security | `agent-bom connect aws --emit --out agent-bom-aws-readonly.json`" in personas
     assert "| Platform / DevOps | `pip install 'agent-bom[ui]' && agent-bom serve`" in personas
     assert "owner and sla" in personas.lower()
+
+
+def test_cloud_connect_leads_with_wheel_safe_emit_before_optional_terraform() -> None:
+    guide = (ROOT / "docs" / "CLOUD_CONNECT.md").read_text(encoding="utf-8")
+    command = "agent-bom connect aws --emit --out agent-bom-aws-readonly.json"
+
+    assert command in guide
+    assert guide.index(command) < guide.index("deploy/terraform/connect-*")
+    assert "Repository Terraform (optional)" in guide
+
+
+def test_readme_header_omits_volatile_metric_strip() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    header = readme.split("## Discover → Scan → Correlate → Act", 1)[0]
+
+    assert "package ecosystems" not in header
+    assert "compliance surfaces" not in header
+    assert "MCP tools · no account required" not in header
 
 
 def test_readme_offline_bootstrap_leads_with_truthful_ecosystem_scope() -> None:
