@@ -2609,9 +2609,9 @@ def scan(
         for w in all_tp_warnings:
             con.print(f"  [yellow]⚠[/yellow] {w}")
 
-    # ── Step 1m: AST source code analysis (auto-detect Python AI code) ──
+    # ── Step 1m: AST source code analysis (explicit project scope) ──
     _ast_result_for_reach = None
-    if not skill_only and not no_discover and project and not dry_run:
+    if not skill_only and project and not dry_run:
         from pathlib import Path as _APath
 
         _aproj = _APath(project)
@@ -2930,7 +2930,11 @@ def scan(
         # Python finding carries a function_reachable / package_reachable /
         # unreachable signal. No-op when no Python entrypoints were analysed.
         if _ast_result_for_reach is not None:
-            apply_symbol_reachability_to_blast_radii(blast_radii, _ast_result_for_reach)
+            apply_symbol_reachability_to_blast_radii(
+                blast_radii,
+                _ast_result_for_reach,
+                packages=all_packages,
+            )
         # The dual-write `report.findings` was materialized before the stamping
         # above, so its CVE findings still carry null reachability. Re-project the
         # stamped rows onto them so the JSON `findings[]` view agrees with

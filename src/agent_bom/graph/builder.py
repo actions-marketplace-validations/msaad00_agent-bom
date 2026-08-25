@@ -481,6 +481,8 @@ def build_unified_graph_from_report(
                     "reachability_basis": list(br_dict.get("reachability_basis") or []),
                     "graph_reachable": br_dict.get("graph_reachable"),
                     "symbol_reachability": br_dict.get("symbol_reachability"),
+                    "symbol_reachability_reason": br_dict.get("symbol_reachability_reason"),
+                    "runtime_dependency_chain": list(br_dict.get("runtime_dependency_chain") or []),
                     "dependency_reachable": br_dict.get("dependency_reachable"),
                 },
                 compliance_tags=_collect_compliance_tags(br_dict),
@@ -1025,6 +1027,8 @@ def build_unified_graph_from_report(
             vuln_node.attributes["reachability_basis"] = list(br_dict.get("reachability_basis") or [])
             vuln_node.attributes["graph_reachable"] = br_dict.get("graph_reachable")
             vuln_node.attributes["symbol_reachability"] = br_dict.get("symbol_reachability")
+            vuln_node.attributes["symbol_reachability_reason"] = br_dict.get("symbol_reachability_reason")
+            vuln_node.attributes["runtime_dependency_chain"] = list(br_dict.get("runtime_dependency_chain") or [])
             vuln_node.attributes["dependency_reachable"] = br_dict.get("dependency_reachable")
             vuln_node.attributes["actionable"] = br_dict.get("actionable", False)
 
@@ -1401,6 +1405,10 @@ def _apply_ast_tool_overlay(graph: UnifiedGraph, report_json: Mapping[str, Any])
                     "source_file": source_file,
                     "line": raw.get("line") if isinstance(raw.get("line"), int) else None,
                     "parameters": sanitize_sensitive_payload(raw.get("parameters", [])),
+                    "handler": sanitize_text(raw.get("handler", ""), max_len=200),
+                    "registration_kind": sanitize_text(raw.get("registration_kind", ""), max_len=100),
+                    "framework": sanitize_text(raw.get("framework", ""), max_len=100),
+                    "provenance": sanitize_text(raw.get("provenance", ""), max_len=500),
                     "discovery_source": "ast_analysis",
                     "canonical_id": canonical_graph_node_id(EntityType.TOOL.value, tool_id),
                 },
@@ -1413,7 +1421,13 @@ def _apply_ast_tool_overlay(graph: UnifiedGraph, report_json: Mapping[str, Any])
                 source=file_id,
                 target=tool_id,
                 relationship=RelationshipType.DEFINES,
-                evidence={"source": "ast_analysis", "line": raw.get("line")},
+                evidence={
+                    "source": "ast_analysis",
+                    "line": raw.get("line"),
+                    "registration_kind": sanitize_text(raw.get("registration_kind", ""), max_len=100),
+                    "framework": sanitize_text(raw.get("framework", ""), max_len=100),
+                    "provenance": sanitize_text(raw.get("provenance", ""), max_len=500),
+                },
             )
         )
 

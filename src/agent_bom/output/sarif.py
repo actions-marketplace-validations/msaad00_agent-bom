@@ -717,6 +717,8 @@ def _cve_sarif_result(
         "reachability": finding.reachability,
         "symbol_reachability": evidence(finding, "symbol_reachability"),
         "reachable_affected_symbols": evidence(finding, "reachable_affected_symbols", []),
+        "symbol_reachability_reason": evidence(finding, "symbol_reachability_reason"),
+        "runtime_dependency_chain": evidence(finding, "runtime_dependency_chain", []),
         "affected_servers": list(finding.affected_servers),
         "affected_agents": list(finding.affected_agents),
         "exposed_tools": list(finding.exposed_tools),
@@ -955,6 +957,24 @@ def to_sarif(
                 "ai_summary": finding.ai_summary,
                 "attack_vector_summary": finding.attack_vector_summary,
                 "suppressed": finding.suppressed,
+                **(
+                    {
+                        key: sanitize_text(value, max_len=500)
+                        for key in ("category", "entrypoint", "sink", "source")
+                        if (value := evidence.get(key))
+                    }
+                    if finding.finding_type == FindingType.SAST
+                    else {}
+                ),
+                **(
+                    {
+                        key: [sanitize_text(item, max_len=500) for item in value]
+                        for key in ("call_path", "detector_categories")
+                        if isinstance((value := evidence.get(key)), list)
+                    }
+                    if finding.finding_type == FindingType.SAST
+                    else {}
+                ),
                 **(
                     {
                         "workload_runtime_evidence": _sanitize_sarif_property(finding.workload_runtime_evidence),
