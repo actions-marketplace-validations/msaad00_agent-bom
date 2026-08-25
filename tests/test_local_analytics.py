@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from click.testing import CliRunner
@@ -182,6 +183,170 @@ def test_local_analytics_store_records_unified_non_cve_findings(tmp_path):
     assert '"asset_type": "prompt_template"' in rows[0]["asset_json"]
 
 
+def test_local_analytics_preserves_distinct_occurrences_with_shared_identity(tmp_path):
+    """One semantic finding may have multiple independently stored occurrences."""
+    store = LocalAnalyticsStore(tmp_path / "local.sqlite")
+    report = _report("scan-occurrences")
+    report["scan_run"] = {"run_id": "run-occurrences"}
+    report.pop("blast_radius")
+    first = {
+        "schema_version": "1",
+        "id": "semantic-finding-1",
+        "canonical_id": "semantic-finding-1",
+        "occurrence_id": "semantic-finding-1",
+        "finding_type": "CIS_FAIL",
+        "source": "CLOUD_SECURITY",
+        "severity": "high",
+        "title": "Shared policy failure",
+        "asset": {
+            "name": "service-a",
+            "asset_type": "iac_resource",
+            "identifier": "service-a",
+            "canonical_id": "asset-a",
+            "location": "deploy/a.yaml",
+        },
+        "affected_agents": ["agent-a"],
+        "evidence": {"path": "deploy/a.yaml", "line": 12},
+    }
+    second = {
+        **first,
+        "asset": {
+            "name": "service-b",
+            "asset_type": "iac_resource",
+            "identifier": "service-b",
+            "canonical_id": "asset-b",
+            "location": "deploy/b.yaml",
+        },
+        "affected_agents": ["agent-b"],
+        "evidence": {"path": "deploy/b.yaml", "line": 27},
+    }
+    # Exact duplicate producer rows collapse, but the distinct occurrence must
+    # survive with the same semantic/canonical identity.
+    report["findings"] = [first, dict(first), second]
+
+    store.record_scan_report(report, source="cli")
+    first_rows = store.query(
+        "SELECT finding_key, canonical_id, affected_agents_json, asset_json FROM scan_findings WHERE run_id = ? ORDER BY finding_key",
+        ("run-occurrences",),
+    )
+
+    assert len(first_rows) == 2
+    assert {row["canonical_id"] for row in first_rows} == {"semantic-finding-1"}
+    assert len({row["finding_key"] for row in first_rows}) == 2
+    assert all(row["finding_key"].startswith("semantic-finding-1:") for row in first_rows)
+    assert {row["affected_agents_json"] for row in first_rows} == {'["agent-a"]', '["agent-b"]'}
+
+    # Re-recording the same durable run replaces its occurrence rows with the
+    # same deterministic storage keys instead of multiplying them.
+    store.record_scan_report(report, source="cli")
+    second_rows = store.query(
+        "SELECT finding_key, canonical_id, affected_agents_json, asset_json FROM scan_findings WHERE run_id = ? ORDER BY finding_key",
+        ("run-occurrences",),
+    )
+    assert second_rows == first_rows
+    assert store.query("SELECT COUNT(*) AS count FROM scan_runs WHERE run_id = ?", ("run-occurrences",)) == [{"count": 1}]
+
+
+def test_local_analytics_preserves_conflicting_projections_order_independently(tmp_path):
+    """Same-location projections with different truth must not be first-row-wins."""
+    store = LocalAnalyticsStore(tmp_path / "local.sqlite")
+    report = _report("scan-projections")
+    report["scan_run"] = {"run_id": "run-projections"}
+    report.pop("blast_radius")
+    high = {
+        "schema_version": "1",
+        "id": "semantic-finding-1",
+        "canonical_id": "semantic-finding-1",
+        "finding_type": "CIS_FAIL",
+        "source": "CLOUD_SECURITY",
+        "severity": "high",
+        "risk_score": 7.0,
+        "title": "Shared policy failure",
+        "description": "producer-A",
+        "asset": {
+            "name": "service-a",
+            "asset_type": "iac_resource",
+            "identifier": "service-a",
+            "canonical_id": "asset-a",
+            "location": "deploy/a.yaml",
+        },
+        "evidence": {"path": "deploy/a.yaml", "line": 12},
+    }
+    critical = {
+        **high,
+        "severity": "critical",
+        "risk_score": 9.9,
+        "description": "producer-B",
+    }
+
+    def _stored_rows():
+        return store.query(
+            "SELECT finding_key, severity, risk_score, raw_json FROM scan_findings WHERE run_id = ? ORDER BY finding_key",
+            ("run-projections",),
+        )
+
+    report["findings"] = [high, critical]
+    store.record_scan_report(report, source="cli")
+    first_rows = _stored_rows()
+
+    assert len(first_rows) == 2
+    assert {(row["severity"], row["risk_score"]) for row in first_rows} == {("high", 7.0), ("critical", 9.9)}
+    assert {json.loads(row["raw_json"])["description"] for row in first_rows} == {"producer-A", "producer-B"}
+
+    report["findings"] = [critical, high]
+    store.record_scan_report(report, source="cli")
+    assert _stored_rows() == first_rows
+
+
+def test_local_analytics_preserves_pii_and_credential_occurrences(tmp_path):
+    """PII and credential exposure occurrences retain distinct source truth."""
+    store = LocalAnalyticsStore(tmp_path / "local.sqlite")
+    report = _report("scan-sensitive-occurrences")
+    report["scan_run"] = {"run_id": "run-sensitive-occurrences"}
+    report.pop("blast_radius")
+    common = {
+        "schema_version": "1",
+        "id": "sensitive-exposure",
+        "canonical_id": "sensitive-exposure",
+        "source": "SECRET_SCANNER",
+        "severity": "high",
+        "title": "Sensitive source occurrence",
+    }
+    report["findings"] = [
+        {
+            **common,
+            "finding_type": "PII_EXPOSURE",
+            "asset": {"canonical_id": "source-a", "asset_type": "source_file", "location": "src/a.py"},
+            "evidence": {"path": "src/a.py", "line": 10},
+        },
+        {
+            **common,
+            "finding_type": "CREDENTIAL_EXPOSURE",
+            "asset": {"canonical_id": "source-b", "asset_type": "source_file", "location": "src/b.py"},
+            "evidence": {"path": "src/b.py", "line": 20},
+        },
+    ]
+
+    store.record_scan_report(report, source="cli")
+    rows = store.query(
+        "SELECT finding_type, canonical_id, asset_canonical_id FROM scan_findings WHERE run_id = ? ORDER BY finding_type",
+        ("run-sensitive-occurrences",),
+    )
+
+    assert rows == [
+        {
+            "finding_type": "CREDENTIAL_EXPOSURE",
+            "canonical_id": "sensitive-exposure",
+            "asset_canonical_id": "source-b",
+        },
+        {
+            "finding_type": "PII_EXPOSURE",
+            "canonical_id": "sensitive-exposure",
+            "asset_canonical_id": "source-a",
+        },
+    ]
+
+
 def test_history_save_dual_writes_local_analytics(monkeypatch, tmp_path):
     import agent_bom.db.local_analytics as local_analytics
     import agent_bom.history as history
@@ -221,7 +386,7 @@ def test_cli_agents_scan_mirrors_to_local_analytics(monkeypatch, tmp_path):
 
     with sqlite3.connect(db_path) as conn:
         count = conn.execute("SELECT COUNT(*) FROM scan_runs").fetchone()[0]
-    assert count >= 1, "CLI scan must persist to local-analytics scan_runs"
+    assert count == 1, "one CLI scan must persist exactly one local-analytics run"
 
 
 def test_cli_local_analytics_mirror_is_best_effort(monkeypatch, tmp_path):

@@ -8,9 +8,11 @@ history JSON file.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
+from collections import defaultdict
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -262,6 +264,7 @@ class LocalAnalyticsStore:
         raw_summary = report_json.get("summary")
         summary: dict[str, Any] = raw_summary if isinstance(raw_summary, dict) else {}
         findings = list(_iter_findings(report_json))
+        finding_rows = _finding_rows(run_id, scan_id, findings)
         package_rows = list(_iter_packages(report_json))
 
         with closing(self._connect()) as conn:
@@ -300,8 +303,8 @@ class LocalAnalyticsStore:
                     _int(summary.get("total_packages")),
                     _int(summary.get("total_vulnerabilities")),
                     _int(summary.get("critical_findings")),
-                    sum(1 for item in findings if _finding_severity(item) == "high"),
-                    len(findings),
+                    sum(1 for row in finding_rows if row[8] == "high"),
+                    len(finding_rows),
                     len(package_rows),
                 ),
             )
@@ -317,7 +320,7 @@ class LocalAnalyticsStore:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                [_finding_row(run_id, scan_id, finding) for finding in findings],
+                finding_rows,
             )
             conn.executemany(
                 """
@@ -503,7 +506,111 @@ def _iter_packages(report_json: dict[str, Any]) -> Iterable[dict[str, Any]]:
                     }
 
 
-def _finding_row(run_id: str, scan_id: str, finding: dict[str, Any]) -> tuple[Any, ...]:
+_OCCURRENCE_FIELDS = (
+    "occurrence_id",
+    "occurrence_key",
+    "finding_id",
+    "source_finding_id",
+    "path",
+    "file",
+    "file_path",
+    "manifest_path",
+    "config_path",
+    "location",
+    "locations",
+    "source_location",
+    "line",
+    "line_number",
+    "start_line",
+    "column",
+    "column_number",
+    "start_column",
+    "rule",
+    "rule_id",
+    "check_id",
+    "control_id",
+    "resource_id",
+    "resource_arn",
+)
+
+
+def _finding_rows(run_id: str, scan_id: str, findings: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
+    """Build deterministic occurrence rows without changing canonical identity.
+
+    ``finding_key`` is the SQLite row boundary. A unique semantic finding keeps
+    its existing key for compatibility. When one semantic key has multiple
+    occurrences, each stored row gets a deterministic occurrence suffix; exact
+    duplicate producer rows collapse instead of aborting the transaction.
+    """
+    entries: dict[tuple[str, str], dict[str, Any]] = {}
+    projections_by_semantic: dict[str, set[str]] = defaultdict(set)
+    for finding in findings:
+        vulnerability_id = _vulnerability_id_from_finding(finding)
+        package_ref = str(finding.get("package") or "")
+        ecosystem = str(finding.get("ecosystem") or "")
+        semantic_key = _finding_key(finding, vulnerability_id, package_ref, ecosystem)
+        occurrence_key = _finding_occurrence_key(finding, package_ref, ecosystem)
+        projection_key = _finding_projection_key(finding)
+        storage_discriminator = f"{occurrence_key}:{projection_key}"
+        entries.setdefault((semantic_key, storage_discriminator), finding)
+        projections_by_semantic[semantic_key].add(storage_discriminator)
+
+    rows: list[tuple[Any, ...]] = []
+    for (semantic_key, storage_discriminator), finding in entries.items():
+        if len(projections_by_semantic[semantic_key]) == 1:
+            storage_key = semantic_key
+        else:
+            suffix = uuid.uuid5(uuid.NAMESPACE_URL, f"agent-bom:local-finding-occurrence:{storage_discriminator}")
+            storage_key = f"{semantic_key}:{suffix}"
+        rows.append(_finding_row(run_id, scan_id, finding, finding_key=storage_key))
+    return rows
+
+
+def _finding_occurrence_key(finding: dict[str, Any], package_ref: str, ecosystem: str) -> str:
+    raw_asset = finding.get("asset")
+    asset: dict[str, Any] = raw_asset if isinstance(raw_asset, dict) else {}
+    raw_evidence = finding.get("evidence")
+    evidence: dict[str, Any] = raw_evidence if isinstance(raw_evidence, dict) else {}
+    occurrence = {
+        "explicit": {key: finding.get(key) for key in _OCCURRENCE_FIELDS if finding.get(key) not in (None, "", [], {})},
+        "asset": {
+            key: asset.get(key)
+            for key in (
+                "canonical_id",
+                "stable_id",
+                "asset_type",
+                "identifier",
+                "location",
+                "name",
+                "provider",
+                "account_ref",
+                "region",
+                "environment",
+            )
+            if asset.get(key) not in (None, "", [], {})
+        },
+        "evidence": {key: evidence.get(key) for key in _OCCURRENCE_FIELDS if evidence.get(key) not in (None, "", [], {})},
+        "affected_agents": sorted(str(item) for item in finding.get("affected_agents") or []),
+        "affected_servers": sorted(str(item) for item in finding.get("affected_servers") or []),
+        "package": package_ref,
+        "ecosystem": ecosystem,
+    }
+    return json.dumps(occurrence, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _finding_projection_key(finding: dict[str, Any]) -> str:
+    """Return a stable full-row key so only structurally exact duplicates collapse."""
+    canonical = json.dumps(finding, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _finding_row(
+    run_id: str,
+    scan_id: str,
+    finding: dict[str, Any],
+    *,
+    finding_key: str | None = None,
+) -> tuple[Any, ...]:
     raw_asset = finding.get("asset")
     asset: dict[str, Any] = raw_asset if isinstance(raw_asset, dict) else {}
     vulnerability_id = _vulnerability_id_from_finding(finding)
@@ -511,11 +618,11 @@ def _finding_row(run_id: str, scan_id: str, finding: dict[str, Any]) -> tuple[An
     package_name = str(finding.get("package_name") or _package_name_from_ref(package_ref))
     package_version = str(finding.get("package_version") or _package_version_from_ref(package_ref))
     ecosystem = str(finding.get("ecosystem") or "")
-    finding_key = _finding_key(finding, vulnerability_id, package_ref, ecosystem)
+    storage_key = finding_key or _finding_key(finding, vulnerability_id, package_ref, ecosystem)
     return (
         run_id,
         scan_id,
-        finding_key,
+        storage_key,
         vulnerability_id,
         package_name,
         package_version,
