@@ -92,6 +92,7 @@ from agent_bom.runtime.gateway_relay_contract import (
     relay_upstream_from_config,
 )
 from agent_bom.runtime.graph_reachability import ReachabilityMap, load_reachability_map
+from agent_bom.runtime.profile_resolution import ProfileResolutionCode
 from agent_bom.security import sanitize_error, sanitize_text
 
 logger = logging.getLogger(__name__)
@@ -329,7 +330,7 @@ def _agent_cost_anomaly(tenant_id: str, source_agent: str) -> tuple[bool, str]:
 
         flagged = cost_anomalous_agents(tenant_id)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("gateway anomaly check failed: %s", _sanitize_for_log(exc))
+        logger.warning("gateway anomaly check failed: %s", sanitize_text(_sanitize_for_log(exc)))
         return False, ""
     info = flagged.get(source_agent)
     if info:
@@ -369,7 +370,7 @@ def _agent_is_quarantined(tenant_id: str, source_agent: str) -> bool:
 
         agent = find_fleet_agent(_get_fleet_store(), tenant_id, source_agent)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("gateway fleet check failed: %s", _sanitize_for_log(exc))
+        logger.warning("gateway fleet check failed: %s", sanitize_text(_sanitize_for_log(exc)))
         return False
     if agent is None:
         return False
@@ -403,7 +404,7 @@ def _agent_identity_revoked(tenant_id: str, source_agent: str) -> tuple[bool, bo
         revoked, lookup_incomplete = agent_identity_revoked(get_agent_identity_store(), tenant_id, source_agent)
         return revoked, lookup_incomplete, False
     except Exception as exc:  # noqa: BLE001
-        logger.warning("gateway agent identity revocation check failed: %s", _sanitize_for_log(exc))
+        logger.warning("gateway agent identity revocation check failed: %s", sanitize_text(_sanitize_for_log(exc)))
         return False, False, True
 
 
@@ -437,7 +438,7 @@ def _open_drift_violates_tool(tenant_id: str, blueprint_id: str, tool_name: str)
 
         incidents = get_drift_incident_store().list(tenant_id, include_resolved=False, limit=_DRIFT_INCIDENT_LOOKUP_CAP)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("gateway drift check failed: %s", _sanitize_for_log(exc))
+        logger.warning("gateway drift check failed: %s", sanitize_text(_sanitize_for_log(exc)))
         return _DriftLookup(unavailable=True, reason="drift incident store unavailable")
     blueprint_key = blueprint_id.strip().lower().replace("-", "_")
     for incident in incidents:
@@ -543,7 +544,7 @@ def _evaluate_control_plane_bundle(
         return evaluate_gateway_policy_bundle(policies, source_agent, tool_name, arguments)
     except Exception as exc:  # noqa: BLE001
         # Fail closed: a bundle that cannot be evaluated must not silently pass.
-        logger.warning("gateway control-plane bundle evaluation failed: %s", _sanitize_for_log(exc))
+        logger.warning("gateway control-plane bundle evaluation failed: %s", sanitize_text(_sanitize_for_log(exc)))
         return False, "control-plane policy evaluation error"
 
 
@@ -714,7 +715,7 @@ def _emit_gateway_governance_event(event_type: str, *, tenant_id: str, subject_i
 
         emit_governance_event(event_type=event_type, tenant_id=tenant_id, source="gateway", subject_id=subject_id, payload=payload)
     except Exception:  # noqa: BLE001
-        logger.debug("gateway governance webhook emit failed for %s", event_type, exc_info=True)
+        logger.debug("gateway governance webhook emit failed for %s", event_type, exc_info=False)
 
 
 async def _emit_policy_interop_event(
@@ -748,7 +749,7 @@ async def _emit_policy_interop_event(
     try:
         event = build_policy_ocsf_event(decision=decision, reason=reason, ctx=ctx, policy_source=policy_source)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("gateway OCSF event build failed: %s", _sanitize_for_log(exc))
+        logger.warning("gateway OCSF event build failed: %s", sanitize_text(_sanitize_for_log(exc)))
         return
     try:
         await asyncio.to_thread(
@@ -758,7 +759,7 @@ async def _emit_policy_interop_event(
             token=settings.policy_webhook_token,
         )
     except Exception as exc:  # noqa: BLE001 — webhook must never break the relay
-        logger.warning("gateway policy webhook dispatch error (event dropped, relay unaffected): %s", _sanitize_for_log(exc))
+        logger.warning("gateway policy webhook dispatch error (event dropped, relay unaffected): %s", sanitize_text(_sanitize_for_log(exc)))
 
 
 class GatewayCircuitOpenError(RuntimeError):
@@ -972,7 +973,7 @@ def _gateway_requires_auth(settings: GatewaySettings) -> bool:
     try:
         return get_key_store().has_keys()
     except Exception as exc:
-        logger.warning("Gateway key store status unavailable: %s", _sanitize_for_log(exc))
+        logger.warning("Gateway key store status unavailable: %s", sanitize_text(_sanitize_for_log(exc)))
         return True
 
 
@@ -1091,14 +1092,14 @@ def _authenticate_gateway_request(request: Request, settings: GatewaySettings) -
         store = get_key_store()
         has_keys = store.has_keys()
     except Exception as exc:
-        logger.warning("Gateway key store unavailable: %s", _sanitize_for_log(exc))
+        logger.warning("Gateway key store unavailable: %s", sanitize_text(_sanitize_for_log(exc)))
         raise HTTPException(status_code=503, detail="gateway authentication unavailable") from exc
 
     if has_keys:
         try:
             api_key = store.verify(raw_token) if raw_token else None
         except Exception as exc:
-            logger.warning("Gateway key verification unavailable: %s", _sanitize_for_log(exc))
+            logger.warning("Gateway key verification unavailable: %s", sanitize_text(_sanitize_for_log(exc)))
             raise HTTPException(status_code=503, detail="gateway authentication unavailable") from exc
         if api_key is None:
             raise HTTPException(status_code=401, detail="gateway authentication required")
@@ -1249,7 +1250,7 @@ def build_control_plane_audit_sink(
                 response = await client.post(audit_url, json=payload, headers=headers)
                 response.raise_for_status()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Gateway audit push failed: %s", _sanitize_for_log(exc))
+            logger.warning("Gateway audit push failed: %s", sanitize_text(_sanitize_for_log(exc)))
 
     return _sink
 
@@ -1342,11 +1343,11 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
                 next_policy = _load_policy_file(settings.policy_path)
             except FileNotFoundError as exc:
                 policy_state["last_error"] = sanitize_error(exc)
-                logger.warning("gateway policy reload failed for %s: %s", settings.policy_path, _sanitize_for_log(exc))
+                logger.warning("gateway policy reload failed for %s: %s", settings.policy_path, sanitize_text(_sanitize_for_log(exc)))
                 return False
             except Exception as exc:  # noqa: BLE001
                 policy_state["last_error"] = sanitize_error(exc)
-                logger.warning("gateway policy reload failed for %s: %s", settings.policy_path, _sanitize_for_log(exc))
+                logger.warning("gateway policy reload failed for %s: %s", settings.policy_path, sanitize_text(_sanitize_for_log(exc)))
                 return False
 
             policy_state["policy"] = next_policy
@@ -1409,7 +1410,7 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
                 logger.warning(
                     "gateway firewall policy reload failed for %s: %s",
                     settings.firewall_policy_path,
-                    _sanitize_for_log(exc),
+                    sanitize_text(_sanitize_for_log(exc)),
                 )
                 return False
             except Exception as exc:  # noqa: BLE001
@@ -1418,7 +1419,7 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
                 logger.warning(
                     "gateway firewall policy reload failed for %s: %s",
                     settings.firewall_policy_path,
-                    _sanitize_for_log(exc),
+                    sanitize_text(_sanitize_for_log(exc)),
                 )
                 return False
 
@@ -1789,6 +1790,7 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
         token_scopes: set[str] = set()
         scoped_identity: Any = None
         managed_identity_lookup_unavailable = False
+        identity_failure_code = ""
         if identity_token:
             try:
                 from agent_bom.api.agent_identity_store import get_agent_identity_store, identity_for_token
@@ -1796,7 +1798,7 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
                 scoped_identity = identity_for_token(get_agent_identity_store(), identity_token)
             except Exception as exc:  # noqa: BLE001
                 managed_identity_lookup_unavailable = True
-                logger.warning("gateway managed identity lookup failed: %s", _sanitize_for_log(exc))
+                logger.warning("gateway managed identity lookup failed: %s", sanitize_text(_sanitize_for_log(exc)))
         if settings.oauth_as is not None:
             for candidate in (identity_token, _extract_request_token(request)):
                 if candidate:
@@ -1812,12 +1814,14 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
             identity_verified = True
             if scoped_identity.tenant_id != tenant_id:
                 identity_invalid_reason = "managed identity tenant mismatch"
+                identity_failure_code = ProfileResolutionCode.TENANT_MISMATCH.value
             elif (
                 not scoped_identity.blueprint_id
                 and settings.drift_enforcement_mode == "enforce"
                 and not _gateway_allows_anonymous_agents(settings)
             ):
                 identity_invalid_reason = "managed identity has no role blueprint binding"
+                identity_failure_code = ProfileResolutionCode.PROFILE_INCOMPLETE.value
         elif as_claims is not None:
             source_agent = str(as_claims.get("sub") or "").strip() or ANONYMOUS
             token_present = True
@@ -1826,6 +1830,8 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
             token_scopes = scopes_from_claims(as_claims)
         else:
             source_agent, token_present, identity_invalid_reason = check_caller_identity(message, current_policy)
+            if identity_invalid_reason is not None:
+                identity_failure_code = ProfileResolutionCode.IDENTITY_INVALID.value
             source_agent = source_agent or ANONYMOUS
             # "Verified" for inline mutual-auth: a resolved, non-anonymous caller
             # whose token was cryptographically checked — JWKS/OIDC-signed JWT or
@@ -1852,15 +1858,18 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
             )
             if agent_revoked:
                 identity_invalid_reason = "agent identity revoked"
+                identity_failure_code = ProfileResolutionCode.IDENTITY_INACTIVE.value
             elif revocation_lookup_incomplete:
                 # A knowingly partial answer is not a negative. Revocation is an
                 # emergency control, so this denies on every listener — the
                 # loopback anonymous-agent allowance does not govern it.
                 identity_invalid_reason = "agent identity revocation status unavailable"
+                identity_failure_code = ProfileResolutionCode.IDENTITY_STORE_UNAVAILABLE.value
             elif revocation_lookup_failed and (
                 current_policy.get("require_agent_identity") or not _gateway_allows_anonymous_agents(settings)
             ):
                 identity_invalid_reason = "agent identity revocation status unavailable"
+                identity_failure_code = ProfileResolutionCode.IDENTITY_STORE_UNAVAILABLE.value
 
         identity_block_reason: str | None = None
         if identity_invalid_reason is not None:
@@ -1868,11 +1877,13 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
         elif not token_present:
             if current_policy.get("require_agent_identity"):
                 identity_block_reason = "Identity required: no agent_identity token in _meta"
+                identity_failure_code = ProfileResolutionCode.MANAGED_IDENTITY_REQUIRED.value
             elif not _gateway_allows_anonymous_agents(settings):
                 identity_block_reason = (
                     "Anonymous agent caller denied on non-loopback listener; supply an agent_identity "
                     "token or set AGENT_BOM_GATEWAY_ALLOW_ANONYMOUS_AGENTS for local development only"
                 )
+                identity_failure_code = ProfileResolutionCode.MANAGED_IDENTITY_REQUIRED.value
 
         # A role blueprint is not a client profile. Keep them distinct until a
         # canonical assignment resolves successfully.
@@ -1937,6 +1948,7 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
                             GatewayRuntimeEventType.TOOL_CALL_BLOCKED,
                             decision="deny",
                             policy_source="identity",
+                            reason_code=identity_failure_code,
                         ),
                     }
                 )
@@ -1961,9 +1973,9 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
         if runtime_profile_mode != "off":
             profile_failure_code = ""
             if managed_identity_lookup_unavailable:
-                profile_failure_code = "identity_store_unavailable"
+                profile_failure_code = ProfileResolutionCode.IDENTITY_STORE_UNAVAILABLE.value
             elif scoped_identity is None:
-                profile_failure_code = "managed_identity_required"
+                profile_failure_code = ProfileResolutionCode.MANAGED_IDENTITY_REQUIRED.value
             else:
                 profile_identity_id = str(getattr(scoped_identity, "identity_id", "") or "")
                 try:
@@ -1979,8 +1991,8 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
                         granted_scopes=token_scopes,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    profile_failure_code = "profile_store_unavailable"
-                    logger.warning("gateway runtime profile lookup unavailable: %s", _public_gateway_error(exc))
+                    profile_failure_code = ProfileResolutionCode.PROFILE_STORE_UNAVAILABLE.value
+                    logger.warning("gateway runtime profile lookup unavailable: %s", sanitize_text(_public_gateway_error(exc)))
                 else:
                     if not resolution.resolved or resolution.profile is None:
                         profile_failure_code = resolution.code.value
@@ -2268,7 +2280,7 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
 
             budget_blocked, budget, budget_spend = check_budget_enforcement(get_cost_store(), tenant_id, source_agent)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("gateway budget check failed: %s", _sanitize_for_log(exc))
+            logger.warning("gateway budget check failed: %s", sanitize_text(_sanitize_for_log(exc)))
             budget_blocked, budget, budget_spend = False, None, 0.0
         if budget_blocked and budget is not None:
             record_gateway_relay(upstream.name, "blocked")
@@ -2322,7 +2334,7 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
 
                 cc_blocked, cc_budget, cc_spend = check_cost_center_budget_enforcement(get_cost_store(), tenant_id, cost_center)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("gateway cost-center budget check failed: %s", _sanitize_for_log(exc))
+                logger.warning("gateway cost-center budget check failed: %s", sanitize_text(_sanitize_for_log(exc)))
                 cc_blocked, cc_budget, cc_spend = False, None, 0.0
             if cc_blocked and cc_budget is not None:
                 record_gateway_relay(upstream.name, "blocked")
@@ -2384,7 +2396,7 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
                 get_cost_store(), tenant_id, source_agent
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("gateway owner budget check failed: %s", _sanitize_for_log(exc))
+            logger.warning("gateway owner budget check failed: %s", sanitize_text(_sanitize_for_log(exc)))
             owner_blocked, owner_budget, owner_spend_usd, budget_owner, budget_workflow = False, None, 0.0, "", ""
         if owner_blocked and owner_budget is not None:
             record_gateway_relay(upstream.name, "blocked")
@@ -2729,7 +2741,7 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
                 try:
                     reach_hit = reachability_map.reaches_privileged(source_agent, tool_name)
                 except Exception as exc:  # noqa: BLE001 — fail-open, never break the relay
-                    logger.warning("gateway graph-reachability check failed: %s", _sanitize_for_log(exc))
+                    logger.warning("gateway graph-reachability check failed: %s", sanitize_text(_sanitize_for_log(exc)))
                     reach_hit = None
                 if reach_hit is not None:
                     reach_reason = (
@@ -2807,7 +2819,7 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
                 try:
                     cond_decision, cond_reason, _cond_rule = evaluate_conditional_rules(current_policy, decision_ctx)
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("gateway conditional-rules evaluation error: %s", _sanitize_for_log(exc))
+                    logger.warning("gateway conditional-rules evaluation error: %s", sanitize_text(_sanitize_for_log(exc)))
                     cond_decision, cond_reason = GatewayDecision.DENY, "conditional rules evaluation error"
                 # Policy plugins follow the gateway fail-mode knob (fail-open
                 # forwards on a plugin engine error, fail-closed denies).
@@ -2819,7 +2831,7 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
                     )
                     plugin_eval_error = False
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("gateway plugin evaluation error: %s", _sanitize_for_log(exc))
+                    logger.warning("gateway plugin evaluation error: %s", sanitize_text(_sanitize_for_log(exc)))
                     plugin_decision, plugin_reason = GatewayDecision.ALLOW, ""
                     plugin_eval_error = True
                 # Compose: DENY outranks QUARANTINE outranks ALLOW. Conditional
@@ -3113,7 +3125,7 @@ def create_gateway_app(settings: GatewaySettings) -> FastAPI:
                 )
             raise HTTPException(status_code=502, detail="upstream error: timeout") from exc
         except Exception as exc:  # noqa: BLE001
-            logger.exception("gateway upstream call failed for %s", upstream.name)
+            logger.error("gateway upstream call failed for %s", upstream.name)
             record_gateway_relay(upstream.name, "upstream_error")
             if settings.audit_sink is not None:
                 await settings.audit_sink(
