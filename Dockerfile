@@ -1,5 +1,5 @@
 ## ── Builder stage ────────────────────────────────────────────────────────────
-FROM python:3.14.7-alpine3.23@sha256:6b8f06d04d5305c1d1288435388df9165ab41e681fae6439d6349d8053cc3f83 AS builder
+FROM python:3.15.0-alpine3.23@sha256:d64bc17e0dff27c5c4a31f616450d032aa73d6325855127ce3a305bf1384c8d5 AS builder
 
 WORKDIR /app
 ARG HTTP_PROXY
@@ -44,7 +44,7 @@ RUN set -eu; \
         -r deploy/docker/runtime-security-requirements.txt
 
 ## ── Runtime stage ────────────────────────────────────────────────────────────
-FROM python:3.14.7-alpine3.23@sha256:6b8f06d04d5305c1d1288435388df9165ab41e681fae6439d6349d8053cc3f83
+FROM python:3.15.0-alpine3.23@sha256:d64bc17e0dff27c5c4a31f616450d032aa73d6325855127ce3a305bf1384c8d5
 
 ARG VERSION=0.102.0
 ARG HTTP_PROXY
